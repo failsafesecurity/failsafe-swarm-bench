@@ -1,0 +1,1056 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "ILOPool.sol",
+      "TickMath.sol",
+      "ILOManager.sol",
+      "Whitelist.sol",
+      "FullMath.sol",
+      "ILOWhitelist.sol",
+      "OracleLibrary.sol",
+      "ILOVest.sol",
+      "LiquidityManagement.sol",
+      "LiquidityAmounts.sol",
+      "PoolAddress.sol",
+      "SqrtPriceMathPartial.sol",
+      "UniswapV3Oracle.sol",
+      "TransferHelper.sol",
+      "PeripheryPayments.sol",
+      "Multicall.sol",
+      "VultisigWhitelisted.sol",
+      "ILOPoolImmutableState.sol",
+      "Initializable.sol",
+      "Vultisig.sol",
+      "ChainId.sol",
+      "PositionKey.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-05T08:04:36.060Z",
+    "duration_ms": 425306
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS-H001",
+      "title": "claim() collect(type(uint128).max) Steals Other Investors' Fees and Permanently DoS Subsequent Claims",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "ILOPool.claim() uses pool.collect(type(uint128).max) which sweeps ALL tokens owed to the shared Uniswap V3 position (all investors share one position key). The first claimer's call collects all accumulated trading fees for all investors. The user receives their calculated fee share, and the remainder (other investors' fees) is sent to FEE_TAKER. When subsequent investors call claim(), their fee calculation uses feeGrowthDelta * positionLiquidity, producing a non-zero expected amount. But the tokens backing those fees were already collected and sent to FEE_TAKER. The subtraction amountCollected0 - amount0 underflows in Solidity 0.7.6 (unchecked arithmetic), causing the safeTransfer to attempt sending a massive amount, which reverts. All subsequent claimers are permanently locked out.",
+      "investigation_rationale": "This is a fundamental accounting flaw in the shared-position fee distribution model. Any claim after the first one that expects historical fees will revert, permanently locking investor funds.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim"
+      ],
+      "affected_contracts": [
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOPool.sol",
+          "function": "claim"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOPool.sol",
+        "lines": "177-213",
+        "pattern": "pool.collect(address(this), TICK_LOWER, TICK_UPPER, type(uint128).max, type(uint128).max) collects ALL owed tokens for the shared position, then amountCollected0-amount0 sent to feeTaker includes other users' uncollected fees"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Pool has been launched successfully (_launchSucceeded == true)",
+        "Trading has occurred on the Uniswap V3 pool generating fees",
+        "At least two investors hold positions in the ILOPool",
+        "First investor's vesting schedule has unlocked some liquidity"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "collect(type(uint128).max) sweeps all position fees, not just the claiming user's proportional share",
+        "admin_dependency": "No admin action required - any investor claiming triggers the issue",
+        "exploitation_window": "Permanent from the moment any trading fees accumulate post-launch"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does burn() settle fees for the entire position or only the burned portion?",
+          "After A's collect(max), what is the actual tokensOwed when B burns their portion?",
+          "Can the underflow in amountCollected0 - amount0 ever be avoided?"
+        ],
+        "validation_requirements": [
+          "Deploy ILOPool with 2+ investors, generate trading fees, have investor A claim, then verify investor B's claim reverts",
+          "Verify that feeGrowthInside values reflect the full history for unclaimed users",
+          "Quantify the exact fee loss per non-first claimer"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Wait for ILO pool launch and trading fee accumulation",
+        "phase_2": "Any investor (or FEE_TAKER acting strategically) claims their vested position first",
+        "phase_3": "collect(max) drains all accumulated fees from the shared Uniswap position",
+        "phase_4": "All subsequent investors' claim() calls revert due to underflow, permanently locking their funds",
+        "coordination_requirements": "None - any normal claim triggers this. Being the first claimer is advantageous."
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "No admin compromise needed",
+        "operational_disruption": "All investors except the first claimer permanently lose access to their vested liquidity and fees",
+        "recovery_difficulty": "No on-chain recovery possible - funds permanently locked in Uniswap V3 position",
+        "affected_operations": "claim() for all non-first investors"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - single transaction by any position holder",
+        "technical_skills": "Basic - just call claim() on a vested position",
+        "operational_timing": "After launch and any fee accumulation"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "First claim transaction followed by reverted claim attempts",
+        "operational_anomalies": "Large fee transfers to FEE_TAKER not proportional to single user's share",
+        "behavioral_patterns": "No abnormal behavior needed - normal usage triggers this",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H002",
+      "title": "Whitelist Bypass: Non-Whitelisted Addresses Pass checkWhitelist Due to Default Mapping Value Logic Flaw",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "In Whitelist.checkWhitelist(), the condition `if (_allowedWhitelistIndex == 0 || _whitelistIndex[to] > _allowedWhitelistIndex)` is intended to block non-whitelisted buyers. However, non-whitelisted addresses have _whitelistIndex[to] == 0 (Solidity mapping default). When _allowedWhitelistIndex > 0, the first condition is false, and `0 > _allowedWhitelistIndex` is also false (0 is never greater than a positive integer). Neither condition triggers the revert, so non-whitelisted addresses freely pass the check. The whitelist mechanism is completely ineffective.",
+      "investigation_rationale": "This is a logic error in the core whitelist enforcement. The check should verify that the user HAS a whitelist index (non-zero) AND that index is within the allowed range.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "checkWhitelist"
+      ],
+      "affected_contracts": [
+        "Whitelist.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Whitelist.sol",
+          "function": "checkWhitelist"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Whitelist.sol",
+        "lines": "152-154",
+        "pattern": "if (_allowedWhitelistIndex == 0 || _whitelistIndex[to] > _allowedWhitelistIndex) revert; default mapping value 0 bypasses the > check"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "_allowedWhitelistIndex > 0 (whitelist is active, some users allowed)",
+        "_locked == false (trading not fully locked)",
+        "Buyer address is not blacklisted",
+        "Transfer originates from _pool (Uniswap V3 buy)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Default Solidity mapping value (0) not treated as 'unwhitelisted' in the comparison logic",
+        "admin_dependency": "None - exploitable by any address once whitelist is active",
+        "exploitation_window": "Entire whitelist-active period"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can non-whitelisted addresses buy unlimited VULT tokens from the pool?",
+          "Does the maxAddressCap still apply (limiting damage per address)?",
+          "How many non-whitelisted addresses could exploit this simultaneously?"
+        ],
+        "validation_requirements": [
+          "Call checkWhitelist with a never-whitelisted address when _allowedWhitelistIndex > 0",
+          "Verify the function does not revert",
+          "Confirm buy from pool succeeds for non-whitelisted address"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Wait for _allowedWhitelistIndex to be set > 0 and _locked to be set false",
+        "phase_2": "Buy VULT from Uniswap V3 pool from any non-whitelisted address",
+        "phase_3": "_beforeTokenTransfer calls checkWhitelist, which passes despite no whitelist entry",
+        "phase_4": "Repeat from multiple addresses to bypass maxAddressCap per address",
+        "coordination_requirements": "None - single attacker with multiple addresses"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Complete whitelist mechanism bypass",
+        "operational_disruption": "Token distribution fairness destroyed; whales can accumulate unlimited tokens",
+        "recovery_difficulty": "Cannot be fixed without contract redeployment or blacklisting exploiters",
+        "affected_operations": "All buy actions from Uniswap V3 pool during whitelist period"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None - trivial single-address exploit",
+        "technical_skills": "Basic - buy tokens from Uniswap",
+        "operational_timing": "Any time during active whitelist period"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Large purchases from non-whitelisted addresses",
+        "operational_anomalies": "Token accumulation by addresses not in whitelist",
+        "behavioral_patterns": "Any buy from pool by non-whitelisted address",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H003",
+      "title": "Per-User Cap Bypass via NFT Transfer Enables Single User to Monopolize ILO Allocation",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "ILOPool.buy() checks `balanceOf(recipient) == 0` to determine if a new NFT should be minted. The maxCapPerUser is enforced against the current position's raiseAmount. If a user transfers their NFT to another wallet, balanceOf drops to 0, and a new position with raiseAmount=0 is created on the next buy. The per-user cap resets. This can be repeated to accumulate up to hardCap worth of RAISE_TOKEN across multiple wallets, all controlled by one entity.",
+      "investigation_rationale": "The cap enforcement is per-NFT-position, not per-historical-address. ERC721 transferability creates a trivial bypass where transferring the NFT resets the user's apparent contribution to zero.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "buy"
+      ],
+      "affected_contracts": [
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOPool.sol",
+          "function": "buy"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOPool.sol",
+        "lines": "104-119",
+        "pattern": "balanceOf(recipient) == 0 triggers new NFT mint; per-user cap checked against _position.raiseAmount of current NFT only; NFT is transferable ERC721"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User is whitelisted (or _openToAll is true)",
+        "Sale is active (between start and end time)",
+        "hardCap has not been reached",
+        "User controls at least 2 addresses"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "ERC721 transferFrom resets balanceOf to 0, triggering fresh NFT mint and clean raiseAmount on next buy()",
+        "admin_dependency": "None",
+        "exploitation_window": "Entire sale period"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can transferring NFT and re-buying be done atomically via multicall?",
+          "Does the whitelist check apply to the new address receiving the NFT?",
+          "How quickly can an attacker exhaust the hardCap?"
+        ],
+        "validation_requirements": [
+          "Buy maxCapPerUser, transfer NFT to second wallet, buy again from original wallet",
+          "Verify new NFT minted with raiseAmount=0 and cap check passes",
+          "Confirm total raised across positions exceeds maxCapPerUser for the original address"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Buy maxCapPerUser from whitelisted address A",
+        "phase_2": "Transfer NFT from A to secondary address B",
+        "phase_3": "Buy maxCapPerUser again from address A (new NFT minted, cap reset)",
+        "phase_4": "Repeat until hardCap reached, accumulating all allocation",
+        "coordination_requirements": "Single attacker with multiple wallets"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None needed",
+        "operational_disruption": "ILO allocation monopolized by single entity, destroying fair distribution",
+        "recovery_difficulty": "Cannot be reversed - purchases are final once made",
+        "affected_operations": "Fair distribution guarantee of ILO sale"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - one attacker with multiple wallets",
+        "technical_skills": "Basic - ERC721 transfer + buy calls",
+        "operational_timing": "During active sale window"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Multiple NFT mints to same address with intermediate transfers",
+        "operational_anomalies": "Single address exceeding maxCapPerUser across multiple positions",
+        "behavioral_patterns": "NFT transfers immediately followed by new buy() calls",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H004",
+      "title": "Missing Upper Bound Price Range Validation in initILOPool Allows Misconfigured Pools That Trap Investor Funds",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "ILOManager.initILOPool validates `sqrtRatioLowerX96 < _project.initialPoolPriceX96 && sqrtRatioLowerX96 < sqrtRatioUpperX96` but does NOT verify `_project.initialPoolPriceX96 < sqrtRatioUpperX96`. If the initial price is at or above the upper tick, the concentrated liquidity math in buy() and launch() produces incorrect results. Specifically, _saleAmountNeeded and liquidity calculations will use inverted parameters in LiquidityAmounts, creating positions where the raise-to-liquidity conversion is fundamentally wrong. Since initProject is permissionless, anyone can create a malicious project with this misconfiguration.",
+      "investigation_rationale": "The RANGE check is incomplete - only one inequality of a required two-sided bound is enforced. This allows creation of ILO pools where the price/tick relationship violates Uniswap V3 concentrated liquidity assumptions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "initILOPool",
+        "buy",
+        "launch"
+      ],
+      "affected_contracts": [
+        "ILOManager.sol",
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOManager.sol",
+          "function": "initILOPool"
+        },
+        {
+          "file": "ILOPool.sol",
+          "function": "buy"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOManager.sol",
+        "lines": "72-73",
+        "pattern": "require(sqrtRatioLowerX96 < _project.initialPoolPriceX96 && sqrtRatioLowerX96 < sqrtRatioUpperX96, 'RANGE') missing check that initialPoolPriceX96 < sqrtRatioUpperX96"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker calls initProject to become project admin",
+        "Sets tickUpper such that sqrtRatioUpperX96 <= initialPoolPriceX96",
+        "Creates ILO pool with these parameters"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Only lower < initial checked, not initial < upper; LiquidityAmounts.getLiquidityForAmount0/1 auto-swap parameters when A > B, masking the error",
+        "admin_dependency": "Exploitable by any project admin (permissionless to become one)",
+        "exploitation_window": "At pool initialization"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What exact liquidity values does _saleAmountNeeded return when price >= upper tick?",
+          "Would launch() succeed or fail with miscalculated amounts?",
+          "Can investors' RAISE_TOKEN be permanently locked in a pool that can never launch?"
+        ],
+        "validation_requirements": [
+          "Create pool with initialPoolPriceX96 >= sqrtRatioUpperX96",
+          "Execute buy() and verify liquidity calculation correctness",
+          "Attempt launch() and verify behavior"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Call initProject with chosen token pair, becoming project admin",
+        "phase_2": "Call initILOPool with tickUpper yielding sqrtRatioUpperX96 <= initialPoolPriceX96",
+        "phase_3": "Investors buy into the misconfigured pool, receiving incorrect liquidity amounts",
+        "phase_4": "Launch fails or produces incorrect Uniswap position; investor funds trapped until refund deadline",
+        "coordination_requirements": "Single attacker creating malicious project"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None needed",
+        "operational_disruption": "Investor funds locked in a non-launchable pool until refund deadline (7+ days)",
+        "recovery_difficulty": "Must wait for refund deadline; funds at market risk during lock period",
+        "affected_operations": "buy(), launch() for the affected pool"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - single attacker",
+        "technical_skills": "Moderate - understanding of Uniswap V3 tick/price math",
+        "operational_timing": "At project/pool creation"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Pool creation with abnormal tick ranges",
+        "operational_anomalies": "Initial price outside tick range",
+        "behavioral_patterns": "Project creation followed by rapid investor deposits",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "buy() Griefing: Anyone Can Fill a Whitelisted User's Allocation Without Their Consent",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "ILOPool.buy(raiseAmount, recipient) accepts an arbitrary recipient parameter and checks whitelist against recipient, not msg.sender. The RAISE_TOKEN is pulled from msg.sender, but the position is created/updated for recipient. An attacker can call buy(maxCapPerUser, victimAddress) with their own RAISE_TOKEN, filling the victim's allocation cap. The victim can no longer participate in the ILO because their per-user cap is exhausted. The attacker loses their RAISE_TOKEN (it goes into the pool for the victim's position), but the victim is denied participation at their desired timing or amount.",
+      "investigation_rationale": "The separation of payer (msg.sender) and recipient allows unsolicited allocation-filling. While the attacker loses funds, the griefing impact on targeted whitelisted users is significant.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "buy"
+      ],
+      "affected_contracts": [
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOPool.sol",
+          "function": "buy"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOPool.sol",
+        "lines": "95-140",
+        "pattern": "buy(raiseAmount, recipient) - whitelist checked on recipient but RAISE_TOKEN pulled from msg.sender; no check that msg.sender == recipient or has recipient's authorization"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Victim address is whitelisted",
+        "Sale is active",
+        "Attacker has sufficient RAISE_TOKEN and has approved ILOPool"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No consent mechanism: msg.sender can buy on behalf of any whitelisted recipient",
+        "admin_dependency": "None",
+        "exploitation_window": "Entire sale period"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can the victim transfer the unwanted NFT and rebuy (combining with OPS-H003)?",
+          "What is the attacker's financial loss vs the griefing impact?",
+          "Can this be used to block high-value whitelisted participants?"
+        ],
+        "validation_requirements": [
+          "Call buy(maxCapPerUser, victimAddress) from attacker address",
+          "Verify victim's cap is exhausted",
+          "Verify victim cannot buy additional allocation"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify target whitelisted addresses",
+        "phase_2": "Approve ILOPool to spend attacker's RAISE_TOKEN",
+        "phase_3": "Call buy(maxCapPerUser, victimAddress) for each target",
+        "phase_4": "Victims cannot participate at their desired allocation",
+        "coordination_requirements": "Single attacker with RAISE_TOKEN"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None needed",
+        "operational_disruption": "Targeted whitelisted users denied ILO participation",
+        "recovery_difficulty": "Victims could use NFT transfer workaround (OPS-H003)",
+        "affected_operations": "Fair access to ILO sale"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Basic",
+        "operational_timing": "During active sale"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "buy() calls where msg.sender != recipient",
+        "operational_anomalies": "Positions created for users who didn't initiate the buy",
+        "behavioral_patterns": "Rapid filling of multiple users' caps by single address",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H006",
+      "title": "Liquidity Accounting Mismatch Between Per-Buy and Aggregate Launch Calculations Locks Late Claimers' Funds",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In buy(), each investor's liquidity is calculated individually: getLiquidity(raiseAmount_i) * shares / BPS with floor division at each step. In launch(), total liquidity is calculated from totalRaised: getLiquidity(totalRaised). Due to non-linearity of getLiquidity functions and accumulated floor-division rounding, sum(individual_liquidities) may exceed the actual Uniswap position liquidity allocated to investors (liquidity * investorShares / BPS). If the sum exceeds reality, late claimers' burn() calls will revert because the Uniswap position has insufficient liquidity.",
+      "investigation_rationale": "getLiquidityForAmount0/1 is not strictly linear with respect to amount. Multiple small inputs produce different aggregate liquidity than one large input. With many investors, cumulative rounding error can become material.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "buy",
+        "launch",
+        "claim"
+      ],
+      "affected_contracts": [
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOPool.sol",
+          "function": "buy"
+        },
+        {
+          "file": "ILOPool.sol",
+          "function": "launch"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOPool.sol",
+        "lines": "118-130",
+        "pattern": "Per-user: getLiquidityForAmount0/1(raiseAmount) then mulDiv(liquidityDelta, shares, BPS) with floor division; launch: _saleAmountNeeded(totalRaised) produces different total liquidity"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multiple investors have purchased positions via buy()",
+        "Pool has launched successfully",
+        "All investors attempt to claim their full vested liquidity"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Individual liquidity calculations use floor division per call; aggregate calculation at launch uses a single floor division",
+        "admin_dependency": "None - inherent mathematical property",
+        "exploitation_window": "After all vesting unlocks, when total claims exceed available liquidity"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the maximum per-investor rounding error?",
+          "With N investors, does cumulative error exceed Uniswap position dust?",
+          "Can the last claimer's burn() revert due to insufficient liquidity?"
+        ],
+        "validation_requirements": [
+          "Simulate 100+ buy calls with varying amounts",
+          "Compare sum of individual liquidities to total launch liquidity",
+          "Attempt full claim of all positions sequentially"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Not an active exploit - occurs naturally with multiple investors",
+        "phase_2": "All investors claim their full positions as vesting unlocks",
+        "phase_3": "Last investor(s) receive insufficient liquidity from Uniswap burn",
+        "phase_4": "Their claim() reverts, permanently locking their remaining position",
+        "coordination_requirements": "None - natural occurrence"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Last claimer(s) cannot withdraw vested funds",
+        "recovery_difficulty": "No on-chain recovery for the rounding-dust locked liquidity",
+        "affected_operations": "claim() for the last position(s) to claim"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "None - occurs naturally",
+        "operational_timing": "After full vesting"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Reverted claim transactions for the last remaining positions",
+        "operational_anomalies": "Sum of tracked liquidities > actual Uniswap position liquidity",
+        "behavioral_patterns": "N/A - natural occurrence",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "Zero-Duration Vesting Schedule Permanently DoS Claims via Division by Zero in _unlockedLiquidity",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "ILOVest._validateVestSchedule does not check that schedule[i].start < schedule[i].end. If start == end (zero-duration vest), _unlockedLiquidity hits the else branch when block.timestamp >= start && block.timestamp == end (or rather, vest.end < block.timestamp won't be true when block.timestamp == vest.end == vest.start). In the else branch: (vest.end - vest.start) * BPS = 0, causing FullMath.mulDiv to revert on zero denominator. Since claim() calls _claimableLiquidity which calls _unlockedLiquidity, all claims for positions with zero-duration vests permanently revert.",
+      "investigation_rationale": "Missing validation of vest.start < vest.end allows construction of unclaimed-forever positions. Since initProject is permissionless, any attacker can become project admin and configure malicious vesting.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_validateVestSchedule",
+        "_unlockedLiquidity",
+        "claim"
+      ],
+      "affected_contracts": [
+        "ILOVest.sol",
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOVest.sol",
+          "function": "_validateVestSchedule"
+        },
+        {
+          "file": "ILOPool.sol",
+          "function": "_unlockedLiquidity"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOVest.sol",
+        "lines": "35-49",
+        "pattern": "_validateVestSchedule checks schedule[i].start >= lastEnd but never checks start < end; _unlockedLiquidity line: (vest.end - vest.start) * BPS used as denominator"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Malicious project admin creates ILO pool with vesting schedule where start == end",
+        "Investors buy into the pool (they see vesting config but may not detect the issue)",
+        "Pool launches successfully"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "_validateVestSchedule allows start == end; _unlockedLiquidity divides by (end - start) which is 0",
+        "admin_dependency": "Requires project admin to configure malicious vesting (anyone can become project admin via permissionless initProject)",
+        "exploitation_window": "At pool initialization; permanent effect after launch"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does _validateVestSchedule accept start == end?",
+          "Does _unlockedLiquidity always hit the else branch for zero-duration vests?",
+          "Can investors detect this before buying?"
+        ],
+        "validation_requirements": [
+          "Create pool with vest schedule entry where start == end",
+          "Confirm _validateVestSchedule passes",
+          "Attempt claim after launch and verify division by zero revert"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Call initProject to become admin, then initILOPool with zero-duration vest schedule",
+        "phase_2": "Wait for investors to buy into the pool",
+        "phase_3": "Launch the pool successfully",
+        "phase_4": "All investor claims permanently revert due to division by zero",
+        "coordination_requirements": "Single attacker as project admin"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None needed",
+        "operational_disruption": "All investor positions permanently locked with no claim path",
+        "recovery_difficulty": "No on-chain recovery - funds trapped in Uniswap position forever",
+        "affected_operations": "claim() for all investors in the affected pool"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - single malicious project admin",
+        "technical_skills": "Moderate - understanding vesting schedule parameters",
+        "operational_timing": "At pool creation"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Vesting configs with identical start and end timestamps",
+        "operational_anomalies": "All claim attempts reverting for a specific pool",
+        "behavioral_patterns": "Project admin who creates pool but never participates",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H008",
+      "title": "Oracle TWAP Fallback to Minimal Period on New Pools Enables Whitelist Cap Bypass via Price Manipulation",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "UniswapV3Oracle.peek() uses `period = PERIOD < longestPeriod ? PERIOD : longestPeriod`. For a newly created or recently initialized pool, getOldestObservationSecondsAgo returns a very small value (seconds). The TWAP window shrinks to near-spot price, making it trivially manipulable. An attacker can manipulate the pool price to make VULT appear extremely cheap in ETH terms, causing the oracle to report a low ETH equivalent. Whitelist.checkWhitelist then allows purchases far exceeding the intended maxAddressCap since the estimated ETH value is artificially depressed.",
+      "investigation_rationale": "The oracle has no minimum safe period check. On a new pool, the TWAP degenerates to spot price, which can be manipulated via large swaps or flash loans in a multi-block strategy.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "peek",
+        "checkWhitelist"
+      ],
+      "affected_contracts": [
+        "UniswapV3Oracle.sol",
+        "Whitelist.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "UniswapV3Oracle.sol",
+          "function": "peek"
+        },
+        {
+          "file": "Whitelist.sol",
+          "function": "checkWhitelist"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "UniswapV3Oracle.sol",
+        "lines": "31-36",
+        "pattern": "uint32 period = PERIOD < longestPeriod ? PERIOD : longestPeriod; no minimum period enforcement; newly created pool has longestPeriod near 0"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "VULT/WETH Uniswap V3 pool has insufficient observation history (< 30 minutes)",
+        "Whitelist is active (_allowedWhitelistIndex > 0, _locked == false)",
+        "Attacker has sufficient capital to move the pool price"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "TWAP falls back to shortest available period, degenerating to spot price",
+        "admin_dependency": "None - depends on pool's observation history",
+        "exploitation_window": "First ~30 minutes after pool creation or observation reset"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the actual observation history when oracle is first configured?",
+          "How much capital is needed to move VULT/WETH price by 10x for one block?",
+          "Does the 5% slippage adjustment in peek() provide meaningful protection?"
+        ],
+        "validation_requirements": [
+          "Check getOldestObservationSecondsAgo for the VULT/WETH pool at deployment",
+          "Simulate price manipulation cost vs whitelist cap bypass benefit",
+          "Verify oracle returns manipulated price with short observation window"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Wait for or identify period when pool observation history is short",
+        "phase_2": "Execute large swap to depress VULT price in ETH terms",
+        "phase_3": "Buy VULT from pool - oracle reports low ETH equivalent, bypassing maxAddressCap",
+        "phase_4": "Reverse the price manipulation in subsequent block",
+        "coordination_requirements": "Single attacker with sufficient capital for temporary price manipulation"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Per-address contribution cap bypassed, unfair token accumulation",
+        "recovery_difficulty": "Tokens already purchased cannot be reclaimed",
+        "affected_operations": "checkWhitelist cap enforcement"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium - requires capital and timing",
+        "technical_skills": "Advanced - price manipulation mechanics",
+        "operational_timing": "Shortly after pool creation when observation history is minimal"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Large swaps immediately before VULT purchases exceeding expected caps",
+        "operational_anomalies": "Oracle returning values significantly below market price",
+        "behavioral_patterns": "Rapid large purchases during pool's first minutes",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "Reentrancy in launch() via SALE_TOKEN Callback Before _launchSucceeded Flag Set",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In ILOPool.launch(), _launchSucceeded is set to true as the LAST statement, after _refundProject(admin) which calls TransferHelper.safeTransfer(SALE_TOKEN, projectAdmin, refundAmount). If SALE_TOKEN is an ERC777 or token with transfer hooks, the callback can re-enter the ILOPool. Since _launchSucceeded is still false, the refundable() modifier could pass (if block.timestamp >= refundDeadline), setting _refundTriggered = true. This corrupts the state machine: both _launchSucceeded and _refundTriggered become true, violating the mutual exclusivity invariant.",
+      "investigation_rationale": "The checks-effects-interactions pattern is violated: the critical state flag _launchSucceeded is set after external calls. With non-standard ERC20 tokens (which the documentation states are expected), reentrancy is plausible.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "launch",
+        "claimRefund"
+      ],
+      "affected_contracts": [
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOPool.sol",
+          "function": "launch"
+        },
+        {
+          "file": "ILOPool.sol",
+          "function": "claimRefund"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOPool.sol",
+        "lines": "244-246",
+        "pattern": "_refundProject(_project.admin) [external SALE_TOKEN transfer] executes BEFORE _launchSucceeded = true on line 246"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "SALE_TOKEN has transfer hooks (ERC777, custom callback)",
+        "block.timestamp >= refundDeadline at launch time (possible if owner manipulated deadline)",
+        "Reentrancy path through claimRefund or claimProjectRefund"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "_launchSucceeded set after _refundProject external call; CEI pattern violated",
+        "admin_dependency": "May require ILOManager owner to set favorable refundDeadline",
+        "exploitation_window": "During launch() execution when SALE_TOKEN transfer triggers callback"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can claimRefund succeed during reentrancy (is RAISE_TOKEN still in contract)?",
+          "What state corruption occurs if both flags are set true?",
+          "Would the RAISE_TOKEN transfer in claimRefund fail (already sent to Uniswap)?"
+        ],
+        "validation_requirements": [
+          "Test with ERC777 SALE_TOKEN that calls back during launch()",
+          "Verify refundable() modifier passes during callback",
+          "Check if both flags can be set simultaneously"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Deploy project with ERC777 or hook-enabled SALE_TOKEN",
+        "phase_2": "Ensure refundDeadline <= launch time",
+        "phase_3": "Trigger launch() - during _refundProject SALE_TOKEN transfer callback, call claimRefund",
+        "phase_4": "Both _launchSucceeded and _refundTriggered become true",
+        "coordination_requirements": "Requires control of SALE_TOKEN contract (project admin)"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "State machine invariant broken",
+        "operational_disruption": "Unpredictable behavior with both lifecycle flags true",
+        "recovery_difficulty": "No recovery mechanism - state corruption permanent",
+        "affected_operations": "All post-launch operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium - requires custom SALE_TOKEN",
+        "technical_skills": "Advanced - ERC777/reentrancy mechanics",
+        "operational_timing": "At launch time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "launch() and claimRefund events in same transaction",
+        "operational_anomalies": "Both _launchSucceeded and _refundTriggered set to true",
+        "behavioral_patterns": "Custom SALE_TOKEN with callback hooks",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "ILOManager Constructor Uses tx.origin for Ownership Creating Deployment Security Gap",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "ILOManager constructor calls `transferOwnership(tx.origin)`. When deployed via a factory, Create2 deployer, multisig, or deployment pipeline, tx.origin is the EOA that initiated the outer transaction, not necessarily the intended owner. Between deployment and initialize() (which transfers ownership to initialOwner), the tx.origin address has full owner privileges and can call setPlatformFee, setPerformanceFee, setFeeTaker, setILOPoolImplementation, etc. The deployment script (Deploy.s.sol) deploys and initializes in the same broadcast, but if initialize() fails or is called separately, the window exists.",
+      "investigation_rationale": "tx.origin-based ownership is a known anti-pattern. The deployment script partially mitigates by initializing in the same transaction, but separate deployment/initialization (Init.s.sol exists as separate script) creates a real window.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "ILOManager deployment and initialization happen in separate transactions"
+      ],
+      "config_evidence": "Init.s.sol exists as a separate initialization script, indicating separate deployment/init is a supported workflow",
+      "affected_functions": [
+        "constructor",
+        "initialize"
+      ],
+      "affected_contracts": [
+        "ILOManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOManager.sol",
+          "function": "constructor"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOManager.sol",
+        "lines": "19-21",
+        "pattern": "constructor () { transferOwnership(tx.origin); } - tx.origin used instead of msg.sender"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "ILOManager deployed via factory/multisig where tx.origin != intended owner",
+        "Gap between deployment and initialize() call",
+        "tx.origin address is aware of ownership or malicious"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "tx.origin ownership in constructor + separate Init.s.sol deployment script",
+        "admin_dependency": "Deployment configuration dependent",
+        "exploitation_window": "Between deployment and initialize() transactions"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is ILOManager always deployed and initialized atomically?",
+          "Can the tx.origin owner call setILOPoolImplementation before initialize()?",
+          "Does the Initializable modifier protect against owner abuse before initialization?"
+        ],
+        "validation_requirements": [
+          "Verify deployment script atomicity",
+          "Check if owner functions work before initialize() (afterInitialize guard on some functions)",
+          "Test tx.origin ownership with factory deployment"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Monitor for ILOManager deployment without immediate initialization",
+        "phase_2": "tx.origin (if compromised) calls setILOPoolImplementation with malicious implementation",
+        "phase_3": "All future ILO pools cloned from malicious implementation",
+        "phase_4": "initialize() called later, transfers ownership away, but damage is done",
+        "coordination_requirements": "Access to tx.origin private key"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Temporary full admin access to ILOManager",
+        "operational_disruption": "Malicious pool implementation affecting all future pools",
+        "recovery_difficulty": "Owner can fix after initialization, but early pools may be compromised",
+        "affected_operations": "setILOPoolImplementation, setFeeTaker, fee setters"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium - requires deployment timing knowledge",
+        "technical_skills": "Moderate",
+        "operational_timing": "Between deployment and initialization"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Owner function calls between deployment and initialization",
+        "operational_anomalies": "Multiple ownership transfers in rapid succession",
+        "behavioral_patterns": "Configuration changes before initialize()",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H011",
+      "title": "ILOManager Owner Can Set Refund Deadline to Far Future Permanently Locking Investor Funds",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "ILOManager.setRefundDeadlineForProject has no constraints - the owner can set refundDeadline to type(uint64).max. Combined with a scenario where launch() fails (e.g., Uniswap V3 pool price changed), both the launch path (price mismatch revert) and the refund path (deadline never reached) become permanently blocked. All investor RAISE_TOKEN and project SALE_TOKEN are permanently locked in ILO pools with no recovery mechanism.",
+      "investigation_rationale": "The refund deadline is the only fallback mechanism for failed sales. If it can be set to an unreachable value, the safety net is removed entirely.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setRefundDeadlineForProject",
+        "claimRefund"
+      ],
+      "affected_contracts": [
+        "ILOManager.sol",
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOManager.sol",
+          "function": "setRefundDeadlineForProject"
+        },
+        {
+          "file": "ILOPool.sol",
+          "function": "claimRefund"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOManager.sol",
+        "lines": "115-119",
+        "pattern": "setRefundDeadlineForProject has no bounds check; can set to type(uint64).max making refundable() modifier's block.timestamp >= refundDeadline unreachable"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "ILOManager owner is malicious or compromised",
+        "Project has active ILO pools with investor deposits",
+        "Launch cannot proceed (price manipulation or other failure)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No upper bound on refundDeadline parameter",
+        "admin_dependency": "Requires ILOManager owner action",
+        "exploitation_window": "Any time before launch or refund is triggered"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is ILOManager owner a multisig or timelock?",
+          "Can refundDeadline be changed after _refundTriggered is set?",
+          "Is there any emergency mechanism to bypass this?"
+        ],
+        "validation_requirements": [
+          "Call setRefundDeadlineForProject with type(uint64).max",
+          "Verify claimRefund reverts with 'RFT'",
+          "Confirm no alternative withdrawal path exists"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "ILOManager owner sets refundDeadline to type(uint64).max for target project",
+        "phase_2": "Manipulate Uniswap V3 pool price to prevent launch()",
+        "phase_3": "Both launch and refund paths are permanently blocked",
+        "phase_4": "All investor RAISE_TOKEN locked with no recovery",
+        "coordination_requirements": "ILOManager owner compromise or collusion"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Requires ILOManager owner compromise",
+        "operational_disruption": "Complete permanent loss of all investor funds in affected pools",
+        "recovery_difficulty": "No on-chain recovery possible - requires contract migration or hard fork",
+        "affected_operations": "claimRefund, launch for affected project"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low once admin access obtained",
+        "technical_skills": "Basic",
+        "operational_timing": "Before launch or refund is triggered"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "setRefundDeadlineForProject calls with extreme values",
+        "operational_anomalies": "Refund deadline set far in the future",
+        "behavioral_patterns": "Owner modifying deadlines for active projects",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H012",
+      "title": "Missing Fee Upper Bound Validation Allows Owner to DoS All Claims via Underflow in _deductFees",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "ILOManager.setPlatformFee and setPerformanceFee accept any uint16 value (up to 65535) with no upper bound check. If PLATFORM_FEE is set >= 10000 BPS (100%), _deductFees computes: amount0Left = amount0 - FullMath.mulDiv(amount0, feeBPS, 10000). When feeBPS >= 10000, the subtracted value >= amount0, causing underflow in Solidity 0.7.6 (no overflow protection). This produces a massive erroneous amount that fails on transfer, permanently DOSing all claim() calls. Fees are snapshot at project creation time in _cachedProject, so this affects all pools created after the fee change.",
+      "investigation_rationale": "uint16 can hold values up to 65535 but BPS should be < 10000. No validation exists, and the fee is applied in unchecked arithmetic.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setPlatformFee",
+        "setPerformanceFee",
+        "_deductFees",
+        "claim"
+      ],
+      "affected_contracts": [
+        "ILOManager.sol",
+        "ILOPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ILOManager.sol",
+          "function": "setPlatformFee"
+        },
+        {
+          "file": "ILOPool.sol",
+          "function": "_deductFees"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ILOManager.sol",
+        "lines": "105-109",
+        "pattern": "setPlatformFee(uint16 _platformFee) has no require(_platformFee < BPS); _deductFees subtracts fee amount from total with no overflow check in Solidity 0.7.6"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "ILOManager owner sets PLATFORM_FEE or PERFORMANCE_FEE >= 10000",
+        "New project is created after fee change (fees snapshot at creation)",
+        "Pool launches and investors attempt to claim"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No bounds check on fee setter; Solidity 0.7.6 unchecked arithmetic in _deductFees",
+        "admin_dependency": "Requires ILOManager owner to set excessive fees",
+        "exploitation_window": "After fee change, for all new projects"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can fees be changed retroactively for existing projects?",
+          "Does the uint16 type limit provide any practical protection?",
+          "What is the exact revert behavior in _deductFees with fee >= 10000?"
+        ],
+        "validation_requirements": [
+          "Set PLATFORM_FEE to 10001, create project, launch pool, attempt claim",
+          "Verify _deductFees underflows",
+          "Confirm claim() permanently reverts"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "ILOManager owner sets PLATFORM_FEE to 10001",
+        "phase_2": "New project created with fee=10001 snapshot",
+        "phase_3": "Investors buy and pool launches",
+        "phase_4": "All claim() calls revert due to underflow in _deductFees",
+        "coordination_requirements": "ILOManager owner compromise"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Requires ILOManager owner action",
+        "operational_disruption": "All investor claims permanently blocked for affected projects",
+        "recovery_difficulty": "No recovery mechanism - funds locked in Uniswap position",
+        "affected_operations": "claim() for all pools created after fee change"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low once admin access obtained",
+        "technical_skills": "Basic",
+        "operational_timing": "Before project creation"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Fee setter calls with values >= 10000",
+        "operational_anomalies": "Consistently reverted claim transactions",
+        "behavioral_patterns": "Fee changes followed by new project creation",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

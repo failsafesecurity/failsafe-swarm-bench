@@ -1,0 +1,322 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T17:25:27.717Z",
+    "duration_ms": 182821
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-sync-ledger",
+        "source": "Whitelisted lending market (msg.sender)",
+        "path": [
+          "Lending market calls sync_ledger(_lender, _delta)",
+          "update_market checks whitelist and updates accCantoPerShare",
+          "User balance (user.amount) is updated by _delta",
+          "User rewardDebt/secRewardDebt adjusted proportionally",
+          "lendingMarketTotalBalance updated"
+        ],
+        "transformations": [
+          "int256 _delta cast to uint256 for balance adjustment",
+          "rewardDebt = delta * accCantoPerShare / 1e18 (truncating division)",
+          "secRewardDebt = delta * secRewardsPerShare / 1e18 (truncating division)"
+        ],
+        "sinks": [
+          "userInfo[market][lender].amount",
+          "userInfo[market][lender].rewardDebt",
+          "userInfo[market][lender].secRewardDebt",
+          "lendingMarketTotalBalance[market]"
+        ],
+        "trust_changes": "Lending market is fully trusted to report correct delta values. No verification of actual cNOTE balances.",
+        "validation_points": [
+          "lendingMarketWhitelist check inside update_market",
+          "updatedMarketBalance >= 0 check after adjustment",
+          "Solidity 0.8 automatic underflow check on user.amount -= uint256(-_delta)"
+        ],
+        "exposure_risks": [
+          "Compromised or malicious whitelisted lending market can fabricate arbitrary deltas for any lender address",
+          "No cross-reference with actual on-chain token balance of the lending market"
+        ],
+        "manipulation_risks": [
+          "A whitelisted lending market can inflate user.amount without actual deposits, enabling fraudulent reward claims",
+          "Repeated tiny deposits can exploit rounding truncation in rewardDebt calculation"
+        ]
+      },
+      {
+        "flow_id": "DF-02-reward-accumulation",
+        "source": "Block progression triggering update_market",
+        "path": [
+          "update_market called (directly or via sync_ledger/claim)",
+          "Loop from lastRewardBlock to block.number",
+          "Each iteration: compute epoch, blockDelta, cantoReward via gauge weight",
+          "accCantoPerShare incremented",
+          "secRewardsPerShare incremented",
+          "lastRewardBlock set to block.number"
+        ],
+        "transformations": [
+          "epoch = (i / BLOCK_EPOCH) * BLOCK_EPOCH (floor to epoch boundary)",
+          "nextEpoch = i + BLOCK_EPOCH (BUG: should be epoch + BLOCK_EPOCH)",
+          "blockDelta = min(nextEpoch, block.number) - i",
+          "cantoReward = blockDelta * cantoPerBlock[epoch] * gauge_relative_weight / 1e18",
+          "accCantoPerShare += cantoReward * 1e18 / marketSupply"
+        ],
+        "sinks": [
+          "marketInfo[market].accCantoPerShare",
+          "marketInfo[market].secRewardsPerShare",
+          "marketInfo[market].lastRewardBlock"
+        ],
+        "trust_changes": "External dependency on GaugeController.gauge_relative_weight_write for weight data; return value directly used in reward calculation",
+        "validation_points": [
+          "Whitelist check at start of update_market",
+          "marketSupply > 0 check to avoid division by zero"
+        ],
+        "exposure_risks": [
+          "accCantoPerShare and secRewardsPerShare are public and can be read by anyone"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: nextEpoch = i + BLOCK_EPOCH incorrectly skips epoch boundaries causing wrong reward rates applied to wrong blocks",
+          "GaugeController weight manipulation could influence reward distribution",
+          "accCantoPerShare cast to uint128 may silently truncate or revert causing permanent DoS"
+        ]
+      },
+      {
+        "flow_id": "DF-03-claim",
+        "source": "User (msg.sender) calling claim(_market)",
+        "path": [
+          "update_market called to bring accCantoPerShare current",
+          "accumulatedCanto = user.amount * accCantoPerShare / 1e18",
+          "cantoToSend = accumulatedCanto - user.rewardDebt",
+          "user.rewardDebt = accumulatedCanto (state updated before external call)",
+          "Native CANTO sent via msg.sender.call{value: cantoToSend}()"
+        ],
+        "transformations": [
+          "uint256 multiplication then int256 cast for accumulatedCanto",
+          "Subtraction of signed integers for cantoToSend",
+          "int256 to uint256 cast for msg.sender.call value"
+        ],
+        "sinks": [
+          "msg.sender receives native CANTO",
+          "userInfo[market][msg.sender].rewardDebt updated"
+        ],
+        "trust_changes": "State is updated before external call (CEI pattern), but no reentrancy guard exists",
+        "validation_points": [
+          "Whitelist check in update_market",
+          "cantoToSend > 0 check before transfer",
+          "require(success) on CANTO transfer"
+        ],
+        "exposure_risks": [
+          "No reentrancy guard; if msg.sender is also a whitelisted market, cross-function reentrancy via sync_ledger possible during callback"
+        ],
+        "manipulation_risks": [
+          "Reward calculation based on buggy accCantoPerShare may over- or under-pay users",
+          "Contract may have insufficient CANTO balance to pay claims (no balance check before send)"
+        ]
+      },
+      {
+        "flow_id": "DF-04-governance-config",
+        "source": "Governance address",
+        "path": [
+          "setRewards sets cantoPerBlock for epoch range",
+          "whiteListLendingMarket toggles whitelist status and initializes lastRewardBlock"
+        ],
+        "transformations": [
+          "No transformation on _amountPerBlock, stored directly",
+          "lastRewardBlock set to current block.number on whitelist"
+        ],
+        "sinks": [
+          "cantoPerBlock[epoch] mapping",
+          "lendingMarketWhitelist[market]",
+          "marketInfo[market].lastRewardBlock"
+        ],
+        "trust_changes": "Governance has unilateral control with no timelock or multisig requirement",
+        "validation_points": [
+          "onlyGovernance modifier",
+          "Epoch alignment check (_fromEpoch % BLOCK_EPOCH == 0)",
+          "No-change check on whitelist toggle"
+        ],
+        "exposure_risks": [
+          "Governance can set arbitrary reward rates, potentially draining contract CANTO"
+        ],
+        "manipulation_risks": [
+          "setRewards can retroactively change reward rates for past epochs if update_market hasnt been called yet",
+          "De-whitelisting a market locks unclaimed user rewards permanently",
+          "setRewards loop has no gas limit — large epoch ranges can cause out-of-gas"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Rewards distributed proportionally to user share of market total balance",
+        "Reward accumulation follows MasterChef accRewardPerShare pattern",
+        "Only whitelisted lending markets can trigger balance updates via sync_ledger",
+        "Rewards sourced from native CANTO held by the contract",
+        "Epoch-based reward rate configuration with BLOCK_EPOCH = 100,000 blocks",
+        "GaugeController weights determine per-market reward allocation"
+      ],
+      "economic_incentives": [
+        "Users incentivized to deposit cNOTE into lending markets for CANTO rewards",
+        "Gauge weight voting determines which markets receive more rewards",
+        "Secondary reward tracking (secRewardsPerShare) for external integrations"
+      ],
+      "governance_mechanisms": [
+        "Single governance address with no timelock or multisig requirement",
+        "Governance sets reward rates per epoch via setRewards",
+        "Governance controls market whitelist via whiteListLendingMarket",
+        "Governance can transfer its own role via setGovernance",
+        "No proposal, voting, or delay mechanism — instant execution"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "update_market called when lastRewardBlock is not epoch-aligned (which is the common case)",
+          "expected_behavior": "Loop should correctly split reward calculation at epoch boundaries, applying the correct cantoPerBlock rate for each epoch",
+          "actual_behavior": "nextEpoch = i + BLOCK_EPOCH instead of epoch + BLOCK_EPOCH causes the loop to skip actual epoch boundaries. Rewards are calculated using the wrong epoch's cantoPerBlock for blocks that span multiple epochs. This systematically misallocates rewards.",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker can time update_market calls to benefit from using a higher-rate epoch's cantoPerBlock for blocks that should use a lower rate, or vice versa. The effect depends on the direction of rate changes across epochs. Can be gamed by strategically triggering updates."
+        },
+        {
+          "scenario": "Zero market supply during active reward period",
+          "expected_behavior": "Rewards for zero-supply blocks should be deferred or redistributed",
+          "actual_behavior": "Rewards for zero-supply blocks are permanently lost — the loop skips reward accumulation when marketSupply == 0 but advances lastRewardBlock past those blocks",
+          "risk_level": "medium",
+          "exploitation_potential": "A user could withdraw all funds temporarily (making supply 0), causing some reward blocks to be skipped, then re-deposit to capture subsequent rewards — effectively wasting protocol funds"
+        },
+        {
+          "scenario": "accCantoPerShare or secRewardsPerShare exceeds uint128 max",
+          "expected_behavior": "Should handle large accumulated values gracefully",
+          "actual_behavior": "uint128() cast will revert in Solidity 0.8.x for values exceeding uint128.max, permanently bricking update_market and all dependent functions (sync_ledger, claim) for that market",
+          "risk_level": "medium",
+          "exploitation_potential": "If market supply is very small (e.g., 1 wei) while rewards are high, accCantoPerShare grows extremely fast. An attacker could deposit dust to inflate accCantoPerShare and permanently DoS a market."
+        },
+        {
+          "scenario": "Repeated dust deposits to exploit rewardDebt rounding",
+          "expected_behavior": "rewardDebt should accurately track entitled rewards regardless of deposit size",
+          "actual_behavior": "Each deposit computes rewardDebt += (delta * accCantoPerShare) / 1e18 with truncating division. Many small deposits truncate more total debt than one large deposit, giving the attacker slightly more claimable rewards",
+          "risk_level": "low",
+          "exploitation_potential": "Rounding dust attack — profit per transaction is tiny (< 1 wei per deposit), but with gas-free or very cheap transactions could be marginally profitable"
+        },
+        {
+          "scenario": "Market de-whitelisted while users have unclaimed rewards",
+          "expected_behavior": "Users should be able to claim accumulated rewards before de-whitelisting takes effect",
+          "actual_behavior": "After de-whitelisting, update_market reverts with 'Market not whitelisted', blocking both claim() and sync_ledger(). All unclaimed rewards are permanently locked.",
+          "risk_level": "high",
+          "exploitation_potential": "Governance (or compromised governance) can de-whitelist a market to prevent users from claiming legitimately earned rewards. No grace period or migration path."
+        },
+        {
+          "scenario": "Governance retroactively changes reward rates for past epochs",
+          "expected_behavior": "Past epoch rewards should be immutable once set",
+          "actual_behavior": "setRewards can overwrite cantoPerBlock for any epoch. If update_market hasn't been called for a market since those epochs, the new rate applies retroactively to that market's reward calculation.",
+          "risk_level": "medium",
+          "exploitation_potential": "Governance can inflate or deflate past rewards for markets that haven't been updated recently, creating unfair reward distribution"
+        },
+        {
+          "scenario": "int256 overflow when computing accumulatedCanto in claim()",
+          "expected_behavior": "Should handle large reward values without overflow",
+          "actual_behavior": "int256(uint256(user.amount) * market.accCantoPerShare / 1e18) reverts if the uint256 result exceeds type(int256).max. This would permanently prevent claiming for affected users.",
+          "risk_level": "medium",
+          "exploitation_potential": "With very large user.amount or very large accCantoPerShare, the claim function becomes permanently non-functional for that user in that market"
+        },
+        {
+          "scenario": "claim() comment says 'only for prior epochs' but code allows current epoch claims",
+          "expected_behavior": "Per NatSpec, rewards should only be claimable for finished epochs",
+          "actual_behavior": "No check prevents claiming rewards accumulated in the current, unfinished epoch. Users can claim immediately as rewards accrue block-by-block.",
+          "risk_level": "low",
+          "exploitation_potential": "Design intent mismatch. If the intent was to restrict to past epochs, current implementation allows early claiming which could enable front-running of gauge weight changes."
+        },
+        {
+          "scenario": "First deposit to a freshly whitelisted market",
+          "expected_behavior": "Rewards should start accumulating from the first deposit",
+          "actual_behavior": "lastRewardBlock is set to block.number at whitelist time. If no deposits occur for many blocks, those reward blocks are skipped (marketSupply = 0). This is correct but means configured rewards for those blocks are wasted.",
+          "risk_level": "low",
+          "exploitation_potential": "Not directly exploitable but leads to reward wastage if markets are whitelisted well before first deposit"
+        }
+      ],
+      "assumption_violations": [
+        "ASSUMPTION: nextEpoch = i + BLOCK_EPOCH correctly advances to the next epoch boundary. VIOLATION: This is only correct when i is epoch-aligned. When i is mid-epoch (common case), it overshoots the next boundary, causing wrong epoch rate to be applied to a range of blocks.",
+        "ASSUMPTION: Lending markets always honestly report deposit/withdrawal deltas. VIOLATION: A compromised or malicious whitelisted market can fabricate arbitrary deltas for any user address.",
+        "ASSUMPTION: Contract always has sufficient CANTO balance to pay claims. VIOLATION: No check that contract balance >= cantoToSend before transfer attempt.",
+        "ASSUMPTION: accCantoPerShare fits in uint128 indefinitely. VIOLATION: With low market supply and high reward rates, this can overflow, bricking the market.",
+        "ASSUMPTION: gauge_relative_weight_write is a pure view-like function. VIOLATION: The _write suffix implies state mutation, which could have side effects during update_market."
+      ],
+      "game_theory_risks": [
+        "Strategic update_market timing: Users can choose when to trigger update_market to benefit from the epoch boundary bug, applying a favorable epoch rate to more blocks",
+        "Deposit/withdraw sandwich: A user can deposit right before a high-reward epoch and withdraw right after, concentrating rewards while minimizing exposure time",
+        "Market supply manipulation: In low-liquidity markets, a whale can withdraw to zero supply (wasting rewards) then re-deposit to capture subsequent rewards at favorable accCantoPerShare",
+        "Gauge weight gaming: If gauge weights change between epochs, users can time updates to lock in favorable weights"
+      ],
+      "integration_risks": [
+        "GaugeController dependency: gauge_relative_weight_write is called within a loop that could execute many iterations. If GaugeController is slow or reverts, update_market becomes DoS'd.",
+        "Lending market trust: The protocol delegates all balance accounting to external lending markets. A compromised market breaks the entire reward system for all its users.",
+        "Native CANTO transfers: msg.sender.call{value}('') can fail for contracts without receive/fallback, locking user rewards",
+        "Secondary reward tracking (secRewardsPerShare) is purely internal accounting with TODO comment — no clear integration spec for third-party consumers"
+      ],
+      "calculation_errors": [
+        "CRITICAL: update_market line 'uint256 nextEpoch = i + BLOCK_EPOCH' should be 'uint256 nextEpoch = epoch + BLOCK_EPOCH'. Current code fails to split reward calculation at actual epoch boundaries, applying incorrect cantoPerBlock rates to blocks spanning multiple epochs.",
+        "Truncation in rewardDebt calculation during sync_ledger: (delta * accCantoPerShare) / 1e18 truncates, allowing marginal rounding profit via many small deposits.",
+        "secRewardsPerShare calculation has TODO comment and no proper scaling factor — likely produces incorrect secondary reward values for tokens with different decimals."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "CANTO (native)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Native gas token. Sent via low-level call{value}. No ERC20 interface. Contract receives via receive() payable."
+        },
+        {
+          "address_or_symbol": "cNOTE",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Not directly transferred by this contract. Balance changes tracked indirectly through sync_ledger delta reports from lending markets. No SafeERC20 interaction needed as the contract never touches cNOTE directly."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "user_balance_sum_equals_market_total",
+          "state_vars": [
+            "sum(userInfo[market][*].amount)",
+            "lendingMarketTotalBalance[market]"
+          ],
+          "notes": "For each market, the sum of all user amounts must equal the total market balance. Maintained by sync_ledger but depends on honest lending market reporting."
+        },
+        {
+          "name": "reward_debt_consistency",
+          "state_vars": [
+            "userInfo[market][user].rewardDebt",
+            "userInfo[market][user].amount",
+            "marketInfo[market].accCantoPerShare"
+          ],
+          "notes": "At any sync point, rewardDebt should equal the integral of (amount * accCantoPerShare_at_deposit_time / 1e18). Rounding truncation causes small systematic drift favoring depositors."
+        },
+        {
+          "name": "contract_solvency",
+          "state_vars": [
+            "address(this).balance",
+            "sum(all_pending_rewards)"
+          ],
+          "notes": "Contract native CANTO balance must be >= sum of all pending claimable rewards. NOT enforced anywhere — governance must manually ensure sufficient funding."
+        },
+        {
+          "name": "accCantoPerShare_monotonically_increasing",
+          "state_vars": [
+            "marketInfo[market].accCantoPerShare"
+          ],
+          "notes": "accCantoPerShare only ever increases (+=). Ensures cantoToSend in claim() is non-negative for users who haven't withdrawn."
+        }
+      ]
+    }
+  }
+}

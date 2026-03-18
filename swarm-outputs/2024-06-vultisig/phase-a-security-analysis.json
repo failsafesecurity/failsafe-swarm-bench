@@ -1,0 +1,339 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T07:57:29.006Z",
+    "duration_ms": 473047
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User Input (ILO Participation)",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "ILOPool.buy",
+          "ILOPool.claim",
+          "ILOPool.claimRefund"
+        ],
+        "failure_modes": [
+          "Bypass of per-user purchase caps via NFT transfers",
+          "Underflow in fee collection causing DoS for subsequent claimers",
+          "Loss of user funds if project fails to launch and refund is not triggered"
+        ],
+        "attack_vectors": [
+          "Sybil attacks or NFT transferring to reset user purchase limits",
+          "First-claimer advantage stealing all accumulated pool fees and bricking other users' claims"
+        ]
+      },
+      {
+        "boundary": "Project Initialization",
+        "trust_level": "untrusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "ILOManager.initProject"
+        ],
+        "failure_modes": [
+          "Attacker claims admin rights over a legitimate project's token pair"
+        ],
+        "attack_vectors": [
+          "Front-running legitimate project initialization to hijack the Uniswap V3 pool mapping and set malicious vesting schedules"
+        ]
+      },
+      {
+        "boundary": "Whitelist Enforcement",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "Whitelist.checkWhitelist",
+          "Whitelist.receive"
+        ],
+        "failure_modes": [
+          "Logic flaw allowing unwhitelisted users to bypass checks",
+          "Oracle manipulation allowing users to bypass ETH contribution caps"
+        ],
+        "attack_vectors": [
+          "Exploiting default mapping value (0) to bypass index checks",
+          "Manipulating spot price of newly created pools to artificially lower estimated ETH value"
+        ]
+      },
+      {
+        "boundary": "Admin Configuration",
+        "trust_level": "trusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "ILOManager.setPlatformFee",
+          "ILOManager.setPerformanceFee",
+          "Whitelist.setAllowedWhitelistIndex"
+        ],
+        "failure_modes": [
+          "Setting fees > 10000 (100%) causes underflows in claim calculations",
+          "Setting allowed index incorrectly opens whitelist to everyone"
+        ],
+        "attack_vectors": [
+          "Compromised admin key bricking claims or disabling whitelist protections"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Initialized",
+        "to_state": "Active (Raising Funds)",
+        "trigger": "ILOPool.buy",
+        "conditions": [
+          "block.timestamp > saleInfo.start",
+          "block.timestamp < saleInfo.end",
+          "totalRaised + raiseAmount <= saleInfo.hardCap"
+        ],
+        "invariants": [
+          "totalRaised cannot exceed hardCap",
+          "User's raiseAmount cannot exceed maxCapPerUser (broken by NFT transfer)"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Active",
+        "to_state": "Launch Succeeded",
+        "trigger": "ILOPool.launch",
+        "conditions": [
+          "!_launchSucceeded",
+          "!_refundTriggered",
+          "totalRaised >= saleInfo.softCap"
+        ],
+        "invariants": [
+          "_launchSucceeded and _refundTriggered are mutually exclusive",
+          "Liquidity is deployed to Uniswap V3 pool"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Active",
+        "to_state": "Refund Triggered",
+        "trigger": "ILOPool.claimRefund or ILOPool.claimProjectRefund",
+        "conditions": [
+          "!_launchSucceeded",
+          "block.timestamp >= _project.refundDeadline"
+        ],
+        "invariants": [
+          "_launchSucceeded and _refundTriggered are mutually exclusive",
+          "Users can reclaim their exact RAISE_TOKEN amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow / Logic Flaw",
+        "locations": [
+          "ILOPool.sol: claim function, lines 185-191"
+        ],
+        "severity": "critical",
+        "evidence": "pool.collect is called with type(uint128).max, collecting ALL accumulated fees for the entire ILOPool position. The contract then subtracts the current user's calculated amount0 from the total amountCollected0 and sends the remainder to the feeTaker. This steals other users' uncollected fees. When subsequent users attempt to claim, amountCollected0 will be less than their calculated amount0, causing an underflow and reverting the transaction.",
+        "exploitation_method": "An attacker (or any normal user) claims their vested liquidity. The contract automatically collects all pool fees and sends the excess to the feeTaker. All subsequent users are permanently locked out of claiming due to underflow.",
+        "affected_assets": [
+          "User vested liquidity",
+          "Accumulated Uniswap V3 fees"
+        ]
+      },
+      {
+        "swc_id": "SWC-115",
+        "pattern": "Logic Flaw / Access Control Bypass",
+        "locations": [
+          "Whitelist.sol: checkWhitelist function, lines 152-154"
+        ],
+        "severity": "critical",
+        "evidence": "The condition `if (_allowedWhitelistIndex == 0 || _whitelistIndex[to] > _allowedWhitelistIndex)` is used to block unwhitelisted users. However, unmapped addresses have a default `_whitelistIndex` of 0. If `_allowedWhitelistIndex` is > 0, `0 > _allowedWhitelistIndex` evaluates to false, meaning the revert is bypassed. Unwhitelisted users are always allowed.",
+        "exploitation_method": "Any user can buy tokens from the Uniswap V3 pool without being whitelisted, as long as `_allowedWhitelistIndex` is set to any value greater than 0.",
+        "affected_assets": [
+          "Token distribution integrity",
+          "Whitelist enforcement"
+        ]
+      },
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Access Control / Per-User Cap Bypass",
+        "locations": [
+          "ILOPool.sol: buy function, lines 104-112"
+        ],
+        "severity": "high",
+        "evidence": "The `buy` function checks `balanceOf(recipient) == 0` to decide whether to mint a new NFT or add to an existing one. It then enforces `raiseAmount <= saleInfo.maxCapPerUser - _position.raiseAmount`. If a user transfers their NFT to another address, their `balanceOf` becomes 0, allowing them to mint a new NFT with a reset `raiseAmount` of 0.",
+        "exploitation_method": "A user buys the maximum allowed cap, transfers the received NFT to a secondary wallet, and then buys the maximum cap again from the original wallet. This can be repeated infinitely to bypass the hard cap per user.",
+        "affected_assets": [
+          "ILO token allocation fairness"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Transaction Order Dependence / Front-Running",
+        "locations": [
+          "ILOManager.sol: initProject function, lines 47-54"
+        ],
+        "severity": "high",
+        "evidence": "The `initProject` function is permissionless and caches the project using the deterministically generated `uniV3PoolAddress` as the key. It assigns `_project.admin = msg.sender`. An attacker can front-run a legitimate project's initialization to become the admin of that token pair's pool.",
+        "exploitation_method": "Attacker monitors the mempool for `initProject` calls, front-runs them with higher gas, becomes the admin of the project, and can then call `initILOPool` with malicious vesting schedules (e.g., assigning 100% of project shares to themselves).",
+        "affected_assets": [
+          "Project ownership",
+          "Project liquidity shares"
+        ]
+      },
+      {
+        "swc_id": "SWC-134",
+        "pattern": "Oracle Manipulation",
+        "locations": [
+          "UniswapV3Oracle.sol: peek function, lines 31-33",
+          "Whitelist.sol: checkWhitelist function, line 158"
+        ],
+        "severity": "high",
+        "evidence": "The TWAP oracle uses `uint32 period = PERIOD < longestPeriod ? PERIOD : longestPeriod;`. If the pool was recently created, `longestPeriod` is very small (e.g., 1 block/second). The TWAP effectively becomes the spot price, which is highly susceptible to manipulation.",
+        "exploitation_method": "An attacker manipulates the spot price of a newly created Uniswap V3 pool to make VULT extremely cheap. They then buy a massive amount of VULT. The oracle returns a tiny estimated ETH amount, bypassing the `_maxAddressCap` in the Whitelist contract.",
+        "affected_assets": [
+          "VULT tokens in the Uniswap V3 pool",
+          "Whitelist ETH contribution caps"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Missing Input Validation / Integer Underflow",
+        "locations": [
+          "ILOManager.sol: setPlatformFee and setPerformanceFee functions, lines 105-113",
+          "ILOPool.sol: _deductFees function, lines 338-344"
+        ],
+        "severity": "medium",
+        "evidence": "The owner can set `PLATFORM_FEE` and `PERFORMANCE_FEE` to values greater than 10000 (BPS). If this happens, `_deductFees` will attempt to subtract a value larger than the amount, causing an underflow and reverting all user claims.",
+        "exploitation_method": "A compromised or malicious owner sets fees > 10000, permanently locking all user funds in the ILOPool.",
+        "affected_assets": [
+          "User vested liquidity"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "ILOManager.sol",
+          "function": "setPlatformFee(uint16)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "No upper bound check on fee value"
+        },
+        {
+          "contract": "ILOManager.sol",
+          "function": "setPerformanceFee(uint16)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "No upper bound check on fee value"
+        },
+        {
+          "contract": "ILOManager.sol",
+          "function": "setFeeTaker(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ILOManager.sol",
+          "function": "setILOPoolImplementation(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ILOManager.sol",
+          "function": "setDefaultDeadlineOffset(uint64)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ILOManager.sol",
+          "function": "setRefundDeadlineForProject(address,uint64)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Whitelist.sol",
+          "function": "setLocked(bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Whitelist.sol",
+          "function": "setMaxAddressCap(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Whitelist.sol",
+          "function": "setAllowedWhitelistIndex(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Whitelist.sol",
+          "function": "setBlacklisted(address,bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "LP-TWAP",
+          "freshness_min_sec": 1800,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "UniswapV3Oracle.sol",
+              "lines": "31-36",
+              "function": "peek"
+            }
+          ],
+          "compositional_usage": [
+            "TWAP*ETH_Estimation"
+          ],
+          "notes": "Falls back to longest available period if pool is newer than 30 minutes, making it vulnerable to spot price manipulation."
+        }
+      ]
+    }
+  }
+}

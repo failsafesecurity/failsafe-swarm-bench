@@ -1,0 +1,52 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "mul() Exponent Overflow: Large Exponent Products Wrap Modulo 16384 Producing Catastrophically Wrong Results",
+      "severity": "high",
+      "summary": "The mul() function computes the result exponent by adding the two input exponents (adjusted for the ZERO_OFFSET bias) then adding normalization offsets. There is no bounds check before packing the exponent into the 14-bit field at bit positions 242-255. When rExp exceeds 16383, the shl(242, rExp) operation at line 552 silently truncates to the low 14 bits because higher bits spill past bit 255 and are lost in the 256-bit EVM word. For example, multiplying two numbers with effective exponent +819",
+      "description": [
+        {
+          "file": "src/Float128.sol",
+          "line_start": 483,
+          "line_end": 552,
+          "desc": "In mul(), rExp is computed as rawA + rawB - 8192 + normalization_adjustments (up to +72 for L-path). For two inputs with large raw exponents (e.g., rawA=rawB=16383), rExp reaches ~24646, exceeding the 14-bit maximum of 16383. When packed via shl(242, rExp), only the bottom 14 bits survive in the uint256 word, so the stored exponent is rExp mod 16384. The same overflow class affects div() when dividing a large-exponent number by a small-exponent number."
+        }
+      ],
+      "impact": "Silent catastrophic corruption of multiplication and division results for inputs with large positive exponents. The result magnitude is off by up to 10^16384. Any protocol using Float128.mul or Float128.div for pricing, collateral calculations, or accounting with large-exponent values will produce completely wrong results.",
+      "proof_of_concept": "1. Attacker creates two valid packedFloats with large exponents via toPackedFloat(MIN_M_DIGIT_NUMBER, 8191).\n2. Attacker multiplies them: mul(a, b).\n3. rExp = 16383 + 16383 - 8192 + normalization = ~24577.\n4. Stored exponent = 24577 mod 16384 = 8193, effective exponent = 1.\n5. The result appears as ~10^1 instead of ~10^16382.\n6. If the protocol uses this result for pricing/accounting, the massive understatement corrupts all dependent calculations.\n7. Similarly, div(largeExpNumber, smallExpNumber) overflows when the quotient exponent exceeds +8191.",
+      "remediation": "Add an exponent range check after computing rExp and before packing in both mul() and div(). If rExp > 16383, revert with 'float128: exponent overflow'."
+    },
+    {
+      "title": "Negative Zero Breaks All Five Comparison Functions Producing Incorrect Ordering Results",
+      "severity": "high",
+      "summary": "When a negative zero packedFloat is compared with canonical zero, all five comparison functions produce wrong results: lt(negZero, zero) = true (should be false), gt(zero, negZero) = true (should be false), le(zero, negZero) = false (should be true), ge(negZero, zero) = false (should be true), eq(negZero, zero) = false (should be true). Trichotomy is violated. Additionally, sqrt(negativeZero) reverts with 'squareroot of negative' instead of returning 0 because the sign-bit check at line 703 fire",
+      "description": [
+        {
+          "file": "src/Float128.sol",
+          "line_start": 842,
+          "line_end": 1072,
+          "desc": "All comparison functions detect zero operands using iszero(x), which checks if the entire uint256 word is zero. A negative zero (sign bit set, mantissa 0, packedFloat value = MANTISSA_SIGN_MASK = 1<<240) has a non-zero uint256, so it evades zero detection. The function treats it as a negative number with exponent 0 and mantissa 0."
+        }
+      ],
+      "impact": "Comparison-based safety checks bypassed for negative zero values. Can lead to bypassed liquidation thresholds, incorrect balance comparisons, DoS via sqrt revert, and fund loss in integrating protocols. The negative zero value propagates through mul/div producing further non-canonical outputs.",
+      "proof_of_concept": "1. Negative zero can be created via packedFloat.wrap(MANTISSA_SIGN_MASK) by any external caller.\n2. It can also be constructed by wrapping raw uint256 values in protocols that allow user-supplied packedFloat inputs.\n3. A protocol using le(balance, limit) where balance is negative zero gets false instead of true, bypassing the limit check.\n4. A protocol using ge(value, zero) as a non-negativity check gets false for negative zero, potentially blocking valid operations or triggering incorrect liquidations.\n5. sqrt(negativeZero) reverts with 'squareroot of negative', causing DoS for any protocol that takes sqrt of a value that could be negative zero.\n6. ln(negativeZero) does not revert (Swarm's TECH-H005 confirms ln ignores sign bit), producing garbage output.",
+      "remediation": "Detect zero by checking the mantissa field: use iszero(and(x, MANTISSA_MASK)) instead of iszero(x). Or canonicalize negative zero to canonical zero at the start of each function. In sqrt(), move the zero check before the sign check."
+    },
+    {
+      "title": "toPackedFloat() Normalization-Induced Exponent Overflow/Underflow for Valid Input Parameters",
+      "severity": "high",
+      "summary": "This is distinct from ECON-H017 (which covers out-of-range raw exponent inputs). Here, both the mantissa and exponent inputs are individually within valid ranges, but normalization shifts the exponent out of bounds. For example: toPackedFloat(10^77, 8186) -- mantissa has 78 digits, exponent 8186 is valid. Normalization reduces to 72-digit L-format, adding 6 to the exponent (8186 + 6 = 8192), which exceeds max 8191. The raw encoding shl(242, 16384) overflows the 14-bit field, storing exponent 0 i",
+      "description": [
+        {
+          "file": "src/Float128.sol",
+          "line_start": 1100,
+          "line_end": 1132,
+          "desc": "toPackedFloat() normalizes the mantissa by adjusting the exponent by (digitsMantissa - 38) for M-format or (digitsMantissa - 72) for L-format. This adjustment can push the exponent outside the representable 14-bit range [-8192, +8191] even when the original input exponent is valid. The adjusted exponent is then silently truncated when packed via shl(242, add(exponent, ZERO_OFFSET))."
+        }
+      ],
+      "impact": "Silent catastrophic value corruption for inputs where mantissa normalization pushes the exponent past the 14-bit boundary. The encoded value is off by a factor of up to 10^16384. This affects any protocol that constructs packed floats from computed values with large mantissas near the exponent boundaries.",
+      "proof_of_concept": "1. A protocol computes a value with a large mantissa and exponent near the upper bound, e.g., accumulating compound interest.\n2. It calls toPackedFloat(accumulated_mantissa, adjusted_exponent) where the adjusted exponent is within [-8192, 8191] but the mantissa has many digits.\n3. After normalization, the exponent overflows the 14-bit field.\n4. The protocol stores this corrupted packed float.\n5. All subsequent calculations using this value are catastrophically wrong, enabling fund extraction.",
+      "remediation": "After normalization, check that the adjusted exponent is within [-8192, 8191]. If not, revert with an appropriate error. Alternatively, check that add(exponent, ZERO_OFFSET) fits in 14 bits (0..16383) before packing."
+    }
+  ]
+}

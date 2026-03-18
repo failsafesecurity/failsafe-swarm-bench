@@ -1,0 +1,156 @@
+{
+  "metadata": {
+    "threat_model_id": "TM_ari_basing_evmbench_unprivileged_no_front_run_primary_opus_2026Mar08-21h32m46s",
+    "phase": "D",
+    "process": "single_hypothesis_validation",
+    "hypothesis_index": 8,
+    "hypothesis_id": "TECH-H014",
+    "llm_model": "gemini",
+    "timestamp": "2026-03-08T22:21:56.920Z",
+    "validation_duration_ms": 343769
+  },
+  "original_hypothesis": {
+    "hypothesis_id": "TECH-H014",
+    "title": "Reserve update step can underflow/overflow and revert during Newton iterations, allowing attackers to force deterministic DoS for specific target prices",
+    "risk_level": "HIGH",
+    "attack_realism": "HIGH",
+    "stride_category": "Denial of Service",
+    "hypothesis_description": "updateReserve adjusts `reserve` by a step proportional to |target-current|/(high-low). If currentPrice drifts outside the LUT bracket or deviates more than the bracket width, the ratio can exceed 1 and the step can exceed maxStepSize and even the reserve itself. The subtraction path will then underflow and revert. Because calcReserveAtRatioSwap/Liquidity loop calls updateReserve repeatedly, an attacker can search for inputs that reliably make the solver revert, blocking any state-changing operation that relies on these computations.",
+    "investigation_rationale": "Phase A flags an invariant that step must be bounded; the implementation does not clamp the step or enforce currentPrice within [low,high]. Practical DoS depends on whether these solvers are called in execution paths (not just quoting).",
+    "config_dependent": false,
+    "deployment_assumptions": [],
+    "config_evidence": "",
+    "affected_functions": [
+      "updateReserve(PriceData,uint256)",
+      "calcReserveAtRatioSwap(uint256[],uint256,uint256[],bytes)",
+      "calcReserveAtRatioLiquidity(uint256[],uint256,uint256[],bytes)"
+    ],
+    "affected_contracts": [
+      "src/functions/Stable2.sol"
+    ],
+    "inventory_refs": [
+      {
+        "file": "Stable2.sol",
+        "function": "updateReserve(PriceData,uint256)"
+      }
+    ],
+    "proof_of_signal": {
+      "file": "src/functions/Stable2.sol",
+      "lines": "approx. 362-378",
+      "pattern": "reserve - step or reserve + step, where step = maxStepSize * |target-current| / (high-low); no clamp; subtraction can underflow"
+    },
+    "invariant_citation": {
+      "invariant_id": "INV-STATE-003",
+      "relationship": "DIRECT_VIOLATION"
+    },
+    "preconditions": [
+      "Caller can trigger calcReserveAtRatioSwap/Liquidity with chosen ratios/reserves such that iteration overshoots",
+      "The code path does not catch/handle revert from updateReserve",
+      "The solver is used in a critical transaction path (e.g., swap/liquidity execution or oracle update)"
+    ],
+    "initial_code_evidence": {
+      "suspicious_location": "src/functions/Stable2.sol updateReserve",
+      "vulnerable_pattern": "unbounded Newton step with direct subtraction/addition",
+      "specific_concern": "underflow revert yields DoS; may also prevent convergence causing TECH-H001",
+      "missing_safeguards": "no clamp to [0,reserve], no enforcement of priceDelta <= (high-low)"
+    },
+    "investigation_scope": {
+      "analysis_questions": [
+        "Can pd.currentPrice move outside [lowPrice, highPrice] within the loop for realistic reserves?",
+        "What regions of targetPrice/reserves cause step > reserve?",
+        "Are these functions used by Well.sol during swaps/liquidity, or only for off-chain ratio guidance?"
+      ],
+      "validation_requirements": [
+        "Fuzz ratios/reserves to find revert-causing inputs in updateReserve path",
+        "If found, verify attacker can create those inputs via public Well entrypoints",
+        "Consider mitigations: clamp step, revert with explicit error, or widen LUT bracket usage"
+      ]
+    },
+    "preliminary_attack_scenario": "Attacker calls a state-changing function that internally targets a ratio/price using calcReserveAtRatioLiquidity. By providing ratios that lead to a poor LUT initial guess, the first updateReserve step underflows and reverts, repeatedly preventing other users from executing that operation under current pool state.",
+    "prerequisites": [
+      "Ability to invoke the solver in a state-changing context with attacker-chosen ratios"
+    ],
+    "potential_impact_if_confirmed": {
+      "financial_impact": "Primarily DoS; may have indirect financial impact if it blocks withdrawals or forces users into unfavorable routes",
+      "affected_users": "All users relying on the blocked operation",
+      "recovery_possibility": "Usually recoverable if inputs/state change; could be persistent if operation is required to change state"
+    },
+    "investigation_complexity": "medium",
+    "validation_priority": "medium",
+    "test_coverage_gap": "No tests covering Newton overshoot and step bounding",
+    "technical_investigation_focus": {
+      "gas_analysis_needed": "No",
+      "capital_requirements": "Low (math-triggered revert)",
+      "execution_timing": "Single transaction per DoS attempt",
+      "detection_analysis": "Look for patterned reverts in ratio solver calls with extreme ratios"
+    },
+    "original_category": "technical",
+    "original_specialist": "technical"
+  },
+  "validation_context": {
+    "relevant_contracts": [
+      "Stable2LUT1.sol",
+      "Stable2.sol",
+      "WellUpgradeable.sol",
+      "WellDeployer.sol",
+      "Logger.sol"
+    ],
+    "filtered_test_context_available": false,
+    "filtered_test_files_count": 0,
+    "filtered_test_files": [],
+    "prompt_character_count": 245255
+  },
+  "validation_result": {
+    "validation_status": "CONFIRMED",
+    "confidence_level": "high",
+    "mechanism": "Newton iteration underflow due to fixed secant slope",
+    "impact_summary": "Deterministic DoS in ratio solvers, preventing oracle updates or swap calculations for specific target prices.",
+    "detailed_analysis": "The `updateReserve` function uses a modified secant method with a fixed slope derived from the LUT bracket: `slope = maxStepSize / (highPrice - lowPrice)`. Because the Stableswap curve is highly convex, the local slope near the edges of wide LUT brackets (e.g., `[0.001083e6, 0.213318e6]`) is much steeper than the average slope of the bracket. \n\nIf `targetPrice` is close to `highPrice` (e.g., `0.200e6`), the iteration starts at `R_high`. Since `targetPrice < currentPrice`, the first step adds a small amount to the reserve. However, due to the steep local slope, this small increase in reserve causes a massive drop in `currentPrice` (e.g., down to `0.10e6`). \n\nIn the second iteration, `targetPrice > currentPrice`, so the algorithm attempts to subtract from the reserve to increase the price. It calculates the step size using the flat average slope: `step = (0.200e6 - 0.10e6) / slope`. Because the average slope is very flat compared to the local slope, this results in a massive step size that exceeds the current reserve. The subtraction `reserve - step` then underflows, causing a revert.",
+    "code_evidence_assessment": "The vulnerability is clearly visible in `updateReserve`. The step size is calculated as `pd.maxStepSize * (pd.targetPrice - pd.currentPrice) / (pd.lutData.highPrice - pd.lutData.lowPrice)`. There is no clamp to ensure the step does not exceed `reserve`. The mathematical properties of the Stableswap curve combined with the wide LUT brackets guarantee that this underflow is reachable.",
+    "vulnerable_code_snippets": [
+      {
+        "function_name": "updateReserve",
+        "file_name": "src/functions/Stable2.sol",
+        "line_numbers": "362-368",
+        "code_snippet": "        if (pd.targetPrice > pd.currentPrice) {\n            // if the targetPrice is greater than the currentPrice,\n            // the reserve needs to be decremented to increase currentPrice.\n            return reserve\n                - pd.maxStepSize * (pd.targetPrice - pd.currentPrice) / (pd.lutData.highPrice - pd.lutData.lowPrice);\n        }",
+        "vulnerability_explanation": "The subtraction does not check if the calculated step exceeds `reserve`. Due to the fixed average slope used for the step calculation, a highly convex curve can cause the step to overestimate the required correction, resulting in an underflow."
+      }
+    ],
+    "execution_path_analysis": {
+      "entry_point": "calcReserveAtRatioSwap (src/functions/Stable2.sol:137)",
+      "calling_sequence": [
+        "calcReserveAtRatioSwap",
+        "updateReserve"
+      ],
+      "vulnerable_code_path": "1. `calcReserveAtRatioSwap` is called with a `targetPrice` near the edge of a wide LUT bracket (e.g., `0.200e6` in the `[0.001e6, 0.213e6]` bracket).\n2. The iteration initializes `scaledReserves[j]` to `R_high` and `currentPrice` to `0.213e6`.\n3. First iteration: `targetPrice < currentPrice`, so `updateReserve` adds a small step to `scaledReserves[j]`.\n4. `_calcRate` is called, and due to high local convexity, `currentPrice` drops massively below `targetPrice`.\n5. Second iteration: `targetPrice > currentPrice`, so `updateReserve` attempts to subtract.\n6. The step is calculated using the flat average slope, resulting in a value larger than `scaledReserves[j]`.\n7. The subtraction underflows and reverts."
+    },
+    "config_validation": {
+      "is_config_dependent": false,
+      "deployment_assumptions_checked": [],
+      "deployment_evidence": "",
+      "config_conclusion": "UNVERIFIABLE"
+    },
+    "attack_scenario_validation": "An attacker manipulates the pool reserves to push the spot price to a specific vulnerable target price (e.g., `0.200e6`). When a protocol mechanism (like an oracle update or a swap router) calls `calcReserveAtRatioSwap` to evaluate the state, the Newton iteration underflows and reverts. This blocks the transaction, causing a deterministic DoS for any operation relying on this calculation.",
+    "impact_assessment": "High. The ratio solvers are critical for oracle functionality and swap routing in Basin/Beanstalk. A deterministic revert allows an attacker to freeze pool operations or oracle updates at specific price points, potentially blocking liquidations or other time-sensitive protocol mechanics.",
+    "recommended_mitigations": [
+      "Clamp the subtraction step to not exceed the current reserve: `uint256 step = ...; return step > reserve ? reserve / 2 : reserve - step;`",
+      "Implement a binary search fallback or halve the step size if an overshoot is detected.",
+      "Use a dynamic local derivative (Newton's method) instead of a fixed secant slope."
+    ],
+    "inventory_refs": [
+      {
+        "file": "src/functions/Stable2.sol",
+        "function": "updateReserve"
+      },
+      {
+        "file": "src/functions/Stable2.sol",
+        "function": "calcReserveAtRatioSwap"
+      }
+    ],
+    "replication_plan": "1. Deploy `Stable2` with `Stable2LUT1`.\n2. Call `calcReserveAtRatioSwap` with `targetPrice = 0.200e6` (by passing appropriate `ratios`).\n3. Observe the transaction revert due to arithmetic underflow in `updateReserve`.",
+    "uncertainties": [],
+    "additional_testing_needed": [
+      "Fuzz `calcReserveAtRatioSwap` and `calcReserveAtRatioLiquidity` across the entire valid price range to map all specific price points that trigger the underflow."
+    ]
+  }
+}

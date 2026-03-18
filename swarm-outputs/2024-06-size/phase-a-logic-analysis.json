@@ -1,0 +1,508 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T04:56:51.972Z",
+    "duration_ms": 807236
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-deposit",
+        "source": "user (msg.sender) or msg.value ETH",
+        "path": [
+          "Size.deposit()",
+          "Deposit.validateDeposit()",
+          "Deposit.executeDeposit()",
+          "DepositTokenLibrary.depositUnderlyingCollateralToken / depositUnderlyingBorrowTokenToVariablePool"
+        ],
+        "transformations": [
+          "ETH -> WETH wrapping if msg.value > 0",
+          "amount overridden by address(this).balance for ETH deposits",
+          "USDC deposited to Aave variable pool, scaled aToken minted",
+          "WETH transferred, szETH collateralToken minted 1:1"
+        ],
+        "sinks": [
+          "state.data.collateralToken (szETH)",
+          "state.data.borrowAToken (szaUSDC)",
+          "Aave variable pool"
+        ],
+        "trust_changes": "User tokens become protocol-controlled NonTransferrableTokens",
+        "validation_points": [
+          "validateDeposit checks token, amount>0, to!=address(0)",
+          "validateBorrowATokenCap (outside multicall)"
+        ],
+        "exposure_risks": [
+          "address(this).balance may include stale/donated ETH"
+        ],
+        "manipulation_risks": [
+          "In multicall, address(this).balance is used instead of msg.value; first deposit in multicall consumes entire contract ETH balance including donations",
+          "Second ETH deposit in multicall would have amount=0 after first consumed all balance, but validation passed with params.amount>0"
+        ]
+      },
+      {
+        "flow_id": "DF-002-buycreditmarket",
+        "source": "lender (msg.sender) with borrowAToken balance",
+        "path": [
+          "Size.buyCreditMarket()",
+          "BuyCreditMarket.validateBuyCreditMarket()",
+          "BuyCreditMarket.executeBuyCreditMarket()",
+          "AccountingLibrary.getCreditAmountOut / getCashAmountIn",
+          "AccountingLibrary.createDebtAndCreditPositions / createCreditPosition",
+          "borrowAToken.transferFrom (lender->borrower, lender->feeRecipient)"
+        ],
+        "transformations": [
+          "APR from yield curve -> ratePerTenor via aprToRatePerTenor",
+          "cashAmountIn -> creditAmountOut or creditAmountOut -> cashAmountIn via fee/rate calculations",
+          "Debt token minted to borrower, credit position created for lender"
+        ],
+        "sinks": [
+          "DebtPosition in state",
+          "CreditPosition in state",
+          "debtToken mint",
+          "borrowAToken transfers"
+        ],
+        "trust_changes": "Lender's borrowAToken transferred; debt position creates obligation for borrower",
+        "validation_points": [
+          "Tenor range check",
+          "BorrowOffer existence",
+          "Minimum credit amount",
+          "Deadline check",
+          "minAPR check",
+          "validateUserIsNotBelowOpeningLimitBorrowCR (for new loans)",
+          "validateVariablePoolHasEnoughLiquidity"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Borrower's borrow offer rate is used - rate could change between tx submission and execution"
+        ]
+      },
+      {
+        "flow_id": "DF-003-sellcreditmarket",
+        "source": "borrower (msg.sender) selling credit / creating debt",
+        "path": [
+          "Size.sellCreditMarket()",
+          "SellCreditMarket.validateSellCreditMarket()",
+          "SellCreditMarket.executeSellCreditMarket()",
+          "AccountingLibrary.getCashAmountOut / getCreditAmountIn",
+          "AccountingLibrary.createDebtAndCreditPositions + createCreditPosition",
+          "borrowAToken.transferFrom (lender->borrower, lender->feeRecipient)"
+        ],
+        "transformations": [
+          "creditAmountIn -> cashAmountOut via rate and fee calculations",
+          "Self-debt created when RESERVED_ID, then credit transferred to lender"
+        ],
+        "sinks": [
+          "DebtPosition",
+          "CreditPosition",
+          "debtToken",
+          "borrowAToken transfers"
+        ],
+        "trust_changes": "Lender's funds transferred to borrower; lender gets credit claim",
+        "validation_points": [
+          "Loan offer existence",
+          "Tenor and due date checks",
+          "Credit position ownership and transferrability",
+          "Deadline and maxAPR"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Fee inconsistency between getCashAmountOut and getCreditAmountIn: swap fee base differs (maxCashAmountOut vs cashAmountOut)"
+        ]
+      },
+      {
+        "flow_id": "DF-004-liquidation",
+        "source": "liquidator (msg.sender)",
+        "path": [
+          "Size.liquidate()",
+          "Liquidate.validateLiquidate()",
+          "Liquidate.executeLiquidate()",
+          "borrowAToken.transferFrom (liquidator->protocol)",
+          "collateralToken.transferFrom (borrower->liquidator, borrower->feeRecipient)",
+          "repayDebt (burn debtToken, reduce futureValue)"
+        ],
+        "transformations": [
+          "debtPosition.futureValue -> debtInCollateralToken via price oracle",
+          "Liquidation reward = min(surplus collateral, futureValue * rewardPercent / PERCENT) -- UNIT MISMATCH",
+          "Protocol profit from collateral remainder"
+        ],
+        "sinks": [
+          "Liquidator receives collateral",
+          "Protocol receives protocol fee",
+          "Debt is repaid"
+        ],
+        "trust_changes": "Borrower loses collateral; debt is cleared",
+        "validation_points": [
+          "isDebtPositionLiquidatable",
+          "validateMinimumCollateralProfit"
+        ],
+        "exposure_risks": [
+          "Oracle price manipulation could trigger premature liquidation"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: Liquidation reward uses futureValue (borrow token units, e.g. 6 decimals) compared with collateral token amounts (18 decimals) - reward is negligible, disincentivizing liquidations"
+        ]
+      },
+      {
+        "flow_id": "DF-005-compensate",
+        "source": "borrower (msg.sender) with credit positions",
+        "path": [
+          "Size.compensate()",
+          "Compensate.validateCompensate()",
+          "Compensate.executeCompensate()",
+          "Optional: createDebtAndCreditPositions (self-debt for RESERVED_ID)",
+          "reduceDebtAndCredit on original debt",
+          "createCreditPosition (transfer credit to original lender)",
+          "Fragmentation fee in collateral if credit split occurs"
+        ],
+        "transformations": [
+          "Credit from one position used to reduce debt on another",
+          "amountToCompensate = min(amount, credit1, credit2)",
+          "fragmentationFee converted from borrow token to collateral token units"
+        ],
+        "sinks": [
+          "Reduced debtPosition",
+          "Reduced creditPosition",
+          "New creditPosition for lender",
+          "collateralToken fee"
+        ],
+        "trust_changes": "Borrower's debt reduced; lender's credit reassigned to new debt",
+        "validation_points": [
+          "Loan status ACTIVE",
+          "Due date compatibility",
+          "Compensator is borrower",
+          "Amount > 0",
+          "validateUserIsNotUnderwater after execution"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Fragmentation fee in collateral capped by user balance - user can minimize collateral before compensating to reduce fee (constrained by underwater check)",
+          "With RESERVED_ID, creates self-debt without swap fee, potentially gaming around normal lending fees"
+        ]
+      },
+      {
+        "flow_id": "DF-006-updateconfig",
+        "source": "Admin (DEFAULT_ADMIN_ROLE)",
+        "path": [
+          "Size.updateConfig()",
+          "UpdateConfig.executeUpdateConfig()",
+          "Initialize.validateInitializeFeeConfigParams/RiskConfigParams/OracleParams (re-validation)"
+        ],
+        "transformations": [
+          "String key -> state variable update",
+          "Address values via uint160 cast"
+        ],
+        "sinks": [
+          "state.feeConfig",
+          "state.riskConfig",
+          "state.oracle"
+        ],
+        "trust_changes": "Protocol parameters changed - affects all future operations",
+        "validation_points": [
+          "Final re-validation via Initialize validators"
+        ],
+        "exposure_risks": [
+          "Admin can change priceFeed, feeRecipient to arbitrary addresses"
+        ],
+        "manipulation_risks": [
+          "crLiquidation can ONLY decrease (never increase) due to check: params.value >= state.riskConfig.crLiquidation",
+          "No validation on liquidationRewardPercent upper bound",
+          "swapFeeAPR, fragmentationFee, liquidationRewardPercent not bounded during initialization"
+        ]
+      },
+      {
+        "flow_id": "DF-007-claim",
+        "source": "Anyone (typically lender)",
+        "path": [
+          "Size.claim()",
+          "Claim.validateClaim()",
+          "Claim.executeClaim()",
+          "reduceCredit (sets credit to 0)",
+          "borrowAToken.transferFrom (protocol -> lender)"
+        ],
+        "transformations": [
+          "claimAmount = credit * currentLiquidityIndex / liquidityIndexAtRepayment (captures Aave yield between repay and claim)"
+        ],
+        "sinks": [
+          "Lender receives borrowAToken"
+        ],
+        "trust_changes": "Credit position consumed",
+        "validation_points": [
+          "Loan status REPAID",
+          "credit > 0 (not already claimed)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "No msg.sender check - anyone can trigger claim, but funds go to creditPosition.lender"
+        ]
+      },
+      {
+        "flow_id": "DF-008-liquidate-with-replacement",
+        "source": "KEEPER_ROLE",
+        "path": [
+          "Size.liquidateWithReplacement()",
+          "LiquidateWithReplacement.executeLiquidateWithReplacement()",
+          "Liquidate.executeLiquidate() -- liquidates original borrower",
+          "Reactivate debt position with new borrower",
+          "debtToken.mint for new borrower",
+          "borrowAToken.transferFrom to new borrower and feeRecipient"
+        ],
+        "transformations": [
+          "Original debt fully repaid then reissued to new borrower",
+          "issuanceValue = futureValue * PERCENT / (PERCENT + ratePerTenor)",
+          "liquidatorProfitBorrowToken = futureValue - issuanceValue (no swap fee charged)"
+        ],
+        "sinks": [
+          "New borrower debt",
+          "Keeper profit in collateral",
+          "Protocol profit in borrow token"
+        ],
+        "trust_changes": "Debt position transferred to new borrower; credit positions unchanged",
+        "validation_points": [
+          "validateLiquidate",
+          "Loan must be ACTIVE",
+          "Tenor range check",
+          "borrowOffer exists for new borrower",
+          "validateUserIsNotBelowOpeningLimitBorrowCR for new borrower"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "KEEPER-only but the entire interest spread goes to feeRecipient with no swap fee - potential value extraction",
+          "Inherits the liquidation reward unit mismatch bug"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "SUM(credit positions per debt) should equal debt position futureValue (for ACTIVE loans)",
+        "Borrowers must maintain CR above crOpening when creating new debt",
+        "Borrowers below crLiquidation are liquidatable",
+        "Credit positions are only transferrable when loan is ACTIVE and borrower is not underwater",
+        "Minimum credit amount enforced on creation and after reduction (0 is allowed for claims)",
+        "Tenor must be within [minTenor, maxTenor]",
+        "Non-transferrable tokens: only Size contract can mint/burn/transfer"
+      ],
+      "economic_incentives": [
+        "Swap fee: APR-based fee proportional to tenor, charged on cash amount",
+        "Fragmentation fee: flat fee in borrow token terms, charged when credit is split",
+        "Liquidation reward: percentage of futureValue given to liquidator (BUGGED - wrong units)",
+        "Protocol liquidation fee: percentage of collateral remainder on profitable liquidations",
+        "Aave yield: borrowAToken accrues yield between deposit and withdrawal/claim"
+      ],
+      "governance_mechanisms": [
+        "DEFAULT_ADMIN_ROLE: upgrade contract, update config",
+        "KEEPER_ROLE: execute liquidateWithReplacement",
+        "PAUSER_ROLE: pause/unpause protocol",
+        "BORROW_RATE_UPDATER_ROLE: update variable pool borrow rate"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Liquidation reward calculation uses futureValue in borrow token units (e.g., 6 decimals for USDC) but compares with collateral token surplus (18 decimals for WETH)",
+          "expected_behavior": "Liquidator receives meaningful reward (e.g., 5% of debt value in collateral terms)",
+          "actual_behavior": "Reward is ~50e6 in collateral units when it should be ~0.025e18, making it 500 billion times too small. Liquidator effectively gets zero profit beyond debt repayment value",
+          "risk_level": "high",
+          "exploitation_potential": "Liquidations become unprofitable, leading to no incentive to liquidate. Bad debt accumulates. Borrowers can be undercollateralized without consequences since no one will liquidate them."
+        },
+        {
+          "scenario": "UpdateConfig crLiquidation can only decrease, never increase",
+          "expected_behavior": "Admin should be able to increase crLiquidation up to (but not including) crOpening",
+          "actual_behavior": "Check `params.value >= state.riskConfig.crLiquidation` prevents any increase. Once lowered, cannot be raised.",
+          "risk_level": "medium",
+          "exploitation_potential": "If admin accidentally sets crLiquidation too low, protocol becomes less safe. Only recourse is full contract upgrade."
+        },
+        {
+          "scenario": "Fee calculation inconsistency between getCashAmountOut and getCreditAmountIn",
+          "expected_behavior": "Swap fee should be based on the same base amount (maxCashAmountOut / present value) in both directions",
+          "actual_behavior": "getCashAmountOut bases swap fee on maxCashAmountOut; getCreditAmountIn bases swap fee on cashAmountOut (which is lower). Protocol collects less fee when getCreditAmountIn is used.",
+          "risk_level": "medium",
+          "exploitation_potential": "Users can use SellCreditMarket with exactAmountIn=false to consistently pay lower fees than the equivalent getCashAmountOut path, causing protocol fee leakage."
+        },
+        {
+          "scenario": "Deposit via ETH in multicall uses address(this).balance instead of msg.value",
+          "expected_behavior": "Only user-sent ETH should be deposited",
+          "actual_behavior": "Any ETH sitting in contract (from selfdestruct, coinbase tx) is included in deposit. Second ETH deposit in multicall deposits 0 after first consumed all balance.",
+          "risk_level": "low",
+          "exploitation_potential": "Could capture donated ETH. Second deposit in multicall silently deposits 0 despite passing validation."
+        },
+        {
+          "scenario": "SellCreditMarket event emits params.tenor as dueDate parameter",
+          "expected_behavior": "Event should emit actual dueDate (block.timestamp + tenor for new loans)",
+          "actual_behavior": "Emits params.tenor twice: once for tenor field, once for dueDate field",
+          "risk_level": "low",
+          "exploitation_potential": "Off-chain monitoring and indexing systems get incorrect dueDate data."
+        },
+        {
+          "scenario": "variablePoolBorrowRateStaleRateInterval set to 0 (default)",
+          "expected_behavior": "Variable rate features should either work or be clearly disabled",
+          "actual_behavior": "Any yield curve with non-zero marketRateMultiplier will always revert with STALE_RATE when interval is 0",
+          "risk_level": "low",
+          "exploitation_potential": "Users who set marketRateMultipliers in their offers find them non-executable. Not an exploit but confusing behavior."
+        },
+        {
+          "scenario": "Compensate with RESERVED_ID creates self-debt at zero cost",
+          "expected_behavior": "Creating new debt should involve some fee or constraint",
+          "actual_behavior": "Borrower creates self-debt (lender=borrower) with no swap fee, only constrained by CR and minimum credit checks. This effectively moves debt from one position to a new one.",
+          "risk_level": "low",
+          "exploitation_potential": "Borrowers can restructure their debt without paying swap fees by compensating with RESERVED_ID. The lender's credit gets moved to a new debt position."
+        },
+        {
+          "scenario": "No upper bound validation on liquidationRewardPercent during initialization or update",
+          "expected_behavior": "liquidationRewardPercent should be bounded (e.g., <= 100%)",
+          "actual_behavior": "Can be set to arbitrarily high values. Combined with the unit mismatch bug, even extreme values produce negligible rewards.",
+          "risk_level": "medium",
+          "exploitation_potential": "Admin misconfiguration could cause unexpected behavior if unit mismatch bug is fixed without also adding bounds."
+        },
+        {
+          "scenario": "Self-liquidation requires CR < PERCENT (100%) which is stricter than crLiquidation check",
+          "expected_behavior": "Self-liquidation should be available when borrower is underwater (CR < crLiquidation)",
+          "actual_behavior": "Additional check `collateralRatio(debtPosition.borrower) >= PERCENT` prevents self-liquidation when CR is between PERCENT and crLiquidation. Self-liquidation only available when actually at loss.",
+          "risk_level": "low",
+          "exploitation_potential": "Lenders cannot self-liquidate when borrower is underwater but CR > 100%. They must wait for regular liquidation which has broken incentives due to reward bug."
+        },
+        {
+          "scenario": "Claim can be called by anyone, not just the lender",
+          "expected_behavior": "Possibly restrict to lender for access control",
+          "actual_behavior": "Anyone can call claim for any repaid credit position. Funds always go to the lender, so no fund loss, but could be used for griefing (forced claiming).",
+          "risk_level": "low",
+          "exploitation_potential": "Third party can force claim on behalf of a lender, potentially impacting their Aave yield accumulation timing."
+        }
+      ],
+      "assumption_violations": [
+        "The liquidation reward formula assumes futureValue and collateral amounts are in the same unit denomination - they are not when borrow and collateral tokens have different decimals",
+        "The crLiquidation update check assumes monotonic decrease is desirable - admin may need to increase it",
+        "The protocol assumes liquidators will be economically incentivized - the reward bug breaks this assumption",
+        "variablePoolBorrowRateStaleRateInterval=0 implicitly assumes no variable rate usage, but the code structure suggests it should be configurable"
+      ],
+      "game_theory_risks": [
+        "With negligible liquidation rewards, rational liquidators will not liquidate, allowing bad debt to accumulate",
+        "Borrowers can approach crLiquidation with low risk since liquidation is disincentivized",
+        "LiquidateWithReplacement sends all interest spread to feeRecipient - keeper has incentive only from collateral profit (which is also broken by reward bug)",
+        "Compensate fragmentation fee capped by collateral balance means borrowers near underwater threshold pay minimal fees",
+        "Fee asymmetry between buy and sell credit market paths creates arbitrage opportunity between paths"
+      ],
+      "integration_risks": [
+        "Aave variable pool could pause withdrawals, leaving borrowAToken holders unable to withdraw",
+        "Price oracle (Chainlink) could return stale or manipulated prices",
+        "Sequencer uptime feed only checked for L2s - L1 deployments skip this check",
+        "WETH wrapper is trusted - non-standard WETH could cause issues",
+        "Aave liquidity index changes between operations could cause slight accounting discrepancies"
+      ],
+      "calculation_errors": [
+        {
+          "location": "Liquidate.sol:executeLiquidate - liquidation reward calculation",
+          "error": "Math.mulDivUp(debtPosition.futureValue, state.feeConfig.liquidationRewardPercent, PERCENT) produces a value in borrow token units (6 decimals for USDC) that is compared via Math.min with collateral token surplus (18 decimals for WETH). The reward is effectively 10^-12 of what it should be.",
+          "correct_formula": "Math.mulDivUp(debtInCollateralToken, state.feeConfig.liquidationRewardPercent, PERCENT)"
+        },
+        {
+          "location": "AccountingLibrary.sol:getCreditAmountIn - fractionalization swap fee",
+          "error": "fees = Math.mulDivUp(cashAmountOut, swapFeePercent, PERCENT) uses cashAmountOut as base, but getCashAmountOut uses maxCashAmountOut as base for the same fee calculation. Inconsistent fee computation across inverse functions.",
+          "correct_formula": "Fee should be based on the gross cash amount (present value of credit), not the net cash amount after fees"
+        }
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "USDC",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "blacklist",
+            "pausable"
+          ],
+          "decimals": 6,
+          "notes": "Underlying borrow token. Standard USDC with Circle blacklist/pause capabilities."
+        },
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Underlying collateral token. Standard WETH wrapper."
+        },
+        {
+          "address_or_symbol": "szaUSDC (NonTransferrableScaledToken / borrowAToken)",
+          "behaviors": [
+            "rebasing:true",
+            "permit:false",
+            "non_standard_return"
+          ],
+          "decimals": 6,
+          "notes": "Non-transferrable scaled token wrapping Aave aUSDC. balanceOf returns unscaled amount. Only Size contract can transfer. transferFrom takes unscaled value, internally operates on scaled amounts.",
+          "approval_model": "infinite_ok",
+          "transfer_model": "hooks",
+          "accounting_model": "shares_indexed"
+        },
+        {
+          "address_or_symbol": "szETH (NonTransferrableToken / collateralToken)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Non-transferrable 1:1 wrapper for WETH collateral. Only Size contract can transfer."
+        },
+        {
+          "address_or_symbol": "szDebt (NonTransferrableToken / debtToken)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 6,
+          "notes": "Non-transferrable debt tracking token. Minted on debt creation, burned on repayment. Only Size contract can mint/burn."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "credit_debt_conservation",
+          "state_vars": [
+            "SUM(creditPositions[i].credit for all i pointing to debtPositionId)",
+            "debtPositions[debtPositionId].futureValue"
+          ],
+          "notes": "For ACTIVE loans, sum of credit should equal debt futureValue. For REPAID loans, credit can be less as lenders claim."
+        },
+        {
+          "name": "collateral_solvency",
+          "state_vars": [
+            "collateralToken.totalSupply()",
+            "underlyingCollateralToken.balanceOf(Size)"
+          ],
+          "notes": "Protocol should hold at least as much underlying collateral as szETH total supply."
+        },
+        {
+          "name": "borrow_atoken_backing",
+          "state_vars": [
+            "borrowAToken.totalSupply()",
+            "aToken.balanceOf(Size)"
+          ],
+          "notes": "Protocol's Aave aToken balance should back the total supply of borrowAToken (in scaled terms)."
+        },
+        {
+          "name": "cr_opening_gt_cr_liquidation",
+          "state_vars": [
+            "riskConfig.crOpening",
+            "riskConfig.crLiquidation"
+          ],
+          "notes": "crOpening must always be strictly greater than crLiquidation. Enforced by Initialize validation."
+        },
+        {
+          "name": "swap_fee_bounded",
+          "state_vars": [
+            "feeConfig.swapFeeAPR",
+            "riskConfig.maxTenor"
+          ],
+          "notes": "swapFeeAPR * maxTenor / YEAR < PERCENT must hold to prevent fee exceeding 100%"
+        }
+      ]
+    }
+  }
+}

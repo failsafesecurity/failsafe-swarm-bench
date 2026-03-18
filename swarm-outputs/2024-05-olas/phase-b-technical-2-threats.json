@@ -1,0 +1,549 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator_2",
+    "llm_model": null,
+    "llm_provider": "gemini",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "Tokenomics.sol",
+      "Dispenser.sol",
+      "StakingBase.sol",
+      "VoteWeighting.sol",
+      "DefaultTargetDispenserL2.sol",
+      "StakingFactory.sol",
+      "StakingVerifier.sol",
+      "DefaultDepositProcessorL1.sol",
+      "ArbitrumDepositProcessorL1.sol",
+      "WormholeDepositProcessorL1.sol",
+      "WormholeTargetDispenserL2.sol",
+      "EthereumDepositProcessor.sol",
+      "TokenomicsConstants.sol",
+      "PolygonDepositProcessorL1.sol",
+      "OptimismDepositProcessorL1.sol",
+      "StakingToken.sol",
+      "GnosisTargetDispenserL2.sol",
+      "SafeTransferLib.sol",
+      "GnosisDepositProcessorL1.sol",
+      "OptimismTargetDispenserL2.sol",
+      "PolygonTargetDispenserL2.sol",
+      "ArbitrumTargetDispenserL2.sol",
+      "IErrorsTokenomics.sol",
+      "StakingProxy.sol",
+      "IBridgeErrors.sol",
+      "StakingNativeToken.sol",
+      "StakingActivityChecker.sol",
+      "IDonatorBlacklist.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T21:44:26.726Z",
+    "duration_ms": 322881
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH2-H001",
+      "title": "Unremoved Slope in `removeNominee` Corrupts Global Weight Sum",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When an admin removes a nominee, its bias is subtracted from the global `pointsSum`, but its slope is not removed. This causes the global weight sum to decay too rapidly, eventually underflowing or prematurely reaching zero, which breaks the entire emission distribution system.",
+      "investigation_rationale": "In `VoteWeighting.removeNominee`, `pointsSum[nextTime].bias` is updated to `newSum`, but `pointsSum[nextTime].slope` is left unmodified. If the removed nominee had active votes (slope > 0), this slope continues to decay the global sum every week, even though the nominee's total bias was already instantly subtracted. This violates the core invariant of the gauge weight system.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "removeNominee"
+      ],
+      "affected_contracts": [
+        "VoteWeighting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "VoteWeighting.sol",
+          "function": "removeNominee"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "VoteWeighting.sol",
+        "lines": "442-452",
+        "pattern": "State update omits slope adjustment: `pointsSum[nextTime].bias = newSum;` without corresponding `pointsSum[nextTime].slope` update."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-011",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Admin calls `removeNominee` on a nominee that currently has active votes (slope > 0)."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "VoteWeighting.sol lines 442-452",
+        "vulnerable_pattern": "Incomplete state cleanup during entity removal",
+        "specific_concern": "`pointsSum[nextTime].slope` retains the removed nominee's slope, causing accelerated decay of the global sum.",
+        "missing_safeguards": "No subtraction of the removed nominee's slope from `pointsSum[nextTime].slope`."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the unremoved slope cause `pointsSum` to underflow in `_getSum`?",
+          "How quickly does the global sum reach zero depending on the removed slope size?",
+          "Can users calling `revokeRemovedNomineeVotingPower` mitigate this, or does it exacerbate the issue by reducing `changesSum` without fixing `pointsSum`?"
+        ],
+        "validation_requirements": [
+          "Simulate a scenario with two nominees, vote for both, remove one, and advance time to observe `pointsSum` behavior.",
+          "Verify if `_getSum` reverts due to underflow when `pt.bias < dBias`."
+        ]
+      },
+      "preliminary_attack_scenario": "Admin removes a deprecated staking target that had significant voting power. The global `pointsSum` begins decaying at an accelerated rate. Within weeks, `pointsSum` underflows or hits zero, causing all `nomineeRelativeWeight` calculations to revert or return zero, halting all staking incentive distributions.",
+      "prerequisites": [
+        "Admin action to remove a nominee",
+        "Nominee must have active votes"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete halt of staking incentive distribution across all chains.",
+        "affected_users": "All stakers and veOLAS voters",
+        "recovery_possibility": "Requires contract upgrade or complex state manipulation to restore `pointsSum`."
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing tests for time advancement and global sum verification after nominee removal.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Multi-week observation post-removal",
+        "detection_analysis": "Monitor `pointsSum` decay rate vs actual active votes."
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H002",
+      "title": "Asymmetric `effectiveBond` Adjustment Inflates Bond Capacity During Year Changes",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "During year transitions where the annual inflation rate drops, `effectiveBond` is not reduced to account for the lower actual inflation, allowing the protocol to mint more OLAS for bonds than the inflation schedule permits.",
+      "investigation_rationale": "In `Tokenomics.checkpoint()`, `effectiveBond` is adjusted if the actual `maxBond` (`incentives[4]`) is greater than the estimated `curMaxBond`. However, there is no `else if (incentives[4] < curMaxBond)` to reduce `effectiveBond`. During year boundaries where inflation drops (e.g., Years 4 through 9), the actual inflation for the epoch will be less than the estimate. The missing downward adjustment leaves `effectiveBond` artificially inflated.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "checkpoint"
+      ],
+      "affected_contracts": [
+        "Tokenomics.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Tokenomics.sol",
+          "function": "checkpoint"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Tokenomics.sol",
+        "lines": "900-904",
+        "pattern": "Asymmetric state adjustment: `if (incentives[4] > curMaxBond)` lacks a corresponding downward adjustment branch."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Epoch spans a year boundary where the new year's inflation rate is lower than the previous year's."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Tokenomics.sol lines 900-904",
+        "vulnerable_pattern": "Missing downward adjustment for an estimated running total",
+        "specific_concern": "`effectiveBond` retains the overestimated `curMaxBond` value when actual inflation drops.",
+        "missing_safeguards": "No `else if (incentives[4] < curMaxBond) { effectiveBond -= (curMaxBond - incentives[4]); }`."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the inflation schedule strictly decrease between years 4 and 9?",
+          "Can `incentives[4]` be strictly less than `curMaxBond` during these transitions?",
+          "How much excess bond capacity is generated per year transition?"
+        ],
+        "validation_requirements": [
+          "Simulate an epoch transition across the Year 4 to Year 5 boundary.",
+          "Calculate the exact difference between `curMaxBond` and `incentives[4]`.",
+          "Verify `effectiveBond` is higher than the mathematically correct cumulative bond allowance."
+        ]
+      },
+      "preliminary_attack_scenario": "As the protocol naturally crosses the boundary from Year 4 to Year 5 (where inflation drops from 80M to 72M), the `checkpoint` function calculates a lower actual `maxBond` but fails to reduce `effectiveBond`. The Depository can then issue bond programs using this phantom capacity, minting OLAS that exceeds the hardcoded inflation curve.",
+      "prerequisites": [
+        "Protocol reaches a deflationary year boundary (Years 4-9)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Minting of unbacked OLAS tokens exceeding the intended inflation schedule.",
+        "affected_users": "All OLAS holders (dilution)",
+        "recovery_possibility": "Cannot be recovered once bonds are minted."
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing tests for epoch checkpoints spanning deflationary year boundaries.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Specific block timestamps corresponding to year boundaries",
+        "detection_analysis": "Monitor `effectiveBond` vs theoretical max bond capacity."
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H003",
+      "title": "Queued Staking Deposits Bypass Emissions Limit Verification on Redemption",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "Staking targets queued due to insufficient dispenser balance are not re-verified during redemption. If a target becomes malicious or is disabled by the DAO while queued, it will still receive the full queued OLAS amount.",
+      "investigation_rationale": "In `DefaultTargetDispenserL2`, `_processData` verifies targets against `IStakingFactory.verifyInstanceAndGetEmissionsAmount`. If the dispenser lacks balance, valid targets are queued. However, the `redeem` function only checks the queue hash and directly deposits the tokens without re-verifying the target. This creates a time-of-check to time-of-use (TOCTOU) vulnerability where a disabled target can still extract funds.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "redeem",
+        "_processData"
+      ],
+      "affected_contracts": [
+        "DefaultTargetDispenserL2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "DefaultTargetDispenserL2.sol",
+          "function": "redeem"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "DefaultTargetDispenserL2.sol",
+        "lines": "182-206",
+        "pattern": "Time-of-check to time-of-use (TOCTOU): `redeem` transfers tokens based on past verification without re-checking current validity."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-019",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "L2 Dispenser must have insufficient balance to process a batch, causing targets to be queued.",
+        "A queued target must be disabled or have its emissions limit reduced before redemption."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "DefaultTargetDispenserL2.sol lines 182-206",
+        "vulnerable_pattern": "Missing re-verification of external state before token transfer",
+        "specific_concern": "Malicious or deprecated staking targets can receive funds if they were queued while still valid.",
+        "missing_safeguards": "No call to `IStakingFactory.verifyInstanceAndGetEmissionsAmount` inside `redeem`."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can an attacker intentionally cause the dispenser to have insufficient balance (e.g., by delaying withheld sync)?",
+          "How quickly can a target be disabled vs how quickly it can be redeemed?"
+        ],
+        "validation_requirements": [
+          "Deploy a valid target, queue a deposit, disable the target via `StakingFactory`, and successfully call `redeem`."
+        ]
+      },
+      "preliminary_attack_scenario": "An attacker deploys a staking target that passes verification. A large batch is processed, but the dispenser lacks balance, so the target is queued. The DAO discovers the target is malicious and disables it via the factory. The attacker waits for the dispenser to be funded, then calls `redeem`. The disabled target receives the funds, bypassing the DAO's intervention.",
+      "prerequisites": [
+        "Insufficient dispenser balance at time of `_processData`",
+        "Target status change before `redeem`"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Loss of OLAS to malicious or deprecated staking targets.",
+        "affected_users": "Protocol treasury",
+        "recovery_possibility": "None once deposited into the malicious target."
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing tests for redeeming queued deposits after a target's status has changed.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Multi-transaction sequence (queue -> disable -> redeem)",
+        "detection_analysis": "Monitor `redeem` events for targets with 0 emissions limit."
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H004",
+      "title": "`removeNominee` Fails to Clear `mapNomineeIds` if Nominee is Last Element",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "If the nominee being removed is the last element in the `setNominees` array, the swap-and-pop logic inadvertently restores its ID in `mapNomineeIds`, leaving dirty state that corrupts view functions and future nominee additions.",
+      "investigation_rationale": "In `VoteWeighting.removeNominee`, `mapNomineeIds[nomineeHash]` is set to 0. Then, the last element is moved to the removed element's index, and `mapNomineeIds[replacedNomineeHash]` is updated. If the removed element IS the last element, `replacedNomineeHash` equals `nomineeHash`, and the mapping is set back to its original ID instead of 0. This causes `getNomineeId` to return an out-of-bounds index and bypasses existence checks in `getNextAllowedVotingTimes`.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "removeNominee"
+      ],
+      "affected_contracts": [
+        "VoteWeighting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "VoteWeighting.sol",
+          "function": "removeNominee"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "VoteWeighting.sol",
+        "lines": "384-391",
+        "pattern": "Self-assignment in swap-and-pop logic: `mapNomineeIds[replacedNomineeHash] = id;` overwrites the zeroing when `replacedNomineeHash == nomineeHash`."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-011",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Admin calls `removeNominee` on the nominee that is currently at the last index of `setNominees`."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "VoteWeighting.sol lines 384-391",
+        "vulnerable_pattern": "Flawed array element removal",
+        "specific_concern": "`mapNomineeIds` retains a non-zero index for a removed nominee, pointing to an out-of-bounds array location.",
+        "missing_safeguards": "No check `if (id != setNominees.length - 1)` before updating the replaced nominee's mapping."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the dirty mapping allow the removed nominee to bypass any critical checks?",
+          "What happens when a new nominee is added and takes the out-of-bounds index?"
+        ],
+        "validation_requirements": [
+          "Add a nominee, remove it immediately (so it is the last element), and assert that `mapNomineeIds` is not zero."
+        ]
+      },
+      "preliminary_attack_scenario": "Admin removes the most recently added nominee. The mapping retains its ID. A user calls `getNextAllowedVotingTimes` for this removed nominee, which succeeds instead of reverting, returning invalid data. If a new nominee is added, it takes the old ID, causing the removed nominee's mapping to point to the new active nominee.",
+      "prerequisites": [
+        "Admin removes the last nominee in the array"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "None directly, but causes state corruption and potential integration failures for off-chain indexers.",
+        "affected_users": "UI and off-chain integrators",
+        "recovery_possibility": "Cannot be easily cleared once corrupted."
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing tests for removing the last element in the nominee array.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Check `mapNomineeIds` for removed nominees."
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H005",
+      "title": "Native ETH Permanently Locked if `migrate` is Called Before `drain`",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The `migrate` function in L2 target dispensers transfers all OLAS tokens and permanently locks the contract by zeroing the owner. If the contract holds native ETH, it becomes permanently trapped because `drain` can no longer be called.",
+      "investigation_rationale": "In `DefaultTargetDispenserL2`, `migrate` sets `owner = address(0)` and `_locked = 2`. The contract can receive native ETH via `receive()` (used for cross-chain refunds or accidental transfers). The only way to recover this ETH is via `drain()`, which requires `msg.sender == owner`. If an admin executes `migrate` without first calling `drain`, the native ETH is permanently locked.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "migrate",
+        "drain"
+      ],
+      "affected_contracts": [
+        "DefaultTargetDispenserL2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "DefaultTargetDispenserL2.sol",
+          "function": "migrate"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "DefaultTargetDispenserL2.sol",
+        "lines": "324-345",
+        "pattern": "Irreversible privilege revocation without sweeping all asset types: `owner = address(0)` leaves `address(this).balance` stranded."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-009",
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "L2 Dispenser contract holds native ETH (e.g., from bridge refunds).",
+        "Admin calls `migrate` before calling `drain`."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "DefaultTargetDispenserL2.sol lines 324-345",
+        "vulnerable_pattern": "Incomplete asset migration",
+        "specific_concern": "Native ETH is ignored during migration and locked due to owner revocation.",
+        "missing_safeguards": "No automatic transfer of `address(this).balance` inside `migrate`."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How often do L2 dispensers accumulate native ETH?",
+          "Is there any fallback mechanism to recover funds from an ownerless contract?"
+        ],
+        "validation_requirements": [
+          "Send ETH to the dispenser, call `migrate`, and verify the ETH cannot be recovered."
+        ]
+      },
+      "preliminary_attack_scenario": "During a protocol upgrade, the DAO votes to migrate to a new L2 dispenser. The execution payload calls `migrate(newAddress)`. The contract successfully moves all OLAS and locks itself. However, accumulated bridge refunds in native ETH are left behind and permanently lost.",
+      "prerequisites": [
+        "Contract migration event",
+        "Native ETH balance > 0"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent loss of native ETH held by the contract.",
+        "affected_users": "Protocol treasury",
+        "recovery_possibility": "Impossible."
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing tests verifying complete asset recovery during migration.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Check native balances of migrated dispensers."
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H006",
+      "title": "`VoteWeighting` Checkpoint Stagnation if Missed for Over 53 Weeks",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If a nominee or the global sum is not checkpointed for more than 53 weeks, the state advancement loop completes without updating the timestamp, causing an infinite loop of stagnation where the state can never catch up to the present.",
+      "investigation_rationale": "In `VoteWeighting._getSum()` and `_getWeight()`, a loop advances the state week-by-week up to `MAX_NUM_WEEKS` (53). The timestamp `timeSum` is only updated if `t > block.timestamp`. If the time elapsed since the last checkpoint is > 53 weeks, the loop finishes 53 iterations, `t` remains `<= block.timestamp`, and `timeSum` is never updated. Subsequent calls will start from the exact same old `timeSum`, recalculate the same 53 weeks, and again fail to advance, permanently bricking the state.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_getSum",
+        "_getWeight"
+      ],
+      "affected_contracts": [
+        "VoteWeighting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "VoteWeighting.sol",
+          "function": "_getSum"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "VoteWeighting.sol",
+        "lines": "145-147",
+        "pattern": "Loop bound prevents state progression: `if (t > block.timestamp) { timeSum = t; }` is unreachable if elapsed time > `MAX_NUM_WEEKS`."
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "No checkpoint is called for a specific nominee or the global sum for > 53 weeks."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "VoteWeighting.sol lines 145-147",
+        "vulnerable_pattern": "Flawed pagination/catch-up logic",
+        "specific_concern": "`timeSum` and `timeWeight` are not updated if the loop hits its maximum iterations before reaching the current time.",
+        "missing_safeguards": "No unconditional update of `timeSum = t` at the end of the loop."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can an attacker intentionally brick a specific nominee by creating it and ignoring it for 54 weeks?",
+          "Does bricking a single nominee affect the global `timeSum`?"
+        ],
+        "validation_requirements": [
+          "Deploy contract, wait 54 weeks, call `checkpoint()`, and observe that `timeSum` does not advance."
+        ]
+      },
+      "preliminary_attack_scenario": "An attacker adds a dummy nominee and does not vote for it. After 54 weeks, the attacker calls `checkpointNominee`. The nominee's `timeWeight` fails to advance. While this only bricks the dummy nominee, if the entire protocol is paused or inactive for 54 weeks, the global `timeSum` becomes permanently bricked, halting all voting and reward distribution.",
+      "prerequisites": [
+        "54 weeks of inactivity for a specific state variable"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent DoS of gauge weight calculations.",
+        "affected_users": "All protocol users",
+        "recovery_possibility": "Requires contract upgrade."
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing tests for extreme time advancement (> 1 year) between checkpoints.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Requires long time delay",
+        "detection_analysis": "Check for `timeSum` values significantly lagging behind `block.timestamp`."
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H007",
+      "title": "Potential Reentrancy in `checkpoint` via Treasury Rebalance",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The `checkpoint` function makes an external call to the Treasury contract before incrementing the `epochCounter`. If the Treasury is compromised, it could re-enter `checkpoint` to duplicate epoch settlement.",
+      "investigation_rationale": "In `Tokenomics.checkpoint()`, `ITreasury(treasury).rebalanceTreasury(incentives[1])` is called. The `epochCounter` is only incremented if this call succeeds. There is no `_locked` reentrancy guard on `checkpoint`. If the Treasury contract re-enters `checkpoint`, the `epochCounter` is still at `eCounter`, and the same epoch data will be processed again, potentially duplicating inflation minting or corrupting state.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Treasury contract is malicious, compromised, or contains a fallback that allows reentrancy."
+      ],
+      "config_evidence": "Treasury is an external contract set by the owner.",
+      "affected_functions": [
+        "checkpoint"
+      ],
+      "affected_contracts": [
+        "Tokenomics.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Tokenomics.sol",
+          "function": "checkpoint"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Tokenomics.sol",
+        "lines": "960-966",
+        "pattern": "External call before state update: `rebalanceTreasury` called before `epochCounter = uint32(eCounter + 1);`."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Treasury contract must be capable of re-entering the Tokenomics contract."
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Tokenomics.sol lines 960-966",
+        "vulnerable_pattern": "CEI violation without reentrancy guard",
+        "specific_concern": "`epochCounter` is updated after the external call, allowing the same epoch to be processed multiple times.",
+        "missing_safeguards": "No `_locked` check in `checkpoint()`."
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the `SameBlockNumberViolation` check prevent reentrancy in the same block?",
+          "Wait, `lastDonationBlockNumber` is only updated in `trackServiceDonations`, not `checkpoint`. So it does not prevent reentrancy."
+        ],
+        "validation_requirements": [
+          "Create a mock malicious Treasury, trigger `checkpoint`, and verify if `epochCounter` increments twice or state is corrupted."
+        ]
+      },
+      "preliminary_attack_scenario": "A compromised Treasury contract re-enters `checkpoint()`. Since `epochCounter` hasn't incremented, the contract recalculates `inflationPerEpoch` and credits `effectiveBond` again, double-counting the inflation for the epoch and allowing excess bonds to be minted.",
+      "prerequisites": [
+        "Compromised or malicious Treasury contract"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Duplication of epoch inflation and bond capacity.",
+        "affected_users": "Protocol tokenomics",
+        "recovery_possibility": "Requires fixing the Treasury and upgrading Tokenomics."
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "low",
+      "test_coverage_gap": "Missing reentrancy tests for `checkpoint`.",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Monitor for multiple `EpochSettled` events in the same transaction."
+      }
+    }
+  ]
+}

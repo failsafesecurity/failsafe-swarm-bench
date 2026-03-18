@@ -1,0 +1,304 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T05:47:24.090Z",
+    "duration_ms": 353672
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_StepVesting.sol",
+        "description": "After transferVesting, the grantor's releaseRate is calculated as totalAmount / numOfSteps, which ignores already-claimed steps and amounts. This causes the per-step claim to be higher than the actual remaining entitlement, allowing the grantor to drain tokens belonging to other beneficiaries in the same contract.",
+        "attack_scenario": "Grantor has 1000 tokens vested over 10 steps, claims 5 steps (500 tokens). Grantor transfers 300 tokens. Now totalAmount=700, amountClaimed=500, remaining=200 over 5 steps. But releaseRate = 700/10 = 70. Over 4 intermediate steps, grantor claims 4×70=280, exceeding 200 remaining. The extra 80 tokens are taken from the contract's balance (other beneficiaries' funds). The final step reverts due to underflow (totalAmount - amountClaimed becomes negative), permanently locking residual.",
+        "invariant_logic": "After transferVesting: grantorVesting.releaseRate == (grantorVesting.totalAmount - grantorVesting.amountClaimed) / (numOfSteps - grantorVesting.stepsClaimed)",
+        "solidity_property": "function invariant_grantor_release_rate(address grantor) public view { Vesting memory v = _vestings[grantor]; if (v.totalAmount > 0 && numOfSteps > v.stepsClaimed) { uint256 correctRate = (v.totalAmount - v.amountClaimed) / (numOfSteps - v.stepsClaimed); assert(v.releaseRate == correctRate); } }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "transferVesting"
+          },
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "claimable"
+          },
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_StepVesting.sol",
+        "description": "A beneficiary's amountClaimed must never exceed their totalAmount. The incorrect releaseRate after transferVesting violates this invariant, causing intermediate step claims to exceed remaining allocation and the final step to revert due to underflow, permanently trapping residual tokens.",
+        "attack_scenario": "After the grantor's releaseRate is miscalculated (see INV-STATE-001), claiming intermediate steps pushes amountClaimed beyond totalAmount. When the final step triggers the catch-all `totalAmount - amountClaimed`, the subtraction underflows and reverts, making the last claim permanently impossible.",
+        "invariant_logic": "forall beneficiary: _vestings[beneficiary].amountClaimed <= _vestings[beneficiary].totalAmount",
+        "solidity_property": "function invariant_claimed_leq_total(address beneficiary) public view { assert(_vestings[beneficiary].amountClaimed <= _vestings[beneficiary].totalAmount); }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "claim"
+          },
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "transferVesting"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SecondSwap_Marketplace.sol",
+        "description": "Referral fees are calculated but never transferred to the referrer. The _handleTransfers function sends the entire buyerFeeTotal + sellerFeeTotal to feeCollector, ignoring the computed referralFeeCost. Referrers are promised rewards (emitted in event) but receive zero tokens.",
+        "attack_scenario": "A referrer promotes the marketplace expecting referral fees. Buyer purchases with referral address set. The Purchased event emits a non-zero referralReward, but no actual transfer occurs to the referrer. The feeCollector silently keeps the referral portion. Users lose trust in the referral system.",
+        "invariant_logic": "When _referral != address(0) && listing.whitelist == address(0): transfer(referral, referralFeeCost) must execute AND feeCollector receives (buyerFeeTotal + sellerFeeTotal - referralFeeCost)",
+        "solidity_property": "// Cannot be expressed as a simple view assertion; requires checking token balance changes: assert(IERC20(currency).balanceOf(referral) >= pre_balance_referral + referralFeeCost);",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "_handleTransfers"
+          },
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "spotPurchase"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_Marketplace.sol",
+        "description": "No upper bound validation on discountPct during listing creation. If discountPct >= BASE (10000), the _getDiscountedPrice function will revert due to unsigned integer underflow, making the listing permanently unpurchasable. Seller's vesting tokens become trapped until manual unlist (potentially incurring penalty fee).",
+        "attack_scenario": "Seller creates a listing with discountType=FIX and discountPct=10001. The listing is created successfully. Any purchase attempt calculates BASE - 10001 which underflows, reverting. The seller must pay penalty fee to unlist early, or wait for minListingDuration. If the seller doesn't realize the error, tokens are effectively locked.",
+        "invariant_logic": "For all listings: (discountType == FIX implies discountPct < BASE) AND (discountType == LINEAR implies discountPct < BASE)",
+        "solidity_property": "function invariant_discount_bound(address vp, uint256 lid) public view { Listing memory l = listings[vp][lid]; if (l.discountType == DiscountType.FIX || l.discountType == DiscountType.LINEAR) { assert(l.discountPct < BASE); } }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "listVesting"
+          },
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "_getDiscountedPrice"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_StepVesting.sol",
+        "description": "Division by zero occurs in _createVesting when numOfSteps equals _stepsClaimed for a new beneficiary receiving a transfer. When all vesting steps have elapsed and a grantor transfers remaining unclaimed tokens to a new beneficiary, the releaseRate calculation divides by (numOfSteps - _stepsClaimed) = 0.",
+        "attack_scenario": "Vesting has 10 steps, all elapsed. A grantor who never claimed has totalAmount=1000, amountClaimed=0. They transfer 500 to a new address. In _createVesting: releaseRate = 500 / (10 - 10) = division by zero. The transaction reverts. Tokens cannot be transferred to new addresses after full vesting, requiring the grantor to claim first.",
+        "invariant_logic": "_createVesting must handle the case where numOfSteps == _stepsClaimed without division by zero",
+        "solidity_property": "function invariant_no_div_zero(uint256 stepsClaimed) public view { if (stepsClaimed >= numOfSteps) { /* releaseRate should be 0 and full amount claimable immediately */ } else { assert(numOfSteps - stepsClaimed > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "_createVesting"
+          },
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "transferVesting"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_Marketplace.sol",
+        "description": "Listing status transitions must be one-directional: LIST -> SOLDOUT or LIST -> DELIST. No reverse transitions are possible. A listing in SOLDOUT or DELIST status cannot return to LIST. This ensures completed or cancelled sales cannot be re-activated.",
+        "invariant_logic": "For all listings: old(status) == SOLDOUT implies status == SOLDOUT; old(status) == DELIST implies status == DELIST",
+        "attack_scenario": "If a SOLDOUT or DELIST listing could return to LIST, a seller could re-sell already-sold tokens or a delisted listing could be purchased despite the seller having received their tokens back, causing double-spend of vesting allocation.",
+        "solidity_property": "function invariant_listing_finality(address vp, uint256 lid) public view { Listing memory l = listings[vp][lid]; if (l.status == Status.SOLDOUT || l.status == Status.DELIST) { assert(l.balance == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "spotPurchase"
+          },
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "unlistVesting"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SecondSwap_StepVesting.sol",
+        "description": "The tokenIssuer can call transferVesting with any _grantor address, unilaterally moving vesting allocations between users without the grantor's consent. This violates the expectation that vesting ownership is controlled by the beneficiary.",
+        "attack_scenario": "Token issuer calls transferVesting(userA, attackerAddress, userA_balance). UserA's entire vesting is transferred to the attacker. UserA has no recourse. Additionally, the VestingDeployer's transferVesting function allows the token owner to specify arbitrary grantor, enabling the same attack through the deployer.",
+        "invariant_logic": "transferVesting(grantor, beneficiary, amount) should require grantor == msg.sender OR explicit approval from grantor, unless called by the marketplace flow (manager on behalf of grantor who initiated listing)",
+        "solidity_property": "// Requires access control redesign; current code allows tokenIssuer/vestingDeployer to move any user's vesting",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "transferVesting"
+          },
+          {
+            "file": "SecondSwap_VestingDeployer.sol",
+            "function": "transferVesting"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "SecondSwap_Marketplace.sol",
+        "description": "Listing IDs per vesting plan must monotonically increase. nextListingId[vestingPlan] only increments via the post-increment operator in listVesting, ensuring unique listing IDs and preventing ID reuse or collision.",
+        "invariant_logic": "For all vestingPlans: nextListingId[vestingPlan] can only increase; old(nextListingId[vp]) < nextListingId[vp] after each listVesting call",
+        "attack_scenario": "If listing IDs could be reused, a new listing could overwrite an existing active listing's data, allowing manipulation of price, balance, or seller address of existing listings.",
+        "solidity_property": "function invariant_listing_id_monotonic(address vp, uint256 oldNext) public view { assert(nextListingId[vp] >= oldNext); }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "listVesting"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SecondSwap_Marketplace.sol",
+        "description": "In spotPurchase, external token transfers (_handleTransfers) execute before listing state updates (balance decrement and status change), violating checks-effects-interactions pattern. While Solidity 0.8 overflow protection prevents exploitation with standard ERC20, use of arbitrary supported currency tokens (ERC-777, callback-enabled tokens) could enable reentrancy to purchase more than the listed balance.",
+        "attack_scenario": "If a supported currency token implements transfer callbacks (e.g., ERC-777), a buyer could re-enter spotPurchase during _handleTransfers. Each re-entrant call sees the original (unmodified) listing.balance and passes validation. Though Solidity 0.8 underflow in balance subtraction causes revert on unwind, with careful crafting of amounts dividing evenly into balance, multiple purchases could complete before the outermost call reverts.",
+        "invariant_logic": "listing.balance must be decremented BEFORE any external calls in spotPurchase",
+        "solidity_property": "// Structural invariant: effects before interactions; cannot be asserted as view function",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "spotPurchase"
+          },
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "_handleTransfers"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_VestingManager.sol",
+        "description": "The maxSellPercent enforcement is point-in-time during listing only. If the tokenIssuer reduces maxSellPercent after listings are active, existing listings remain purchasable, allowing sellers to have sold more than the new limit permits. The sold amount can exceed the retroactively lowered sell limit.",
+        "invariant_logic": "For all users and plans: allocations[user][plan].sold <= computedSellLimit(user, plan) should hold at ALL times, not just at listing time",
+        "attack_scenario": "Token issuer sets maxSellPercent to 100% (10000). User lists 80% of allocation. Token issuer lowers maxSellPercent to 20% (2000). The existing listing is still active and purchasable. After purchase, user has sold 80% while limit is 20%, violating the intent of the restriction.",
+        "solidity_property": "function invariant_sell_limit(address user, address plan) public view { uint256 currentAlloc = SecondSwap_Vesting(plan).total(user); Allocation memory a = allocations[user][plan]; uint256 sellLimit = a.bought; if (currentAlloc + a.sold > a.bought) { sellLimit += ((currentAlloc + a.sold - a.bought) * vestingSettings[plan].maxSellPercent) / BASE; } assert(a.sold <= sellLimit); }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_VestingManager.sol",
+            "function": "listVesting"
+          },
+          {
+            "file": "SecondSwap_VestingManager.sol",
+            "function": "setMaxSellPercent"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "SecondSwap_VestingManager.sol",
+        "description": "Upgradeable contracts (SecondSwap_Marketplace, SecondSwap_VestingManager, SecondSwap_VestingDeployer) use Initializable but do not call _disableInitializers() in a constructor, leaving the implementation contract uninitialised. An attacker can call initialize() on the implementation directly and set themselves as admin.",
+        "attack_scenario": "Attacker identifies the implementation contract address behind the proxy. They call initialize() on the implementation contract directly, setting their address as s2Admin. While this doesn't affect the proxy's state, in some upgrade patterns (e.g., UUPS), the implementation's state can be leveraged to call selfdestruct or manipulate the proxy through delegatecall.",
+        "invariant_logic": "Implementation contracts must be initialized or have initialization disabled in their constructor",
+        "solidity_property": "// Structural: constructor should contain _disableInitializers()",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "initialize"
+          },
+          {
+            "file": "SecondSwap_VestingManager.sol",
+            "function": "initialize"
+          },
+          {
+            "file": "SecondSwap_VestingDeployer.sol",
+            "function": "initialize"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SecondSwap_StepVesting.sol",
+        "description": "The sum of all beneficiaries' (totalAmount - amountClaimed) must not exceed the contract's token balance. The releaseRate miscalculation bug (INV-STATE-001) violates this conservation invariant, allowing intermediate claims to extract more tokens than a beneficiary's remaining allocation.",
+        "invariant_logic": "sum(forall b: _vestings[b].totalAmount - _vestings[b].amountClaimed) <= token.balanceOf(address(this))",
+        "attack_scenario": "Multiple grantors transfer vestings after partial claiming, each getting an inflated releaseRate. Intermediate step claims from these grantors collectively exceed what the contract holds for them, draining tokens allocated to other innocent beneficiaries. When innocent beneficiaries try to claim, the contract has insufficient tokens and their safeTransfer reverts.",
+        "solidity_property": "function invariant_solvency() public view { /* Requires iterating all beneficiaries; pseudo: assert(totalObligations <= token.balanceOf(address(this))); */ }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "claim"
+          },
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "transferVesting"
+          },
+          {
+            "file": "SecondSwap_StepVesting.sol",
+            "function": "_createVesting"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "SecondSwap_Marketplace.sol",
+        "description": "For PARTIAL listings, minPurchaseAmt is not validated during creation (no bound check). A seller can set minPurchaseAmt greater than the listed amount, creating a listing that can only be purchased in full (buying exactly balance), effectively behaving as a SINGLE listing but without SINGLE's explicit validation.",
+        "invariant_logic": "For PARTIAL listings: minPurchaseAmt <= total at creation time",
+        "attack_scenario": "Seller creates PARTIAL listing with amount=100 and minPurchaseAmt=200. Buyers can only purchase when _amount == listing.balance. After a partial purchase (impossible since minPurchaseAmt > total), the only valid purchase is the full balance. This confuses users expecting partial fill capability.",
+        "solidity_property": "function invariant_min_purchase(address vp, uint256 lid) public view { Listing memory l = listings[vp][lid]; if (l.listingType == ListingType.PARTIAL && l.status == Status.LIST) { assert(l.minPurchaseAmt <= l.total); } }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "listVesting"
+          },
+          {
+            "file": "SecondSwap_Marketplace.sol",
+            "function": "_validatePurchase"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "SecondSwap_VestingManager.sol",
+        "description": "setMaxSellPercent has no upper bound validation, allowing the tokenIssuer to set maxSellPercent to values far exceeding BASE (10000). While this doesn't directly cause fund loss due to available() checks, it bypasses the sell percentage restriction entirely, making the sell limit effectively unlimited for original allocation holders.",
+        "invariant_logic": "vestingSettings[vesting].maxSellPercent <= BASE (10000)",
+        "attack_scenario": "Token issuer sets maxSellPercent to type(uint256).max. All original allocation holders can now sell 100% of their vesting, bypassing any intended sell restrictions. If the protocol's economic model relies on limiting secondary market supply, this undermines it.",
+        "solidity_property": "function invariant_max_sell_bound(address vesting) public view { assert(vestingSettings[vesting].maxSellPercent <= 10000); }",
+        "inventory_refs": [
+          {
+            "file": "SecondSwap_VestingManager.sol",
+            "function": "setMaxSellPercent"
+          }
+        ]
+      }
+    ]
+  }
+}

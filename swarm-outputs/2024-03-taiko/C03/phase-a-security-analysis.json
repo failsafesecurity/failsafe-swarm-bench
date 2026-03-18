@@ -1,0 +1,307 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T05:21:23.888Z",
+    "duration_ms": 168301
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Block Proposers",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "TaikoL1.proposeBlock"
+        ],
+        "failure_modes": [
+          "Proposer skips blocks requiring higher security tiers due to predictable randomness",
+          "Proposer gets DoS'd by malicious prover reverting ETH transfer"
+        ],
+        "attack_vectors": [
+          "Randomness manipulation to bypass ZKVM tier",
+          "Griefing via reverting fallback in AssignmentHook"
+        ]
+      },
+      {
+        "boundary": "Block Provers",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "TaikoL1.proveBlock"
+        ],
+        "failure_modes": [
+          "Prover reuses SGX keys indefinitely by self-replacing",
+          "Assigned prover uses sybil address to recover 50% of liveness bond after timeout"
+        ],
+        "attack_vectors": [
+          "SGX key rotation bypass",
+          "Sybil proving to evade full liveness bond slashing"
+        ]
+      },
+      {
+        "boundary": "Guardians",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "GuardianProver.approve"
+        ],
+        "failure_modes": [
+          "Guardians overwrite each other's proofs on the same tier",
+          "Guardians approve invalid state transitions if compromised"
+        ],
+        "attack_vectors": [
+          "Multisig compromise",
+          "Malicious guardian proof submission"
+        ]
+      },
+      {
+        "boundary": "Protocol Admins",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "TaikoL1.pauseProving",
+          "SgxVerifier.addInstances",
+          "SgxVerifier.deleteInstances",
+          "Guardians.setGuardians",
+          "AddressManager.setAddress"
+        ],
+        "failure_modes": [
+          "Admin bypasses timelock delay to execute instant upgrades",
+          "Admin pauses proving indefinitely"
+        ],
+        "attack_vectors": [
+          "Privilege escalation via Timelock bypass",
+          "Centralization risks"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Block Unproposed",
+        "to_state": "Block Proposed",
+        "trigger": "TaikoL1.proposeBlock",
+        "conditions": [
+          "Valid prover assignment",
+          "Sufficient liveness bond",
+          "Ring buffer not full",
+          "Valid parent hash"
+        ],
+        "invariants": [
+          "numBlocks increments by 1",
+          "Liveness bond is locked in TaikoL1"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Block Unproven",
+        "to_state": "Block Proven",
+        "trigger": "TaikoL1.proveBlock",
+        "conditions": [
+          "Proof tier >= minTier",
+          "Proof tier >= current transition tier",
+          "Valid proof verified by tier verifier"
+        ],
+        "invariants": [
+          "Transition state updated",
+          "Validity bond locked if applicable"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Block Proven",
+        "to_state": "Block Verified",
+        "trigger": "TaikoL1.verifyBlocks",
+        "conditions": [
+          "Cooldown window passed",
+          "No active contestation"
+        ],
+        "invariants": [
+          "lastVerifiedBlockId increments",
+          "Bonds returned to correct prover"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-120",
+        "pattern": "Weak Sources of Randomness from Chain Attributes",
+        "locations": [
+          "LibProposing.sol: proposeBlock"
+        ],
+        "severity": "high",
+        "evidence": "meta_.difficulty = keccak256(abi.encodePacked(block.prevrandao, b.numBlocks, block.number)); meta_.minTier = ITierProvider(...).getMinTier(uint256(meta_.difficulty));",
+        "exploitation_method": "Proposers can compute the required tier off-chain before submitting a transaction. If the block requires a high-cost tier (e.g., SGX_ZKVM), they can simply withhold the proposal and wait for the next L1 block, effectively bypassing the protocol's random high-security audits.",
+        "affected_assets": [
+          "Protocol Security / Multi-tier Proving System"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Missing State Validation / Logic Error",
+        "locations": [
+          "SgxVerifier.sol: verifyProof",
+          "SgxVerifier.sol: _replaceInstance"
+        ],
+        "severity": "medium",
+        "evidence": "The function _replaceInstance does not check if newInstance == oldInstance. It simply sets instances[id] = Instance(newInstance, uint64(block.timestamp));",
+        "exploitation_method": "A prover can set newInstance to be the same as oldInstance in their proof data. This resets the validSince timestamp to the current block.timestamp, allowing the SGX key to remain valid indefinitely and bypassing the intended 180-day expiry and side-channel protection key rotation requirements.",
+        "affected_assets": [
+          "SGX Enclave Security"
+        ]
+      },
+      {
+        "swc_id": "SWC-286",
+        "pattern": "Incorrect Access Control / Privilege Escalation",
+        "locations": [
+          "TaikoTimelockController.sol: getMinDelay"
+        ],
+        "severity": "medium",
+        "evidence": "return hasRole(TIMELOCK_ADMIN_ROLE, msg.sender) ? 0 : super.getMinDelay();",
+        "exploitation_method": "An address with TIMELOCK_ADMIN_ROLE can bypass the minimum delay of the timelock entirely, allowing for instant execution of potentially malicious upgrades or parameter changes, breaking the trust assumption of the timelock.",
+        "affected_assets": [
+          "Governance / Protocol Upgrades"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "DoS with Failed Call",
+        "locations": [
+          "AssignmentHook.sol: onBlockProposed"
+        ],
+        "severity": "low",
+        "evidence": "_blk.assignedProver.sendEther(proverFee, MAX_GAS_PAYING_PROVER); which uses ExcessivelySafeCall but reverts the entire transaction if success is false.",
+        "exploitation_method": "A malicious prover can sign an assignment, wait for a proposer to submit it, and then cause their fallback function to revert. This causes the proposer's proposeBlock transaction to revert, wasting their gas and causing a griefing DoS.",
+        "affected_assets": [
+          "Proposer Gas / Block Liveness"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "TaikoL1.sol",
+          "function": "pauseProving(bool)",
+          "guards": [
+            "onlyFromOwnerOrNamed(\"chain_pauser\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can pause the proving process instantly"
+        },
+        {
+          "contract": "SgxVerifier.sol",
+          "function": "addInstances(address[])",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Adds trusted SGX instances"
+        },
+        {
+          "contract": "SgxVerifier.sol",
+          "function": "deleteInstances(uint256[])",
+          "guards": [
+            "onlyFromOwnerOrNamed(\"rollup_watchdog\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Removes compromised SGX instances instantly"
+        },
+        {
+          "contract": "Guardians.sol",
+          "function": "setGuardians(address[],uint8)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Updates the multisig guardian set"
+        },
+        {
+          "contract": "AddressManager.sol",
+          "function": "setAddress(uint64,bytes32,address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Updates core protocol contract addresses"
+        },
+        {
+          "contract": "TaikoToken.sol",
+          "function": "burn(address,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Burns Taiko tokens from a specified address"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "block.prevrandao",
+          "freshness_min_sec": 12,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "LibProposing.sol",
+              "lines": "180-185",
+              "function": "proposeBlock"
+            }
+          ],
+          "compositional_usage": [
+            "Used as randomness to determine the minimum proving tier"
+          ]
+        },
+        {
+          "source": "block.basefee",
+          "freshness_min_sec": 12,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "LibDepositing.sol",
+              "lines": "70-75",
+              "function": "processDeposits"
+            }
+          ],
+          "compositional_usage": [
+            "Used to calculate the L1-to-L2 ETH deposit fee"
+          ]
+        },
+        {
+          "source": "Automata DCAP Attestation",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "SgxVerifier.sol",
+              "lines": "100-110",
+              "function": "registerInstance"
+            }
+          ],
+          "compositional_usage": [
+            "Verifies SGX quotes to register new instances"
+          ]
+        }
+      ]
+    }
+  }
+}

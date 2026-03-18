@@ -1,0 +1,271 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T05:22:56.032Z",
+    "duration_ms": 261925
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Cross-Chain Message Relay",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "Bridge.processMessage",
+          "Bridge.recallMessage",
+          "SignalService.proveSignalReceived"
+        ],
+        "failure_modes": [
+          "Invalid Merkle proofs submitted by relayers",
+          "Relayers providing insufficient gas for message execution",
+          "Spoofed chain IDs or block IDs in hop proofs"
+        ],
+        "attack_vectors": [
+          "Relayer gas griefing to steal execution fees",
+          "Submitting fake state roots if proof validation is bypassed",
+          "Replaying messages on different chains"
+        ]
+      },
+      {
+        "boundary": "Vault to Bridge Interaction",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "ERC20Vault.sendToken",
+          "ERC721Vault.sendToken",
+          "ERC1155Vault.sendToken"
+        ],
+        "failure_modes": [
+          "Vaults sending malformed messages to the bridge",
+          "Incorrect fee or value calculations causing bridge reverts"
+        ],
+        "attack_vectors": [
+          "Reentrancy from malicious ERC20 tokens during deposit",
+          "Exploiting fee-on-transfer tokens to drain vault balance"
+        ]
+      },
+      {
+        "boundary": "Protocol Administration",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "Bridge.suspendMessages",
+          "Bridge.banAddress",
+          "SignalService.authorize",
+          "ERC20Vault.changeBridgedToken",
+          "BridgedERC20Base.changeMigrationStatus"
+        ],
+        "failure_modes": [
+          "Admin accidentally banning critical protocol addresses",
+          "Admin setting incorrect migration addresses causing token loss"
+        ],
+        "attack_vectors": [
+          "Compromised admin key pausing the bridge indefinitely",
+          "Malicious watchdog suspending valid user messages"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "NEW",
+        "to_state": "DONE",
+        "trigger": "Bridge.processMessage (successful execution)",
+        "conditions": [
+          "Message is proven via SignalService",
+          "Invocation delay has passed",
+          "Target contract does not revert and consumes less than gasLimit"
+        ],
+        "invariants": [
+          "Message status cannot be changed once DONE",
+          "Fees and refunds are distributed correctly"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "NEW",
+        "to_state": "RETRIABLE",
+        "trigger": "Bridge.processMessage (failed execution)",
+        "conditions": [
+          "Message is proven via SignalService",
+          "Target contract reverts or runs out of gas during execution"
+        ],
+        "invariants": [
+          "Message can be retried by anyone or the owner",
+          "Relayer fee is paid even if execution fails"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "RETRIABLE",
+        "to_state": "FAILED",
+        "trigger": "Bridge.retryMessage (with _isLastAttempt = true)",
+        "conditions": [
+          "Caller is the destination owner",
+          "Execution fails again"
+        ],
+        "invariants": [
+          "Message is marked FAILED and can be recalled on the source chain"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "NEW",
+        "to_state": "RECALLED",
+        "trigger": "Bridge.recallMessage",
+        "conditions": [
+          "Message is proven to have FAILED on the destination chain",
+          "Invocation delay has passed"
+        ],
+        "invariants": [
+          "Assets are refunded to the source owner",
+          "Message status is permanently set to RECALLED"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Relayer Gas Griefing / Fee Theft",
+        "locations": [
+          "Bridge.sol:_invokeMessageCall",
+          "Bridge.sol:processMessage"
+        ],
+        "severity": "high",
+        "evidence": "In `processMessage`, if `msg.sender != _message.destOwner`, the `gasLimit` passed to `_invokeMessageCall` is `_message.gasLimit`. However, the contract does not verify that `gasleft() >= _message.gasLimit` before making the `ExcessivelySafeCall`. The EVM will silently pass whatever gas is available. If the call fails due to Out-Of-Gas, the bridge catches the failure, marks the message as `RETRIABLE`, and still pays `_message.fee` to the relayer.",
+        "exploitation_method": "A malicious relayer monitors the mempool for bridge messages with high fees. They submit the `processMessage` transaction with a gas limit slightly above the base overhead but significantly below `_message.gasLimit`. The external call fails due to OOG, the relayer pockets the fee, and the user's message is left in a RETRIABLE state, forcing the user to pay for execution again.",
+        "affected_assets": [
+          "User bridge fees",
+          "Message execution reliability"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "Denial of Service (Push-over-Pull Refund)",
+        "locations": [
+          "Bridge.sol:processMessage",
+          "Bridge.sol:recallMessage",
+          "ERC20Vault.sol:onMessageRecalled",
+          "ERC721Vault.sol:onMessageRecalled",
+          "ERC1155Vault.sol:onMessageRecalled"
+        ],
+        "severity": "high",
+        "evidence": "In `processMessage`, the bridge attempts to push ETH using `refundTo.sendEther(refundAmount)`. If `refundTo` is a smart contract without a `receive` or `fallback` function, this call reverts the entire transaction. The message remains permanently stuck in the `NEW` state on the destination chain and can never transition to `FAILED`, meaning it can never be recalled. Similarly, `recallMessage` and Vault `onMessageRecalled` functions push ETH and NFTs back to `srcOwner`. If `srcOwner` cannot receive them (e.g., lacks `onERC721Received`), the recall reverts permanently.",
+        "exploitation_method": "An attacker or a user interacting via a proxy wallet sets `refundTo` or `srcOwner` to a contract that rejects ETH or lacks NFT receiver interfaces. When the message is processed or recalled, the forced push of assets reverts the transaction. The bridged assets become permanently locked in the source chain's Vault/Bridge.",
+        "affected_assets": [
+          "Bridged ETH",
+          "Bridged ERC20, ERC721, and ERC1155 tokens"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Bridge.sol",
+          "function": "suspendMessages(bytes32[],bool)",
+          "guards": [
+            "onlyFromOwnerOrNamed(\"bridge_watchdog\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can indefinitely delay message processing"
+        },
+        {
+          "contract": "Bridge.sol",
+          "function": "banAddress(address,bool)",
+          "guards": [
+            "onlyFromOwnerOrNamed(\"bridge_watchdog\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Prevents messages from being executed on the target address"
+        },
+        {
+          "contract": "SignalService.sol",
+          "function": "authorize(address,bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Authorizes addresses to sync chain data"
+        },
+        {
+          "contract": "ERC20Vault.sol",
+          "function": "changeBridgedToken(CanonicalERC20,address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Initiates token migration to a new bridged token contract"
+        },
+        {
+          "contract": "BridgedERC20Base.sol",
+          "function": "changeMigrationStatus(address,bool)",
+          "guards": [
+            "onlyFromOwnerOrNamed(\"erc20_vault\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Enables minting/burning for token migration"
+        },
+        {
+          "contract": "BridgedERC20.sol",
+          "function": "setSnapshoter(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "BridgedERC20.sol",
+          "function": "snapshot()",
+          "guards": [
+            "onlyOwnerOrSnapshooter"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "EssentialContract.sol",
+          "function": "pause()",
+          "guards": [
+            "whenNotPaused",
+            "_authorizePause"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Halts core protocol functions"
+        },
+        {
+          "contract": "EssentialContract.sol",
+          "function": "unpause()",
+          "guards": [
+            "whenPaused",
+            "_authorizePause"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

@@ -1,0 +1,501 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:54:01.087Z",
+    "duration_ms": 393608
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User (msg.sender) deposits BLACK tokens",
+        "path": [
+          "create_lock / deposit_for / increase_amount",
+          "_deposit_for validates lock state",
+          "_checkpoint updates global and per-user point history",
+          "IERC20.transferFrom moves tokens to VotingEscrow (or _black.burnFrom for SMNFT)"
+        ],
+        "transformations": [
+          "lock_duration rounded down to WEEK multiples",
+          "SMNFT deposits: amount inflated by calculate_sm_nft_bonus (SMNFT_BONUS/PRECISION)",
+          "slope = amount / iMAXTIME for time-decaying locks",
+          "bias = slope * (end - now)"
+        ],
+        "sinks": [
+          "VotingEscrow contract (token balance)",
+          "locked mapping (per-NFT state)",
+          "slope_changes mapping (global schedule)",
+          "votingBalanceLogicData (point histories)"
+        ],
+        "trust_changes": "User tokens become protocol-managed. Owner retains NFT control unless transferred to AVM.",
+        "validation_points": [
+          "_value > 0 check",
+          "_locked.end > block.timestamp || isPermanent",
+          "_isApprovedOrOwner for increase_amount"
+        ],
+        "exposure_risks": [
+          "supply variable not decremented when SMNFT merges burn tokens from contract, leading to supply vs actual balance desync"
+        ],
+        "manipulation_risks": [
+          "If SMNFT_BONUS is changed via setSmNFTBonus, existing SMNFTs have incorrect calculate_original_sm_nft_amount results, misrepresenting individual smNFT vs smNFTBonus in checkpoints",
+          "int128 overflow risk: int128(int256(_value + calculate_sm_nft_bonus(_value))) could overflow for very large amounts near int128 max"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "veNFT owner calls VoterV3.vote",
+        "path": [
+          "vote() -> onlyNewEpoch checks timing + lastVoted",
+          "_vote() -> _reset() clears old votes from weights, IBribe.withdraw for each old pool",
+          "_vote() -> reads balanceOfNFT from VE (flash loan protected)",
+          "_vote() -> normalizes weights to _totalVoteWeight, calculates _poolWeight per pool",
+          "_vote() -> IBribe(internal_bribe).deposit + IBribe(external_bribe).deposit per pool",
+          "Updates weights[], votes[], poolVote[], usedWeights[], totalWeight"
+        ],
+        "transformations": [
+          "_poolWeight = _weights[i] * _weight / _totalVoteWeight (proportional distribution)",
+          "Only alive gauges receive votes"
+        ],
+        "sinks": [
+          "VoterV3 storage (votes, weights, totalWeight)",
+          "Bribe contracts (deposit checkpoints)"
+        ],
+        "trust_changes": "VoterV3 calls VE.voting() marking token as voted, preventing transfers until reset",
+        "validation_points": [
+          "isApprovedOrOwner",
+          "onlyNewEpoch modifier",
+          "poolVote.length <= maxVotingNum",
+          "epochVoteEnd timing check"
+        ],
+        "exposure_risks": [
+          "Bribe withdraw silently skips if amount > balanceOf[tokenId] (no revert), leaving stale bribe checkpoint data"
+        ],
+        "manipulation_risks": [
+          "poke() can be called by anyone with isApprovedOrOwner - if VE is msg.sender (via deposit_for triggering poke), the weight recalculation uses current balanceOfNFT which may differ from original vote weight"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Bribe rewards deposited via notifyRewardAmount or trading fee accrual",
+        "path": [
+          "notifyRewardAmount: safeTransferFrom tokens to Bribe contract",
+          "tokenRewardsPerEpoch[token][epochStart] += reward",
+          "getReward (called by gaugeManager): earned() calculates pro-rata share",
+          "earned: iterates epochs from lastEarn to current, sums (balanceOf * rewardPerEpoch / supply)",
+          "safeTransfer reward to _owner"
+        ],
+        "transformations": [
+          "reward per epoch = tokenRewardsPerEpoch[token][epoch]",
+          "user share = checkpointBalance * epochReward / supplyAtCheckpoint",
+          "For AVM tokens: owner lookup via IAutomatedVotingManager(avm).originalOwner(tokenId)"
+        ],
+        "sinks": [
+          "Token owner address (reward recipient)",
+          "lastEarn mapping updated"
+        ],
+        "trust_changes": "gaugeManager is trusted caller for getReward. Owner resolution depends on AVM originalOwner mapping.",
+        "validation_points": [
+          "msg.sender == gaugeManager for getReward",
+          "_isRewardToken check for notifyRewardAmount"
+        ],
+        "exposure_risks": [
+          "CRITICAL: originalOwner mapping in AutoVotingEscrowManager is never written (setOriginalOwner is no-op). For AVM-owned tokens, originalOwner(tokenId) returns address(0). safeTransfer to address(0) reverts, permanently locking AVM bribe rewards.",
+          "Fee-on-transfer tokens: notifyRewardAmount records full amount but contract receives less, causing reward insolvency"
+        ],
+        "manipulation_risks": [
+          "recoverERC20AndUpdateData subtracts from next epoch rewards based on active_period()+WEEK. If minter's active_period hasn't been updated, wrong epoch's rewards are modified."
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "User enables auto-voting via AutoVotingEscrowManager.enableAutoVoting",
+        "path": [
+          "enableAutoVoting: checks isApprovedOrOwner, not last hour, minimum balance",
+          "Finds or creates a non-full AutoVotingEscrow instance",
+          "votingEscrow.transferFrom(msg.sender, address(target), tokenId)",
+          "VE._transferFrom calls IAutomatedVotingManager(avm).setOriginalOwner (NO-OP!)",
+          "target.acceptLock stores LockInfo{owner, tokenId}",
+          "tokenIdToAVMId[tokenId] = nextAvailableAVMIndex + 1"
+        ],
+        "transformations": [
+          "Token ownership moves from user to AutoVotingEscrow contract"
+        ],
+        "sinks": [
+          "AutoVotingEscrow.locks array",
+          "tokenIdToAVMId mapping",
+          "VE ownership state"
+        ],
+        "trust_changes": "User loses direct NFT control; relies on AutoVotingEscrow + Manager to protect and return token",
+        "validation_points": [
+          "isApprovedOrOwner",
+          "isLastHour check",
+          "minBalanceForAutovoting"
+        ],
+        "exposure_risks": [
+          "VE.avm is set to AutoVotingEscrowManager, but actual NFT owner is individual AutoVotingEscrow. Bribe.avm check (_owner == avm) compares individual AVM address against manager address - always false. Rewards sent to AutoVotingEscrow contract, stuck.",
+          "lockOwner() returns locks[0].owner for any non-existent tokenId due to default mapping value of 0"
+        ],
+        "manipulation_risks": [
+          "Executor can call performLockAction to vote with all AVM tokens using arbitrary pool/weight strategies set by separate strategy contracts. If strategy is malicious, votes are misdirected."
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "RewardsDistributor receives minting rebase tokens",
+        "path": [
+          "Minter deposits tokens to RewardsDistributor",
+          "_checkpoint_token distributes tokens_per_week proportionally",
+          "claim: _claim iterates weeks, calculates share = balanceOfNFTAt * tokens_per_week / totalSupplyAtT",
+          "If lock active: deposit_for (compound into VE lock)",
+          "If lock expired: transfer directly to owner"
+        ],
+        "transformations": [
+          "Tokens distributed proportionally across weeks based on time since last checkpoint",
+          "User share based on historical voting power at each week boundary"
+        ],
+        "sinks": [
+          "VotingEscrow (via deposit_for) or direct transfer to owner"
+        ],
+        "trust_changes": "depositor is trusted to call checkpoint_token",
+        "validation_points": [
+          "Only depositor can checkpoint",
+          "claim iterates max 50 weeks"
+        ],
+        "exposure_risks": [
+          "claim_many does NOT check AVM originalOwner for expired locks - rewards sent to AutoVotingEscrow contract address instead of original user",
+          "_checkpoint_token iterates max 20 times. If called after >20 weeks gap, remaining tokens are never distributed"
+        ],
+        "manipulation_risks": [
+          "Anyone can call claim() for any tokenId. Combined with deposit_for compounding, attacker can force-compound for others (usually benign but changes their lock economics)"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "VotingEscrow merge/split operations",
+        "path": [
+          "merge: validates attachments, ownership, type compatibility",
+          "Burns source NFT, modifies dest locked balance",
+          "For non-SMNFT into SMNFT: adds bonus, increases smNFTBalance, burns tokens from VE contract",
+          "split: burns original, creates two new NFTs with split amounts"
+        ],
+        "transformations": [
+          "Merge SMNFT->SMNFT: amounts added directly",
+          "Merge normal->SMNFT: bonus added, smNFTBalance += value0, _black.burn(value0)",
+          "Merge normal->permanent: permanentLockBalance += value0",
+          "Split: _splitAmount includes bonus for SMNFT"
+        ],
+        "sinks": [
+          "locked mapping",
+          "permanentLockBalance",
+          "smNFTBalance",
+          "token burn"
+        ],
+        "trust_changes": "Source NFT destroyed; dest NFT absorbs value",
+        "validation_points": [
+          "attachments==0, !voted for source",
+          "isApprovedOrOwner for both",
+          "type compatibility checks"
+        ],
+        "exposure_risks": [
+          "Merge non-permanent into SMNFT burns value0 tokens from VE contract. supply variable NOT decremented. Over time, cumulative burns reduce VE token balance below sum of normal locked amounts, potentially making normal withdrawals fail."
+        ],
+        "manipulation_risks": [
+          "Merging an expired non-permanent into active permanent: value0 = old locked amount. permanentLockBalance increases. No check if _locked0.end < block.timestamp for non-permanent source. User retains locked value despite expiration."
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "PermissionsRegistry role management",
+        "path": [
+          "blackMultisig calls addRole/removeRole/setRoleFor/removeRoleFrom",
+          "hasRole mapping updated",
+          "Modifiers in VoterV3, TokenHandler etc check hasRole"
+        ],
+        "transformations": [
+          "Role bytes compared via keccak256"
+        ],
+        "sinks": [
+          "hasRole mapping",
+          "_roleToAddresses",
+          "_addressToRoles"
+        ],
+        "trust_changes": "blackMultisig is single point of trust for all role management",
+        "validation_points": [
+          "onlyBlackMultisig modifier"
+        ],
+        "exposure_risks": [
+          "removeRole corrupts _addressToRoles: uses _roles[_roles.length-1] instead of _addressToRoles[rta[i]][length-1] for swap-and-pop, writing wrong role data into user's role list"
+        ],
+        "manipulation_risks": [
+          "removeRoleFrom loop doesn't break after swap-and-pop. If array ordering causes the swapped-in element to match, double-pop could occur (mitigated by no-duplicate invariant)"
+        ]
+      },
+      {
+        "flow_id": "DF-008",
+        "source": "BlackClaims seasonal rewards",
+        "path": [
+          "Owner calls reportRewards to set per-address rewards",
+          "Owner calls finalize to pull tokens from treasury",
+          "Users call claimAndStakeReward with percent parameter",
+          "_preClaim validates eligibility, deducts from remaining_reward_amount",
+          "Creates SMNFT lock via _ve.create_lock_for with isSMNFT=true"
+        ],
+        "transformations": [
+          "If percent < 100: credit_amount = reward*100/110, forfeit = reward - credit_amount (~9.09%)",
+          "staked_reward = credit_amount * percent / 100",
+          "claimed_reward = credit_amount - staked_reward (transferred directly)"
+        ],
+        "sinks": [
+          "VotingEscrow (SMNFT lock)",
+          "msg.sender (claimed portion)",
+          "remaining_reward_amount (forfeit)"
+        ],
+        "trust_changes": "Treasury tokens become permanently locked SMNFTs (tokens burned on SMNFT creation)",
+        "validation_points": [
+          "claimed_rewards[msg.sender] == 0 (single claim)",
+          "isSeasonClaimingActive",
+          "percent 50-100"
+        ],
+        "exposure_risks": [
+          "reportRewards can be called multiple times before finalization. Increasing a user's reward increases reward_amount. Decreasing reduces it. But uint256 subtraction in _season.reward_amount -= _decrease could underflow if individual rewards exceed total."
+        ],
+        "manipulation_risks": [
+          "recoverERC20 allows owner to withdraw ANY token including the reward token, potentially draining claimable rewards"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "veNFT voting power decays linearly over lock duration (max 4 years/MAXTIME)",
+        "Permanent locks have non-decaying voting power equal to locked amount",
+        "SMNFT locks are permanent + bonus voting power (SMNFT_BONUS/PRECISION), tokens are burned",
+        "Users can only vote once per epoch, with timing restrictions (NO_VOTING_WINDOW at start and end)",
+        "WEEK = 1800 seconds (30 minutes) in BlackTimeLibrary - very short epoch for production",
+        "Gauge emissions proportional to vote weight; bribe rewards proportional to individual vote deposit in bribe contract"
+      ],
+      "economic_incentives": [
+        "Lock longer for more voting power (linear decay from end date)",
+        "Permanent locks get constant voting power without decay",
+        "SMNFT locks sacrifice liquidity (burned tokens) for 10% bonus voting power",
+        "Bribes incentivize veNFT holders to vote for specific pools",
+        "Rebase distribution (RewardsDistributor) dilution protection proportional to voting power",
+        "BlackClaims: 100% stake gets full reward; <100% stake forfeits ~9.09% penalty"
+      ],
+      "governance_mechanisms": [
+        "ERC721Checkpointable delegation system for DAO voting",
+        "delegateBySig for gasless delegation via EIP-712 signatures",
+        "getPastVotes used for snapshot-based governance voting",
+        "PermissionsRegistry role-based access control for protocol operations"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "setOriginalOwner in AutoVotingEscrowManager is a no-op (empty function body)",
+          "expected_behavior": "originalOwner mapping should be populated when VE transfers token to AVM, so Bribe.getReward can resolve the actual user",
+          "actual_behavior": "originalOwner mapping is never written. Bribe.getReward gets address(0) for AVM-managed tokens. safeTransfer to address(0) reverts, permanently locking all bribe rewards for AVM-delegated veNFTs",
+          "risk_level": "high",
+          "exploitation_potential": "Not an exploit per se, but all users who enable auto-voting permanently lose bribe rewards. The rewards accumulate in the Bribe contract with no recovery mechanism for those specific epochs."
+        },
+        {
+          "scenario": "AVM-managed NFT bribe rewards - ownerOf returns AutoVotingEscrow, not Manager",
+          "expected_behavior": "Bribe.getReward should detect AVM-managed tokens and route rewards to original owner",
+          "actual_behavior": "Bribe.avm is set to AutoVotingEscrowManager address. ownerOf returns individual AutoVotingEscrow address. The check _owner == avm is false. Rewards are sent to individual AutoVotingEscrow contract with no withdrawal function, permanently locking them.",
+          "risk_level": "high",
+          "exploitation_potential": "All bribe rewards for AVM-managed tokens are permanently lost. Users are not warned. Even if setOriginalOwner worked, the avm address comparison would still fail because the NFT is held by the child AutoVotingEscrow, not the manager."
+        },
+        {
+          "scenario": "PermissionsRegistry.removeRole corrupts _addressToRoles mapping",
+          "expected_behavior": "Removing a role should cleanly update both _roleToAddresses and _addressToRoles",
+          "actual_behavior": "Uses _roles[_roles.length-1] (global roles array last element) instead of _addressToRoles[rta[i]][_addressToRoles[rta[i]].length-1] for swap, corrupting users' role lists with unrelated role strings",
+          "risk_level": "high",
+          "exploitation_potential": "After removeRole, affected addresses have corrupted _addressToRoles entries. While hasRole mapping is correctly cleared, the addressToRole view function returns incorrect data, and subsequent removeRoleFrom operations on those addresses may behave incorrectly."
+        },
+        {
+          "scenario": "WEEK=1800 with 255-iteration checkpoint loop",
+          "expected_behavior": "Checkpoint loop should be able to catch up from any historical state to present",
+          "actual_behavior": "255 iterations * 1800 seconds/WEEK = 459,000 seconds (~5.3 days) max catch-up. MAX_LOCK_DURATION = 4 years. If no interaction for >5.3 days, single checkpoint call cannot fully update slope_changes, causing permanently incorrect global voting power accounting.",
+          "risk_level": "high",
+          "exploitation_potential": "If protocol has low activity periods exceeding 5.3 days, the global point_history becomes permanently desynchronized. totalSupply calculations would be wrong, affecting all reward distributions and governance votes. Multiple checkpoint calls needed but no mechanism ensures this."
+        },
+        {
+          "scenario": "claim_many in RewardsDistributor doesn't check AVM for expired locks",
+          "expected_behavior": "For expired AVM-managed locks, rewards should go to original owner",
+          "actual_behavior": "claim_many sends to ownerOf(_tokenId) which is the AutoVotingEscrow contract. Rewards are stuck in the AutoVotingEscrow with no withdrawal function.",
+          "risk_level": "medium",
+          "exploitation_potential": "Users using AVM who let their locks expire lose rebase rewards if claim_many is used instead of claim. The single claim() function does check AVM but has its own issue (depends on broken originalOwner)."
+        },
+        {
+          "scenario": "Merging non-SMNFT into SMNFT burns tokens from VotingEscrow without supply adjustment",
+          "expected_behavior": "supply variable should track actual contract token balance, or at least ensure enough tokens for all normal withdrawals",
+          "actual_behavior": "supply variable unchanged after burn. Actual VE token balance reduced. If cumulative SMNFT merges burn more tokens than the SMNFT portion of deposits, normal lock withdrawals could fail due to insufficient contract balance.",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker creates many normal locks then merges them all into SMNFT, burning tokens from VE contract. If other users' normal locks total exceeds remaining VE balance, those users cannot withdraw. However, the attacker loses their own tokens permanently, making this a griefing attack."
+        },
+        {
+          "scenario": "SMNFT_BONUS change breaks existing SMNFT calculations",
+          "expected_behavior": "Changing SMNFT_BONUS should only affect new SMNFTs or apply migration logic",
+          "actual_behavior": "calculate_original_sm_nft_amount uses current SMNFT_BONUS. After changing bonus, existing SMNFT checkpoint calculations return wrong smNFT/smNFTBonus split (total unchanged). Global point smNFTBonus = calculate_sm_nft_bonus(smNFTBalance) uses new rate, creating mismatch between sum of individual balances and total supply.",
+          "risk_level": "medium",
+          "exploitation_potential": "If bonus is increased, total supply (global) increases (more smNFTBonus) without corresponding individual balance increases until each SMNFT's next checkpoint. This inflates totalSupply, diluting all users' share of rebase rewards."
+        },
+        {
+          "scenario": "AutoVotingEscrow.lockOwner returns wrong owner for non-existent tokenId",
+          "expected_behavior": "Should revert or return address(0) for tokens not in the AVM",
+          "actual_behavior": "tokenIdIndex defaults to 0 for unmapped tokenIds. If locks array is non-empty, lockOwner returns locks[0].owner regardless of actual token. This affects disableAutoVoting and getOriginalOwner.",
+          "risk_level": "medium",
+          "exploitation_potential": "If getOriginalOwner is called for a tokenId that was never in an AVM, it could return the wrong address. In the Bribe reward flow, this could send rewards to the wrong user. However, the prerequisite is that tokenIdToAVMId returns a valid index, which it wouldn't for non-AVM tokens."
+        },
+        {
+          "scenario": "Bribe notifyRewardAmount with fee-on-transfer tokens",
+          "expected_behavior": "tokenRewardsPerEpoch should reflect actual received amount",
+          "actual_behavior": "Records full reward amount without checking received delta. Contract receives less than recorded, causing later getReward calls to fail when balance is insufficient.",
+          "risk_level": "medium",
+          "exploitation_potential": "If protocol whitelists a fee-on-transfer token as bribe token (via TokenHandler.isConnector), accumulated rewards will be overstated. Last claimers lose rewards."
+        },
+        {
+          "scenario": "Bribe.withdraw silently does nothing when amount > balanceOf",
+          "expected_behavior": "Should revert if attempting to withdraw more than deposited",
+          "actual_behavior": "Silently skips the withdrawal, leaving stale checkpoint data. If VoterV3._reset passes a higher amount than expected, the bribe contract retains phantom votes affecting reward calculations.",
+          "risk_level": "medium",
+          "exploitation_potential": "If a voting power increase (via poke) followed by reset causes inconsistent amounts, users could retain bribe deposits while their votes are cleared, earning extra rewards."
+        },
+        {
+          "scenario": "disableAutoVoting fails if AVM already voted in current epoch",
+          "expected_behavior": "User should be able to exit AVM at any time",
+          "actual_behavior": "disableAutoVoting calls voter.reset(tokenId) which has onlyNewEpoch modifier. If AVM already voted for this epoch, reset reverts with 'VOTED', locking user in AVM until next epoch.",
+          "risk_level": "low",
+          "exploitation_potential": "Users are temporarily locked into AVM delegation. Not exploitable but disrupts user experience and could prevent emergency exits."
+        },
+        {
+          "scenario": "updateToSMNFT double counting in smNFTBalance",
+          "expected_behavior": "smNFTBalance should track the original deposited amount exactly",
+          "actual_behavior": "smNFTBalance += _amount where _amount = uint(int256(_locked.amount)) which is the FULL locked amount before bonus recalculation. This is correct for the first SMNFT conversion. But if increase_amount was called before conversion, _amount includes all deposited value, which is also correct.",
+          "risk_level": "low",
+          "exploitation_potential": "No immediate exploit, but the accounting relies on _locked.amount matching the actual unbonused deposit, which is true for non-SMNFT locks."
+        },
+        {
+          "scenario": "delegateBySig ecrecover returns address(0) for invalid signatures",
+          "expected_behavior": "Should reject invalid signatures safely",
+          "actual_behavior": "Check requires signatory != address(0), so invalid signatures are properly rejected. However, if ecrecover returns a valid but unintended address due to signature malleability, delegation could be manipulated.",
+          "risk_level": "low",
+          "exploitation_potential": "Standard ECDSA malleability - mitigated by nonce check, but no explicit s-value range check as recommended by OpenZeppelin."
+        }
+      ],
+      "assumption_violations": [
+        "Assumption: VotingEscrow always has enough token balance for all normal lock withdrawals. Violated by SMNFT merge burns reducing contract balance without supply tracking.",
+        "Assumption: SMNFT_BONUS is constant after deployment. setSmNFTBonus can change it, breaking calculate_original_sm_nft_amount for existing locks.",
+        "Assumption: AVM manager address equals NFT owner for AVM-managed tokens. Actually, individual AutoVotingEscrow contracts hold NFTs, not the manager.",
+        "Assumption: setOriginalOwner will be implemented. Currently no-op, breaking entire AVM reward distribution.",
+        "Assumption: checkpoint loop (255 iterations) is sufficient to catch up. With WEEK=1800, only covers 5.3 days of inactivity.",
+        "Assumption: All reward tokens are standard ERC20. Fee-on-transfer tokens break bribe accounting."
+      ],
+      "game_theory_risks": [
+        "AVM executor has centralized control over voting for all AVM-delegated tokens. Malicious executor can direct all AVM voting power to their preferred pools to maximize their own bribe income.",
+        "Strategy contracts (SetterTopNPoolsStrategy, SetterVoteWeightStrategy) are fully controlled by executor. No on-chain verification that strategies are fair or optimal.",
+        "Bribe depositors can deposit rewards for current epoch after seeing vote distributions, concentrating bribes in low-vote pools to attract votes cheaply.",
+        "BlackClaims owner can call reportRewards to inflate/deflate any user's rewards before finalization, with no on-chain verification of off-chain scores."
+      ],
+      "integration_risks": [
+        "IBlack.burn() and burnFrom() - custom burn interface, correctness depends on BLACK token implementation. If burn fails silently, SMNFT creation succeeds without actually burning tokens.",
+        "gaugeManager.isGaugeAliveForPool and fetchBribeFromPool are non-view functions (no view keyword in interface), potentially causing state changes during view-like usage.",
+        "IAutoVotingEscrowManager.tokenIdToAVMId is non-view in interface, causing potential state changes when called from view contexts in Bribe.",
+        "RewardsDistributor assumes VotingEscrow.deposit_for will always succeed for active locks. If VE contract is paused or token transfer fails, rebase compounds silently fail."
+      ],
+      "calculation_errors": [
+        "PermissionsRegistry.removeRole: _addressToRoles[rta[i]][k] = _roles[_roles.length - 1] should be _addressToRoles[rta[i]][_addressToRoles[rta[i]].length - 1]. Uses wrong source array for swap-and-pop, corrupting data.",
+        "RewardsDistributor._checkpoint_token: Loop iterates max 20 times with WEEK=1800 increments = 36000 seconds (10 hours). If called less frequently, excess tokens are never distributed to those weeks.",
+        "VotingBalanceLogic._supply_at: Returns uint(uint128(last_point.bias)) + last_point.permanent + last_point.smNFT + last_point.smNFTBonus. The uint128 cast could truncate if bias somehow exceeded uint128 range (though bias is int128 so this is safe).",
+        "BlackClaims._preClaim: _season.remaining_reward_amount -= _reward uses uint subtraction. If remaining_reward_amount < _reward due to rounding in reportRewards, this reverts, preventing valid claims."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "BLACK",
+          "behaviors": [
+            "mint_burn_restricted",
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Custom IBlack interface with burn(uint) and burnFrom(address,uint) returning bool. Used as base lock token in VotingEscrow. assert() used on transfer/burn results - silent failure not handled."
+        },
+        {
+          "address_or_symbol": "veBlack (veBLACK)",
+          "behaviors": [
+            "non_standard_return",
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "ERC721 veNFT. balanceOf returns NFT count, balanceOfNFT returns voting power. Non-transferable while voted or attached."
+        },
+        {
+          "address_or_symbol": "BRIBE_TOKENS",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Arbitrary ERC20 tokens used as bribes. No fee-on-transfer protection in notifyRewardAmount. Should use SafeERC20 received-amount delta pattern."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation",
+          "state_vars": [
+            "supply",
+            "IERC20(token).balanceOf(address(this))"
+          ],
+          "notes": "VIOLATED: SMNFT merge burns tokens without decrementing supply. supply >= actualBalance after merges."
+        },
+        {
+          "name": "permanent_balance_tracking",
+          "state_vars": [
+            "permanentLockBalance",
+            "sum of all permanent (non-SMNFT) locked amounts"
+          ],
+          "notes": "Should be maintained across all operations. Merge handles correctly but updateToSMNFT path needs verification."
+        },
+        {
+          "name": "smnft_balance_tracking",
+          "state_vars": [
+            "smNFTBalance",
+            "sum of original (pre-bonus) SMNFT locked amounts"
+          ],
+          "notes": "Correct at creation time. Changes to SMNFT_BONUS break reverse calculation consistency."
+        },
+        {
+          "name": "total_voting_power_consistency",
+          "state_vars": [
+            "totalSupply()",
+            "sum of all balanceOfNFT()"
+          ],
+          "notes": "Global point stores permanent + smNFT + smNFTBonus + decaying bias. Individual points may use different SMNFT_BONUS rate after bonus change."
+        },
+        {
+          "name": "bribe_balance_solvency",
+          "state_vars": [
+            "sum(tokenRewardsPerEpoch[token][*])",
+            "IERC20(token).balanceOf(bribe)"
+          ],
+          "notes": "Can be violated by fee-on-transfer tokens or emergencyRecoverERC20 calls."
+        },
+        {
+          "name": "checkpoint_loop_coverage",
+          "state_vars": [
+            "epoch",
+            "255 * WEEK seconds"
+          ],
+          "notes": "With WEEK=1800, loop covers only 5.3 days. Protocol must have activity at least every 5 days or global accounting breaks."
+        }
+      ]
+    }
+  }
+}

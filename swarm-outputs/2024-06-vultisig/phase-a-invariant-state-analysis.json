@@ -1,0 +1,292 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T07:56:10.687Z",
+    "duration_ms": 394726
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "ILOPool.sol",
+        "description": "claim() uses pool.collect(type(uint128).max) which collects ALL tokens owed to the shared Uniswap V3 position (all investors share one position). The excess beyond the claimer's calculated share is sent to feeTaker. This steals other investors' accumulated trading fee shares and causes subsequent claim() calls to revert because expected fee tokens no longer exist in the contract.",
+        "attack_scenario": "After launch, trading generates fees on the Uniswap V3 pool. Investor A calls claim(). burn() triggers fee settlement for the ENTIRE position liquidity, adding all accumulated fees to tokensOwed. collect(max) grabs everything. A receives their calculated fee share, the rest (other investors' fees) goes to feeTaker. When Investor B claims, burn() only settles fees accumulated SINCE A's claim, but B's code calculates fees based on feeGrowthDelta since their last claim (which is 0). B expects tokens that don't exist, causing the feeTaker transfer to underflow (Solidity 0.7.6 unchecked) or the user transfer to exceed contract balance, reverting the transaction. All subsequent investors are permanently locked out of claiming.",
+        "invariant_logic": "For each claim: amountCollected from collect() MUST >= amount0 sent to user + amount0 sent to feeTaker. Equivalently: fee tokens attributed to investor i must be backed by actual tokens available, not taken from other investors' shares.",
+        "solidity_property": "function invariant_claim_solvency() public view { /* For all tokenIds: sum(expectedFees(tokenId)) <= actual Uniswap position fee accumulation available to this contract */ }",
+        "inventory_refs": [
+          {
+            "file": "ILOPool.sol",
+            "function": "claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "ILOPool.sol",
+        "description": "_launchSucceeded and _refundTriggered are mutually exclusive terminal states, but _launchSucceeded is set AFTER all side effects in launch() (addLiquidity, minting NFTs, _refundProject token transfers). If the sale token or any callback re-enters during launch execution, _launchSucceeded is still false, potentially allowing refundable() modifier to pass if refundDeadline conditions are met.",
+        "attack_scenario": "If ILOManager owner sets refundDeadline <= launchTime, then at launch time both conditions (block.timestamp > launchTime AND block.timestamp >= refundDeadline) are true. During launch()'s _refundProject transfer, a malicious SALE_TOKEN could callback, and claimRefund could be triggered since _launchSucceeded is still false. While the RAISE_TOKEN has already been sent to Uniswap so refund transfers would fail, this violates the state machine invariant.",
+        "invariant_logic": "_launchSucceeded == true MUST be set BEFORE any external calls in launch(). Alternative: _launchSucceeded XOR _refundTriggered XOR (both false, pre-terminal state)",
+        "solidity_property": "function invariant_launch_refund_mutex() public view { assert(!(_launchSucceeded && _refundTriggered)); }",
+        "inventory_refs": [
+          {
+            "file": "ILOPool.sol",
+            "function": "launch"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "claimRefund"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ILOPool.sol",
+        "description": "Per-user cap (maxCapPerUser) is enforced per-NFT-position, not per-address. If a whitelisted user transfers their NFT to another address, their balanceOf becomes 0, and buy() mints a fresh position with raiseAmount=0, allowing them to buy up to maxCapPerUser again. This can be repeated to bypass the cap entirely (up to hardCap).",
+        "attack_scenario": "Whitelisted user A buys maxCapPerUser worth of tokens, receiving NFT#1. A transfers NFT#1 to cold wallet B. A calls buy(maxCapPerUser, A) again - balanceOf(A)==0, new NFT#2 is minted with raiseAmount=0, cap check passes. A can repeat this N times until hardCap is reached, effectively bypassing the per-user cap. The cap was meant to ensure fair distribution among whitelisted participants.",
+        "invariant_logic": "For any whitelisted address W: sum(positions[t].raiseAmount for all t ever minted to W) <= maxCapPerUser. Current code only checks positions[currentNFT].raiseAmount <= maxCapPerUser.",
+        "solidity_property": "function invariant_cap_per_user(address user) public view { /* totalEverRaised[user] <= saleInfo.maxCapPerUser */ }",
+        "inventory_refs": [
+          {
+            "file": "ILOPool.sol",
+            "function": "buy"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ILOManager.sol",
+        "description": "initILOPool RANGE validation only checks sqrtRatioLowerX96 < initialPoolPriceX96 but does NOT check initialPoolPriceX96 < sqrtRatioUpperX96. If the initial price is at or above the upper tick, the concentrated liquidity position is entirely in one token, breaking sale token amount calculations and liquidity math in buy() and launch().",
+        "attack_scenario": "Project admin creates an ILO pool with tickUpper such that sqrtRatioUpperX96 <= initialPoolPriceX96. The RANGE check passes because lower < initial and lower < upper. But _saleAmountNeeded calculates wrong amounts (getLiquidityForAmount0/1 swap parameters internally when A>B, producing incorrect liquidity). Investors buy positions with miscalculated liquidity. At launch, addLiquidity deploys with wrong token ratios, potentially losing sale tokens or failing entirely.",
+        "invariant_logic": "SQRT_RATIO_LOWER_X96 < SQRT_RATIO_X96 < SQRT_RATIO_UPPER_X96 (both strict inequalities required for valid concentrated liquidity position)",
+        "solidity_property": "function invariant_price_in_range() public view { assert(SQRT_RATIO_LOWER_X96 < SQRT_RATIO_X96 && SQRT_RATIO_X96 < SQRT_RATIO_UPPER_X96); }",
+        "inventory_refs": [
+          {
+            "file": "ILOManager.sol",
+            "function": "initILOPool"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "buy"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "launch"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ILOManager.sol",
+        "description": "ILOManager owner can call setRefundDeadlineForProject to set refundDeadline to any value including type(uint64).max. This permanently blocks the refund path for all investors. Combined with a failed launch (e.g., price manipulation prevents launch), both RAISE_TOKEN (from investors) and SALE_TOKEN (from project) are permanently locked in ILO pools.",
+        "attack_scenario": "1) A project is initialized with ILO pools. 2) Investors deposit RAISE_TOKEN. 3) An attacker manipulates Uniswap V3 pool price to prevent launch (price check fails). 4) ILOManager owner (malicious or compromised) sets refundDeadline to type(uint64).max. 5) Neither launch() nor claimRefund() can succeed. Investor funds are permanently locked.",
+        "invariant_logic": "refundDeadline SHOULD NOT be modifiable to a value that would lock funds beyond a reasonable bound. At minimum: refundDeadline > launchTime AND refundDeadline <= launchTime + MAX_REASONABLE_OFFSET.",
+        "solidity_property": "function invariant_refund_accessible() public view { Project memory p = _cachedProject[pool]; assert(p.refundDeadline <= p.launchTime + MAX_SAFE_OFFSET); }",
+        "inventory_refs": [
+          {
+            "file": "ILOManager.sol",
+            "function": "setRefundDeadlineForProject"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "claimRefund"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ILOManager.sol",
+        "description": "launch() is permissionless and checks that Uniswap V3 pool price matches initialPoolPriceX96. An attacker can grief/block launch by front-running the launch transaction with a swap that changes the pool price. Since the Uniswap V3 pool is publicly accessible after initProject creates it, any actor can trade on it. The attacker can repeatedly front-run launch attempts for the entire window between launchTime and refundDeadline.",
+        "attack_scenario": "1) Project initializes pool at price P. 2) At launchTime, someone calls launch(). 3) Attacker front-runs with a swap moving price to P'. 4) launch() reverts with 'UV3P'. 5) Attacker swaps back, paying minimal fees. 6) Repeat for every launch attempt. 7) After refundDeadline, the project is forced into refund state. The attacker gains nothing directly but can extort the project admin.",
+        "invariant_logic": "launch() SHOULD have a mechanism to guarantee execution (e.g., flashbots, private mempool, or price tolerance) OR the price check should be done atomically with the liquidity addition.",
+        "solidity_property": "function invariant_launch_not_griefable() public view { /* No on-chain assertion possible for MEV resistance */ }",
+        "inventory_refs": [
+          {
+            "file": "ILOManager.sol",
+            "function": "launch"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "UniswapV3Oracle.sol",
+        "description": "Oracle TWAP period falls back to the oldest available observation if PERIOD (30 min) is unavailable. For a newly created pool, this could be as low as 1 second, making the TWAP essentially a spot price that is trivially manipulable via flash loans or sandwich attacks.",
+        "attack_scenario": "1) Pool is newly created (observation age = few seconds). 2) Attacker manipulates pool price in a single block (flash loan or large swap). 3) Oracle returns manipulated price with period=1s. 4) In Whitelist.checkWhitelist, the estimated ETH amount is artificially low, allowing the attacker to buy far more tokens than the maxAddressCap should allow. 5) Attacker reverses the price manipulation in the same or next block.",
+        "invariant_logic": "Oracle period used for TWAP MUST be >= a minimum safe threshold (e.g., 300 seconds). If insufficient observation history exists, the oracle should revert rather than use an unsafe period.",
+        "solidity_property": "function invariant_oracle_period() public view { uint32 longestPeriod = OracleLibrary.getOldestObservationSecondsAgo(pool); assert(longestPeriod >= MIN_SAFE_PERIOD); }",
+        "inventory_refs": [
+          {
+            "file": "UniswapV3Oracle.sol",
+            "function": "peek"
+          },
+          {
+            "file": "Whitelist.sol",
+            "function": "checkWhitelist"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ILOManager.sol",
+        "description": "setPlatformFee and setPerformanceFee have no upper bound validation. If fee BPS is set >= 10000, the _deductFees function in ILOPool.claim() will underflow (Solidity 0.7.6 has no overflow checks), producing a massive erroneous amount that would cause token transfer failures or drain contract funds.",
+        "attack_scenario": "1) ILOManager owner sets PLATFORM_FEE to 10001. 2) A project is initialized, capturing platformFee=10001. 3) After launch, investor calls claim(). 4) _deductFees computes: amount0Left = amount0 - mulDiv(amount0, 10001, 10000) = amount0 - amount0*1.0001 which underflows to ~2^256. 5) The transfer of this massive amount fails, permanently DOSing all claims for the project.",
+        "invariant_logic": "PLATFORM_FEE < BPS (10000) AND PERFORMANCE_FEE < BPS (10000). Ideally PLATFORM_FEE + PERFORMANCE_FEE < BPS to prevent combined over-100% fee extraction.",
+        "solidity_property": "function invariant_fee_bounds() public view { assert(PLATFORM_FEE < 10000 && PERFORMANCE_FEE < 10000); }",
+        "inventory_refs": [
+          {
+            "file": "ILOManager.sol",
+            "function": "setPlatformFee"
+          },
+          {
+            "file": "ILOManager.sol",
+            "function": "setPerformanceFee"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "_deductFees"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "ILOManager.sol",
+        "description": "initProject does not validate that launchTime is in the future. A past launchTime means the sale period (start < end < launchTime) would also be in the past, rendering the ILO pool unusable. Furthermore, refundDeadline = launchTime + DEFAULT_DEADLINE_OFFSET could be immediately past, enabling instant refunds.",
+        "attack_scenario": "Project admin accidentally or maliciously sets launchTime to a past timestamp. ILO pools created for this project cannot have valid sale periods (params.start < params.end < launchTime, all must be past). If sale somehow completes, launch() can be called immediately, and refundDeadline may already be past, creating race conditions between launch and refund.",
+        "invariant_logic": "launchTime > block.timestamp at project creation time",
+        "solidity_property": "function invariant_launch_future() public view { assert(_cachedProject[pool].launchTime > block.timestamp); }",
+        "inventory_refs": [
+          {
+            "file": "ILOManager.sol",
+            "function": "initProject"
+          },
+          {
+            "file": "ILOManager.sol",
+            "function": "_cacheProject"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "ILOPool.sol",
+        "description": "totalRaised only increases during buy() but is never checked against soft cap until launch(). After the sale period ends, if totalRaised < softCap, launch() reverts with 'SC'. The only recovery path is refund, which requires waiting until refundDeadline. There is no early termination mechanism if it's clear softCap won't be met.",
+        "attack_scenario": "A sale raises 10% of softCap by end time. Launch fails with 'SC'. Investors must wait until refundDeadline (7+ days after launchTime) to recover funds. During this period, their RAISE_TOKEN is locked and exposed to market risk. If refundDeadline is extended by owner, funds are locked indefinitely.",
+        "invariant_logic": "If block.timestamp > saleInfo.end AND totalRaised < softCap, there SHOULD be an immediate path to refund without waiting for refundDeadline.",
+        "solidity_property": "function invariant_failed_sale_refundable() public view { if (block.timestamp > saleInfo.end && totalRaised < saleInfo.softCap) { assert(/* refund path available */); } }",
+        "inventory_refs": [
+          {
+            "file": "ILOPool.sol",
+            "function": "buy"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "launch"
+          },
+          {
+            "file": "ILOPool.sol",
+            "function": "claimRefund"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "ILOPool.sol",
+        "description": "buy() accepts a recipient parameter and checks whitelist against recipient, not msg.sender. This allows anyone to call buy() on behalf of a whitelisted address, filling their maxCapPerUser allocation without their consent and spending the caller's RAISE_TOKEN.",
+        "attack_scenario": "Attacker knows address W is whitelisted with limited allocation. Attacker calls buy(maxCapPerUser, W), spending their own RAISE_TOKEN. W now has a full position they didn't ask for, and their cap is exhausted. If W wanted to participate later, they cannot because their cap is used up. The attacker loses funds but griefs W.",
+        "invariant_logic": "msg.sender == recipient OR msg.sender is explicitly authorized by recipient to buy on their behalf",
+        "solidity_property": "function invariant_buy_consent() public view { /* buy() should require msg.sender == recipient or explicit delegation */ }",
+        "inventory_refs": [
+          {
+            "file": "ILOPool.sol",
+            "function": "buy"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "ILOManager.sol",
+        "description": "ILOManager constructor uses tx.origin for ownership transfer. If deployed via a factory contract, create2 deployer, or multisig, tx.origin is the EOA that initiated the transaction, not the intended owner. The initialize() function also calls transferOwnership(initialOwner), creating a race condition where the tx.origin owner could front-run initialization.",
+        "attack_scenario": "ILOManager is deployed via a deployer contract. tx.origin is the deployer EOA. Before initialize() is called, the tx.origin owner can call onlyOwner functions (setFeeTaker, setILOPoolImplementation, etc.) to set malicious values. Even after initialize() transfers ownership to initialOwner, the damage may be done.",
+        "invariant_logic": "Ownership should be deterministic and not depend on tx.origin. Constructor should either set owner to msg.sender or defer all ownership to initialize().",
+        "solidity_property": "function invariant_ownership() public view { assert(owner() == EXPECTED_OWNER); }",
+        "inventory_refs": [
+          {
+            "file": "ILOManager.sol",
+            "function": "constructor"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "Whitelist.sol",
+        "description": "Whitelist.checkWhitelist only validates purchases where from==_pool. Tokens acquired through any other mechanism (direct transfers, other DEXes, aggregators) completely bypass all whitelist restrictions, blacklist checks, and contribution cap enforcement.",
+        "attack_scenario": "During locked/whitelist period, a blacklisted or non-whitelisted address cannot buy from the Uniswap pool. However, a whitelisted address buys tokens and transfers them to the blacklisted address via a direct ERC20 transfer. The _beforeTokenTransfer hook calls checkWhitelist, but since from != _pool, no checks are applied. The blacklisted address receives tokens freely.",
+        "invariant_logic": "If _locked == true, no non-owner non-whitelisted address should be able to increase their token balance. Current check only covers the pool as source.",
+        "solidity_property": "function invariant_whitelist_comprehensive(address to) public view { if (_locked && to != owner() && !isWhitelisted(to)) { assert(balanceOf(to) == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "Whitelist.sol",
+            "function": "checkWhitelist"
+          },
+          {
+            "file": "VultisigWhitelisted.sol",
+            "function": "_beforeTokenTransfer"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "Vultisig.sol",
+        "description": "approveAndCall makes an external call to an arbitrary spender contract via IApproveAndCallReceiver(spender).receiveApproval(). After approval is set, the callback can execute arbitrary logic including re-entering the token contract or the calling contract. Since the approval is already set, the spender can transferFrom within the callback.",
+        "attack_scenario": "User calls approveAndCall(maliciousContract, amount, data). The _approve sets allowance. Then receiveApproval is called on maliciousContract which calls transferFrom to drain the full approved amount, plus executes arbitrary logic with the user as msg.sender context.",
+        "invariant_logic": "approveAndCall callback should not allow more tokens to be transferred than explicitly intended. Consider checks-effects-interactions pattern or reentrancy guard.",
+        "solidity_property": "function invariant_approve_and_call_safety() public view { /* No reentrancy during approveAndCall execution */ }",
+        "inventory_refs": [
+          {
+            "file": "Vultisig.sol",
+            "function": "approveAndCall"
+          }
+        ]
+      }
+    ]
+  }
+}

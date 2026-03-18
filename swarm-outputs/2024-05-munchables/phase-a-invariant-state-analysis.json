@@ -1,0 +1,232 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T21:42:58.813Z",
+    "duration_ms": 401810
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LockManager.sol",
+        "description": "setLockDuration validates new unlock time using block.timestamp but computes actual unlockTime using lastLockTime, allowing users to set unlockTime to an already-passed timestamp and bypass lock duration entirely",
+        "attack_scenario": "User locks 1000 ETH during lockdrop with 365-day duration (lastLockTime=T0, unlockTime=T0+365d). They receive NFT rewards based on locked amount. At T0+364d, user calls setLockDuration(2 days). Validation: (T0+364d)+2d = T0+366d >= T0+365d passes. Assignment: unlockTime = T0 + 2d (362 days in the past). User immediately calls unlock() to withdraw all 1000 ETH, having received lockdrop NFT rewards without actually locking for the promised duration. Any user who has waited past the halfway point of their lock can unlock immediately.",
+        "invariant_logic": "For any setLockDuration call: new_unlockTime = lastLockTime + _duration MUST be >= old_unlockTime AND MUST be >= block.timestamp",
+        "solidity_property": "function invariant_unlockTimeNeverBackward() public view { for (uint i; i < configuredTokenContracts.length; i++) { address tc = configuredTokenContracts[i]; LockedToken memory lt = lockedTokens[msg.sender][tc]; if (lt.quantity > 0) { assert(lt.unlockTime >= lt.lastLockTime); assert(lt.unlockTime >= block.timestamp || lt.quantity == 0); } } }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "setLockDuration"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LockManager.sol",
+        "description": "lockOnBehalf unconditionally resets the recipient's unlockTime to block.timestamp + lockDuration, allowing any external party to indefinitely extend a victim's lock period by locking zero or dust amounts",
+        "attack_scenario": "User A locks 100 ETH with a 90-day lock duration. At day 89, attacker calls lockOnBehalf(address(0), 0, userA) with msg.value=0, spending only gas. This resets userA's unlockTime to now+90days, extending their lock by ~89 days. The attacker repeats this every 89 days, permanently preventing userA from ever withdrawing their 100 ETH. For ERC20 tokens, the attacker can also lock 0 tokens since allowance >= 0 always holds for uint256.",
+        "invariant_logic": "In _lock: new unlockTime MUST be >= old unlockTime for existing locks (lockedToken.quantity > 0). Alternatively, lockOnBehalf SHOULD NOT allow _quantity == 0.",
+        "solidity_property": "function invariant_lockOnBehalfCannotExtend(address recipient, address tokenContract) public view { LockedToken memory lt = lockedTokens[recipient][tokenContract]; assert(lt.unlockTime <= lt.lastLockTime + playerSettings[recipient].lockDuration); }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "lockOnBehalf"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "_lock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LockManager.sol",
+        "description": "_lock function does not enforce monotonicity of unlockTime for existing locks — every lock operation overwrites unlockTime without checking it exceeds the previous value, allowing lock shortening through re-locking",
+        "attack_scenario": "User locks token A with 365-day duration. unlockTime = T0+365d. User then reduces their lockDuration (possible if no tokens of OTHER types are locked, or via the setLockDuration bug). User locks 1 wei more of token A. New unlockTime = now + new_short_duration, potentially far earlier than the original T0+365d. All previously locked tokens of that type become unlockable early.",
+        "invariant_logic": "In _lock: if lockedToken.quantity > 0 then (block.timestamp + _lockDuration) >= lockedToken.unlockTime",
+        "solidity_property": "function invariant_lockNeverShortensExistingUnlock(address player, address token) public view { LockedToken memory lt = lockedTokens[player][token]; if(lt.quantity > 0) { assert(lt.unlockTime >= block.timestamp || lt.quantity == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "_lock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LockManager.sol",
+        "description": "Fee-on-transfer ERC20 tokens cause accounting insolvency: contract records _quantity as locked but receives fewer tokens due to transfer fee, making later withdrawals fail for last unlockers",
+        "attack_scenario": "Admin configures a fee-on-transfer token (2% fee). User locks 100 tokens: contract records quantity=100, but only receives 98 tokens. Multiple users lock tokens. When users unlock, the contract attempts to transfer the full recorded quantity. Last users to unlock will find insufficient balance in the contract, permanently losing their tokens.",
+        "invariant_logic": "lockedToken.quantity += actualReceivedAmount (not _quantity). Should use balanceOf(this) before/after transfer pattern.",
+        "solidity_property": "function invariant_tokenBalanceSolvency(address tokenContract) public view { if(tokenContract != address(0)) { uint256 totalLocked = 0; /* sum all lockedTokens[*][tokenContract].quantity */ assert(IERC20(tokenContract).balanceOf(address(this)) >= totalLocked); } }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "_lock"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "unlock"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LockManager.sol",
+        "description": "USD price governance allows a voter who disapproved to subsequently approve the same proposal, inflating both tallies simultaneously. This breaks the mutual exclusivity of approve/disapprove votes and can cause proposals with sufficient approvals to fail execution due to phantom disapprovals.",
+        "attack_scenario": "With APPROVE_THRESHOLD=3 and DISAPPROVE_THRESHOLD=2: Proposer auto-approves (1a). Voter B disapproves then approves (1d+2a). Voter C disapproves then approves (2d+3a). In _execUSDPriceUpdate: approvalsCount=3>=3 but disapprovalsCount=2>=2, so the condition 'disapprovalsCount < DISAPPROVE_THRESHOLD' is false and the price update is NOT executed despite having 3 valid approvals. The proposal becomes stuck — cannot execute (phantom disapprovals) and cannot be re-proposed (proposer != address(0)).",
+        "invariant_logic": "For each voter: (approvals[voter] == proposalId) XOR (disapprovals[voter] == proposalId) XOR (neither). A voter MUST NOT appear in both approve and disapprove sets.",
+        "solidity_property": "function invariant_voteExclusivity(address voter) public view { assert(!(usdUpdateProposal.approvals[voter] == _usdProposalId && usdUpdateProposal.disapprovals[voter] == _usdProposalId)); }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "approveUSDPrice"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "disapproveUSDPrice"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LockManager.sol",
+        "description": "Locking tokens outside an active lockdrop period unconditionally zeroes the user's remainder from a previous lockdrop, destroying their accrued partial-NFT value",
+        "attack_scenario": "User locks 150 tokens during lockdrop where nftCost=100. They receive 1 NFT and remainder=50. After lockdrop ends, user locks 60 more tokens. quantity = 60+50=110, but since lockdrop is not active, no NFT calculation runs and remainder is set to 0. User loses 50 tokens worth of NFT progress permanently. A subsequent lockdrop lock would start from scratch.",
+        "invariant_logic": "Outside lockdrop: lockedToken.remainder SHOULD be preserved (not overwritten to 0) unless explicitly consumed for NFT calculation",
+        "solidity_property": "function invariant_remainderPreserved(address player, address token) public view { /* remainder should only decrease during active lockdrop NFT minting */ }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "_lock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LockManager.sol",
+        "description": "USD price proposal applies a single proposedPrice to ALL token contracts in the proposal array, making it impossible to set different prices for different tokens and potentially assigning wildly incorrect prices",
+        "attack_scenario": "Price feed operators propose updating both WETH ($3000) and USDC ($1). Since only one proposedPrice exists, both tokens receive the same price. If set to $3000, USDC lockers get 3000x overvalued weighted positions. If set to $1, WETH lockers get 3000x undervalued positions. Schnibbles and NFT reward distributions become severely distorted.",
+        "invariant_logic": "Each token contract in a USD update SHOULD have an independently specified price. proposedPrice per contract rather than global.",
+        "solidity_property": "function invariant_perTokenPricing() public pure { /* structural invariant: proposal should map address => price, not use single price */ assert(false); }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "proposeUSDPrice"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "_execUSDPriceUpdate"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LockManager.sol",
+        "description": "configuredTokenContracts array grows unboundedly with each new token configuration and is iterated fully in setLockDuration, getLocked, and getLockedWeightedValue — can cause gas exhaustion DoS",
+        "attack_scenario": "Admin configures hundreds of tokens over time. setLockDuration iterates all configured tokens for every player calling it. At ~200+ tokens, the gas cost exceeds block gas limit, permanently preventing any user from changing their lock duration. getLockedWeightedValue (used by external contracts for reward calculations) also becomes uncallable, breaking schnibbles distribution.",
+        "invariant_logic": "configuredTokenContracts.length MUST be bounded by a reasonable maximum (e.g., <= 50)",
+        "solidity_property": "function invariant_tokenArrayBounded() public view { assert(configuredTokenContracts.length <= 100); }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "configureToken"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "setLockDuration"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "getLockedWeightedValue"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "LockManager.sol",
+        "description": "setUSDThresholds has no minimum bound validation — admin can set APPROVE_THRESHOLD or DISAPPROVE_THRESHOLD to 0 or 1, effectively breaking the multi-sig governance model for USD price updates",
+        "attack_scenario": "Admin sets DISAPPROVE_THRESHOLD=0. Now in _execUSDPriceUpdate, the condition 'disapprovalsCount < 0' is always false for uint8, so NO proposal can ever execute regardless of approval count. Alternatively, setting APPROVE_THRESHOLD=0 while DISAPPROVE_THRESHOLD=255 means any 2-person collusion (proposer + 1 approver) can set arbitrary prices.",
+        "invariant_logic": "APPROVE_THRESHOLD >= 2 AND APPROVE_THRESHOLD <= 5 AND DISAPPROVE_THRESHOLD >= 1 AND DISAPPROVE_THRESHOLD <= 5 AND APPROVE_THRESHOLD + DISAPPROVE_THRESHOLD <= 6",
+        "solidity_property": "function invariant_thresholdBounds() public view { assert(APPROVE_THRESHOLD >= 2 && APPROVE_THRESHOLD <= 5); assert(DISAPPROVE_THRESHOLD >= 1 && DISAPPROVE_THRESHOLD <= 5); }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "setUSDThresholds"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "_execUSDPriceUpdate"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LockManager.sol",
+        "description": "When no lockdrop is configured or lockdrop.minLockDuration is 0, and a user has not set a lockDuration, the default lockDuration is 0 — resulting in unlockTime equal to block.timestamp and allowing immediate unlock",
+        "attack_scenario": "Before any lockdrop is configured (lockdrop.minLockDuration = 0), a new user who has never set lockDuration locks tokens. playerSettings.lockDuration = 0, so _lockDuration = lockdrop.minLockDuration = 0. unlockTime = block.timestamp + 0 = block.timestamp. In the next block (or same block via different tx), user calls unlock. lockedToken.unlockTime = T is NOT > T, so the check passes. User locks and unlocks with zero effective lock duration, potentially gaming schnibbles calculation.",
+        "invariant_logic": "Effective _lockDuration used in _lock MUST be > 0 when locking tokens",
+        "solidity_property": "function invariant_nonZeroLockDuration(address player, address token) public view { LockedToken memory lt = lockedTokens[player][token]; if(lt.quantity > 0) { assert(lt.unlockTime > lt.lastLockTime); } }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "_lock"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "LockManager.sol",
+        "description": "unlockTime for a locked position with quantity > 0 MUST NOT decrease below block.timestamp through any code path (setLockDuration, _lock, or lockOnBehalf). Currently, setLockDuration violates this by computing unlockTime from lastLockTime instead of block.timestamp, and _lock violates this by unconditionally overwriting unlockTime.",
+        "attack_scenario": "Combined exploit: (1) User locks 500 ETH during lockdrop for 365 days, receives NFTs. (2) At day 300, user calls setLockDuration(66 days). Check: 300+66=366>=365 passes. New unlockTime = 0+66=66 (day 66, 234 days in the past). User immediately unlocks 500 ETH, keeping NFT rewards earned from lockdrop commitment they didn't honor. Protocol loses TVL and lockdrop integrity.",
+        "invariant_logic": "For all code paths modifying unlockTime: if lockedToken.quantity > 0 then new_unlockTime >= max(old_unlockTime, block.timestamp)",
+        "solidity_property": "function invariant_unlockTimeMonotonic(address player, address token) public view { LockedToken memory lt = lockedTokens[player][token]; if(lt.quantity > 0) { assert(lt.unlockTime >= block.timestamp); } }",
+        "inventory_refs": [
+          {
+            "file": "LockManager.sol",
+            "function": "setLockDuration"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "_lock"
+          },
+          {
+            "file": "LockManager.sol",
+            "function": "lockOnBehalf"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,306 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "onlyOperator Modifier Inverted Logic Locks Out All Designated Operators",
+      "severity": "high",
+      "summary": "The onlyOperator modifier uses `if (msg.sender != owner() || operator[msg.sender]) revert` which reverts when operator[msg.sender] is true. This means designated operators can NEVER call harvest, delegateAmount, undelegateAmount, redelegateAmount, harvestAndDelegateRewards, or finaliseRonRewardsForEpoch. Additionally, if the owner is also set as an operator via updateOperator(owner, true), even the owner is permanently locked out of all operator functions until the mapping is toggled back.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 97,
+          "line_end": 100,
+          "desc": "if (msg.sender != owner() || operator[msg.sender]) revert — OR operator should use AND with negation: != owner() && !operator[msg.sender]"
+        }
+      ],
+      "impact": "CRITICAL. All six operator-gated functions are affected: harvest, harvestAndDelegateRewards, delegateAmount, redelegateAmount, undelegateAmount, and finaliseRonRewardsForEpoch. Designated operators can never call these functions. If the owner is also set as operator, the entire protocol is bricked — no staking management, no reward harvesting, and no withdrawal finalization. User funds in requestWithdrawal become permanently locked since finaliseRonRewardsForEpoch cannot be called. The workaround is for the owner to operate directly without being in the operator mapping, but this defeats the purpose of operator delegation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "LiquidProxy.harvest() Claims Rewards N Times Redundantly, Risking DoS",
+      "severity": "high",
+      "summary": "LiquidProxy.harvest() loops over _consensusAddrs.length and calls claimRewards(_consensusAddrs) — passing the FULL array — on EACH iteration. This means rewards are claimed N times for the same set of validators. The first call claims all rewards; subsequent calls attempt to claim zero. If the Ronin staking contract reverts on zero-reward claims, harvest becomes impossible for arrays with length > 1. Additionally, the function uses address(this).balance as claimed amount, which includes any pre-",
+      "description": [
+        {
+          "file": "LiquidProxy.sol",
+          "line_start": 29,
+          "line_end": 35,
+          "desc": "for (i = 0; i < _consensusAddrs.length; i++) { claimRewards(_consensusAddrs); } — passes full array in loop"
+        },
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: harvest"
+        }
+      ],
+      "impact": "HIGH - The redundant loop is a clear code defect. If the Ronin staking contract reverts on empty claims, harvest() becomes non-functional for multi-validator scenarios (which is the standard deployment pattern with 5 validators per the deployment script). Even without reversion, N-1 redundant external calls waste substantial gas. The address(this).balance usage compounds the issue by allowing manipulation of harvested amounts through the open receive() function. The deployment script confirms 5 consensus addresses are used, meaning every harvest call would make 5 redundant claimRewards calls instead of 1.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "No Withdrawal Request Cancellation Creates Permanent Fund Lock Risk",
+      "severity": "high",
+      "summary": "Users who call requestWithdrawal() transfer their LRON shares to the vault contract. There is no mechanism to cancel a withdrawal request and reclaim shares. If finaliseRonRewardsForEpoch() is never called for the current epoch (due to operator unavailability, the onlyOperator bug INV-ACCESS-001, or contract pause), user shares are permanently locked in the vault with no recovery path. Combined with the onlyOperator bug, if the owner is also flagged as operator, ALL withdrawal requests become pe",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 282,
+          "line_end": 292,
+          "desc": "shares transferred to vault via _transfer with no cancel/recovery mechanism; finalization is sole exit path"
+        }
+      ],
+      "impact": "All users who call requestWithdrawal for an unfinalized epoch permanently lose access to their shares. The shares sit in the vault contract with no mechanism to return them. This is not just a theoretical concern - the onlyOperator bug means a single accidental updateOperator(owner, true) call permanently locks all future withdrawal requests. Even without the bug, the single-path dependency on operator availability and sufficient vault liquidity creates unacceptable fund lock risk.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "redeem(uint256 _epoch) Emits Wrong Epoch in WithdrawalClaimed Event",
+      "severity": "high",
+      "summary": "In the redeem(uint256 _epoch) function, a local variable `uint256 epoch = withdrawalEpoch` shadows the parameter _epoch. The WithdrawalClaimed event emits `epoch` (current global withdrawalEpoch) instead of `_epoch` (the actual epoch being redeemed). This causes all event emissions to reference the current epoch rather than the claimed epoch.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 297,
+          "line_end": 311,
+          "desc": "emit WithdrawalClaimed(msg.sender, epoch, shares, assets) — epoch is withdrawalEpoch, not _epoch"
+        }
+      ],
+      "impact": "MEDIUM severity. No direct on-chain financial impact since all state mutations correctly use _epoch. However, off-chain systems (indexers, UIs, analytics, accounting tools) that track withdrawal claims by epoch from event logs will record incorrect data. This could cause reconciliation failures, incorrect dashboard displays, and potential issues if any downstream system uses event data for verification or triggers. The bug affects every single redemption call.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "_checkUserCanReceiveRon Uses Zero-Value Check That Doesn't Guarantee Non-Zero Transfers",
+      "severity": "high",
+      "summary": "_checkUserCanReceiveRon sends a 0-value call to verify the user can receive RON. However, many contracts accept 0-value calls (2300 gas stipend sufficient) but revert on non-zero value transfers (e.g., due to gas limits in receive/fallback or conditional logic). A user contract could pass this check during requestWithdrawal but later fail to receive RON in the redeem(epoch) call, permanently locking their withdrawal claim — the request is marked fulfilled but the assets can never be sent.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 336,
+          "line_end": 339,
+          "desc": "payable(_user).call{value: 0}('') — 0-value check doesn't prove non-zero value acceptance"
+        }
+      ],
+      "impact": "Permanent loss of funds for any contract-based user whose contract accepts 0-value calls but rejects non-zero value RON transfers. The severity is MEDIUM because: (1) it affects a subset of users (contract wallets with specific receive behavior), (2) the amount locked is the full withdrawal claim, (3) there is zero recovery possibility if the contract cannot be upgraded. The WRON remains in escrow but can never be claimed by the affected user or returned to them in any form.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Undelegation path assumes exact/immediate RON return; mismatch can revert or silently mis-account, breaking staking/vault fund conservation",
+      "severity": "high",
+      "summary": "LiquidProxy.undelegateAmount computes `totalUndelegated` as the sum of requested amounts and immediately wraps+sends exactly that amount to the vault. If Ronin staking’s `bulkUndelegate` has a cooldown, returns less due to slashing/rounding, or returns asynchronously, the proxy may not have enough native RON to wrap, causing a revert; or it may wrap more than newly received by using residual RON on the proxy, distorting accounting.",
+      "description": [
+        {
+          "file": "LiquidProxy.sol",
+          "line_start": 88,
+          "line_end": 97,
+          "desc": "totalUndelegated=sum(_amounts); bulkUndelegate(...); _depositRONTo(vault, totalUndelegated) without checking actual balance delta"
+        }
+      ],
+      "impact": "If the Ronin staking contract does not return exact RON synchronously on bulkUndelegate: (1) All undelegation operations become non-functional, blocking operators from making staked funds liquid. (2) Withdrawal requests cannot be funded if vault WRON balance is insufficient, as operators cannot undelegate to replenish it. (3) Rebalancing between validators via undelegate+delegate path is broken. (4) In the residual balance scenario, vault accounting is distorted. The severity is HIGH for DoS impact, MEDIUM for accounting distortion.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "harvestAndDelegateRewards Creates Unbacked Operator Fee Draining User Deposits",
+      "severity": "high",
+      "summary": "When harvestAndDelegateRewards is called, staking rewards are re-delegated to a validator via delegateRewards (RON never enters the vault). However, operatorFeeAmount is incremented by (claimableAmount * operatorFee / BIPS). This fee is entirely unbacked by WRON in the vault. When feeRecipient calls fetchOperatorFee(), the vault's _withdrawRONTo unwraps and sends WRON from the vault balance — which consists of user deposits — to the fee recipient. This is a direct drain of depositor principal.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 138,
+          "line_end": 151,
+          "desc": "operatorFeeAmount += (harvestedAmount * operatorFee) / BIPS but LiquidProxy.harvestAndDelegateRewards calls delegateRewards which re-stakes rewards without sending any WRON to vault"
+        },
+        {
+          "file": "LiquidProxy.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: harvestAndDelegateRewards"
+        }
+      ],
+      "impact": "CRITICAL accounting defect with two impacts:\n\n1. **Share price inflation**: totalAssets is inflated by operatorFeeAmount between harvestAndDelegateRewards and fetchOperatorFee. Depositors during this window get fewer shares (overpay). When fee is collected, share price drops, harming holders.\n\n2. **Liquidity drain**: Fee obligation against user deposits. If vault WRON is fully delegated, fetchOperatorFee either reverts (fee unclaimable) or must wait for new deposits, effectively using new depositor funds to pay fees from prior reward compounding.\n\nThe NET value per share is ultimately the same as the harvest() path (depositors get rewards minus fee), but the timing and distribution are unfair due to the totalAssets inflation bug.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "totalAssets Inflation by Unreduced operatorFeeAmount Enables Share Price Arbitrage",
+      "severity": "high",
+      "summary": "After harvest() is called, the full gross reward amount enters the vault as WRON (counted in super.totalAssets()). The operatorFeeAmount is tracked separately but NOT subtracted from totalAssets(). Before harvest, getTotalRewards() deducts the fee portion from unrealized rewards. After harvest, rewards are realized as WRON in vault balance but the fee portion is no longer deducted anywhere. This creates a window where totalAssets() is inflated by operatorFeeAmount, increasing share price. An att",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 247,
+          "line_end": 249,
+          "desc": "totalAssets() = super.totalAssets() + getTotalStaked() + getTotalRewards() — missing `- operatorFeeAmount` deduction from vault WRON balance"
+        }
+      ],
+      "impact": "Every harvest cycle inflates totalAssets by (harvestedAmount * operatorFee / BIPS). This directly inflates share price, enabling informed actors to extract value from passive holders. The impact compounds over time as harvest cycles repeat. Additionally, this causes share price to be non-monotonic (violating INV-ECON-005): it jumps up on harvest and drops on fetchOperatorFee, creating arbitrage opportunities that drain value from other depositors. For a vault with substantial TVL and regular harvests, the cumulative extraction could be significant.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "LiquidProxy.harvest() Captures Unrelated Native RON as Rewards via address(this).balance",
+      "severity": "high",
+      "summary": "LiquidProxy.harvest() uses `uint256 claimedAmount = address(this).balance` after calling claimRewards, treating the proxy's entire native RON balance as harvested rewards. Since the proxy has an open receive() function, anyone can send native RON to the proxy. This extra RON is then: (1) wrapped and sent to the vault, (2) has operatorFeeAmount calculated on it (fee applied to non-reward funds), and (3) inflates the harvest amount. Additionally, residual RON from previous operations (e.g., bulkUn",
+      "description": [
+        {
+          "file": "LiquidProxy.sol",
+          "line_start": 32,
+          "line_end": 39,
+          "desc": "`uint256 claimedAmount = address(this).balance` captures entire native RON balance, not just the delta from claimRewards; open `receive() external payable {}` allows external deposits"
+        },
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: harvest"
+        }
+      ],
+      "impact": "The defect causes: (1) operatorFeeAmount to be inflated by the fee percentage of any non-reward RON in the proxy, which is taken from depositor funds when fetchOperatorFee() is called. (2) totalAssets to be transiently distorted, affecting share price calculations. (3) Events to report incorrect harvest amounts. With the deployment's 2.5% operator fee, for every 100 RON donated, 2.5 RON of additional operator fees are incorrectly charged against depositors. The vulnerability is exploitable by the fee recipient or through accumulated residual RON from normal operations.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "WRON.transfer() in RonHelper Does Not Check Return Value",
+      "severity": "high",
+      "summary": "RonHelper._depositRONTo() calls `IWRON(wron).transfer(to, amount)` without checking the return value. The IWRON interface declares transfer with no return value. If the WRON contract returns false on failure instead of reverting (as some ERC20 implementations do), the transfer would silently fail. This would mean WRON deposits, harvests, and undelegations could complete without actually moving tokens, creating phantom balances.",
+      "description": [
+        {
+          "file": "RonHelper.sol",
+          "line_start": 21,
+          "line_end": 24,
+          "desc": "`IWRON(wron).transfer(to, amount)` — raw transfer call without return value check or SafeERC20"
+        }
+      ],
+      "impact": "If WRON returns false on transfer failure: (1) Harvested rewards could be lost in proxy contracts while operatorFeeAmount is still incremented, (2) Undelegated amounts could remain as WRON in proxy while vault accounting believes they were received, (3) This would desynchronize WRON balances across the system, inflating totalAssets relative to actual holdings, and potentially causing insolvency when users try to withdraw.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Withdrawal Request Starvation via Opportunistic Liquid Withdrawals",
+      "severity": "high",
+      "summary": "When the vault lacks sufficient liquid WRON to finalize an epoch, the operator must undelegate stake. However, once the undelegated RON enters the vault, it is immediately available to any user calling the standard ERC4626 `withdraw()` function. Opportunistic users can instantly drain the newly available liquid WRON before the operator can call `finaliseRonRewardsForEpoch()`. This creates a starvation condition where users who properly used `requestWithdrawal()` can never have their epochs final",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 258,
+          "line_end": 266,
+          "desc": "withdraw() does not reserve liquid WRON for pending withdrawal requests"
+        }
+      ],
+      "impact": "HIGH severity. Users who called requestWithdrawal() can have their shares permanently locked if liquid withdrawals consistently drain available WRON before epoch finalization. There is no requestWithdrawal cancellation mechanism. The operator is forced into an arms race of repeatedly undelegating stake, losing staking yield, while liquid withdrawers keep draining the pool. This fundamentally breaks the withdrawal queue mechanism and could lead to permanent fund lockup for queued users.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permanent Protocol DoS via Staking Contract Revert on Invalid Validator",
+      "severity": "high",
+      "summary": "`totalAssets()` iterates over all known validators to calculate the total staked amount via `IRoninValidator.getManyStakingAmounts`. If the Ronin staking contract reverts when queried for a slashed or invalid validator, `totalAssets()` will consistently revert. This completely bricks the protocol, disabling deposits, withdrawals, and epoch finalizations. Furthermore, the recovery function `pruneValidatorList()` also calls `getManyStakingAmounts` and will similarly revert.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 334,
+          "line_end": 345,
+          "desc": "Calls getManyStakingAmounts without try-catch"
+        }
+      ],
+      "impact": "If triggered, this would be a complete protocol freeze: all ERC4626 functions (deposit, mint, withdraw, redeem) depend on totalAssets(), as does finaliseRonRewardsForEpoch(). All user funds in staking proxies and the vault would be locked with no on-chain recovery mechanism. The severity depends on whether the Ronin staking contract actually reverts for problematic validators.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "delegateAmount Can Deploy Operator-Fee-Reserved WRON to Staking, Breaking Fee Withdrawal",
+      "severity": "high",
+      "summary": "delegateAmount() calls _withdrawRONTo(proxy, total) which unwraps WRON from the vault balance and sends native RON to the proxy for delegation. There is no check ensuring that vault WRON balance remains >= operatorFeeAmount after delegation. If the operator delegates too much, the WRON backing accumulated operator fees is sent to validators. fetchOperatorFee() will then revert (insufficient WRON balance), and the fee obligation persists, permanently inflating totalAssets() until new deposits or ",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 150,
+          "line_end": 163,
+          "desc": "_withdrawRONTo(stakingProxy, total) sends full requested amount without checking vault_wron_balance >= operatorFeeAmount + total"
+        },
+        {
+          "file": "LiquidProxy.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: delegateAmount"
+        }
+      ],
+      "impact": "HIGH severity. (1) Fee withdrawal is blocked - feeRecipient cannot claim accumulated fees. (2) totalAssets() is permanently inflated by operatorFeeAmount, affecting share pricing for all users. (3) This can occur during normal operations without malicious intent. (4) The condition creates a cascading effect: inflated share price means new depositors get fewer shares than they should, and existing holders can redeem for more than their fair share. (5) The operator can fix this by undelegating, but this requires awareness of the issue and may have staking cooldown implications.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unbounded Validator List Growth via _tryPushValidator Causes totalAssets DoS",
+      "severity": "high",
+      "summary": "Every call to delegateAmount and redelegateAmount invokes _tryPushValidator for destination validators, adding new entries to the validators array. The array is only shrinkable via pruneValidatorList() which requires validators to have zero stake AND zero rewards across all proxies. Since totalAssets() iterates all validators for every proxy (O(validators * proxies) external calls to Ronin staking), unbounded growth can cause totalAssets() to exceed gas limits. This would DoS all deposit, withdr",
+      "description": [
+        {
+          "file": "ValidatorTracker.sol",
+          "line_start": 27,
+          "line_end": 33,
+          "desc": "_tryPushValidator unconditionally adds to validators array with no upper bound; validators.push(_validator) grows array indefinitely"
+        },
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: delegateAmount"
+        }
+      ],
+      "impact": "If the validators array grows large enough, totalAssets() exceeds the block gas limit, which DoS's all deposit(), withdraw(), redeem(), requestWithdrawal(), and finaliseRonRewardsForEpoch() operations since they all depend on share price calculations. The pruneValidatorList() function hits gas limits first due to its higher per-validator gas cost (individual getReward calls vs batched calls), preventing recovery. All user funds would be locked.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ERC4626 First Depositor Inflation Attack Due to Zero _decimalsOffset",
+      "severity": "high",
+      "summary": "LiquidRon does not override _decimalsOffset() (defaults to 0), providing minimal virtual share/asset offset (10^0 = 1). An attacker can be the first depositor with 1 wei, mint 1 share, then donate a large WRON amount directly to the vault. This inflates totalAssets so that subsequent depositors' previewDeposit returns 0 shares for substantial deposits. The attacker then redeems their 1 share for the entire vault balance including the victim's deposit.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 30,
+          "line_end": 30,
+          "desc": "No _decimalsOffset override; inherits default 0 from OpenZeppelin ERC4626"
+        }
+      ],
+      "impact": "At deployment: LOW risk due to 10000 ether seed deposit. Post-deployment: HIGH risk if vault reaches near-zero supply. Code quality: The absence of _decimalsOffset override for an 18-decimal underlying token is a recognized code defect per ERC4626 security best practices. If exploitable, the attacker can steal near-100% of a victim's deposit.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Withdrawal-request redemption uses custom _convertToAssets (with +1/+offset) differing from ERC4626 conversion used at epoch finalization; rounding mismatch may over/under-pay claimants",
+      "severity": "high",
+      "summary": "Epoch finalization sets `assetSupply = previewRedeem(lockedShares)` using OZ ERC4626 math, but later claim uses a custom `_convertToAssets(shares, lock.assetSupply, lock.shareSupply)` with `(_totalAssets + 1)` and `(_totalShares + 10**_decimalsOffset())`. This mismatch can create systematic rounding differences, potentially enabling some users to redeem slightly more/less than intended across many requests, and could break the invariant that total claimed per epoch <= assetSupply.",
+      "description": [
+        {
+          "file": "LiquidRon.sol",
+          "line_start": 323,
+          "line_end": 334,
+          "desc": "_convertToAssets uses mulDiv((_totalAssets+1), (_totalShares+10**_decimalsOffset()), Floor) differing from OZ ERC4626 previewRedeem used at finalization"
+        }
+      ],
+      "impact": "No real impact. The formulas are identical in structure. Floor rounding causes some dust to remain in escrow (favorable to the protocol, not users), but this is standard ERC4626 behavior and not a vulnerability. The dust per epoch is bounded by the number of claimants minus 1 wei per claimant.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

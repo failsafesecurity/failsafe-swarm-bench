@@ -1,0 +1,362 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T03:19:42.579Z",
+    "duration_ms": 306122
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Forwarder Meta-Transactions",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "Forwarder.execute(ForwardRequest,bytes32,bytes32,bytes,bytes)"
+        ],
+        "failure_modes": [
+          "Cross-contract signature replay due to unvalidated domain separator",
+          "Relayer griefing via front-running to force transaction revert"
+        ],
+        "attack_vectors": [
+          "Attacker replays a signature from another contract by passing that contract's domain separator",
+          "User front-runs relayer to invalidate state, causing relayer to lose gas"
+        ]
+      },
+      {
+        "boundary": "Token Transfers with Fees",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "Token.transferFrom(address,address,uint256)",
+          "Token.transferWithAuthorization(address,address,uint256,uint256,uint8,bytes32,bytes32)"
+        ],
+        "failure_modes": [
+          "Spender drains more than approved allowance due to fee deduction from sender",
+          "Signer pays unexpected fees if admin increases fee rates before execution"
+        ],
+        "attack_vectors": [
+          "Spender calls transferFrom to transfer the full allowance, forcing the sender to pay additional fees on top of the allowance limit"
+        ]
+      },
+      {
+        "boundary": "Admin Operations",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "Token.setTxFeeRate(uint256)",
+          "Token.setGaslessBasefee(uint256)",
+          "ERC20AdminUpgradeable.forceTransfer(address,address,uint256)",
+          "ERC20ControlerMinterUpgradeable.safetySwitch()"
+        ],
+        "failure_modes": [
+          "Admin maliciously or accidentally sets fee rates too high",
+          "Admin force-transfers tokens from arbitrary users"
+        ],
+        "attack_vectors": [
+          "Compromised admin key drains user balances via high fees or force transfers"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Sender has balance >= amount + fees",
+        "to_state": "Sender balance -= (amount + fees), Recipient balance += amount, Faucet balance += fees",
+        "trigger": "Token.transfer() or Token.transferFrom()",
+        "conditions": [
+          "Contract is not paused",
+          "Sender and recipient are not blacklisted",
+          "Sender has sufficient balance for amount + fees",
+          "Spender has sufficient allowance for amount (if transferFrom)"
+        ],
+        "invariants": [
+          "Total supply remains constant during transfers"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Minter has allowance >= amount",
+        "to_state": "Minter allowance -= amount, Recipient balance += amount, Total supply += amount",
+        "trigger": "ERC20ControlerMinterUpgradeable.mint()",
+        "conditions": [
+          "Contract operating state is true",
+          "Caller has MINTER_ROLE or MASTER_MINTER role",
+          "Amount <= minter allowance (if MINTER_ROLE)"
+        ],
+        "invariants": [
+          "Total supply increases exactly by minted amount",
+          "Minter allowance decreases exactly by minted amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Operating state is true",
+        "to_state": "Operating state is false (minting/burning disabled)",
+        "trigger": "ERC20ControlerMinterUpgradeable.safetySwitch()",
+        "conditions": [
+          "Caller has CONTROLLER role"
+        ],
+        "invariants": [
+          "Only DEFAULT_ADMIN_ROLE or the CONTROLLER who disabled operations can re-enable them"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-347",
+        "pattern": "Signature Malleability / Cross-Contract Replay",
+        "locations": [
+          "Forwarder.sol: execute()",
+          "Forwarder.sol: _verifySig()"
+        ],
+        "severity": "critical",
+        "evidence": "The `domainSeparator` is passed as an external parameter to `execute()` and used directly in `_verifySig()` without being validated against the contract's actual domain separator.",
+        "exploitation_method": "An attacker can take a valid signed `ForwardRequest` intended for another contract (e.g., OpenZeppelin's MinimalForwarder) and submit it to this Forwarder by passing the other contract's domain separator. This bypasses signature verification and allows unauthorized execution of meta-transactions.",
+        "affected_assets": [
+          "User tokens (EURF)"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Transaction Order Dependence / Allowance Bypass",
+        "locations": [
+          "Token.sol: transferFrom()",
+          "Token.sol: _payTxFee()"
+        ],
+        "severity": "high",
+        "evidence": "`_payTxFee()` deducts `txFees` directly from the `sender`'s balance. `super.transferFrom()` then deducts `amount` from the `sender`'s balance and reduces the `allowance` by `amount`. The `txFees` are not deducted from the allowance.",
+        "exploitation_method": "A spender can transfer tokens from a sender and force the sender to pay the transaction fees on top of the transferred amount. The total amount deducted from the sender (`amount + txFees`) will exceed the approved `allowance`, violating the ERC20 allowance invariant.",
+        "affected_assets": [
+          "User tokens (EURF)"
+        ]
+      },
+      {
+        "swc_id": "SWC-110",
+        "pattern": "Trust Boundary Violation / Unbounded Fee Deduction",
+        "locations": [
+          "Token.sol: payGaslessBasefee()",
+          "Token.sol: transferWithAuthorization()"
+        ],
+        "severity": "medium",
+        "evidence": "Meta-transaction signers authorize a specific `value` to be transferred, but they do not sign the `_gaslessBasefee` or `_txfeeRate`. These fees are deducted from the signer's balance during execution.",
+        "exploitation_method": "If an admin increases the fee rates (`_gaslessBasefee` or `_txfeeRate`), pending signed transactions will execute with the new, higher fees. Signers will unexpectedly lose more funds than they anticipated when signing the transaction.",
+        "affected_assets": [
+          "User tokens (EURF)"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "Denial of Service / Relayer Griefing",
+        "locations": [
+          "Forwarder.sol: execute()"
+        ],
+        "severity": "medium",
+        "evidence": "`require(success, \"NGEUR Forwarder: failed tx execution\");` reverts the entire transaction if the inner call fails.",
+        "exploitation_method": "A user can sign a meta-transaction, broadcast it to a relayer, and then front-run the relayer's submission with a transaction that invalidates the meta-transaction (e.g., transferring their balance). The relayer's transaction will revert, costing them gas without receiving the `_gaslessBasefee`.",
+        "affected_assets": [
+          "Relayer gas funds"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Token.sol",
+          "function": "setOwner(address)",
+          "guards": [
+            "onlyRole(OWNER)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal grantRole modifier check"
+        },
+        {
+          "contract": "Token.sol",
+          "function": "setTrustedForwarder(address)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Token.sol",
+          "function": "setFeeFaucet(address)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Token.sol",
+          "function": "setTxFeeRate(uint256)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Token.sol",
+          "function": "setGaslessBasefee(uint256)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ERC20AdminUpgradeable.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ERC20AdminUpgradeable.sol",
+          "function": "unpause()",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ERC20AdminUpgradeable.sol",
+          "function": "blacklist(address)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal setBlacklist modifier check"
+        },
+        {
+          "contract": "ERC20AdminUpgradeable.sol",
+          "function": "unblacklist(address)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal setBlacklist modifier check"
+        },
+        {
+          "contract": "ERC20AdminUpgradeable.sol",
+          "function": "forceTransfer(address,address,uint256)",
+          "guards": [
+            "onlyRole(ADMIN)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ERC20AdminUpgradeable.sol",
+          "function": "setAdministrator(address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "addController(address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal grantRole modifier check"
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "removeController(address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal revokeRole modifier check"
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "safetySwitch()",
+          "guards": [
+            "onlyRole(CONTROLLER)",
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Custom logic allows CONTROLLER to disable, and DEFAULT_ADMIN_ROLE or specific CONTROLLER to enable"
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "setMasterMinter(address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal grantRole/revokeRole modifier checks"
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "addMinter(address,uint256)",
+          "guards": [
+            "onlyRole(MASTER_MINTER)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal grantRole modifier check"
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "removeMinter(address)",
+          "guards": [
+            "onlyRole(MASTER_MINTER)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Protected by internal revokeRole modifier check"
+        },
+        {
+          "contract": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "updateMintingAllowance(address,uint256)",
+          "guards": [
+            "onlyRole(MASTER_MINTER)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Forwarder.sol",
+          "function": "registerRequestType(string,string)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

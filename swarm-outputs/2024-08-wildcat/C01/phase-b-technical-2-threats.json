@@ -1,0 +1,336 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator_2",
+    "llm_model": null,
+    "llm_provider": "gemini",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "WildcatMarket.sol",
+      "WildcatMarketBase.sol",
+      "WildcatMarketWithdrawals.sol",
+      "WildcatMarketConfig.sol",
+      "WildcatMarketToken.sol",
+      "HooksFactory.sol",
+      "WildcatArchController.sol",
+      "WildcatSanctionsSentinel.sol",
+      "WildcatSanctionsEscrow.sol",
+      "HooksConfig.sol",
+      "MarketState.sol",
+      "ReentrancyGuard.sol",
+      "TransientBytesArray.sol",
+      "LibStoredInitCode.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T00:17:49.116Z",
+    "duration_ms": 343955
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH2-H001",
+      "title": "Dust Donation Inflates Unclaimed Withdrawals Leading to Insolvency and DoS",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "An attacker can donate specific dust amounts of underlying assets to the market and trigger batch processing. Due to `scaleAmount` rounding to the nearest integer, the `normalizedAmountPaid` can exceed the donated `availableLiquidity`. This inflates `state.normalizedUnclaimedWithdrawals` beyond the actual assets held, breaking the solvency invariant and causing `collectFees` to permanently revert due to underflow.",
+      "investigation_rationale": "The `_applyWithdrawalBatchPayment` function uses `scaleAmount` (which rounds to nearest) on `availableLiquidity`. When converted back to `normalizedAmountPaid` via `mulDiv` (which rounds down), the result can be strictly greater than `availableLiquidity`. This allows an attacker to artificially inflate the protocol's internal debt accounting relative to its actual asset balance.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "repayAndProcessUnpaidWithdrawalBatches",
+        "collectFees"
+      ],
+      "affected_contracts": [
+        "WildcatMarketBase.sol",
+        "WildcatMarketWithdrawals.sol",
+        "WildcatMarket.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarketBase.sol",
+          "function": "_applyWithdrawalBatchPayment"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarketBase.sol",
+        "lines": "442-446",
+        "pattern": "scaledAvailableLiquidity = state.scaleAmount(availableLiquidity); ... normalizedAmountPaid = MathUtils.mulDiv(scaledAmountBurned, state.scaleFactor, RAY).toUint128();"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market has an unpaid withdrawal batch",
+        "Attacker can transfer dust amounts of the underlying asset to the market contract"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "WildcatMarketBase.sol lines 442-446",
+        "vulnerable_pattern": "Rounding up during scale conversion followed by rounding down during normalization",
+        "specific_concern": "normalizedAmountPaid can exceed availableLiquidity, inflating normalizedUnclaimedWithdrawals",
+        "missing_safeguards": "No check ensuring normalizedAmountPaid <= availableLiquidity"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What specific combinations of scaleFactor and availableLiquidity trigger the rounding up?",
+          "Can the inflation of normalizedUnclaimedWithdrawals be repeated enough to cause significant insolvency?",
+          "Does this affect any other accounting variables?"
+        ],
+        "validation_requirements": [
+          "Write a PoC that donates dust and calls repayAndProcessUnpaidWithdrawalBatches",
+          "Verify that normalizedUnclaimedWithdrawals increases by more than the donated amount",
+          "Verify that collectFees reverts due to underflow after the attack"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker queues a withdrawal, then repeatedly donates specific dust amounts (e.g., 4 wei) and calls repayAndProcessUnpaidWithdrawalBatches. The market reserves 5 wei for the batch each time, creating a 1 wei deficit per iteration until collectFees reverts.",
+      "prerequisites": [
+        "Market scaleFactor must be high enough (>= 2.5e27) to allow rounding up to exceed the original value"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent lock of protocol fees and potential loss of funds for the last withdrawers due to insolvency",
+        "affected_users": "Protocol fee recipient, late withdrawers",
+        "recovery_possibility": "Requires borrower to over-collateralize the market to cover the artificial deficit"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing fuzz tests for rounding discrepancies between scaleAmount and normalizeAmount during batch payments",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Gas cost of repeated dust donations",
+        "capital_requirements": "Minimal (dust amounts of underlying asset)",
+        "execution_timing": "Can be executed over multiple blocks",
+        "detection_analysis": "Visible on-chain as repeated small transfers to the market contract"
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H002",
+      "title": "Unbounded Loop in closeMarket Causes Out-of-Gas DoS",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial_of_Service",
+      "hypothesis_description": "The `closeMarket` function iterates over all unpaid withdrawal batches in a single unbounded `for` loop. If a market has a short `withdrawalBatchDuration`, it can accumulate thousands of unpaid batches. Processing each batch consumes significant gas, eventually causing `closeMarket` to permanently revert due to exceeding the block gas limit.",
+      "investigation_rationale": "There is no minimum bound on `withdrawalBatchDuration` during market deployment, and no pagination in `closeMarket`'s unpaid batch processing loop (unlike `repayAndProcessUnpaidWithdrawalBatches` which uses `maxBatches`).",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "withdrawalBatchDuration is set to a small value (e.g., 0 or 1 hour)"
+      ],
+      "config_evidence": "HooksFactory.sol does not enforce a minimum withdrawalBatchDuration during market deployment.",
+      "affected_functions": [
+        "closeMarket"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "231-236",
+        "pattern": "for (uint256 i; i < numBatches; i++) { ... _processUnpaidWithdrawalBatch(state, availableLiquidity); }"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Market has accumulated a large number of unpaid withdrawal batches",
+        "Borrower attempts to close the market"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "WildcatMarket.sol lines 231-236",
+        "vulnerable_pattern": "Unbounded loop over an array that can grow indefinitely",
+        "specific_concern": "Transaction will exceed block gas limit if numBatches is large",
+        "missing_safeguards": "No maxBatches parameter or pagination mechanism in closeMarket"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How much gas does _processUnpaidWithdrawalBatch consume per iteration?",
+          "How quickly can an attacker bloat the unpaidBatches array if withdrawalBatchDuration is 0?",
+          "Is there any alternative way for the borrower to close the market?"
+        ],
+        "validation_requirements": [
+          "Deploy a market with withdrawalBatchDuration = 0",
+          "Queue and expire enough batches to exceed the block gas limit",
+          "Verify that closeMarket reverts with Out of Gas"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker repeatedly queues 1 wei withdrawals and calls updateState to expire them, bloating the unpaidBatches array. When the borrower tries to close the market, the transaction runs out of gas, trapping the borrower in an active market.",
+      "prerequisites": [
+        "Market must have a short withdrawalBatchDuration"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Borrower is forced to continue paying interest indefinitely as the market cannot be closed",
+        "affected_users": "Borrower",
+        "recovery_possibility": "None, unless the block gas limit is increased by the network"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing tests for closeMarket with a large number of unpaid batches",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Calculate exact gas cost per batch iteration",
+        "capital_requirements": "Minimal (dust amounts for queuing withdrawals)",
+        "execution_timing": "Requires time to accumulate batches depending on withdrawalBatchDuration",
+        "detection_analysis": "Visible as a large number of queued withdrawals from the same address"
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H003",
+      "title": "pushProtocolFeeBipsUpdates DoS via Closed Market",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial_of_Service",
+      "hypothesis_description": "The `pushProtocolFeeBipsUpdates` function iterates over all markets for a template to update their protocol fee. If any market in the array is closed, `setProtocolFeeBips` reverts. The factory uses a low-level call that explicitly reverts the entire transaction if any call fails, breaking the 'update all' functionality.",
+      "investigation_rationale": "The function lacks a `try/catch` or a mechanism to ignore failed calls, meaning a single closed market poisons the entire batch update process, forcing the admin to manually paginate around it.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "pushProtocolFeeBipsUpdates"
+      ],
+      "affected_contracts": [
+        "HooksFactory.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksFactory.sol",
+          "function": "pushProtocolFeeBipsUpdates"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksFactory.sol",
+        "lines": "440-452",
+        "pattern": "if iszero(call(gas(), market, 0, setProtocolFeeBipsCalldataPointer, 0x24, 0, 0)) { revert(0x1c, 0x04) }"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "At least one market deployed from the hooks template has been closed by its borrower",
+        "Admin attempts to update protocol fees for the template"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "HooksFactory.sol lines 440-452",
+        "vulnerable_pattern": "Strict revert on failed external call within a loop",
+        "specific_concern": "A closed market naturally reverts on setProtocolFeeBips, breaking the loop",
+        "missing_safeguards": "No mechanism to gracefully skip failed calls"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does setProtocolFeeBips always revert on closed markets?",
+          "Can the admin easily bypass this using the pagination parameters?"
+        ],
+        "validation_requirements": [
+          "Deploy multiple markets from a template",
+          "Close one of the markets",
+          "Attempt to call pushProtocolFeeBipsUpdates for all markets and verify it reverts"
+        ]
+      },
+      "preliminary_attack_scenario": "A borrower closes their market. Later, the ArchController admin updates the template's protocol fee and calls pushProtocolFeeBipsUpdates. The transaction reverts, preventing the fee update from reaching active markets.",
+      "prerequisites": [
+        "A closed market exists in the template's market array"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Delayed or missed protocol fee revenue updates",
+        "affected_users": "Protocol Admin",
+        "recovery_possibility": "Admin must manually call the function multiple times with specific indices to skip the closed market"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing tests for pushProtocolFeeBipsUpdates when the array contains a closed market",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Immediate upon admin action",
+        "detection_analysis": "Admin transaction reverts"
+      }
+    },
+    {
+      "hypothesis_id": "TECH2-H004",
+      "title": "Chainalysis Oracle DoS Blocks All Market Operations",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial_of_Service",
+      "hypothesis_description": "The protocol relies on synchronous `staticcall`s to the Chainalysis sanctions oracle during core operations (deposits, withdrawals, transfers, borrows). If the oracle contract is paused, upgraded incorrectly, or reverts, all these operations will revert, completely freezing the protocol.",
+      "investigation_rationale": "The `_isSanctioned` function explicitly reverts if the call to the sentinel (and subsequently Chainalysis) fails, creating a hard dependency on the oracle's uptime for almost all state-modifying functions.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Chainalysis oracle is used as the sanctions list"
+      ],
+      "config_evidence": "WildcatSanctionsSentinel constructor takes chainalysisSanctionsList address.",
+      "affected_functions": [
+        "deposit",
+        "queueWithdrawal",
+        "transfer",
+        "borrow"
+      ],
+      "affected_contracts": [
+        "WildcatMarketBase.sol",
+        "WildcatSanctionsSentinel.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarketBase.sol",
+          "function": "_isSanctioned"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarketBase.sol",
+        "lines": "242-255",
+        "pattern": "if iszero(...) { revert(0, returndatasize()) }"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Chainalysis oracle contract reverts or is unavailable"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "WildcatMarketBase.sol lines 242-255",
+        "vulnerable_pattern": "Strict revert on failed external oracle call",
+        "specific_concern": "Oracle downtime causes protocol-wide DoS",
+        "missing_safeguards": "No fallback mechanism or try/catch for oracle failure"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can the ArchController admin update the oracle address if it fails?",
+          "Are there any operations that can succeed without the oracle?"
+        ],
+        "validation_requirements": [
+          "Mock a reverting Chainalysis oracle",
+          "Verify that deposit, queueWithdrawal, transfer, and borrow all revert"
+        ]
+      },
+      "preliminary_attack_scenario": "The Chainalysis oracle contract is paused or experiences an issue. All lenders are unable to withdraw their funds or transfer their tokens, and borrowers cannot borrow, until the oracle is restored.",
+      "prerequisites": [
+        "Oracle failure"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Temporary freezing of all protocol assets",
+        "affected_users": "All users",
+        "recovery_possibility": "Requires oracle to be fixed or ArchController to deploy a new sentinel (which may not be possible for existing markets)"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing tests for protocol behavior when the sanctions oracle reverts",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Immediate upon oracle failure",
+        "detection_analysis": "All core transactions revert"
+      }
+    }
+  ]
+}

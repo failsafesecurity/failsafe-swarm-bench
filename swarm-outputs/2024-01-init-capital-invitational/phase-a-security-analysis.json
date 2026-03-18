@@ -1,0 +1,392 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T05:30:18.285Z",
+    "duration_ms": 215951
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User Input to Margin Trading Hook",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "updateOrder",
+          "cancelOrder",
+          "fillOrder"
+        ],
+        "failure_modes": [
+          "Missing ownership validation allows cross-position order modification",
+          "Slippage parameters manipulated to extract value"
+        ],
+        "attack_vectors": [
+          "Modifying another user's active order to set a malicious limit price, then filling it to steal collateral"
+        ]
+      },
+      {
+        "boundary": "User Input to Money Market Hook",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "execute"
+        ],
+        "failure_modes": [
+          "Leftover native tokens from previous operations can be swept by subsequent callers"
+        ],
+        "attack_vectors": [
+          "MEV bots backrunning transactions that leave WETH/ETH in the hook by calling execute with returnNative=true"
+        ]
+      },
+      {
+        "boundary": "Core Multicall Execution",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "multicall"
+        ],
+        "failure_modes": [
+          "Deferred health checks bypassed if state is not properly tracked",
+          "Reentrancy during delegatecall execution"
+        ],
+        "attack_vectors": [
+          "Attempting to nest multicalls or exploit payable delegatecalls (mitigated by isMulticallTx lock)"
+        ]
+      },
+      {
+        "boundary": "Oracle Price Feeds",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "getPrice_e36",
+          "calculatePrice_e36"
+        ],
+        "failure_modes": [
+          "Primary and secondary sources deviate beyond max threshold, halting liquidations",
+          "API3 feed returns stale data"
+        ],
+        "attack_vectors": [
+          "Manipulating spot reserves of LP tokens if kLast is 0 (mitigated by using invariant k = r0*r1)"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Healthy Position",
+        "to_state": "Unhealthy Position",
+        "trigger": "Interest accrual or oracle price drop",
+        "conditions": [
+          "Health factor drops below 1e18"
+        ],
+        "invariants": [
+          "Position cannot be made unhealthy by user actions (enforced by ensurePositionHealth)"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Active Order",
+        "to_state": "Filled Order",
+        "trigger": "fillOrder",
+        "conditions": [
+          "Oracle mark price meets trigger price condition",
+          "Executor provides required repayAmt and amtOut"
+        ],
+        "invariants": [
+          "Order status becomes Filled",
+          "Collateral is transferred to executor"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Deferred Health Check",
+        "to_state": "Validated Health Check",
+        "trigger": "multicall completion",
+        "conditions": [
+          "All posIds in uncheckedPosIds must have health >= 1e18"
+        ],
+        "invariants": [
+          "isMulticallTx is reset to false",
+          "uncheckedPosIds is cleared"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Missing Ownership Validation / Access Control",
+        "locations": [
+          "MarginTradingHook.sol:updateOrder"
+        ],
+        "severity": "critical",
+        "evidence": "The `updateOrder` function retrieves `Order storage order = __orders[_orderId];` but fails to assert `order.initPosId == initPosId`. It only checks that the caller's position exists and has enough collateral to satisfy the new `_collAmt`.",
+        "exploitation_method": "An attacker creates their own valid position with sufficient collateral. They call `updateOrder` passing their `_posId` and the victim's `_orderId`. They modify the victim's order to have a highly favorable `limitPrice_e36`. The attacker then calls `fillOrder` to execute the modified order, extracting the victim's collateral at an artificial price.",
+        "affected_assets": [
+          "User collateral locked in MarginTradingHook orders"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Unprotected Fund Sweep / MEV Extraction",
+        "locations": [
+          "MoneyMarketHook.sol:execute"
+        ],
+        "severity": "medium",
+        "evidence": "If a user calls `execute` with `returnNative = false` and overpays `msg.value` (e.g., during a repay operation where `repayAmt < msg.value`), the excess WETH remains in the contract. The `execute` function allows any user to set `returnNative = true`, which sweeps all WETH and ETH balances to `msg.sender`.",
+        "exploitation_method": "An MEV bot monitors for transactions to `MoneyMarketHook.execute` that leave WETH/ETH in the contract. The bot immediately backruns the transaction with a call to `execute` with empty parameters and `returnNative = true` to steal the leftover funds.",
+        "affected_assets": [
+          "User native tokens (ETH/WETH) left in the hook"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Incompatible with Fee-on-Transfer Tokens",
+        "locations": [
+          "LendingPool.sol:repay"
+        ],
+        "severity": "low",
+        "evidence": "The `repay` function calculates the required `amt` and checks `_require(amt <= IERC20(underlyingToken).balanceOf(address(this)) - _cash)`. For fee-on-transfer tokens, the actual transferred amount is less than `amt`, causing this check to revert.",
+        "exploitation_method": "Users who borrow fee-on-transfer tokens will be unable to repay their debt because the strict balance check will always fail, leading to inevitable liquidation or stuck positions.",
+        "affected_assets": [
+          "Fee-on-transfer tokens"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "MarginTradingHook.sol",
+          "function": "setQuoteAsset(address,address,address)",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "InitCore.sol",
+          "function": "setConfig(address)",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "InitCore.sol",
+          "function": "setOracle(address)",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "InitCore.sol",
+          "function": "setLiqIncentiveCalculator(address)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "InitCore.sol",
+          "function": "setRiskManager(address)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "PosManager.sol",
+          "function": "setMaxCollCount(uint8)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "MoneyMarketHook.sol",
+          "function": "setWhitelistedHelpers(address[],bool)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "LendingPool.sol",
+          "function": "setIrm(address)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "LendingPool.sol",
+          "function": "setReserveFactor_e18(uint256)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "LendingPool.sol",
+          "function": "setTreasury(address)",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Config.sol",
+          "function": "setPoolConfig(address,PoolConfig)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Config.sol",
+          "function": "setCollFactors_e18(uint16,address[],uint128[])",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Config.sol",
+          "function": "setBorrFactors_e18(uint16,address[],uint128[])",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Config.sol",
+          "function": "setModeStatus(uint16,ModeStatus)",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "InitOracle.sol",
+          "function": "setPrimarySources(address[],address[])",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "InitOracle.sol",
+          "function": "setMaxPriceDeviations_e18(address[],uint256[])",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "LiqIncentiveCalculator.sol",
+          "function": "setModeLiqIncentiveMultiplier_e18(uint16[],uint256[])",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "RiskManager.sol",
+          "function": "setModeDebtCeilingInfo(uint16,address[],uint128[])",
+          "guards": [
+            "onlyGuardian"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Api3OracleReader.sol",
+          "function": "setDataFeedIds(address[],bytes32[])",
+          "guards": [
+            "onlyGovernor"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "InitOracle.sol",
+              "lines": "50-81",
+              "function": "getPrice_e36"
+            }
+          ],
+          "compositional_usage": [
+            "primary-secondary-deviation-check"
+          ]
+        },
+        {
+          "source": "API3",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "Api3OracleReader.sol",
+              "lines": "61-75",
+              "function": "getPrice_e36"
+            }
+          ],
+          "compositional_usage": [
+            "raw-feed-to-1e36"
+          ]
+        },
+        {
+          "source": "LP-TWAP",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "WLpMoeMasterChef.sol",
+              "lines": "136-150",
+              "function": "calculatePrice_e36"
+            }
+          ],
+          "compositional_usage": [
+            "fair-lp-pricing-formula"
+          ]
+        }
+      ]
+    }
+  }
+}

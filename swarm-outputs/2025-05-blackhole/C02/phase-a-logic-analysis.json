@@ -1,0 +1,470 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:53:34.828Z",
+    "duration_ms": 365796
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-SWAP-FEE",
+        "source": "User swap via Pair.swap()",
+        "path": [
+          "User sends tokenIn to Pair",
+          "Pair computes amountIn from balance delta",
+          "Fee = amountIn * factory.getFee / 10000",
+          "_update0/_update1 called with fee amount",
+          "Referral fee deducted and sent to dibs",
+          "Staking fee tracked via PairFees.processStakingFees",
+          "Remaining amount transferred to PairFees contract",
+          "LP fee index updated for LP holders"
+        ],
+        "transformations": [
+          "amountIn * fee / 10000 -> fee amount",
+          "fee * referralRate / 10000 -> referral fee",
+          "(fee - referral) * stakingNFTFee / 10000 -> staking fee",
+          "fee - referral - staking -> LP fee",
+          "LP fee * 1e18 / totalSupply -> index ratio"
+        ],
+        "sinks": [
+          "PairFees (LP + staking fees)",
+          "dibs contract (referral fees)"
+        ],
+        "trust_changes": "PairFactory fee manager controls all fee percentages; no upper bound on referral fee",
+        "validation_points": [
+          "K invariant check after fee extraction",
+          "Pair.lock reentrancy guard"
+        ],
+        "exposure_risks": [
+          "Fee amounts visible on-chain",
+          "Fee distribution ratios configurable by feeManager"
+        ],
+        "manipulation_risks": [
+          "feeManager can set MAX_REFERRAL_FEE to 10000 (100%), diverting all fees to referral",
+          "Rounding down in index calculation causes dust loss for LP holders",
+          "Fee-on-transfer tokens cause incorrect amountIn calculation"
+        ]
+      },
+      {
+        "flow_id": "DF-ROUTER-SWAP",
+        "source": "User calls RouterV2 swap functions",
+        "path": [
+          "User calls swapExactTokensForTokens / swapExactTokensForTokensSimple",
+          "getAmountsOut computes expected outputs from routes[].pair",
+          "Tokens transferred from user to first pair (or router for CL)",
+          "_swap iterates routes, using routes[i].receiver as destination",
+          "Final output sent to routes[last].receiver"
+        ],
+        "transformations": [
+          "amountIn -> getAmountsOut via pair.getAmountOut or quoterV2",
+          "CL swaps: amounts set by ISwapRouter with amountOutMinimum=0"
+        ],
+        "sinks": [
+          "routes[i].receiver for each hop",
+          "Final recipient from route struct (NOT _to parameter)"
+        ],
+        "trust_changes": "User-controlled route.receiver determines token destination; _to parameter in _swap is dead code",
+        "validation_points": [
+          "amountOutMin check before swap",
+          "ensure(deadline) modifier"
+        ],
+        "exposure_risks": [
+          "CL swaps use amountOutMinimum=0 allowing sandwich attacks within individual hops"
+        ],
+        "manipulation_risks": [
+          "swapExactTokensForTokensSimple never sets routes[0].pair or routes[0].receiver, making function completely broken",
+          "_swap ignores _to parameter, only uses routes[i].receiver",
+          "UNSAFE_swapExactTokensForTokens allows arbitrary amounts with no price verification"
+        ]
+      },
+      {
+        "flow_id": "DF-GAUGE-GENESIS",
+        "source": "GenesisPool calls GaugeV2.depositsForGenesis",
+        "path": [
+          "GenesisPool calls depositsForGenesis with tokenOwner, timestamp, totalAmount",
+          "updateReward(address(0)) updates global state but NOT user state",
+          "TOKEN transferred from genesisPool to gauge",
+          "_totalSupply increased but _balances[tokenOwner] NOT increased",
+          "Balance tracked via genesisPool.balanceOf()"
+        ],
+        "transformations": [
+          "totalSupply += totalAmount",
+          "maturityTime[tokenOwner] = timestamp"
+        ],
+        "sinks": [
+          "GaugeV2 token balance",
+          "Reward distribution to genesis depositors"
+        ],
+        "trust_changes": "Genesis depositor's userRewardPerTokenPaid never set at deposit time",
+        "validation_points": [
+          "onlyGenesisPool modifier",
+          "nonReentrant guard"
+        ],
+        "exposure_risks": [
+          "User reward checkpoint not updated at deposit time"
+        ],
+        "manipulation_risks": [
+          "If rewards were already distributing before genesis deposit, depositor retroactively earns past rewards because userRewardPerTokenPaid[user] remains 0"
+        ]
+      },
+      {
+        "flow_id": "DF-GAUGE-REWARDS",
+        "source": "GaugeManager calls notifyRewardAmount",
+        "path": [
+          "Distribution calls notifyRewardAmount with reward amount",
+          "rewardRate calculated from reward / DURATION",
+          "Users accrue rewards via rewardPerToken() over time",
+          "Users call getReward() to claim accumulated rewards"
+        ],
+        "transformations": [
+          "reward / DURATION -> rewardRate",
+          "(lastTimeRewardApplicable - lastUpdateTime) * rewardRate * 1e18 / _totalSupply -> rewardPerToken increment",
+          "_balanceOf(user) * (rewardPerToken - userRewardPerTokenPaid) / 1e18 -> user earned"
+        ],
+        "sinks": [
+          "User wallet via rewardToken.safeTransfer"
+        ],
+        "trust_changes": "DISTRIBUTION address fully controls reward amounts",
+        "validation_points": [
+          "rewardRate <= balance / DURATION check",
+          "isNotEmergency modifier"
+        ],
+        "exposure_risks": [
+          "rewardRate visible on-chain"
+        ],
+        "manipulation_risks": [
+          "Genesis depositors can steal rewards by not having userRewardPerTokenPaid set at deposit time",
+          "_balanceOf includes genesisPool balance which can be manipulated by genesis pool contract"
+        ]
+      },
+      {
+        "flow_id": "DF-LP-MINT-BURN",
+        "source": "User adds/removes liquidity via Router",
+        "path": [
+          "Router transfers tokens to Pair",
+          "Pair.mint calculates liquidity from deposited amounts",
+          "_updateFor called for recipient to checkpoint fees",
+          "LP tokens minted to recipient",
+          "reserves updated via _update"
+        ],
+        "transformations": [
+          "sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY for first mint",
+          "min(amount0 * totalSupply / reserve0, amount1 * totalSupply / reserve1) for subsequent mints"
+        ],
+        "sinks": [
+          "LP tokens to user",
+          "MINIMUM_LIQUIDITY locked to address(0)"
+        ],
+        "trust_changes": "No access control on mint/burn (relies on router for safety checks)",
+        "validation_points": [
+          "liquidity > 0 check",
+          "lock modifier"
+        ],
+        "exposure_risks": [
+          "First depositor can manipulate initial price with donation attack"
+        ],
+        "manipulation_risks": [
+          "Front-running first deposit to manipulate price ratio"
+        ]
+      },
+      {
+        "flow_id": "DF-EXTRA-REWARDER",
+        "source": "GaugeExtraRewarder reward distribution",
+        "path": [
+          "Owner calls setDistributionRate with amount",
+          "rewardPerSecond calculated",
+          "On gauge deposit/withdraw, onReward called",
+          "updatePool recalculates accRewardPerShare using GAUGE TOKEN balance",
+          "Pending reward calculated and transferred to user"
+        ],
+        "transformations": [
+          "amount / distributePeriod -> rewardPerSecond",
+          "time * rewardPerSecond * ACC_TOKEN_PRECISION / lpSupply -> accRewardPerShare increment",
+          "user.amount * accRewardPerShare / ACC_TOKEN_PRECISION - user.rewardDebt -> pending"
+        ],
+        "sinks": [
+          "User receives rewardToken via safeTransfer"
+        ],
+        "trust_changes": "Only GAUGE can call onReward",
+        "validation_points": [
+          "onlyGauge modifier",
+          "balance check in setDistributionRate"
+        ],
+        "exposure_risks": [
+          "lpSupply uses balanceOf(GAUGE) which may differ from gauge._totalSupply"
+        ],
+        "manipulation_risks": [
+          "Potential underflow in pending calculation if rewardDebt exceeds computed value due to rounding",
+          "lpSupply mismatch if tokens sent directly to gauge without deposit()"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "K invariant: x*y >= k (volatile) or x³y + xy³ >= k (stable) must hold after every swap",
+        "Fees are extracted before K invariant check",
+        "LP tokens represent pro-rata share of pool reserves",
+        "Gauge rewards distributed proportional to staked LP balance over time",
+        "Genesis deposits create maturity-locked stakes",
+        "Referral fees deducted before staking and LP fee calculations"
+      ],
+      "economic_incentives": [
+        "LP holders earn swap fees proportional to their LP share",
+        "Gauge stakers earn emission rewards proportional to their staked LP",
+        "Voters direct emissions to gauges, earning bribes in return",
+        "Referral system incentivizes bringing trade volume",
+        "Staking NFT fee creates additional revenue for protocol stakers"
+      ],
+      "governance_mechanisms": [
+        "feeManager controls all fee parameters with no timelock",
+        "Owner can pause all swaps via PairFactory.isPaused",
+        "EmergencyCouncil can activate emergency mode on gauges",
+        "genesisManager controls genesis pool lifecycle"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "GaugeV2.depositsForGenesis called after notifyRewardAmount has been distributing rewards",
+          "expected_behavior": "Genesis depositor should only earn rewards from the time of their deposit",
+          "actual_behavior": "Genesis depositor earns rewards retroactively from start because updateReward(address(0)) does not set userRewardPerTokenPaid for the depositor",
+          "risk_level": "high",
+          "exploitation_potential": "Genesis depositor can claim rewards they were not entitled to, stealing from other stakers. The theft amount equals balanceOf(depositor) * rewardPerTokenStored / 1e18 at time of first interaction after deposit."
+        },
+        {
+          "scenario": "User calls RouterV2.swapExactTokensForTokensSimple",
+          "expected_behavior": "Simple single-hop swap should execute successfully",
+          "actual_behavior": "Function is completely broken: routes[0].pair and routes[0].receiver default to address(0). For non-concentrated: getAmountsOut returns 0 because isPair(address(0)) is false. For concentrated: quoter call fails with invalid deployer. Function always reverts.",
+          "risk_level": "high",
+          "exploitation_potential": "Not exploitable per se, but renders a core protocol function non-functional. Users lose gas fees on failed transactions."
+        },
+        {
+          "scenario": "RouterV2._swap called with _to parameter set to user address",
+          "expected_behavior": "Final swap output should be sent to _to address",
+          "actual_behavior": "_to parameter is completely ignored; output goes to routes[last].receiver instead. For swapExactTokensForETH, if last route receiver is not address(this), WETH won't arrive at router and withdraw fails.",
+          "risk_level": "high",
+          "exploitation_potential": "Tokens sent to wrong address if routes[i].receiver is not correctly set. In swapExactTokensForETH, funds could be stuck if receiver mismatch occurs."
+        },
+        {
+          "scenario": "PairFactory.setReferralFee called with value 10000",
+          "expected_behavior": "Should be bounded to a reasonable maximum",
+          "actual_behavior": "No upper bound check. Setting to 10000 causes 100% of swap fees to go to referral system, leaving 0 for LPs and stakers.",
+          "risk_level": "high",
+          "exploitation_potential": "Compromised or malicious feeManager can divert all swap fees from LP holders and stakers to the referral system"
+        },
+        {
+          "scenario": "RouterV2._swapSupportingFeeOnTransferTokens with stable and volatile pools for same pair",
+          "expected_behavior": "Should use the pair specified in the route for amount calculation",
+          "actual_behavior": "Uses router's getAmountOut which selects the best pool (stable or volatile), not necessarily the one specified in the route. amountOutput may be calculated for wrong pool.",
+          "risk_level": "medium",
+          "exploitation_potential": "If the best pool returns higher amountOut than the actual pair, swap will fail (K invariant). If lower, user receives less than possible. Can cause unexpected reverts or suboptimal swaps."
+        },
+        {
+          "scenario": "TradeHelper.getAmountsIn called with any route",
+          "expected_behavior": "Should return required input amounts for each hop",
+          "actual_behavior": "Infinite loop: uint i decrements from routes.length-1 to 0, then underflows to type(uint).max, looping forever until out-of-gas.",
+          "risk_level": "medium",
+          "exploitation_potential": "Function is non-functional, always reverts. Any integrator relying on this function will have broken functionality."
+        },
+        {
+          "scenario": "TradeHelper.getAmountInStable calculation for stable pool",
+          "expected_behavior": "Should correctly compute required input for desired output",
+          "actual_behavior": "y_1 = reserveOut + output (line adds output instead of subtracting). Also uses decimalsOut instead of decimalsIn for final conversion. Returns incorrect amountIn values.",
+          "risk_level": "medium",
+          "exploitation_potential": "Returns wrong values for integrators. If used for pricing, could lead to unfavorable trades. View-only so no direct fund loss from this contract."
+        },
+        {
+          "scenario": "Pair.current called when only one observation exists",
+          "expected_behavior": "Should return a valid TWAP price",
+          "actual_behavior": "If block.timestamp == lastObservation.timestamp, accesses observations[length-2] which underflows for single observation, causing revert.",
+          "risk_level": "low",
+          "exploitation_potential": "Oracle can be made unreliable by querying immediately after pair creation. View function so no direct fund loss."
+        },
+        {
+          "scenario": "Pair.sample called with points * window > observations.length",
+          "expected_behavior": "Should handle insufficient data gracefully",
+          "actual_behavior": "uint underflow in: i = length - (points * window), causing extremely large i and out-of-bounds array access revert",
+          "risk_level": "low",
+          "exploitation_potential": "Oracle queries revert, potentially affecting dependent protocols"
+        },
+        {
+          "scenario": "GaugeV2.setInternalBribe called with address(0)",
+          "expected_behavior": "Should reject zero address",
+          "actual_behavior": "require(_int >= address(0)) always passes since all addresses >= address(0). Internal bribe can be set to address(0), breaking fee distribution.",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner (or admin through factory) can set internal_bribe to address(0), causing claimFees to fail when trying to approve/notifyRewardAmount on zero address"
+        },
+        {
+          "scenario": "CL swap via RouterV2._swap with concentrated=true",
+          "expected_behavior": "Should enforce minimum output protection",
+          "actual_behavior": "amountOutMinimum is hardcoded to 0 in ExactInputSingleParams, providing zero slippage protection per hop for concentrated liquidity swaps",
+          "risk_level": "medium",
+          "exploitation_potential": "Sandwich attacks on individual CL swap hops. Overall swap has amountOutMin check, but intermediate hops can be manipulated."
+        },
+        {
+          "scenario": "WAVAX.withdraw called by a contract with expensive receive function",
+          "expected_behavior": "Should transfer ETH successfully",
+          "actual_behavior": "Uses payable(msg.sender).transfer(wad) which forwards only 2300 gas, insufficient for contracts with non-trivial receive/fallback logic",
+          "risk_level": "low",
+          "exploitation_potential": "Smart contract wallets or multisigs may be unable to withdraw WAVAX"
+        },
+        {
+          "scenario": "GlobalRouter.exactInput called",
+          "expected_behavior": "Should execute multi-hop V3-style swap",
+          "actual_behavior": "Function body is entirely commented out, returns 0 for amountOut silently",
+          "risk_level": "medium",
+          "exploitation_potential": "Integrators calling this function would receive 0 tokens without error, potentially losing their input if combined with other operations"
+        },
+        {
+          "scenario": "RouterV2 owner functions called after key compromise",
+          "expected_behavior": "Should have ownership transfer mechanism",
+          "actual_behavior": "No owner transfer function exists. Owner set in constructor is permanent.",
+          "risk_level": "low",
+          "exploitation_potential": "If owner key is compromised, attacker permanently controls swapRouter, algebraFactory, quoterV2, and algebraPoolAPIStorage settings"
+        },
+        {
+          "scenario": "Fee-on-transfer token used in Pair.swap",
+          "expected_behavior": "Fees calculated on actual received amount",
+          "actual_behavior": "amountIn calculated from balance delta (correct), but fee transferred via _safeTransfer may deliver less to PairFees than expected with FoT tokens, causing index tracking mismatch",
+          "risk_level": "medium",
+          "exploitation_potential": "Fee accounting becomes incorrect for FoT tokens; LP holders may be unable to claim all fees"
+        }
+      ],
+      "assumption_violations": [
+        "TradeHelper.getAmountsIn assumes uint can safely decrement past 0 - it cannot, causing infinite loop",
+        "swapExactTokensForTokensSimple assumes route struct fields are initialized - pair and receiver are not",
+        "_swap assumes _to parameter is used - it is dead code, only routes[i].receiver matters",
+        "depositsForGenesis assumes rewards haven't started accumulating - no guarantee of this",
+        "getAmountInStable assumes output increases reserve - it should decrease it",
+        "GaugeExtraRewarder assumes user.amount * accRewardPerShare >= user.rewardDebt - rounding can violate this",
+        "setInternalBribe validation assumes address comparison works for zero check - >= address(0) is always true"
+      ],
+      "game_theory_risks": [
+        "Genesis depositors can steal accumulated rewards from existing gauge stakers if rewards were already being distributed",
+        "Fee manager can extract all swap fees via unbounded referral fee setting",
+        "UNSAFE_swapExactTokensForTokens allows arbitrary amount specification enabling sandwich attacks",
+        "Oracle manipulation possible through observations array bounds issues affecting TWAP calculations"
+      ],
+      "integration_risks": [
+        "Algebra CL integration uses amountOutMinimum=0 per hop, no per-hop slippage protection",
+        "algebraPoolAPIStorage.pairToDeployer must return valid deployer for CL swaps to work",
+        "PairFees contract must always have sufficient balance for both LP claims and staking fee withdrawals",
+        "External gaugeRewarder callback could revert, blocking deposits/withdrawals",
+        "IGenesisPool.balanceOf must be consistent with gauge accounting"
+      ],
+      "calculation_errors": [
+        "TradeHelper.getAmountInStable: y_1 = reserveOut + output should be reserveOut - output",
+        "TradeHelper.getAmountInStable: uses decimalsOut for amountIn conversion instead of decimalsIn",
+        "Pair._update0/_update1: ratio = amount * 1e18 / totalSupply rounds down, causing dust fee loss over time",
+        "GaugeExtraRewarder._pendingReward: potential underflow revert in (user.amount * accRewardPerShare / ACC_TOKEN_PRECISION) - user.rewardDebt"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "Pair LP Token",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "ERC20 LP token with custom permit implementation. DOMAIN_SEPARATOR recomputed on each permit call. _updateFor called on all balance changes for fee tracking."
+        },
+        {
+          "address_or_symbol": "WAVAX",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Standard wrapped native token. Uses .transfer (2300 gas limit) for withdrawals which may fail for complex receivers."
+        },
+        {
+          "address_or_symbol": "BLACK (rewardToken)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Emission reward token distributed through GaugeV2. Used with SafeERC20 in gauge contracts."
+        },
+        {
+          "address_or_symbol": "Generic token0/token1",
+          "behaviors": [
+            "fee_on_transfer:possible",
+            "rebasing:possible"
+          ],
+          "decimals": -1,
+          "notes": "Arbitrary ERC20 tokens in pairs. Fee-on-transfer tokens cause accounting issues in Pair._update0/_update1 and PairFees. Router has separate FoT-supporting swap functions but they use wrong getAmountOut."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "k_invariant_volatile",
+          "state_vars": [
+            "reserve0",
+            "reserve1"
+          ],
+          "rule": "After swap: reserve0_new * reserve1_new >= reserve0_old * reserve1_old"
+        },
+        {
+          "name": "k_invariant_stable",
+          "state_vars": [
+            "reserve0",
+            "reserve1"
+          ],
+          "rule": "After swap: x³y + xy³ (normalized) >= k_old"
+        },
+        {
+          "name": "lp_supply_conservation",
+          "state_vars": [
+            "totalSupply",
+            "sum(balanceOf)"
+          ],
+          "rule": "totalSupply == sum of all balanceOf values"
+        },
+        {
+          "name": "fee_index_monotonicity",
+          "state_vars": [
+            "index0",
+            "index1"
+          ],
+          "rule": "index0 and index1 should only increase over time"
+        },
+        {
+          "name": "gauge_supply_balance",
+          "state_vars": [
+            "GaugeV2._totalSupply",
+            "TOKEN.balanceOf(gauge)"
+          ],
+          "rule": "_totalSupply should equal TOKEN.balanceOf(gauge) minus any unrealized reward token balance overlap"
+        },
+        {
+          "name": "pairfees_balance_coverage",
+          "state_vars": [
+            "PairFees.toStake0",
+            "PairFees.toStake1",
+            "accumulated LP claims"
+          ],
+          "rule": "token.balanceOf(PairFees) >= toStake0 + sum(unclaimed LP fees for token0) for each token"
+        },
+        {
+          "name": "reward_rate_solvency",
+          "state_vars": [
+            "rewardRate",
+            "DURATION",
+            "rewardToken.balanceOf(gauge)"
+          ],
+          "rule": "rewardRate * DURATION <= rewardToken.balanceOf(gauge)"
+        }
+      ]
+    }
+  }
+}

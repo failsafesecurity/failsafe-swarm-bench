@@ -1,0 +1,934 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "LendingTerm.sol",
+      "ERC20RebaseDistributor.sol",
+      "ProfitManager.sol",
+      "ERC20Gauges.sol",
+      "ERC20MultiVotes.sol",
+      "SurplusGuildMinter.sol",
+      "GuildVetoGovernor.sol",
+      "LendingTermOnboarding.sol",
+      "GuildToken.sol",
+      "AuctionHouse.sol",
+      "LendingTermOffboarding.sol",
+      "RateLimitedV2.sol",
+      "SimplePSM.sol",
+      "GuildGovernor.sol",
+      "CreditToken.sol",
+      "CoreRef.sol",
+      "Core.sol",
+      "RateLimitedMinter.sol",
+      "CoreRoles.sol",
+      "GuildTimelockController.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T17:16:46.940Z",
+    "duration_ms": 411818
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H001",
+      "title": "SurplusGuildMinter.getRewards() Checks Slashed Flag Against Uninitialized Memory Variable",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In SurplusGuildMinter.getRewards(), the `slashed` flag is evaluated by comparing `lastGaugeLoss > uint256(userStake.lastGaugeLoss)` BEFORE `userStake` is loaded from storage. Since `userStake` is a return variable initialized to default zero values, `userStake.lastGaugeLoss` is always 0. Any term that has ever had a gauge loss (lastGaugeLoss > 0) will cause ALL stakers on that term to be flagged as slashed, regardless of when they staked.",
+      "investigation_rationale": "This is a clear code defect where the order of operations is wrong. The slashed check occurs at line where userStake is still default-initialized, before the actual storage read at `userStake = _stakes[user][term]`. This means any historical loss permanently breaks all future staking on that term.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getRewards",
+        "stake",
+        "unstake"
+      ],
+      "affected_contracts": [
+        "SurplusGuildMinter.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SurplusGuildMinter.sol",
+          "function": "getRewards(address,address)"
+        },
+        {
+          "file": "SurplusGuildMinter.sol",
+          "function": "stake(address,uint256)"
+        },
+        {
+          "file": "SurplusGuildMinter.sol",
+          "function": "unstake(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SurplusGuildMinter.sol",
+        "lines": "216-230",
+        "pattern": "slashed flag checked against default-zero userStake.lastGaugeLoss before userStake is loaded from _stakes[user][term] at line 230"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A term has had at least one gauge loss (lastGaugeLoss > 0)",
+        "A user has staked CREDIT on that term via SurplusGuildMinter",
+        "Anyone can call getRewards(user, term)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "SurplusGuildMinter.sol lines 216-230",
+        "vulnerable_pattern": "Return variable checked before storage load",
+        "specific_concern": "Line ~222: `if (lastGaugeLoss > uint256(userStake.lastGaugeLoss))` uses uninitialized userStake (all zeros). Line ~230: `userStake = _stakes[user][term]` loads actual data AFTER the slashed check.",
+        "missing_safeguards": "No ordering guarantee between slashed check and storage load"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the exact impact when slashed=true in getRewards?",
+          "Does the slashed path in getRewards zero out the user stake permanently?",
+          "Can the user recover CREDIT from the termSurplusBuffer after being incorrectly slashed?"
+        ],
+        "validation_requirements": [
+          "Confirm userStake is default-zero at the point of slashed check",
+          "Trace the slashed=true path: stake is zeroed, credit in surplus buffer is inaccessible",
+          "Verify unstake() returns early on slashed without withdrawing from surplus buffer"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker calls getRewards(victim, term) for any user staking on a term with historical gauge loss. The slashed flag is incorrectly set to true. The user's entire stake record is zeroed. Their CREDIT in the termSurplusBuffer becomes permanently locked. In unstake(), the early return on slashed prevents withdrawal.",
+      "prerequisites": [
+        "Any term with lastGaugeLoss > 0",
+        "Any user with an active stake on that term"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete loss of all CREDIT staked by all users on any term with historical gauge loss",
+        "affected_users": "All SurplusGuildMinter stakers on affected terms",
+        "recovery_possibility": "No recovery mechanism - CREDIT locked in surplus buffer with zeroed stake records"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "Missing test for getRewards after gauge loss with staker who staked post-loss",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A - straightforward function call",
+        "capital_requirements": "None - permissionless call on behalf of any user",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Easily detectable on-chain via stake zeroing events"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H002",
+      "title": "LendingTermOffboarding canOffboard Persists Across Re-onboarding, Enabling Immediate Re-offboarding and PSM DoS",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When a term is offboarded via LendingTermOffboarding, `canOffboard[term]` is set to true and `nOffboardingsInProgress` is incremented. If the term is later re-onboarded through governance without cleanup() being called first, `canOffboard[term]` remains true. Anyone can immediately call offboard(term) again without any new poll, incrementing `nOffboardingsInProgress` a second time. When cleanup() is eventually called, it only decrements once and sets canOffboard=false, leaving nOffboardingsInProgress permanently elevated at ≥1, keeping PSM redemptions paused indefinitely.",
+      "investigation_rationale": "The canOffboard flag is never cleared during re-onboarding, and cleanup can only be called once per flag. The nOffboardingsInProgress counter has no recovery mechanism if it becomes desynchronized.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "offboard",
+        "cleanup",
+        "proposeOnboard"
+      ],
+      "affected_contracts": [
+        "LendingTermOffboarding.sol",
+        "LendingTermOnboarding.sol",
+        "SimplePSM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingTermOffboarding.sol",
+          "function": "offboard(address)"
+        },
+        {
+          "file": "LendingTermOffboarding.sol",
+          "function": "cleanup(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingTermOffboarding.sol",
+        "lines": "154-170,175-200",
+        "pattern": "offboard() only checks canOffboard[term] with no check for current gauge status; cleanup() sets canOffboard=false but can only decrement nOffboardingsInProgress once"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A term was previously offboarded (canOffboard[term] = true)",
+        "The term is re-onboarded via governance without cleanup being called",
+        "Attacker can call offboard(term) permissionlessly"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingTermOffboarding.sol lines 154-170",
+        "vulnerable_pattern": "canOffboard flag never cleared on re-onboarding",
+        "specific_concern": "offboard() only checks `canOffboard[term]` without verifying the offboarding corresponds to the current onboarding cycle; nOffboardingsInProgress incremented twice but cleanup only decrements once",
+        "missing_safeguards": "No reset of canOffboard when term is re-onboarded; no check in offboard that the term hasn't already been offboarded in this cycle"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can a term be re-onboarded while canOffboard is still true?",
+          "After double-offboarding and single cleanup, is nOffboardingsInProgress permanently stuck > 0?",
+          "Can governor directly call setRedemptionsPaused(false) to mitigate?"
+        ],
+        "validation_requirements": [
+          "Trace the full offboard -> re-onboard -> offboard -> cleanup sequence",
+          "Verify nOffboardingsInProgress counter becomes permanently elevated",
+          "Check if governor intervention can fix the PSM pause"
+        ]
+      },
+      "preliminary_attack_scenario": "1) Term is offboarded (canOffboard=true, nOffboardingsInProgress=1). 2) Governance re-onboards term. 3) Attacker calls offboard(term) immediately (nOffboardingsInProgress=2). 4) cleanup(term) called (nOffboardingsInProgress=1, canOffboard=false). 5) PSM redemptions remain permanently paused since nOffboardingsInProgress > 0.",
+      "prerequisites": [
+        "Previous offboarding poll that reached quorum",
+        "Governance re-onboards term without calling cleanup first"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "PSM redemptions permanently paused, blocking all CREDIT-to-pegToken conversions",
+        "affected_users": "All CREDIT holders attempting to redeem via PSM",
+        "recovery_possibility": "Governor can manually unpause PSM, but counter remains corrupted"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing test for re-onboarding without cleanup",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "None for re-offboarding step",
+        "execution_timing": "Multi-transaction, waiting for re-onboarding governance",
+        "detection_analysis": "Detectable via nOffboardingsInProgress check"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H003",
+      "title": "GuildVetoGovernor createVeto Can Be Griefed to Permanently Block Veto of Timelock Action",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "GuildVetoGovernor.createVeto() generates a deterministic proposalId from the timelockId. Once a veto proposal is created and fails to reach quorum (state = Defeated), the same proposalId can never be created again due to OZ Governor's duplicate proposal check. An attacker can call createVeto() immediately when an action is queued in the timelock, creating a veto proposal that will likely fail (not enough time to gather votes or quorum too low initially). This permanently prevents any future veto attempt on the same timelockId.",
+      "investigation_rationale": "The OZ Governor base contract prevents creating proposals with duplicate proposalIds. Since the proposalId is deterministic from the timelockId, a failed veto blocks all future vetoes of the same action.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "createVeto",
+        "state"
+      ],
+      "affected_contracts": [
+        "GuildVetoGovernor.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "GuildVetoGovernor.sol",
+          "function": "createVeto(bytes32)"
+        },
+        {
+          "file": "GuildVetoGovernor.sol",
+          "function": "state(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "GuildVetoGovernor.sol",
+        "lines": "282-310",
+        "pattern": "Deterministic proposalId from timelockId; OZ Governor prevents duplicate proposalIds; failed veto = permanent block"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "An action is queued in the timelock (timelockExecutionTime > 1)",
+        "Attacker can call createVeto() before legitimate voters organize",
+        "The veto fails to reach quorum before the action becomes executable"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "GuildVetoGovernor.sol lines 282-310",
+        "vulnerable_pattern": "Deterministic proposalId with no retry mechanism",
+        "specific_concern": "_getVetoCalls produces identical targets/values/calldatas/description for same timelockId, so proposalId is always the same. OZ Governor.propose reverts on duplicate proposalId.",
+        "missing_safeguards": "No mechanism to re-create a veto proposal after failure"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does OZ Governor prevent creating a proposal with the same proposalId after Defeated?",
+          "Is the description unique enough across calls or always the same?",
+          "Can the veto succeed if created later with different block.number?"
+        ],
+        "validation_requirements": [
+          "Verify OZ Governor.propose reverts on duplicate proposalId even after Defeated state",
+          "Confirm proposalId is identical for same timelockId across different callers/times",
+          "Test attack scenario: early createVeto -> fail -> attempt second createVeto"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker monitors timelock for new queued actions. Immediately calls createVeto(timelockId). The veto proposal enters Active state. Since it was created early and voting power may not yet be mobilized, it eventually transitions to Defeated when the timelock action becomes ready. No one can ever create another veto for this timelockId.",
+      "prerequisites": [
+        "Action queued in timelock",
+        "Attacker acts before legitimate vetoes organize"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Governance safety mechanism bypassed - malicious timelock actions cannot be vetoed",
+        "affected_users": "All protocol stakeholders relying on veto governance",
+        "recovery_possibility": "No recovery - the specific timelock action can never be vetoed"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing test for duplicate veto creation after failed veto",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "None - permissionless call",
+        "execution_timing": "Single transaction, timing-dependent for maximum impact",
+        "detection_analysis": "Detectable on-chain via veto proposal creation event"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "LendingTerm._partialRepay minBorrow Check Uses Inconsistent Units After creditMultiplier Decrease",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In _partialRepay(), the remaining borrowAmount after partial repay is compared against `ProfitManager.minBorrow()`. However, borrowAmount is stored as the original CREDIT amount at borrow time, while minBorrow() returns `_minBorrow * 1e18 / creditMultiplier`. When creditMultiplier decreases (due to bad debt), minBorrow() increases, potentially exceeding the stored borrowAmount even though the loan's effective debt in peg terms is still well above the minimum. This blocks partial repayments entirely for affected loans.",
+      "investigation_rationale": "The unit mismatch between stored borrowAmount (original nominal CREDIT) and the dynamically-scaled minBorrow (current CREDIT) creates a scenario where valid partial repayments are blocked after creditMultiplier decreases.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_partialRepay",
+        "minBorrow"
+      ],
+      "affected_contracts": [
+        "LendingTerm.sol",
+        "ProfitManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingTerm.sol",
+          "function": "_partialRepay(address,bytes32,uint256)"
+        },
+        {
+          "file": "ProfitManager.sol",
+          "function": "minBorrow()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingTerm.sol",
+        "lines": "380-385",
+        "pattern": "require(borrowAmount - issuanceDecrease > ProfitManager.minBorrow()) compares stored nominal amount against dynamically scaled minimum"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "creditMultiplier has decreased from its value at loan origination",
+        "Loan's stored borrowAmount (original nominal) < current minBorrow() (scaled)",
+        "Borrower attempts partial repayment"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingTerm.sol lines 380-385",
+        "vulnerable_pattern": "Unit mismatch in comparison",
+        "specific_concern": "borrowAmount is stored nominal CREDIT from borrow time. minBorrow() = _minBorrow * 1e18 / creditMultiplier grows as creditMultiplier shrinks. A loan with borrowAmount=150e18 opened at multiplier=1e18 cannot partial repay if multiplier drops to 0.5e18 (minBorrow becomes 200e18 > 150e18).",
+        "missing_safeguards": "No scaling of borrowAmount to current creditMultiplier for comparison"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "With _minBorrow=100e18, at what creditMultiplier does partial repay become impossible for loans of various sizes?",
+          "Are borrowers forced to fully repay or face liquidation?",
+          "Is the strict > (instead of >=) an additional issue?"
+        ],
+        "validation_requirements": [
+          "Calculate threshold creditMultiplier for various loan sizes",
+          "Verify partial repay reverts when borrowAmount < minBorrow() after multiplier decrease",
+          "Test with concrete values showing the DoS"
+        ]
+      },
+      "preliminary_attack_scenario": "System experiences bad debt, creditMultiplier drops from 1e18 to 0.5e18. All existing loans with borrowAmount below 200e18 (original nominal) can no longer do partial repayments. These borrowers must either fully repay or face liquidation when partial repay delays pass.",
+      "prerequisites": [
+        "creditMultiplier decrease via bad debt",
+        "Loan's borrowAmount < _minBorrow * 1e18 / new creditMultiplier"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Borrowers forced into full repayment or liquidation unnecessarily",
+        "affected_users": "All borrowers with smaller loans after creditMultiplier decrease",
+        "recovery_possibility": "Governor could lower _minBorrow to mitigate"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing test for partial repay after creditMultiplier decrease",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "N/A - triggered by normal protocol operations",
+        "detection_analysis": "Detectable when partial repay transactions start reverting"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H005",
+      "title": "ERC20Gauges._decrementWeightUntilFree Infinite Loop When User Has Zero-Weight Gauge",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In ERC20Gauges._decrementWeightUntilFree(), the loop counter `i` is only incremented inside the `if (userGaugeWeight != 0)` block. If a user has a gauge with 0 weight in their gauge set (added via incrementGauge(gauge, 0)), and the loop reaches that gauge before freeing enough weight, it will loop infinitely on the zero-weight entry, causing an out-of-gas revert. This blocks all token transfers and burns for the affected user.",
+      "investigation_rationale": "The incrementGauge function does not validate weight > 0, allowing a gauge to be added to the user's set with 0 weight. The greedy decrement algorithm assumes all gauges in the set have positive weight.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_decrementWeightUntilFree",
+        "incrementGauge",
+        "transfer",
+        "transferFrom",
+        "_burn"
+      ],
+      "affected_contracts": [
+        "ERC20Gauges.sol",
+        "GuildToken.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Gauges.sol",
+          "function": "_decrementWeightUntilFree(address,uint256)"
+        },
+        {
+          "file": "ERC20Gauges.sol",
+          "function": "incrementGauge(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Gauges.sol",
+        "lines": "474-500",
+        "pattern": "unchecked { ++i; } only inside if (userGaugeWeight != 0) block; zero-weight gauge causes infinite iteration"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "User calls incrementGauge(gauge, 0), adding gauge to their set with 0 weight",
+        "User has other gauge allocations that consume their balance",
+        "User attempts to transfer or burn tokens requiring weight freeing"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ERC20Gauges.sol lines 474-500",
+        "vulnerable_pattern": "Loop counter increment inside conditional block",
+        "specific_concern": "The for loop at line 484 only increments i (line 498) when userGaugeWeight != 0. A gauge with 0 weight causes the same index to be checked repeatedly, creating an infinite loop.",
+        "missing_safeguards": "No weight > 0 check in incrementGauge; no unconditional i++ in loop"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can an attacker cause this on the SurplusGuildMinter if mintRatio is set to 0?",
+          "Is incrementGauge(gauge, 0) actually reachable given GuildToken override checks?",
+          "Can the user recover by manually decrementing the zero-weight gauge?"
+        ],
+        "validation_requirements": [
+          "Test incrementGauge(gauge, 0) succeeds and adds to gauge set",
+          "Test subsequent transfer/burn reverts with out of gas",
+          "Verify if decrementGauge(gauge, 0) can remove the problematic entry"
+        ]
+      },
+      "preliminary_attack_scenario": "User calls GuildToken.incrementGauge(gauge, 0). The gauge is added to their _userGauges set with 0 weight. Later, when the user tries to transfer tokens that require weight freeing, _decrementWeightUntilFree enters an infinite loop on the zero-weight gauge, consuming all gas.",
+      "prerequisites": [
+        "User (or protocol acting on user's behalf) calls incrementGauge with weight=0"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "User's GUILD tokens permanently locked - cannot transfer or burn",
+        "affected_users": "Self-inflicted for direct users; could affect SurplusGuildMinter if mintRatio=0",
+        "recovery_possibility": "User may recover by calling decrementGauge(gauge, 0) to remove the entry"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing test for incrementGauge with zero weight followed by transfer",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Loop will consume all gas in block",
+        "capital_requirements": "None",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "User transactions revert with out of gas"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H006",
+      "title": "ProfitManager.notifyPnL Reverts on Large Loss Due to Underflow in creditMultiplier Calculation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In ProfitManager.notifyPnL(), during loss handling, after depleting the surplus buffer, the remaining loss is used to update creditMultiplier: `newCreditMultiplier = (creditMultiplier * (creditTotalSupply - loss)) / creditTotalSupply`. If the remaining loss exceeds creditTotalSupply, the subtraction underflows in Solidity 0.8.13 (checked arithmetic), causing a revert. This means the loss can never be processed, blocking the auction settlement and locking collateral permanently.",
+      "investigation_rationale": "When creditMultiplier drops from prior losses, the principal calculation `borrowAmount * borrowCreditMultiplier / creditMultiplier` amplifies the loss. If this amplified principal exceeds creditTotalSupply after surplus buffer depletion, the system enters an irrecoverable state.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "notifyPnL"
+      ],
+      "affected_contracts": [
+        "ProfitManager.sol",
+        "LendingTerm.sol",
+        "AuctionHouse.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ProfitManager.sol",
+          "function": "notifyPnL(address,int256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ProfitManager.sol",
+        "lines": "315-330",
+        "pattern": "uint256 newCreditMultiplier = (creditMultiplier * (creditTotalSupply - loss)) / creditTotalSupply; underflows when loss > creditTotalSupply"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "creditMultiplier has decreased significantly from prior losses",
+        "A loan opened at a higher creditMultiplier defaults",
+        "The amplified principal (borrowAmount * oldMultiplier / currentMultiplier) exceeds creditTotalSupply after buffer depletion"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ProfitManager.sol lines 315-330",
+        "vulnerable_pattern": "Unchecked subtraction potential underflow in Solidity 0.8.13",
+        "specific_concern": "(creditTotalSupply - loss) can underflow when loss is amplified by creditMultiplier ratio",
+        "missing_safeguards": "No clamping of loss to creditTotalSupply; no floor on creditMultiplier"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What creditMultiplier ratio causes the amplified principal to exceed totalSupply?",
+          "Can this state be reached through cascading liquidations?",
+          "What happens to the auction and collateral when notifyPnL reverts?"
+        ],
+        "validation_requirements": [
+          "Calculate threshold creditMultiplier for various loan sizes",
+          "Trace the full auction -> onBid -> notifyPnL path to confirm revert blocks settlement",
+          "Verify collateral is permanently locked in LendingTerm"
+        ]
+      },
+      "preliminary_attack_scenario": "Multiple losses reduce creditMultiplier to 0.01e18. A loan opened at creditMultiplier=1e18 with borrowAmount=X defaults. Principal = X * 100. If X*100 > creditTotalSupply - surplusBuffer, notifyPnL reverts. The auction cannot settle via bid(), forgive() also fails. The loan and its collateral are permanently stuck.",
+      "prerequisites": [
+        "Significant prior creditMultiplier reduction",
+        "Large loan default relative to current total supply"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "System enters irrecoverable state; affected loan collateral permanently locked; credit system potentially bricked",
+        "affected_users": "All protocol participants if system enters death spiral",
+        "recovery_possibility": "Only through governor emergencyAction to manually patch state"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "critical",
+      "test_coverage_gap": "Missing test for cascading losses with creditMultiplier approaching extreme values",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A - revert, not gas issue",
+        "capital_requirements": "Requires significant prior bad debt to reduce creditMultiplier",
+        "execution_timing": "Market-condition dependent",
+        "detection_analysis": "Detectable when auctions cannot settle"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "GuildToken._decrementGaugeWeight Debt Ceiling Check Blocks Gauge Voting Decrease and Token Transfers",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "GuildToken overrides _decrementGaugeWeight to require `issuance <= debtCeilingAfterDecrement`. When a lending term's issuance is at or near its debt ceiling, ALL voters for that term cannot decrement their gauge weight, transfer their tokens, or burn them. The _decrementWeightUntilFree algorithm (triggered on transfer/burn) will revert when it tries to decrement weight from a fully-utilized term.",
+      "investigation_rationale": "The debt ceiling check in _decrementGaugeWeight creates a dependency between lending term utilization and GUILD token transferability, allowing borrowing activity to lock voter tokens.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_decrementGaugeWeight",
+        "_decrementWeightUntilFree",
+        "transfer",
+        "transferFrom",
+        "applyGaugeLoss"
+      ],
+      "affected_contracts": [
+        "GuildToken.sol",
+        "ERC20Gauges.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "GuildToken.sol",
+          "function": "_decrementGaugeWeight(address,address,uint256)"
+        },
+        {
+          "file": "ERC20Gauges.sol",
+          "function": "_decrementWeightUntilFree(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "GuildToken.sol",
+        "lines": "220-235",
+        "pattern": "require(issuance <= debtCeilingAfterDecrement) in _decrementGaugeWeight blocks weight decrease when term is fully utilized"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-008",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A lending term has issuance close to or at its debt ceiling",
+        "GUILD voters have weight allocated to this term",
+        "Voters attempt to transfer tokens or decrement weight"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "GuildToken.sol lines 220-235",
+        "vulnerable_pattern": "External state (LendingTerm.issuance/debtCeiling) gates token transferability",
+        "specific_concern": "debtCeiling(-int256(weight)) returns a lower ceiling. If current issuance > this lower ceiling, the require reverts. All voters for the term have their tokens locked until borrowers repay.",
+        "missing_safeguards": "No escape hatch for voters when term is fully utilized"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does this also block applyGaugeLoss when a fully-utilized term incurs bad debt?",
+          "Can a borrower keep a term at max utilization indefinitely to grief voters?",
+          "What is the interaction with the offboarding flow?"
+        ],
+        "validation_requirements": [
+          "Verify that applyGaugeLoss also calls _decrementGaugeWeight and would be blocked",
+          "Test transfer of GUILD tokens when only gauge allocation is to a fully-utilized term",
+          "Check if offboarding the term removes it from totalWeight, changing the calculation"
+        ]
+      },
+      "preliminary_attack_scenario": "An attacker borrows up to the debt ceiling of a term. All GUILD voters for this term cannot transfer, burn, or decrease their gauge weight. If the term incurs bad debt, applyGaugeLoss also reverts, preventing slashing. Voters' GUILD tokens are effectively frozen until issuance decreases.",
+      "prerequisites": [
+        "Lending term at maximum utilization",
+        "GUILD voters allocated to this term"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "GUILD tokens locked; slashing mechanism blocked; potential governance manipulation",
+        "affected_users": "All GUILD voters allocated to the fully-utilized term",
+        "recovery_possibility": "Requires borrowers to repay or loans to be called and auction-settled"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing test for token transfer when gauge term is fully utilized",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A - revert condition",
+        "capital_requirements": "Enough collateral to borrow to debt ceiling",
+        "execution_timing": "Maintained as long as term stays at max utilization",
+        "detection_analysis": "Detectable when GUILD transfers revert"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H008",
+      "title": "ProfitManager Guild Profit Permanently Stuck When Gauge Weight Is Zero",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In ProfitManager.notifyPnL(), when profit is distributed, amountForGuild is calculated and subtracted from the total to compute amountForCredit. However, if the gauge's weight is 0 at the time of profit notification, the gaugeProfitIndex is not updated, and the CREDIT tokens allocated to GUILD stakers remain stuck in ProfitManager with no claimant. This can occur when a term is offboarded (gauge deprecated, weight removed from totals) but auctions from that term still settle with profit.",
+      "investigation_rationale": "The code path for guild profit distribution silently skips index update when gauge weight is 0, but the CREDIT tokens have already been deducted from the creditSplit. These tokens become permanently unrecoverable.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "notifyPnL",
+        "claimGaugeRewards"
+      ],
+      "affected_contracts": [
+        "ProfitManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ProfitManager.sol",
+          "function": "notifyPnL(address,int256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ProfitManager.sol",
+        "lines": "356-370",
+        "pattern": "if (_gaugeWeight != 0) { update profit index } -- amountForGuild CREDIT stays in ProfitManager when weight is 0"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A gauge has weight 0 when profit is notified (e.g., term offboarded)",
+        "guildSplit in profitSharingConfig is > 0",
+        "An auction settles with profit for a deprecated term"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ProfitManager.sol lines 356-370",
+        "vulnerable_pattern": "Conditional profit index update with unconditional profit split deduction",
+        "specific_concern": "amountForGuild is computed and subtracted from total regardless of gauge weight. When weight is 0, index not updated, tokens stuck.",
+        "missing_safeguards": "No redirection of guild split to surplus buffer or credit holders when weight is 0"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How much CREDIT can accumulate in ProfitManager from this path?",
+          "Can governance recover these funds via emergencyAction?",
+          "Is there a timing window during offboarding where this consistently occurs?"
+        ],
+        "validation_requirements": [
+          "Verify amountForGuild is subtracted from profit even when gaugeWeight is 0",
+          "Trace CREDIT balance of ProfitManager after profit notification with 0-weight gauge",
+          "Confirm no claim mechanism exists for these orphaned funds"
+        ]
+      },
+      "preliminary_attack_scenario": "A term is offboarded and its gauge weight drops to 0. Ongoing auctions for that term settle with profit. The guild share of profit is allocated but not distributed to any profit index. CREDIT tokens accumulate in ProfitManager without any claim path.",
+      "prerequisites": [
+        "Term offboarded (gauge weight = 0)",
+        "Auction settles with profit after offboarding"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "CREDIT tokens permanently locked in ProfitManager proportional to guildSplit * total profits from 0-weight terms",
+        "affected_users": "Protocol treasury; indirectly all CREDIT holders who lose their share",
+        "recovery_possibility": "Governor could recover via emergencyAction on ProfitManager"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing test for profit notification on deprecated gauge",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Occurs naturally during offboarding + auction settlement",
+        "detection_analysis": "Detectable by comparing ProfitManager CREDIT balance to surplusBuffer + pending rewards"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "LendingTerm.forgive() On Loan In Active Auction Permanently Corrupts AuctionHouse State",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "LendingTerm.forgive() does not check if the loan has been called and is in an active auction (callTime != 0). If governor calls forgive() on an auctioned loan, it sets closeTime and decrements issuance. Subsequently, AuctionHouse.bid() and AuctionHouse.forgive() both call LendingTerm.onBid() which requires closeTime == 0, causing a permanent revert. The auction becomes unsettleable, nAuctionsInProgress is permanently elevated, and setAuctionHouse (which requires nAuctionsInProgress == 0) is permanently blocked.",
+      "investigation_rationale": "The loan lifecycle state machine allows an illegal transition from Called to Closed via forgive(), bypassing the auction settlement path, creating an orphaned auction.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "forgive",
+        "onBid"
+      ],
+      "affected_contracts": [
+        "LendingTerm.sol",
+        "AuctionHouse.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingTerm.sol",
+          "function": "forgive(bytes32)"
+        },
+        {
+          "file": "LendingTerm.sol",
+          "function": "onBid(bytes32,address,uint256,uint256,uint256)"
+        },
+        {
+          "file": "AuctionHouse.sol",
+          "function": "bid(bytes32)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingTerm.sol",
+        "lines": "508-530",
+        "pattern": "forgive() checks borrowTime != 0 and closeTime == 0 but NOT callTime == 0; onBid requires closeTime == 0"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governor (GOVERNOR role) calls forgive on a loan that has been called",
+        "An auction exists for the loan in AuctionHouse"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingTerm.sol lines 508-530",
+        "vulnerable_pattern": "Missing callTime == 0 check in forgive()",
+        "specific_concern": "forgive() only checks borrowTime and closeTime. If callTime > 0, the auction in AuctionHouse becomes orphaned. nAuctionsInProgress never decrements.",
+        "missing_safeguards": "No check for callTime == 0 in forgive(); no mechanism to settle orphaned auctions"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does nAuctionsInProgress being permanently > 0 block other critical operations?",
+          "Can emergencyAction fix the AuctionHouse state?",
+          "Is issuance double-decremented if both forgive and onBid succeed somehow?"
+        ],
+        "validation_requirements": [
+          "Trace forgive() on called loan -> verify auction stuck",
+          "Verify nAuctionsInProgress never decrements",
+          "Test setAuctionHouse blocked permanently"
+        ]
+      },
+      "preliminary_attack_scenario": "Governor calls forgive(loanId) on a loan currently in auction (e.g., emergency with frozen collateral). Loan is closed but auction remains active and unsettleable. nAuctionsInProgress is permanently stuck at >= 1. setAuctionHouse can never be called again.",
+      "prerequisites": [
+        "Governor action on an actively auctioned loan"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "AuctionHouse migration permanently blocked; potential protocol upgrade path broken",
+        "affected_users": "Protocol governance and future auction system upgrades",
+        "recovery_possibility": "Only through governor emergencyAction to directly modify AuctionHouse storage"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing test for forgive on called loan",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Single governor transaction",
+        "detection_analysis": "Immediately visible via nAuctionsInProgress counter"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "ERC20RebaseDistributor distribute() Griefing via Small Amounts Delays Reward Interpolation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Each call to ERC20RebaseDistributor.distribute() resets the interpolation endpoint to 30 days from the current timestamp. An attacker can repeatedly call distribute(1) (burning 1 CREDIT each time) to continuously push back the interpolation endpoint, significantly delaying the materialization of larger pending rewards from legitimate distributions. While the current interpolated value is preserved as the new lastValue, the remaining un-interpolated portion is stretched over a fresh 30-day window.",
+      "investigation_rationale": "The distribute function's interpolation reset affects both __rebasingSharePrice and __unmintedRebaseRewards. Frequent small distributions can perpetually delay reward delivery to rebasing CREDIT holders.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "distribute"
+      ],
+      "affected_contracts": [
+        "ERC20RebaseDistributor.sol",
+        "CreditToken.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20RebaseDistributor.sol",
+          "function": "distribute(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20RebaseDistributor.sol",
+        "lines": "268-300",
+        "pattern": "Each distribute() sets targetTimestamp = block.timestamp + DISTRIBUTION_PERIOD (30 days) regardless of existing pending distribution"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker has at least 1 CREDIT token per griefing transaction",
+        "There are existing pending rewards being interpolated",
+        "Rebasing supply is non-zero"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ERC20RebaseDistributor.sol lines 268-300",
+        "vulnerable_pattern": "Interpolation window reset on every distribute() call",
+        "specific_concern": "targetTimestamp is always set to block.timestamp + 30 days. A large distribution made 29 days ago (almost fully interpolated) has its remaining ~3% stretched to 30 more days if distribute(1) is called.",
+        "missing_safeguards": "No minimum distribution amount relative to existing pending; no per-distribution tracking"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the quantified delay impact per griefing transaction?",
+          "How much does it cost per day to maintain the griefing?",
+          "Do the rewards eventually materialize, just delayed?"
+        ],
+        "validation_requirements": [
+          "Calculate exact delay impact: if 10% of rewards pending, distribute(1) stretches them to 30 more days",
+          "Cost analysis: 1 CREDIT per block for continuous griefing",
+          "Verify rewards are not lost, only delayed"
+        ]
+      },
+      "preliminary_attack_scenario": "A large interest payment triggers CreditToken.distribute(X). Over 25 days, ~83% of X has been interpolated. Attacker calls distribute(1), resetting the endpoint to 30 days from now. The remaining 17% of X is now spread over 30 days instead of 5 days. Repeating this every few days perpetually delays full reward delivery.",
+      "prerequisites": [
+        "Attacker willing to burn small amounts of CREDIT",
+        "Existing pending rewards"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Delayed reward delivery to rebasing CREDIT holders; opportunity cost but no permanent loss",
+        "affected_users": "All rebasing CREDIT holders",
+        "recovery_possibility": "Rewards are not lost, only delayed; ceasing attack allows normal interpolation"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing test for repeated small distributions affecting interpolation timing",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~50-100K gas per griefing transaction",
+        "capital_requirements": "1 CREDIT per griefing call",
+        "execution_timing": "Must be repeated frequently for sustained impact",
+        "detection_analysis": "Detectable via distribute events with tiny amounts"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H011",
+      "title": "ERC20RebaseDistributor updateTotalRebasingShares Can Overflow uint224 Trapping Last Rebasers",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In ERC20RebaseDistributor.updateTotalRebasingShares(), when shares decrease significantly (most rebasers exit), the adjusted target share price `targetNewSharePrice = currentRebasingSharePrice + (delta * START_REBASING_SHARE_PRICE) / percentChange` can overflow uint224 if percentChange is very small. This happens because dividing by a tiny percentChange amplifies the delta. SafeCastLib.safeCastTo224 would revert, blocking the remaining rebaser from exiting rebase.",
+      "investigation_rationale": "The formula adjusts the remaining interpolation delta inversely to the share change. When shares decrease dramatically (e.g., from 1000 to 1), the multiplier 1000x is applied to the remaining delta, potentially exceeding uint224 max.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "updateTotalRebasingShares",
+        "_exitRebase",
+        "transfer",
+        "transferFrom"
+      ],
+      "affected_contracts": [
+        "ERC20RebaseDistributor.sol",
+        "CreditToken.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20RebaseDistributor.sol",
+          "function": "updateTotalRebasingShares(uint256,int256)"
+        },
+        {
+          "file": "ERC20RebaseDistributor.sol",
+          "function": "_exitRebase(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20RebaseDistributor.sol",
+        "lines": "155-185",
+        "pattern": "targetNewSharePrice = currentPrice + (delta * START_REBASING_SHARE_PRICE) / percentChange; percentChange can be very small, amplifying result beyond uint224"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-014",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Active interpolation with delta between current and target share price > 0",
+        "Most rebasers exit, leaving very few shares (percentChange becomes very small)",
+        "The amplified targetNewSharePrice exceeds uint224 max (~2.7e67)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ERC20RebaseDistributor.sol lines 155-185",
+        "vulnerable_pattern": "Inverse proportional scaling without overflow guard",
+        "specific_concern": "percentChange = (sharesAfter * 1e30) / sharesBefore. If sharesAfter << sharesBefore, percentChange is tiny. targetNewSharePrice = currentPrice + (delta * 1e30) / percentChange can exceed 2^224.",
+        "missing_safeguards": "No capping of targetNewSharePrice before safeCastTo224"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the minimum share ratio that causes overflow?",
+          "Can this occur organically or only through manipulation?",
+          "Are the remaining trapped rebasers' funds permanently locked?"
+        ],
+        "validation_requirements": [
+          "Calculate exact threshold: delta and share ratio that causes uint224 overflow",
+          "Verify _exitRebase path goes through updateTotalRebasingShares with negative sharesDelta",
+          "Check if waiting for interpolation to complete (delta = 0) allows safe exit"
+        ]
+      },
+      "preliminary_attack_scenario": "Large distribution occurs, creating significant delta in share price interpolation. Most rebasers exit (reducing shares by 99%). The remaining delta is amplified 100x, potentially exceeding uint224. The last few rebasers cannot exit because updateTotalRebasingShares reverts on safeCastTo224.",
+      "prerequisites": [
+        "Active share price interpolation with non-zero delta",
+        "Dramatic reduction in rebasing shares"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Remaining rebasers' CREDIT tokens trapped in rebasing state",
+        "affected_users": "Last remaining rebasing CREDIT holders",
+        "recovery_possibility": "May recover after interpolation completes (delta goes to 0) or via forceExitRebase"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Missing test for share price adjustment with dramatic share decrease during active interpolation",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A - revert condition",
+        "capital_requirements": "Requires controlling most of rebasing supply",
+        "execution_timing": "Must exit during active interpolation period",
+        "detection_analysis": "Detectable when exitRebase/transfer transactions revert"
+      }
+    }
+  ]
+}

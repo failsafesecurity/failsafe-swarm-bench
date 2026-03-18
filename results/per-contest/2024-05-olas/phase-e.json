@@ -1,0 +1,228 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Dispenser.retain() Does Not Apply stakingDiff Cap, Allowing It to Refund More Than a Nominee's Fair Share",
+      "severity": "high",
+      "summary": "In calculateStakingIncentives() (line 901-944), the protocol carefully distinguishes between availableStakingAmount (capped to totalWeightSum) and stakingDiff (excess over totalWeightSum). The retainer's allocation is computed differently: it multiplies the full stakingPoint.stakingIncentive by stakingWeight and divides by 1e18 (lines 1157-1159). This means when totalWeightSum < stakingIncentive (i.e., veOLAS voting participation is low), calculateStakingIncentives allocates only the proportiona",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Dispenser.sol",
+          "line_start": 1146,
+          "line_end": 1159,
+          "desc": "retain() computes totalReturnAmount as stakingPoint.stakingIncentive * stakingWeight / 1e18 without applying the availableStakingAmount / stakingDiff logic that calculateStakingIncentives() uses to cap amounts when totalWeightSum < stakingIncentive."
+        }
+      ],
+      "impact": "Excess OLAS refunded to staking inflation pool, distorting future epoch allocations. The magnitude depends on the gap between totalWeightSum and stakingIncentive and the retainer's weight.",
+      "proof_of_concept": "1. veOLAS participation is low: totalWeightSum = 50e18, stakingIncentive = 100e18 for an epoch.\n2. Retainer has 10% relative weight (1e17).\n3. calculateStakingIncentives for a normal nominee with 10% weight: gets stakingIncentive = (50e18 * 1e17)/1e18 = 5e18 allocated; returnAmount = (50e18 * 1e17)/1e18 = 5e18 returned. Combined: 10e18 accounted for.\n4. retain() for retainer with 10% weight: totalReturnAmount += 100e18 * 1e17 / 1e18 = 10e18.\n5. The retainer returns 10e18 instead of the correct combined amount of (5e18 + 5e18) = 10e18 of what a normal nominee would account for. However, the retain() amount is entirely refunded via refundFromStaking(), while for a normal nominee, the 5e18 stakingIncentive would be sent to the target and only 5e18 returnAmount is refunded. So retain() refunds 2x what should be returned.\n6. Over epochs with low participation, this systematically inflates the staking incentive budget.",
+      "remediation": "Align retain()'s calculation with calculateStakingIncentives() by fetching totalWeightSum and applying the same availableStakingAmount cap and stakingDiff logic."
+    },
+    {
+      "title": "Tokenomics checkpoint() Staking Incentive Concentrates All Epoch Refunds Into Current Epoch Via refundFromStaking, Enabling Strategic Timing Attacks",
+      "severity": "high",
+      "summary": "During an epoch, when Dispenser claims staking incentives, any returned amounts (from nominees below minStakingWeight, or from excess over maxStakingAmount, or bridging precision loss) are refunded via Tokenomics.refundFromStaking(). This function adds the refunded amount to mapEpochStakingPoints[currentEpoch].stakingIncentive (line 839).\n\nLater, when checkpoint() runs at epoch end, it reads this accumulated refund (line 1235: incentives[7] = mapEpochStakingPoints[eCounter].stakingIncentive), th",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Tokenomics.sol",
+          "line_start": 1233,
+          "line_end": 1238,
+          "desc": "incentives[7] reads stakingIncentive that was accumulated via refundFromStaking() during the current epoch, then incentives[8] adds the new inflation-based staking amount ON TOP of that refunded amount, writing the combined value back as the epoch's stakingIncentive."
+        }
+      ],
+      "impact": "Staking incentive concentration in single epochs, enabling strategic timing of claims to maximize staking rewards for favored nominees during high-refund epochs.",
+      "proof_of_concept": "1. Suppose 10 epochs pass without anyone claiming staking incentives for a particular chain.\n2. Each epoch allocated 100 OLAS in staking incentives.\n3. An attacker claims all 10 epochs at once. Due to weight dynamics, suppose 50% is returned each epoch (returnAmount = 50 per epoch = 500 total).\n4. All 500 OLAS is refunded to the CURRENT epoch via refundFromStaking.\n5. Current epoch checkpoint: incentives[7] = 500 (refunded) + current epoch inflation of 100 = 600 OLAS staking budget.\n6. This 600 OLAS is now available for the current epoch's nominees, 6x the normal allocation.\n7. Nominees claiming in this epoch get disproportionately large allocations.",
+      "remediation": "Consider tracking refunded amounts separately and distributing them more evenly, or make refundFromStaking add to a separate accumulator that is spread across future epochs rather than concentrated in the current one."
+    },
+    {
+      "title": "Withheld OLAS on L2 Can Be Consumed By redeem() Before Compensating Batch Arrives, Creating Permanent L2 Deficit",
+      "severity": "high",
+      "summary": "The withheld amount mechanism works across L1 and L2 as follows:\n\n1. On L2: DefaultTargetDispenserL2._processData() withholds OLAS for invalid targets (line 172), incrementing withheldAmount.\n2. On L2: syncWithheldTokens() sends a message to L1 reporting the withheld amount and zeros it (line 342). Crucially, the OLAS tokens remain on the L2 contract.\n3. On L1: Dispenser records mapChainIdWithheldAmounts[chainId] += amount.\n4. On L1: Next claim reduces transferAmount by withheldAmount (lines 101",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Dispenser.sol",
+          "line_start": 1007,
+          "line_end": 1041,
+          "desc": "When withheld amounts exist for a chain, transferAmount is reduced by the withheld amount, but the L2 dispenser's queued redemptions can consume the withheld OLAS balance before the next reduced-transfer batch arrives, creating an irrecoverable deficit."
+        }
+      ],
+      "impact": "Permanent OLAS deficit on L2 dispenser if withheld tokens are consumed by redeem() before the compensating batch arrives. Staking targets may not receive allocated incentives.",
+      "proof_of_concept": "1. Epoch 1: 100 OLAS sent to L2, target invalid -> 100 OLAS withheld on L2. A different target's 50 OLAS deposit was queued due to pause.\n2. L2 calls syncWithheldTokens() -> L1 records mapChainIdWithheldAmounts[chainId] = 100. L2 withheldAmount = 0.\n3. L2 contract balance: 150 OLAS (100 withheld-in-contract + 50 queued-but-undelivered from a prior batch).\n4. Someone calls redeem() for the 50 OLAS queued request. L2 balance: 100 OLAS.\n5. Epoch 2: Nominee claims 120 OLAS. L1 deducts withheld: transferAmount = 120 - 100 = 20. Only 20 OLAS minted and bridged.\n6. Bridge message tells L2 to distribute 120 OLAS. L2 has: 100 + 20 = 120 OLAS. This works.\n7. But if in step 4, someone redeems 80 OLAS instead of 50 (from multiple queued entries), L2 balance becomes 70. After bridging 20 more: 90 OLAS < 120 needed. 30 OLAS deficit, targets get queued.",
+      "remediation": "Track withheld amounts separately from redeemable balances on L2. Ensure redeem() cannot consume tokens earmarked as withheld-but-synced."
+    },
+    {
+      "title": "VoteWeighting.removeNominee Does Not Zero the Nominee's pointsSum Slope, Causing Accelerated Decay of Global Weight Sum",
+      "severity": "high",
+      "summary": "When removeNominee is called:\n1. pointsWeight[nomineeHash][nextTime].bias is set to 0\n2. pointsSum[nextTime].bias = oldSum - oldWeight (correct for next week)\n3. pointsSum[nextTime].slope is NOT adjusted — it still includes the slope from all voters who voted for the removed nominee\n\nAs _getSum() iterates week by week, it applies: pt.bias -= pt.slope * WEEK. Since pt.slope includes the removed nominee's voters' slopes, bias decays faster than it should. Meanwhile, individual nominees' weights (c",
+      "description": [
+        {
+          "file": "governance/contracts/VoteWeighting.sol",
+          "line_start": 602,
+          "line_end": 612,
+          "desc": "removeNominee zeroes the nominee's bias (pointsWeight[nomineeHash][nextTime].bias = 0) and adjusts pointsSum[nextTime].bias = oldSum - oldWeight, but does NOT subtract the removed nominee's slope from pointsSum[nextTime].slope. The stale slope causes pointsSum to decay faster than the actual sum of remaining nominees."
+        }
+      ],
+      "impact": "Systematic over-allocation of staking incentives across all chains and nominees after any nominee removal. Compounds over time until removed nominees' voters' locks expire. Could lead to minting more OLAS than the inflation schedule permits.",
+      "proof_of_concept": "1. 10 nominees exist, each with proportional bias of 100 and slope contributing 0.1 per second.\n2. pointsSum.bias = 1000, pointsSum.slope = 1.0 total.\n3. Owner removes nominee A (individual weight 100, voters contributing slope 0.1).\n4. After removal: pointsSum.bias = 900 (correct), pointsSum.slope = 1.0 (should be 0.9).\n5. After 1 week: pointsSum.bias decays by 1.0 * 604800 instead of correct 0.9 * 604800.\n6. Bias decays ~11% faster per week than correct. After a few weeks, pointsSum.bias << sum of individual nominee weights.\n7. Each remaining nominee's relative weight becomes inflated. Sum of all relative weights > 1e18.\n8. calculateStakingIncentives allocates more total OLAS across all nominees than the epoch's stakingIncentive budget.",
+      "remediation": "When removing a nominee, also subtract the nominee's current slope from pointsSum[nextTime].slope. Additionally, cancel all future changesSum entries for voters of the removed nominee, or require all voters to call revokeRemovedNomineeVotingPower before removal takes effect."
+    },
+    {
+      "title": "Tokenomics.changeTokenomicsParameters Uses Unsafe Downcast Without Bounds Check, Allowing Silent Parameter Corruption via Governance",
+      "severity": "high",
+      "summary": "In changeTokenomicsParameters:\n\nLine 652: `if (uint72(_devsPerCapital) > MIN_PARAM_VALUE)` - If _devsPerCapital is, say, 2^72 + 5, it gets truncated to 5 as uint72. If 5 > MIN_PARAM_VALUE, then devsPerCapital is set to 5 instead of the intended 2^72+5. The owner thinks they set a large value but actually set a tiny one.\n\nLine 660: Same issue with `uint72(_codePerDev)`.\n\nLine 677: `if (uint32(_epochLen) >= MIN_EPOCH_LENGTH && uint32(_epochLen) <= MAX_EPOCH_LENGTH)` - A value like MIN_EPOCH_LENGTH",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Tokenomics.sol",
+          "line_start": 651,
+          "line_end": 681,
+          "desc": "changeTokenomicsParameters checks if uint72(_devsPerCapital) > MIN_PARAM_VALUE, but this casts the input to uint72 BEFORE comparing, silently truncating values > 2^72-1. Similarly, uint32(_epochLen) truncates large values before range comparison."
+        }
+      ],
+      "impact": "Silent corruption of critical tokenomics parameters affecting IDF calculations, epoch timing, and veOLAS eligibility thresholds. Could lead to incorrect incentive distributions.",
+      "proof_of_concept": "1. DAO proposes changing devsPerCapital to a new value calculated off-chain.\n2. Due to a bug in the governance proposal encoding, the value is 2^72 + intended_value.\n3. uint72() truncation silently reduces it to intended_value mod 2^72.\n4. If the truncated value > MIN_PARAM_VALUE, it's accepted without error.\n5. The IDF calculation uses the truncated value, producing incorrect incentive distributions for the epoch.\n6. No one notices because the function emits the truncated value in the event, matching what was stored.",
+      "remediation": "Add explicit overflow checks before casting: require(_devsPerCapital <= type(uint72).max) before the cast, or use SafeCast library."
+    },
+    {
+      "title": "EthereumDepositProcessor._deposit Reverts Entire Batch If Any Single Target Has Zero Emissions, With No OLAS Recovery Mechanism",
+      "severity": "high",
+      "summary": "EthereumDepositProcessor._deposit() processes targets in a loop. For each target, it calls IStakingFactory(stakingFactory).verifyInstanceAndGetEmissionsAmount(target) with a regular call (line 99). If the result is 0, it reverts with TargetEmissionsZero (line 103). This is critically different from L2 dispensers which use a low-level call and gracefully skip invalid targets.\n\nThe full sequence is:\n1. Dispenser.claimStakingIncentivesBatch() calls _calculateStakingIncentivesBatch(), which computes",
+      "description": [
+        {
+          "file": "tokenomics/contracts/staking/EthereumDepositProcessor.sol",
+          "line_start": 99,
+          "line_end": 104,
+          "desc": "_deposit() calls verifyInstanceAndGetEmissionsAmount with a regular (non-low-level) call and reverts if limitAmount == 0, which blocks all other targets in the same batch from receiving deposits. OLAS tokens transferred to EthereumDepositProcessor before the call are left stranded."
+        }
+      ],
+      "impact": "DoS of all Ethereum staking incentive claims. A single malicious target deployer can block all other legitimate Ethereum staking targets from receiving their allocated OLAS incentives indefinitely.",
+      "proof_of_concept": "1. An attacker creates a staking instance that initially passes verification.\n2. The instance gets voted on alongside legitimate instances and allocated staking incentives.\n3. Before the batch claim transaction, the deployer (attacker) calls setInstanceStatus(instance, false) on StakingFactory.\n4. When claimStakingIncentivesBatch is called for Ethereum chain, _deposit() iterates, reaches the disabled target, reverts.\n5. ALL Ethereum staking targets in the batch are denied incentives. No one can claim until the situation is resolved.\n6. The attacker can repeatedly enable/disable to keep blocking claims, griefing all Ethereum staking targets.",
+      "remediation": "Add try/catch around the verification and deposit in _deposit(), similar to how DefaultTargetDispenserL2._processData() uses low-level calls. Gracefully skip or refund amounts for invalid targets instead of reverting the entire batch."
+    },
+    {
+      "title": "Dispenser._distributeStakingIncentivesBatch Sends Full valueAmounts[i] Despite Filtering Zero-Incentive Targets, Causing ETH Overpayment for Bridge Fees",
+      "severity": "high",
+      "summary": "In _distributeStakingIncentivesBatch (lines 448-497), before calling the deposit processor, the function filters out zero-incentive targets (lines 460-479). This means updatedStakingTargets and updatedStakingAmounts may be smaller than the original arrays.\n\nHowever, valueAmounts[i] was provided by the caller based on ALL targets including those that ended up with zero incentives. The caller has no way to predict which targets will have zero incentive (it depends on calculateStakingIncentives' co",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Dispenser.sol",
+          "line_start": 488,
+          "line_end": 496,
+          "desc": "_distributeStakingIncentivesBatch sends valueAmounts[i] as msg.value to each deposit processor's sendMessageBatch, but if some targets had zero incentives and were filtered out, the value amount is excessive for the actual batch size."
+        }
+      ],
+      "impact": "ETH overpayment for bridge fees with no refund mechanism. Users lose ETH proportional to the number of filtered-out zero-incentive targets across all chains.",
+      "proof_of_concept": "1. Caller constructs a batch with 5 targets per chain. They estimate 0.1 ETH bridge fee per target = 0.5 ETH per chain.\n2. 3 of the 5 targets get zero incentive because their weight is below minStakingWeight.\n3. _distributeStakingIncentivesBatch filters them out, sending only 2 targets to the bridge.\n4. But 0.5 ETH (not 0.2 ETH) is sent as msg.value to the deposit processor.\n5. For Arbitrum: the deposit processor's _sendMessage calculates totalCost = cost[0] + cost[1] for 2 targets, and checks msg.value >= totalCost. The excess 0.3 ETH stays in the deposit processor with no recovery function.\n6. Over time, significant ETH accumulates in deposit processors.",
+      "remediation": "Recalculate the required value amount after filtering zero-incentive targets, or implement a refund mechanism for excess ETH. Alternatively, allow the deposit processors to refund excess ETH to the caller."
+    },
+    {
+      "title": "Tokenomics checkpoint() Year Boundary Logic Only Handles Single Year Crossings, Miscalculating Inflation for Multi-Year Gaps",
+      "severity": "high",
+      "summary": "In checkpoint(), the inflation calculation at lines 1126-1147 handles year changes:\n\n```\nnumYears = (block.timestamp - timeLaunch) / ONE_YEAR;\nif (numYears > currentYear) {\n    yearEndTime = timeLaunch + numYears * ONE_YEAR;\n    inflationPerEpoch = (yearEndTime - prevEpochTime) * curInflationPerSecond;\n    curInflationPerSecond = getInflationForYear(numYears) / ONE_YEAR;\n    inflationPerEpoch += (block.timestamp - yearEndTime) * curInflationPerSecond;\n}\n```\n\nThis computes yearEndTime as the STAR",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Tokenomics.sol",
+          "line_start": 1126,
+          "line_end": 1147,
+          "desc": "The year boundary calculation assumes at most one year boundary is crossed per epoch (numYears == currentYear + 1), but does not handle the case where an epoch spans multiple years (numYears > currentYear + 1), which could happen if checkpoint is not called for over a year."
+        }
+      ],
+      "impact": "Under current parameters, the risk is mitigated by the one-year epoch cap. However, if MAX_EPOCH_LENGTH is ever increased or if edge cases near year boundaries compound, inflation calculations would skip intermediate years' rates, leading to incorrect OLAS minting amounts.",
+      "proof_of_concept": "1. Epoch length is set to 11 months. currentYear = 5.\n2. Previous epoch ended 1 month before year 5->6 boundary.\n3. No one calls checkpoint for 11 months. diffNumSeconds = 11 months < ONE_YEAR.\n4. checkpoint is called. numYears = 6, currentYear = 5.\n5. yearEndTime = timeLaunch + 6 * ONE_YEAR. inflationPerEpoch uses year 5 rate for first 10 months, year 6 rate for last 1 month. This is correct for single crossing.\n6. The real risk materializes if governance increases MAX_EPOCH_LENGTH or if the code is upgraded to relax this constraint. Under current parameters, at most one boundary can be crossed per epoch.",
+      "remediation": "Add a loop to handle multiple year boundaries: iterate from currentYear+1 to numYears, accumulating inflation at each year's rate for the portion of the epoch within that year."
+    },
+    {
+      "title": "DefaultTargetDispenserL2.redeem() Does Not Re-verify Staking Target, Allowing Deposits to Disabled or Invalid Targets",
+      "severity": "high",
+      "summary": "When _processData() is called and the OLAS balance is insufficient or the contract is paused, the staking request is queued via stakingQueueingNonces[queueHash] = true (line 199). Later, anyone can call redeem() to fulfill the queued request.\n\nredeem() (lines 266-303) performs:\n1. Pause check\n2. Hash verification (target, amount, batchNonce exists in queue)\n3. Balance check (sufficient OLAS)\n4. approve + deposit to target\n5. Remove from queue\n\nCritically, redeem() does NOT re-verify the target b",
+      "description": [
+        {
+          "file": "tokenomics/contracts/staking/DefaultTargetDispenserL2.sol",
+          "line_start": 266,
+          "line_end": 303,
+          "desc": "redeem() only checks that the (target, amount, batchNonce) hash was queued but does not re-verify the target against the StakingFactory. A target that was valid when queued but subsequently disabled/corrupted receives OLAS tokens when redeemed."
+        }
+      ],
+      "impact": "OLAS tokens deposited to staking contracts that would fail current verification checks. If the staking contract has been compromised, the deposited OLAS could be stolen.",
+      "proof_of_concept": "1. A staking instance is valid and receives a staking incentive message via bridge.\n2. The L2 dispenser is paused at that moment, so the request is queued: stakingQueueingNonces[hash(target, 1000, nonce)] = true.\n3. The staking instance's deployer calls setInstanceStatus(instance, false) on StakingFactory, disabling it.\n4. The L2 dispenser is unpaused.\n5. Anyone calls redeem(target, 1000, nonce). The function doesn't check if the target is still valid.\n6. 1000 OLAS is approved and deposited to the disabled/potentially compromised staking contract.\n7. If the staking contract has been modified to steal deposited tokens (e.g., via a proxy upgrade), the OLAS is lost.",
+      "remediation": "Add a re-verification step in redeem() by calling stakingFactory.verifyInstanceAndGetEmissionsAmount(target) and checking the result before depositing. If verification fails, withhold the amount instead."
+    },
+    {
+      "title": "GnosisDepositProcessorL1._sendMessage Does Not Pass gasLimitMessage When Tokens Are Transferred, Using OmniBridge Default Gas",
+      "severity": "high",
+      "summary": "GnosisDepositProcessorL1._sendMessage has two code paths:\n\n1. transferAmount > 0 (lines 63-71): Uses IBridge(l1TokenRelayer).relayTokensAndCall(olas, l2TargetDispenser, transferAmount, data). This sends tokens AND a message via OmniBridge. The bridgePayload (which contains gasLimitMessage) is NOT decoded or used. The gas limit for the L2 execution is determined by OmniBridge's internal parameters.\n\n2. transferAmount == 0 (lines 71-93): Uses IBridge(l1MessageRelayer).requireToPassMessage(l2Target",
+      "description": [
+        {
+          "file": "tokenomics/contracts/staking/GnosisDepositProcessorL1.sol",
+          "line_start": 62,
+          "line_end": 93,
+          "desc": "When transferAmount > 0, the function calls relayTokensAndCall() which sends both tokens and a message via OmniBridge. The gasLimitMessage parameter from bridgePayload is only decoded and used in the else branch (transferAmount == 0). When tokens are sent, the message gas limit is determined entirely by the OmniBridge's internal defaults."
+        }
+      ],
+      "impact": "Message delivery failure on Gnosis Chain when token transfers are involved with large batches. OLAS tokens arrive on L2 but distribution instructions are lost, requiring DAO intervention to recover.",
+      "proof_of_concept": "1. A batch claim includes 20+ Gnosis Chain staking targets with nonzero incentives.\n2. The caller carefully provides enough gas in bridgePayload for 20 targets.\n3. Since transferAmount > 0, GnosisDepositProcessorL1._sendMessage uses relayTokensAndCall, ignoring the gas limit.\n4. OmniBridge uses its default gas limit, which may be insufficient for processing 20 targets in _processData().\n5. The OLAS tokens are successfully transferred to the L2 dispenser.\n6. But the message execution on L2 fails due to out-of-gas.\n7. The L2 dispenser has OLAS tokens but no instruction on how to distribute them.\n8. DAO must manually call processDataMaintenance() to recover.",
+      "remediation": "Decode gasLimitMessage from bridgePayload in both code paths. For the relayTokensAndCall path, either find a way to pass the gas limit to OmniBridge, or use separate token transfer and message calls (like Arbitrum and Optimism do)."
+    },
+    {
+      "title": "Treasury.withdrawToAccount Silently Returns Without Sending ETH Rewards If ETHFromServices < accountRewards",
+      "severity": "high",
+      "summary": "In Treasury.withdrawToAccount():\n\nLine 402: `if (accountRewards > 0 && amountETHFromServices >= accountRewards)` - If ETHFromServices is less than accountRewards, the ETH transfer is completely skipped. No revert, no error.\n\nLine 413: `if (accountTopUps > 0)` - If there are top-ups, OLAS is minted and `success = true` is returned.\n\nSo if a user claims both ETH rewards AND OLAS top-ups, but ETHFromServices has been depleted (e.g., by previous claimants or a treasury rebalance), the user receives ",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Treasury.sol",
+          "line_start": 400,
+          "line_end": 420,
+          "desc": "withdrawToAccount checks if amountETHFromServices >= accountRewards before sending ETH, but if the condition fails, it silently skips the ETH transfer without reverting. The function still processes the topUp mint, and returns success=true from the topUp branch, causing the caller (Dispenser) to believe the claim succeeded."
+        }
+      ],
+      "impact": "Permanent loss of ETH rewards for component/agent owners when Treasury's ETHFromServices balance is insufficient. The rewards are cleared from accounting but never paid out.",
+      "proof_of_concept": "1. During an epoch, total ETH donations = 10 ETH. ETHFromServices = 10 ETH.\n2. Tokenomics allocates: 5 ETH to treasury, 2.5 ETH to component owners, 2.5 ETH to agent owners.\n3. Tokenomics checkpoint calls rebalanceTreasury(5 ETH). ETHFromServices = 5 ETH, ETHOwned += 5 ETH.\n4. Component owner A claims: reward = 2.5 ETH, topUp = X OLAS. Treasury checks: 5 >= 2.5 ✓. Sends 2.5 ETH. ETHFromServices = 2.5.\n5. Agent owner B claims: reward = 2.5 ETH, topUp = Y OLAS. Treasury checks: 2.5 >= 2.5 ✓. Sends 2.5 ETH. ETHFromServices = 0.\n6. Component owner C (from next epoch's rewards) claims: reward = 1 ETH, topUp = Z OLAS. Treasury checks: 0 >= 1 ✗. ETH NOT sent.\n7. But topUp Z OLAS IS minted. success = true. Dispenser considers claim successful.\n8. Owner C's reward balance was already cleared in Tokenomics. Their 1 ETH is permanently lost.",
+      "remediation": "Either revert the entire withdrawToAccount if ETH rewards cannot be paid, or track the unfulfilled ETH amount and allow users to claim it later. At minimum, return success=false when ETH rewards are skipped."
+    },
+    {
+      "title": "Dispenser.claimOwnerIncentives Fails Permanently When reward > 0 but topUp == 0 and ETHFromServices Is Insufficient",
+      "severity": "high",
+      "summary": "When a user has ETH rewards (reward > 0) but no OLAS top-ups (topUp == 0), the claim flow is:\n\n1. accountOwnerIncentives clears rewards and returns (reward, 0)\n2. reward + topUp > 0, so withdrawToAccount is called\n3. In withdrawToAccount: accountRewards > 0 but ETHFromServices < accountRewards → ETH skipped\n4. accountTopUps == 0 → no OLAS mint → success stays at default (false in Solidity)\n5. Back in claimOwnerIncentives: !success → revert ClaimIncentivesFailed\n\nThe revert undoes the balance cle",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Dispenser.sol",
+          "line_start": 806,
+          "line_end": 832,
+          "desc": "claimOwnerIncentives calls accountOwnerIncentives which clears reward/topUp balances, then calls withdrawToAccount. If withdrawToAccount returns false (no ETH available, no topUp to trigger success=true), the function reverts with ClaimIncentivesFailed. But the revert also undoes the balance clearing, allowing the user to try again. However, the condition that caused ETHFromServices to be insufficient may persist."
+        }
+      ],
+      "impact": "Users with ETH-only rewards (no top-ups) can be permanently blocked from claiming if ETHFromServices is depleted by earlier claimants.",
+      "proof_of_concept": "1. An epoch has minimal ETH donations (e.g., just above minAcceptedETH).\n2. After treasury fraction, only 0.03 ETH is allocated to component/agent owner rewards.\n3. Multiple owners have accumulated pending rewards from previous epochs.\n4. Owner A claims first: gets their 0.01 ETH reward. ETHFromServices drops.\n5. Owner B tries to claim: reward = 0.02 ETH, topUp = 0. withdrawToAccount returns false. Claim reverts.\n6. Owner B must wait for more donations to replenish ETHFromServices.\n7. If donations remain low, Owner B may wait indefinitely.",
+      "remediation": "Allow partial claims where ETH rewards are skipped if insufficient but the claim still succeeds. Or maintain a queue for unfulfilled ETH rewards. At minimum, don't revert the entire claim when only ETH is unavailable."
+    },
+    {
+      "title": "StakingFactory.verifyInstanceAndGetEmissionsAmount Trusts Instance-Reported emissionsAmount Without Cross-Checking",
+      "severity": "high",
+      "summary": "The emission amount limit for a staking instance is determined by:\n1. The instance's self-reported emissionsAmount() value\n2. The StakingVerifier's global emissionsLimit (rewardsPerSecondLimit * timeForEmissionsLimit * numServicesLimit)\n3. The minimum of these two values is used\n\nThe issue is that the instance's emissionsAmount is set during initialization and can be an arbitrary value chosen by the deployer. StakingVerifier.verifyInstance() (lines 179-223) checks rewardsPerSecond <= rewardsPerS",
+      "description": [
+        {
+          "file": "registries/contracts/staking/StakingFactory.sol",
+          "line_start": 294,
+          "line_end": 313,
+          "desc": "verifyInstanceAndGetEmissionsAmount calls IStaking(instance).emissionsAmount() to get the emissions amount. The instance itself reports its emissions, and this value is only capped by the verifier's global emissionsLimit, but not validated against the instance's actual staking parameters (rewardsPerSecond * maxNumServices * timeForEmissions)."
+        }
+      ],
+      "impact": "Staking instances can claim more OLAS emissions than their actual staking parameters require, draining the staking incentive pool. The excess OLAS is controlled by the instance deployer.",
+      "proof_of_concept": "1. StakingVerifier is configured with generous limits: rewardsPerSecondLimit = 1e18, timeForEmissionsLimit = 30 days, numServicesLimit = 100.\n2. emissionsLimit = 1e18 * 2592000 * 100 = 2.592e26 OLAS.\n3. Attacker creates a staking instance with emissionsAmount = type(uint256).max and minimal actual staking parameters.\n4. verifyInstanceAndGetEmissionsAmount returns min(uint256.max, 2.592e26) = 2.592e26.\n5. This limitAmount is used in DefaultTargetDispenserL2._processData (line 166) to cap deposits.\n6. The staking instance can receive up to 2.592e26 OLAS per epoch, far more than it needs for its actual staking configuration.\n7. The excess OLAS accumulates in the staking contract, which the deployer controls.",
+      "remediation": "In StakingVerifier.verifyInstance or getEmissionsAmountLimit, validate that the instance's emissionsAmount is consistent with its rewardsPerSecond, maxNumServices, and timeForEmissions parameters. Add a per-instance emissions limit calculation rather than using only the global maximum."
+    },
+    {
+      "title": "Dispenser.claimStakingIncentives and claimStakingIncentivesBatch Have No Access Control, Allowing Anyone to Trigger Claims for Any Nominee",
+      "severity": "high",
+      "summary": "Both claimStakingIncentives (line 953) and claimStakingIncentivesBatch (line 1058) have no access control - any address can call them for any nominee. While this is likely by design (permissionless claiming), it creates several issues:\n\n1. The caller controls bridgePayload, which for Arbitrum includes refundAccount (line 131-136 in ArbitrumDepositProcessorL1). If refundAccount is set to the caller's address, any excess ETH from the bridge fee is refunded to the caller, not the intended beneficia",
+      "description": [
+        {
+          "file": "tokenomics/contracts/Dispenser.sol",
+          "line_start": 953,
+          "line_end": 1047,
+          "desc": "claimStakingIncentives and claimStakingIncentivesBatch are external payable functions with no access control. Anyone can call them for any chain/target pair, triggering OLAS minting and bridge transfers. The bridge payload (including refund addresses) is specified by the caller."
+        }
+      ],
+      "impact": "Front-running of staking incentive claims. Malicious callers can control bridge fee refund routing and force suboptimal claiming patterns on legitimate targets.",
+      "proof_of_concept": "1. A legitimate operator wants to claim 10 epochs for their Arbitrum staking target.\n2. A front-runner sees this transaction in the mempool.\n3. Front-runner calls claimStakingIncentives with numClaimedEpochs=1, routing the Arbitrum refundAccount to their own address.\n4. The claim succeeds for 1 epoch. mapLastClaimedStakingEpochs is updated.\n5. The legitimate operator's transaction now fails (or claims only epochs 2-10).\n6. The front-runner provided exactly enough ETH for bridge fees, but with a refund address that captures any excess.\n7. Repeat each epoch to grief the legitimate operator.",
+      "remediation": "Consider restricting claimStakingIncentives to the nominee address itself (for EVM chains where the target is a contract, this would be the deployer or an authorized claimer). Alternatively, ensure bridgePayload refund addresses are validated or hardcoded to the target."
+    }
+  ]
+}

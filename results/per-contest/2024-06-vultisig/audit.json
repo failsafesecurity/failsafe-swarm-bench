@@ -1,0 +1,340 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Whitelist Bypass: Unwhitelisted Addresses Pass checkWhitelist Due to Default Mapping Value",
+      "severity": "high",
+      "summary": "The checkWhitelist function uses the condition `_allowedWhitelistIndex == 0 || _whitelistIndex[to] > _allowedWhitelistIndex` to revert for non-whitelisted users. However, unwhitelisted addresses have a default _whitelistIndex of 0. When _allowedWhitelistIndex is set to any value > 0 (normal operation), the check `0 > N` evaluates to false, so the revert is never triggered for unwhitelisted addresses. This means ANY address can buy tokens from the Uniswap V3 pool during the whitelist period, comp",
+      "description": [
+        {
+          "file": "Whitelist.sol",
+          "line_start": 152,
+          "line_end": 154,
+          "desc": "Default mapping value 0 for _whitelistIndex[to] bypasses `_whitelistIndex[to] > _allowedWhitelistIndex` check when _allowedWhitelistIndex > 0"
+        }
+      ],
+      "impact": "CRITICAL: The whitelist mechanism is completely non-functional during the intended whitelist period. Any address (not just whitelisted ones) can purchase tokens from the Uniswap V3 pool, destroying fair launch mechanics. The only remaining protection is the per-address contribution cap (_maxAddressCap), but since anyone can participate, an unlimited number of Sybil addresses can drain the pool. Whitelisted participants who expected priority access receive no advantage.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Missing Upper Price Range Validation in initILOPool Allows Invalid Liquidity Position Creation",
+      "severity": "high",
+      "summary": "ILOManager.initILOPool only validates `sqrtRatioLowerX96 < _project.initialPoolPriceX96` but does NOT validate `_project.initialPoolPriceX96 < sqrtRatioUpperX96`. If initialPoolPriceX96 >= sqrtRatioUpperX96, the concentrated liquidity position is entirely in one token. The buy() and launch() functions use _saleAmountNeeded which calculates liquidity based on the assumption that price is within range, producing incorrect values. Investors purchase positions with miscalculated liquidity, and launc",
+      "description": [
+        {
+          "file": "ILOManager.sol",
+          "line_start": 74,
+          "line_end": 74,
+          "desc": "require(sqrtRatioLowerX96 < _project.initialPoolPriceX96 && sqrtRatioLowerX96 < sqrtRatioUpperX96, 'RANGE') — missing initialPoolPriceX96 < sqrtRatioUpperX96"
+        },
+        {
+          "file": "ILOPool.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: buy(uint256,address)"
+        }
+      ],
+      "impact": "HIGH severity. The missing validation allows creating permanently broken ILO pools. Investors who deposit funds face: (1) launch failure requiring wait until refundDeadline, (2) if a malicious admin combines this with the owner extending refundDeadline, funds could be locked indefinitely. Even in the benign case, this is a functional bug that wastes gas and delays fund recovery.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "launch() Sets _launchSucceeded After External Calls Creating Reentrancy Window",
+      "severity": "high",
+      "summary": "In ILOPool.launch(), _launchSucceeded is set to true as the LAST operation, after addLiquidity (external call to Uniswap), minting project NFTs, and _refundProject (external call transferring SALE_TOKEN). If SALE_TOKEN has transfer callbacks (e.g., ERC777 or custom hook), the callback executes while _launchSucceeded is still false. If ILOManager owner has set refundDeadline <= block.timestamp, the refundable() modifier would pass, potentially allowing state corruption. Even without callbacks, th",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 232,
+          "line_end": 270,
+          "desc": "_launchSucceeded = true is the last statement; _refundProject makes external safeTransfer call before this"
+        }
+      ],
+      "impact": "The primary impact is a code quality/security defect rather than an immediately exploitable vulnerability. The CEI violation means: (1) Inconsistent state window where _launchSucceeded is false but liquidity is deployed; (2) Potential for future composability issues if additional functions are added that depend on _launchSucceeded; (3) With callback-capable SALE_TOKEN and manipulated refundDeadline, the launch transaction could be DoS'd if the callback reverts. The state corruption scenario (both flags true) appears prevented by the RAISE_TOKEN balance being depleted, but this is a fragile defense-by-coincidence rather than a proper safeguard.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Whitelist.receive() refunds ETH via transfer() causing self-whitelist DoS for contract wallets and potentially blocking whitelist growth",
+      "severity": "high",
+      "summary": "Whitelist.receive() self-whitelists sender then refunds msg.value using `payable(_msgSender()).transfer(msg.value)`, which forwards only 2300 gas. Contract wallets (multisigs, smart accounts) with non-trivial receive/fallback logic will revert on transfer, preventing self-whitelisting for those users. This can be exploited as a griefing/availability issue for legitimate participants who rely on smart accounts, and can also become a systemic DoS if most users are contract wallets.",
+      "description": [
+        {
+          "file": "Whitelist.sol",
+          "line_start": 52,
+          "line_end": 66,
+          "desc": "refund uses payable(msg.sender).transfer(msg.value) (2300 gas stipend)"
+        }
+      ],
+      "impact": "MEDIUM severity. Contract wallet users (a significant and growing portion of the Ethereum user base) are entirely excluded from the self-whitelist feature. This reduces participation in the token launch and creates an operational burden on the Whitelist owner to manually add these addresses. The defect does not cause fund loss but creates a denial of service for a meaningful user segment. The constructor defaults _isSelfWhitelistDisabled to false (bool default), confirming self-whitelist is intended to be active by default.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "claim() Collects ALL Uniswap Position Fees, Stealing Other Users' Shares and Causing Permanent DoS",
+      "severity": "high",
+      "summary": "ILOPool.claim() calls pool.collect(type(uint128).max) which sweeps ALL accumulated fees for the entire shared Uniswap V3 position. User's calculated fee share (amount0/amount1) is sent to the token owner, and the remainder (amountCollected - amount) is sent to FEE_TAKER. Since the remainder includes other users' uncollected fees, those fees are permanently stolen. When subsequent users claim, their calculated fee amounts exceed what collect() returns (because earlier collect swept everything), c",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 175,
+          "line_end": 222,
+          "desc": "pool.collect(address(this), TICK_LOWER, TICK_UPPER, type(uint128).max, type(uint128).max) collects ALL owed tokens for shared position; then amountCollected0-amount0 sent to feeTaker where amount0 may include fees not backed by collected tokens for later claimers"
+        }
+      ],
+      "impact": "CRITICAL: (1) Fee theft: FEE_TAKER receives all non-claiming users' accumulated trading fees on every claim. (2) Permanent DoS: After the first claim, all other users' claim() calls revert because calculated fee amounts exceed available tokens. (3) Locked funds: Users cannot access their vested liquidity or accumulated fees. There is no alternative claim path. The only positions that work are those claimed when fee accumulation is exactly zero (practically impossible for active pools).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Per-User Cap Bypass via NFT Transfer Enables Single Actor to Fill Hard Cap",
+      "severity": "high",
+      "summary": "ILOPool.buy() checks `balanceOf(recipient) == 0` to determine if a new NFT should be minted. The per-user cap is enforced against `_position.raiseAmount` of the current NFT. If a user transfers their NFT to another address, balanceOf drops to 0, and they can buy() again with a fresh position and full maxCapPerUser allocation. Repeated indefinitely until hardCap is reached.",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 104,
+          "line_end": 118,
+          "desc": "balanceOf(recipient) == 0 check for minting; cap enforced per-position raiseAmount, not per-address cumulative; ERC721 transferable"
+        }
+      ],
+      "impact": "HIGH severity. The maxCapPerUser is the primary fairness mechanism ensuring equitable distribution among whitelisted participants. A single actor can monopolize the entire ILO by filling the hardCap, completely excluding all other legitimate participants. This violates the fundamental economic guarantee of fair distribution (INV-ECON-002 related). The attacker captures the full upside if the token appreciates post-launch.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Uniswap V3 Pool Price Manipulation Griefs Launch Permanently",
+      "severity": "high",
+      "summary": "ILOManager.launch() requires the Uniswap V3 pool's current sqrtPriceX96 to exactly match the project's initialPoolPriceX96. Since the pool is publicly created during initProject, anyone can swap on it to move the price away from the initial value. The attacker can repeatedly move the price to block every launch attempt between launchTime and refundDeadline, forcing the project into refund state. This doesn't require observing pending transactions — the attacker simply maintains the pool at a dif",
+      "description": [
+        {
+          "file": "ILOManager.sol",
+          "line_start": 138,
+          "line_end": 139,
+          "desc": "require(_cachedProject[uniV3PoolAddress].initialPoolPriceX96 == sqrtPriceX96, 'UV3P') — exact price match on publicly accessible pool"
+        }
+      ],
+      "impact": "HIGH severity. This vulnerability allows any actor to permanently prevent any ILO project from launching. The impact includes: (1) All investor funds are locked until refundDeadline (default 7 days), causing opportunity cost. (2) Project's SALE_TOKEN is locked until refund. (3) The project cannot proceed at all. (4) The attacker can use this for extortion or competitive sabotage. (5) Every project using ILOManager is vulnerable. The attack cost is minimal (< 1 ETH including gas) while the damage is potentially millions in locked capital and failed launches.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Oracle TWAP Period Fallback to Near-Spot Price Enables Whitelist Cap Bypass",
+      "severity": "high",
+      "summary": "UniswapV3Oracle.peek() uses `period = PERIOD < longestPeriod ? PERIOD : longestPeriod`. For a newly created pool with minimal observation history, longestPeriod could be as low as a few seconds, making the TWAP effectively a spot price. An attacker can manipulate the pool's spot price in a single transaction (flash loan or large swap), causing the oracle to return an artificially low ETH estimate for VULT tokens. This allows buying far more VULT tokens than _maxAddressCap should permit, because ",
+      "description": [
+        {
+          "file": "UniswapV3Oracle.sol",
+          "line_start": 31,
+          "line_end": 36,
+          "desc": "uint32 period = PERIOD < longestPeriod ? PERIOD : longestPeriod; falls back to potentially 1-second TWAP"
+        },
+        {
+          "file": "Whitelist.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: checkWhitelist"
+        }
+      ],
+      "impact": "HIGH. The _maxAddressCap (default 3 ETH) is the primary fairness mechanism during the whitelist launch period. Bypassing it allows whales to monopolize the token launch, undermining fair distribution for legitimate whitelisted participants. The severity depends on pool age at oracle activation, but the code unconditionally permits degraded TWAP periods without any safety threshold.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permissionless initProject Allows Admin Hijacking of Token Pair Projects",
+      "severity": "high",
+      "summary": "ILOManager.initProject() is permissionless (no access control beyond afterInitialize). It sets msg.sender as the project admin for a Uniswap V3 pool address derived from the token pair. An attacker who knows a project's planned sale/raise token pair can call initProject first, becoming the admin. As admin, they can initialize ILO pools with malicious vesting configs (e.g., assigning 99% of liquidity shares to themselves), control the whitelist, and receive project refunds.",
+      "description": [
+        {
+          "file": "ILOManager.sol",
+          "line_start": 47,
+          "line_end": 54,
+          "desc": "No access control on initProject(); _project.admin = msg.sender; first caller wins for any token pair"
+        }
+      ],
+      "impact": "HIGH severity. The legitimate project team is permanently locked out from using their intended token pair (with that specific fee tier). If investors participate in attacker-controlled pools, the attacker can configure vesting to extract up to 99% of project liquidity shares. The attacker also controls whitelist (can block/allow arbitrary addresses) and can claim project refunds. This is an elevation of privilege vulnerability that undermines the entire project admin model.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Whitelist and Contribution Caps Completely Bypassed via Direct Token Transfers",
+      "severity": "high",
+      "summary": "The `_beforeTokenTransfer` hook in `VultisigWhitelisted` only enforces whitelist and cap checks if `from == _pool`. Whitelisted users can buy tokens from the pool and immediately transfer them to any blacklisted, unwhitelisted, or capped-out address via standard ERC20 transfers.",
+      "description": [
+        {
+          "file": "Whitelist.sol",
+          "line_start": 145,
+          "line_end": 146,
+          "desc": "if (from == _pool && to != owner()) { ... apply checks ... }"
+        },
+        {
+          "file": "VultisigWhitelisted.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _beforeTokenTransfer(address,address,uint256)"
+        }
+      ],
+      "impact": "HIGH impact: (1) Blacklist enforcement is completely ineffective — any blacklisted address can receive tokens through a proxy. (2) Whitelist enforcement only controls the initial purchase vector but not token distribution. (3) Contribution caps (_maxAddressCap) are meaningless since unlimited tokens can flow through whitelisted proxies. (4) The locked period only prevents direct pool purchases but doesn't freeze token movement. This fundamentally undermines the token distribution controls that the Whitelist contract was designed to enforce.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ILOManager Constructor Uses tx.origin for Ownership Creating Deployment Security Gap",
+      "severity": "high",
+      "summary": "ILOManager constructor calls `transferOwnership(tx.origin)`. When deployed via a factory, Create2 deployer, multisig, or deployment pipeline, tx.origin is the EOA that initiated the outer transaction, not necessarily the intended owner. Between deployment and initialize() (which transfers ownership to initialOwner), the tx.origin address has full owner privileges and can call setPlatformFee, setPerformanceFee, setFeeTaker, setILOPoolImplementation, etc. The deployment script (Deploy.s.sol) deplo",
+      "description": [
+        {
+          "file": "ILOManager.sol",
+          "line_start": 19,
+          "line_end": 21,
+          "desc": "constructor () { transferOwnership(tx.origin); } - tx.origin used instead of msg.sender"
+        }
+      ],
+      "impact": "MEDIUM impact. The tx.origin anti-pattern creates a privilege escalation window. The most persistent damage is modification of DEFAULT_DEADLINE_OFFSET (not reset by initialize()). Setting it to 0 would mean all future projects have refundDeadline = launchTime, enabling immediate refund at launch time. Other owner-settable values (fees, fee taker, implementation) are overwritten by initialize(). The initProject function requires afterInitialize guard, preventing project/pool creation before initialization.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Early whitelist phase can be fully DoSed if oracle consult period becomes 0 (no observations), reverting all pool buys",
+      "severity": "high",
+      "summary": "UniswapV3Oracle.peek() computes `period = min(PERIOD, longestObservationSecondsAgo)`. If longestObservationSecondsAgo returns 0 (e.g., pool has no initialized observations old enough), OracleLibrary.consult requires period!=0 and reverts ('BP'). Since Whitelist.checkWhitelist calls oracle.peek(amount) for pool-origin transfers, all buys from the pool revert, freezing distribution.",
+      "description": [
+        {
+          "file": "OracleLibrary.sol",
+          "line_start": 15,
+          "line_end": 18,
+          "desc": "consult(address pool, uint32 period) requires(period != 0, 'BP')"
+        },
+        {
+          "file": "UniswapV3Oracle.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: name()"
+        }
+      ],
+      "impact": "Medium severity. During initial pool deployment, all buys from the Uniswap pool revert when the whitelist is active and the oracle pool lacks observation history (at least 1 second old). This blocks the entire token distribution through the pool until the observation ages. The window is at minimum 1 block but could be longer if the pool has no activity. The owner can mitigate by disabling the whitelist contract or changing the oracle, but this changes the launch policy.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Tokens Break Refund Accounting",
+      "severity": "high",
+      "summary": "If `RAISE_TOKEN` is a fee-on-transfer token, the `buy` function records the full `raiseAmount` in `_positions[tokenId].raiseAmount` but the contract receives less. During a refund, the contract attempts to return the full `raiseAmount` to users. The last users to claim refunds will find the contract has insufficient balance, permanently losing their funds.",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 119,
+          "line_end": 122,
+          "desc": "TransferHelper.safeTransferFrom used without checking actual received balance"
+        }
+      ],
+      "impact": "MEDIUM severity. The code has a genuine defect - missing balance verification after incoming transfers. If a fee-on-transfer token is used as RAISE_TOKEN, approximately (fee_rate * total_users) users will permanently lose their deposited funds during the refund phase. The same issue also affects the launch path: the contract would attempt to deploy `totalRaised` worth of RAISE_TOKEN to Uniswap, but only holds `totalRaised * (1 - fee)`, causing launch to either fail or deploy less liquidity than intended. The impact is limited by the configuration dependency - standard ERC20 tokens are unaffected.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unnecessary Fund Locking on Failed Soft Cap Raises",
+      "severity": "high",
+      "summary": "If a sale ends without meeting the soft cap, investors cannot immediately reclaim their funds and must wait until the refund deadline, exposing them to unnecessary market risk.",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 248,
+          "line_end": 251,
+          "desc": "refundable modifier strictly requires block.timestamp >= _project.refundDeadline with no early exit for failed sales"
+        }
+      ],
+      "impact": "MEDIUM severity. Investor funds (RAISE_TOKEN) are locked for a deterministic period (up to launchTime + 7 days from sale end) even when it's provably impossible for the sale to succeed. This exposes investors to market risk on their RAISE_TOKEN (e.g., if RAISE_TOKEN is WETH or USDC, the opportunity cost of locked capital). The locking period could be extended further if the ILOManager owner sets a longer DEFAULT_DEADLINE_OFFSET or explicitly extends refundDeadline. While funds are not permanently lost (they will eventually be refundable), the unnecessary locking period is a code defect.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Zero-Duration Vest Schedule Causes Permanent Division-by-Zero DoS on Claims",
+      "severity": "high",
+      "summary": "_validateVestSchedule does not check that schedule[i].start < schedule[i].end. If a vesting entry has start == end, the _unlockedLiquidity function's else branch computes (vest.end - vest.start) * BPS = 0 * 10000 = 0 as the denominator in FullMath.mulDiv, causing a division by zero revert. This permanently DoSes all claim() calls for affected positions, locking vested liquidity forever.",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 283,
+          "line_end": 295,
+          "desc": "else branch: FullMath.mulDiv(vest.shares * totalLiquidity, block.timestamp - vest.start, (vest.end - vest.start) * BPS) with zero denominator when start==end"
+        },
+        {
+          "file": "ILOVest.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _validateVestSchedule(uint64,LinearVest[])"
+        }
+      ],
+      "impact": "LOW to MEDIUM. The code defect is real (missing validation), but the actual impact is a 1-second transient DoS, not a permanent fund lockup. An attacker (project admin) cannot permanently lock investor funds this way. The worst case is a brief inability to claim during one specific second, which resolves immediately after. The missing validation is still a code quality issue that should be fixed.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "ILOManager._initUniV3PoolIfNecessary may allow attacker-chosen initial pool price if pool exists uninitialized (sqrtPriceX96Existing==0)",
+      "severity": "high",
+      "summary": "When a Uniswap V3 pool already exists but slot0.sqrtPriceX96Existing == 0, ILOManager initializes it with the caller-provided sqrtPriceX96. If an attacker can cause a pool to exist in an uninitialized state (e.g., factory created pool but never initialized), the first initProject caller dictates initial price. That can affect downstream assumptions (launch price equality checks and sale economics).",
+      "description": [
+        {
+          "file": "ILOManager.sol",
+          "line_start": 86,
+          "line_end": 101,
+          "desc": "if pool exists and sqrtPriceX96Existing==0 then initialize(sqrtPriceX96) with caller-supplied value"
+        }
+      ],
+      "impact": "MEDIUM impact. An attacker can hijack any token pair + fee combination by becoming its project admin and setting an arbitrary initial price. This blocks legitimate projects from using that combination, forces them to use different fee tiers, and if the attacker proceeds to set up malicious vesting configs via initILOPool, could harm investors. The downstream launch() price check (initialPoolPriceX96 == current price) means the attacker's price choice directly constrains launch conditions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "buy() Allows Griefing Whitelisted Users by Filling Their Cap Without Consent",
+      "severity": "high",
+      "summary": "ILOPool.buy(raiseAmount, recipient) checks whitelist on `recipient` but transfers RAISE_TOKEN from `msg.sender`. An attacker can call buy(maxCapPerUser, victimAddress) to fill the victim's per-user cap allocation, spending the attacker's own tokens. The victim's cap is fully consumed, preventing them from participating on their own terms. The NFT is minted to the victim but with the attacker's chosen amount and timing.",
+      "description": [
+        {
+          "file": "ILOPool.sol",
+          "line_start": 96,
+          "line_end": 135,
+          "desc": "buy(raiseAmount, recipient) checks _isWhitelisted(recipient) but transfers from msg.sender; no consent mechanism for recipient"
+        }
+      ],
+      "impact": "MEDIUM severity. Direct impact: whitelisted users can have their ILO allocation forcibly consumed by an attacker. The victim receives a position NFT with vested liquidity, but at the attacker's chosen amount and timing, not their own. The victim cannot subsequently participate. Combined with the per-user cap bypass (NFT transfer trick from INV-ACCESS-001), an attacker could grief all legitimate users while bypassing their own cap to monopolize the ILO. The attacker's cost is maxCapPerUser * N victims in RAISE_TOKEN, which they lose to the victims' positions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "ILOManager.initialize() Race Allows Hostile Takeover Between Deployment and Configuration",
+      "severity": "high",
+      "summary": "ILOManager.initialize() has no access control beyond whenNotInitialized. If deployment and initialization happen in separate transactions (as supported by Init.s.sol), anyone observing the confirmed deployment can call initialize() first, setting themselves as owner with a malicious ILO_POOL_IMPLEMENTATION and FEE_TAKER.",
+      "description": [
+        {
+          "file": "ILOManager.sol",
+          "line_start": 24,
+          "line_end": 36,
+          "desc": "initialize() is external with only whenNotInitialized guard — no msg.sender check; sets owner via transferOwnership(initialOwner)"
+        }
+      ],
+      "impact": "CRITICAL. Complete protocol takeover: attacker becomes owner, controls pool implementation for all future ILO pools, receives all fees via FEE_TAKER, and can set near-100% fee rates. All future ILO pools would be compromised since they clone the attacker's malicious ILO_POOL_IMPLEMENTATION. The legitimate deployer cannot re-initialize as _initialized is permanently set to true.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

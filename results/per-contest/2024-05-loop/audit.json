@@ -1,0 +1,225 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "_claim for Non-ETH Tokens Sweeps All Contract ETH via Absolute Balance Instead of Swap Delta",
+      "severity": "high",
+      "summary": "In `_claim` for non-ETH tokens, after the swap via `_fillQuote`, `claimedAmount` is set to `address(this).balance` (absolute balance), not the delta from the swap. Any pre-existing ETH in the contract—from `receive()`, selfdestruct force-sends, or prior swap residuals—is captured by the claimer and deposited into lpETH on their behalf. The `_fillQuote` function correctly computes the delta (`boughtETHAmount = address(this).balance - boughtETHAmount`) but only uses it for the event. The actual cl",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 252,
+          "line_end": 255,
+          "desc": "claimedAmount = address(this).balance; lpETH.deposit{value: claimedAmount}(_receiver); — uses absolute balance not swap delta"
+        }
+      ],
+      "impact": "Any ETH sent to the contract after convertAllETH() is stolen by the next LRT claimer. The attack requires minimal capital (just 1 wei of any allowed LRT token locked before loopActivation). Sources of post-conversion ETH include: accidental sends via receive(), forced ETH via selfdestruct/coinbase, and potentially residual ETH from swap mechanics. While the amount stolen per occurrence depends on how much ETH accumulates, the code defect is clear and the vulnerability is exploitable.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "UniswapV3 Calldata Validation Bypass via Non-Standard ABI Encoding Offset",
+      "severity": "high",
+      "summary": "_decodeUniswapV3Data reads encodedPath data from hardcoded calldata offsets, skipping the dynamic bytes offset pointer at position 4. Standard ABI encoding places the bytes data at offset 0x80 (from args start), which the decoder assumes. An attacker can craft non-standard ABI encoding with a different offset pointer: fake path data at the standard position passes validation (correct inputToken=LRT, outputToken=WETH), while the real path data at the actual offset is followed by the 0x exchange p",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 329,
+          "line_end": 343,
+          "desc": "p := add(p, 36) skips bytes offset pointer; encodedPathLength/inputToken/outputToken read from hardcoded positions, not from ABI-decoded offset"
+        }
+      ],
+      "impact": "The primary impact is path manipulation: an attacker can route swaps through arbitrary intermediate pools while passing validation. For `sellTokenForEthToUniswapV3`, the function still requires the path to end in WETH and outputs native ETH, so the output token type cannot be changed. However, routing through attacker-controlled pools allows: (1) extraction of value via unfavorable exchange rates in attacker-owned pools, (2) potential sandwich attack vectors where the attacker controls both the routing and the liquidity. Combined with the separate address(this).balance vulnerability (INV-STATE-002), this could amplify damage. Additionally, if the fake encodedPathLength is crafted to be very small or zero, the fake outputToken read could point to arbitrary data, potentially allowing the validator to see WETH while the real output path differs.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Tokens Cause Balance Inflation Leading to Last-Claimer Insolvency",
+      "severity": "high",
+      "summary": "In `_processLock`, `balances[_receiver][_token] += _amount` credits the full requested amount, but for fee-on-transfer tokens, `safeTransferFrom` delivers fewer tokens than `_amount`. The contract's actual token balance becomes less than the sum of user balances. When the last users try to claim or withdraw, the contract lacks sufficient tokens, causing reverts.",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 193,
+          "line_end": 197,
+          "desc": "IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount); then balances[_receiver][_token] += _amount — no balance delta check"
+        }
+      ],
+      "impact": "If a fee-on-transfer token is whitelisted, the last users to withdraw or claim that token will be unable to do so. The loss equals approximately (fee_percentage * total_deposits) distributed as unrecoverable shortfall among last claimers. The recoverERC20 function cannot help because it explicitly blocks allowed tokens (line 326: `if (tokenAddress == address(lpETH) || isTokenAllowed[tokenAddress]) revert NotValidToken()`). Emergency mode enables LRT token withdrawals but doesn't fix the solvency gap.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "_fillQuote Uses Raw approve() Instead of SafeERC20.safeApprove, Causing DoS for Non-Standard Tokens",
+      "severity": "high",
+      "summary": "_fillQuote calls `require(_sellToken.approve(exchangeProxy, _amount))` using raw IERC20.approve instead of SafeERC20.safeApprove. In Solidity 0.8, if the token's approve() doesn't return a value (like USDT), the ABI decoder reverts when trying to decode a bool from empty return data. This would permanently block all claims for that token, as _fillQuote is the only path for LRT claims.",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 375,
+          "line_end": 375,
+          "desc": "require(_sellToken.approve(exchangeProxy, _amount)); — raw approve, not safeApprove; inconsistent with SafeERC20 usage elsewhere"
+        }
+      ],
+      "impact": "If a non-standard approve() token is whitelisted: all deposits of that token become unclaimable through the normal path. Users cannot convert their locked tokens to lpETH. Recovery is only possible through emergency mode withdrawal, which returns the raw token (not the lpETH the user was entitled to receive). The defect is permanent for the affected token and affects all users who deposited it. The severity depends on whether such tokens are whitelisted, but the code defect exists regardless.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "convertAllETH Captures Pre-existing lpETH via balanceOf, Inflating Claim Ratio",
+      "severity": "high",
+      "summary": "In convertAllETH, `totalLpETH = lpETH.balanceOf(address(this))` reads the TOTAL lpETH balance, not just the amount received from the deposit. If lpETH tokens are sent to the contract before conversion (by anyone), totalLpETH is inflated. The proportional claim formula `userStake * totalLpETH / totalSupply` distributes the excess lpETH to all ETH depositors. The donor loses their lpETH to benefit all depositors proportionally.",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 300,
+          "line_end": 301,
+          "desc": "totalLpETH = lpETH.balanceOf(address(this)); — captures total balance including pre-existing lpETH, not deposit delta"
+        }
+      ],
+      "impact": "The defect breaks the intended 1:1 ETH→lpETH conversion invariant. If D lpETH is donated before conversion, and totalSupply = S, then each user with stake U receives U*(S+D)/S lpETH instead of U lpETH. The severity depends on the amount of lpETH that can be donated relative to totalSupply. In practice, lpETH may not be widely available before the contract's conversion (it may be newly deployed), limiting the practical impact. However, the code is unambiguously defective - it should use a balance delta pattern.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unrestricted ownership transfer to address(0) can permanently brick admin-only recovery and lifecycle actions",
+      "severity": "high",
+      "summary": "setOwner() allows setting owner to address(0) (or an otherwise unreachable address). This would permanently disable onlyAuthorized functions (setLoopAddresses, convertAllETH, allowToken, setEmergencyMode, recoverERC20), potentially trapping user funds (especially if loop is not activated or if a later emergency requires emergencyMode).",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 254,
+          "line_end": 259,
+          "desc": "owner = _owner; with no nonzero or sanity check; onlyAuthorized gates future admin actions"
+        }
+      ],
+      "impact": "CRITICAL for user funds depending on protocol state: (1) Pre-setLoopAddresses: users can still withdraw ETH after 120-day timeout, but LRT token whitelisting, emergency mode, and conversion are impossible. (2) Post-setLoopAddresses, pre-convertAllETH: users in grace period can withdraw, but conversion to lpETH is permanently blocked. After grace period closes, ETH depositors are stuck. (3) Post-convertAllETH: emergency mode cannot be activated. If lpETH contract has issues, ETH depositors have zero recovery path since withdraw(ETH) reverts with UseClaimInstead (line 222) and claim requires functional lpETH. recoverERC20 is also disabled, so accidentally sent tokens are permanently locked.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Zero-Cost Infinite Drain of Contract ETH via Percentage Truncation",
+      "severity": "high",
+      "summary": "The `claim` function calculates `userClaim = userStake * _percentage / 100`. For small `userStake` values or small percentages, this rounds down to 0. A 0-amount swap executes successfully, but `claimedAmount` is set to `address(this).balance` rather than the swap delta. The attacker's balance is reduced by 0, allowing them to repeatedly mint `lpETH` equal to the contract's entire ETH balance without spending any tokens.",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 178,
+          "line_end": 185,
+          "desc": "userClaim rounds to 0, claimedAmount = address(this).balance"
+        }
+      ],
+      "impact": "CRITICAL. Two independent code defects combine: (1) any non-ETH claimer captures ALL contract ETH rather than just their swap proceeds, and (2) zero-amount claims leave the attacker's balance unchanged for infinite repetition. Even without the zero-amount variant, defect (1) alone means the first LRT claimer after any ETH arrives in the contract steals all that ETH as bonus lpETH. This violates the invariant that `claimedAmount` should equal only the ETH received from the specific swap.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Emergency Mode Fails to Protect ETH Depositors Post-Conversion: Funds Permanently Locked if lpETH is Broken",
+      "severity": "high",
+      "summary": "After convertAllETH sets startClaimDate, the withdraw function contains a hard check `if (block.timestamp >= startClaimDate) revert UseClaimInstead()` that executes REGARDLESS of emergencyMode. ETH depositors are forced to use claim(), which requires a functioning lpETH contract. If lpETH is buggy, malicious, or paused, ETH depositors have zero recovery path: withdraw reverts with UseClaimInstead, claim reverts because lpETH.safeTransfer fails, and recoverERC20 blocks lpETH. Emergency mode, desi",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 274,
+          "line_end": 283,
+          "desc": "withdraw() checks emergencyMode bypass for time restrictions but UseClaimInstead check at line 281 executes unconditionally after balance zeroing, blocking ETH withdrawal post-startClaimDate regardless of emergencyMode"
+        }
+      ],
+      "impact": "All ETH/WETH depositors lose 100% of their funds if lpETH becomes non-functional after convertAllETH. The emergency mode, designed as the ultimate safety valve, fails to provide any protection for ETH depositors in this scenario. The total value at risk equals the entire totalSupply of locked ETH. Note: after convertAllETH, the contract holds lpETH tokens (not native ETH), so even removing the UseClaimInstead check would require additional logic to handle lpETH distribution. The fundamental issue is that there is no emergency recovery mechanism for the post-conversion state.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "TransformERC20 Recipient Validation Bypassed Due to Uninitialized Variable Defaulting to Zero",
+      "severity": "high",
+      "summary": "In `_validateData`, the `recipient` variable is only assigned for UniswapV3 exchange type. For TransformERC20, `_decodeTransformERC20Data` does not return a recipient. The local variable `recipient` defaults to `address(0)`. The final check `if (recipient != address(this) && recipient != address(0))` passes because `address(0) != address(0)` is false. This means TransformERC20 swaps have NO recipient validation at all. The unchecked `transformations` array in TransformERC20 calldata could contai",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 303,
+          "line_end": 320,
+          "desc": "TransformERC20 branch does not set `recipient`; default address(0) passes the recipient != address(0) check at line 322-324"
+        }
+      ],
+      "impact": "The confirmed defect means TransformERC20 swap validation is weaker than UniswapV3 validation. While UniswapV3 has full recipient validation, TransformERC20 has none. The practical impact depends on 0x protocol transformer capabilities. If transformations can redirect funds (via PayTakerTransformer, custom transformers, or flash transformer callbacks), an attacker could redirect swap output to their own address. The contract would then have 0 ETH from the swap, and `claimedAmount = address(this).balance` would capture whatever residual ETH exists. In the worst case with residual ETH in the contract, the attacker redirects the legitimate swap output AND captures residual ETH.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Residual ERC20 Approval to Exchange Proxy Persists After Swap, Enabling Token Theft",
+      "severity": "high",
+      "summary": "_fillQuote approves `exchangeProxy` for `_amount` of the sell token but never resets the approval to 0 after the swap. If the exchange proxy doesn't consume the full allowance (partial fill scenarios, or specific 0x transformer behavior), the residual approval persists. Since the exchange proxy is a publicly callable contract, an attacker could potentially use a crafted call to the exchange proxy to consume the leftover approval and transfer tokens out of PrelaunchPoints.",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 371,
+          "line_end": 382,
+          "desc": "require(_sellToken.approve(exchangeProxy, _amount)); — approval set but never reset to 0 after swap"
+        }
+      ],
+      "impact": "The impact depends on the interaction capabilities of the 0x Exchange Proxy. In the worst case, residual approvals could be used to steal LRT tokens held by the contract that belong to other users. The risk scales with the number and value of tokens locked in the contract. Since exchangeProxy is immutable and publicly callable, this is a persistent risk throughout the contract's lifetime.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Unvalidated TransformERC20 Transformations Enable Arbitrary Execution",
+      "severity": "high",
+      "summary": "When using the `TransformERC20` exchange option, `_validateData` only verifies the `selector`, `inputToken`, `outputToken`, and `inputTokenAmount`. It completely ignores the `transformations` array in the 0x calldata. The 0x `transformERC20` function executes these transformations, which can include arbitrary contract calls. If the contract has any residual token approvals to the 0x proxy, an attacker can craft a transformation to steal those tokens.",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 307,
+          "line_end": 314,
+          "desc": "Only validates selector, inputToken, outputToken, and amount. Ignores transformations array."
+        }
+      ],
+      "impact": "The confirmed code defect has multiple impact dimensions: (1) Zero slippage protection for TransformERC20 swaps since minOutputTokenAmount is not validated or enforced, enabling sandwich attacks and MEV extraction. (2) Unvalidated transformation chains could potentially interact with contract state in unexpected ways depending on 0x proxy capabilities. (3) Missing approval reset creates potential for residual allowance exploitation. The severity of actual exploitation depends on the 0x proxy's transformer implementations, but the code defect in PrelaunchPoints is clear and violates the security principle of validating all user-controlled data before forwarding to external contracts.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Immutable exchangeProxy Cannot Be Updated If 0x Proxy Is Upgraded Maliciously, Risking All LRT Approvals",
+      "severity": "high",
+      "summary": "The exchangeProxy (0xDef1C0ded9bec7F1a1670819833240f027b25EfF) is set as immutable in the constructor and is the 0x TransparentUpgradeableProxy. During every LRT claim, _fillQuote approves this proxy for the sell token amount. The 0x proxy is upgradeable by 0x governance. If 0x governance is compromised or acts maliciously, a new implementation could steal all approved tokens. Since exchangeProxy is immutable, PrelaunchPoints cannot switch to a different swap router. Additionally, _fillQuote nev",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 371,
+          "line_end": 383,
+          "desc": "_fillQuote approves exchangeProxy for _amount but never resets to 0 after swap; exchangeProxy is immutable and points to upgradeable 0x proxy"
+        }
+      ],
+      "impact": "MEDIUM impact. The residual approvals expose LRT tokens held by the contract to the risk of unauthorized transfer via the exchangeProxy. The total value at risk equals the sum of all LRT tokens held by the contract that have had _fillQuote called on them with partial fills. In the worst case (0x proxy compromise), all LRT tokens with any residual approval could be drained. The immutability of exchangeProxy means there is no remediation path other than emergency withdrawal of all tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "lock() for Allowed Token That Is Also lpETH Address Creates Shared Balance Pool Conflict",
+      "severity": "high",
+      "summary": "If owner calls allowToken(address(lpETH)) after setLoopAddresses, users can lock lpETH as an LRT token via lock(). During claim, _fillQuote approves the exchange proxy for lpETH and swaps it to ETH. Since the contract holds lpETH for BOTH ETH claimers (from convertAllETH) and LRT depositors (from lock(lpETH)) in the same ERC20 balance, the exchange proxy's transferFrom pulls from the shared pool. While mathematically the user's locked lpETH amount should equal what's pulled, any swap slippage or",
+      "description": [
+        {
+          "file": "PrelaunchPoints.sol",
+          "line_start": 345,
+          "line_end": 347,
+          "desc": "allowToken(address _token) sets isTokenAllowed[_token] = true with no check that _token != address(lpETH)"
+        }
+      ],
+      "impact": "HIGH",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

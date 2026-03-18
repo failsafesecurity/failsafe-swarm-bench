@@ -1,0 +1,263 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T03:28:18.474Z",
+    "duration_ms": 251775
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "Owner withdraw() can drain TITN while users hold unclaimed balances, breaking the solvency invariant that titn.balanceOf(address(this)) >= totalTitnClaimable",
+        "attack_scenario": "Owner calls withdraw(titn, amount) to drain some or all TITN from the contract. Users who have claimableTitnPerUser > 0 then call claimTitn() or withdrawRemainingTitn() and the safeTransfer reverts due to insufficient balance, permanently locking their claims.",
+        "invariant_logic": "titn.balanceOf(address(this)) >= totalTitnClaimable at all times after owner deposits TITN",
+        "solidity_property": "function invariant_solvency() public view { assert(titn.balanceOf(address(this)) >= totalTitnClaimable); }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "claimTitn"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdrawRemainingTitn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "No cap on cumulative TGT deposits means totalTitnClaimable can exceed TITN_ARB, making the contract insolvent. quoteTitn calculates output proportionally per deposit but never checks cumulative against the finite TITN pool.",
+        "attack_scenario": "During the first 90 days, more than TGT_TO_EXCHANGE (579M TGT) is deposited via onTokenTransfer. The cumulative claimable TITN exceeds TITN_ARB (173.7M TITN). Later depositors who call claimTitn() get reverts due to insufficient TITN balance. Additionally, withdrawRemainingTitn() will underflow on (remainingTitnAfter1Year - initialTotalClaimable) since the balance is less than total owed.",
+        "invariant_logic": "totalTitnClaimable + totalTitnClaimed <= TITN_ARB",
+        "solidity_property": "function invariant_no_overcommit() public view { assert(totalTitnClaimable + totalTitnClaimed <= TITN_ARB); }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "onTokenTransfer"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "quoteTitn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "withdrawRemainingTitn() contains an arithmetic underflow when remainingTitnAfter1Year < initialTotalClaimable. The expression (remainingTitnAfter1Year - initialTotalClaimable) underflows in Solidity 0.8+ causing a revert, permanently DoS-ing all post-year claims.",
+        "attack_scenario": "Either through owner withdrawal of TITN or through TGT over-deposit (INV-STATE-002), the contract's TITN balance at the 360-day mark is less than totalTitnClaimable. The first caller to withdrawRemainingTitn() snapshots these values. The subtraction (remainingTitnAfter1Year - initialTotalClaimable) underflows, reverting the transaction. Since this snapshot is set on the first successful call, if it always reverts, no user can ever claim their remaining TITN.",
+        "invariant_logic": "When withdrawRemainingTitn is callable: remainingTitnAfter1Year >= initialTotalClaimable",
+        "solidity_property": "function invariant_no_underflow() public view { if(remainingTitnAfter1Year > 0) { assert(remainingTitnAfter1Year >= initialTotalClaimable); } }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdrawRemainingTitn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "Off-by-one boundary at exactly 360 days: onTokenTransfer uses (> 360 days) while claimTitn uses (>= 360 days) and quoteTitn returns 0 at 360 days. A user can deposit TGT at exactly t=360 days, receive 0 claimable TITN, and permanently lose their TGT.",
+        "attack_scenario": "At block.timestamp - launchTime == 360 days: (1) onTokenTransfer allows the deposit since (360 > 360) is false. (2) quoteTitn returns 0 since timeSinceLaunch is not < 360 days. (3) User's TGT is transferred into the contract but claimableTitnPerUser gains 0. (4) claimTitn reverts since (360 >= 360) is true. User irreversibly loses TGT with zero TITN credited.",
+        "invariant_logic": "If quoteTitn(amount) == 0, then onTokenTransfer MUST revert (deposit should not proceed for zero output)",
+        "solidity_property": "function invariant_no_zero_deposit() public view { uint256 t = block.timestamp - launchTime; if(t >= 360 days) { /* onTokenTransfer should revert */ assert(false); } }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "onTokenTransfer"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "quoteTitn"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "claimTitn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "claimTitn is permanently blocked after 360 days with no migration path. Users who did not claim before 360 days MUST use withdrawRemainingTitn, but if withdrawRemainingTitn reverts (due to underflow INV-STATE-003), their funds are locked forever. The two claim functions have mutually exclusive time windows with no overlap.",
+        "attack_scenario": "User deposits TGT at day 89, gets claimable TITN. They try to claim at day 361 via claimTitn() → reverts (TooLateToClaimRemainingTitn). They try withdrawRemainingTitn() → reverts if underflow exists. User's TITN is permanently locked.",
+        "invariant_logic": "For all users with claimableTitnPerUser > 0, there must exist at least one callable claim path (claimTitn OR withdrawRemainingTitn) that succeeds",
+        "solidity_property": "function invariant_claimpath_exists(address user) public view { if(claimableTitnPerUser[user] > 0) { bool canClaim = (block.timestamp - launchTime < 360 days); bool canWithdraw = (block.timestamp - launchTime >= 360 days) && (remainingTitnAfter1Year == 0 || remainingTitnAfter1Year >= initialTotalClaimable); assert(canClaim || canWithdraw); } }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "claimTitn"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdrawRemainingTitn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "withdrawRemainingTitn initialization is a one-shot snapshot that can be manipulated by timing. The first caller sets remainingTitnAfter1Year and initialTotalClaimable permanently. If the owner withdraws TITN just before this snapshot, all users receive reduced proportional shares.",
+        "attack_scenario": "Owner calls withdraw(titn, surplus) to extract excess TITN right before the 360-day mark. After 360 days, first user triggers withdrawRemainingTitn(). remainingTitnAfter1Year is snapshotted at the reduced balance. All users receive lower proportional shares because unclaimedTitn = (reducedBalance - initialTotalClaimable) is artificially small.",
+        "invariant_logic": "Between owner's TITN deposit and the 360-day snapshot, no TITN should be withdrawn by owner (or: remainingTitnAfter1Year should equal TITN_ARB minus legitimately claimed amounts)",
+        "solidity_property": "function invariant_fair_snapshot() public view { if(remainingTitnAfter1Year > 0) { assert(remainingTitnAfter1Year == TITN_ARB - totalTitnClaimed); } }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdrawRemainingTitn"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "Titn.sol",
+        "description": "isBridgedTokenHolder mapping is strictly monotonic (false → true) with no reversal mechanism. Once marked via _credit during cross-chain receive, an address is permanently flagged as a bridged token holder even if they transfer all tokens away or if the restriction is temporarily lifted and re-enabled.",
+        "attack_scenario": "User bridges 1 token from Base to Arbitrum and back. On the destination chain, _credit marks them as isBridgedTokenHolder. Even after sending all tokens back and owning 0 bridged tokens, they remain flagged. If isBridgedTokensTransferLocked is re-enabled after a temporary unlock, previously-flagged addresses are restricted again despite having only non-bridged tokens.",
+        "invariant_logic": "Once isBridgedTokenHolder[addr] == true, it can never become false (no setter exists). This is a design risk, not necessarily a bug, but creates permanent state that owner cannot override per-address.",
+        "solidity_property": "function invariant_bridged_monotonic(address user) public view { /* If user was ever bridged, they remain bridged forever */ /* No function exists to set isBridgedTokenHolder[user] = false */ }",
+        "inventory_refs": [
+          {
+            "file": "Titn.sol",
+            "function": "_credit"
+          },
+          {
+            "file": "Titn.sol",
+            "function": "_validateTransfer"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Titn.sol",
+        "description": "On Arbitrum (chainid 42161), ALL non-owner transfers are restricted (not just bridged token holders) due to the disjunction (isBridgedTokenHolder[from] || block.chainid == arbitrumChainId). However, OFT's _debit calls _burn which bypasses transfer/transferFrom overrides entirely, meaning cross-chain sends are unrestricted while on-chain transfers are blocked. The to==lzEndpoint exemption is ineffective for actual bridging and only allows direct token loss by transferring to the endpoint address.",
+        "attack_scenario": "On Arbitrum, a user mistakenly calls transfer(lzEndpoint, amount) thinking this bridges their tokens. The tokens are transferred to the endpoint address but NOT bridged cross-chain (bridging requires calling OFT.send()). Tokens are permanently stuck at the endpoint address. Meanwhile, the exemption provides no useful functionality since actual OFT bridging uses _burn (internal, bypasses transfer override).",
+        "invariant_logic": "Transfer restriction exemption for to==lzEndpoint should only allow actual bridging operations, not direct transfers to the endpoint address",
+        "solidity_property": "function invariant_no_direct_lz_transfer() public view { /* assert: no direct ERC20.transfer to lzEndpoint should succeed */ /* Bridging should only occur through OFT.send() which uses _burn */ }",
+        "inventory_refs": [
+          {
+            "file": "Titn.sol",
+            "function": "_validateTransfer"
+          },
+          {
+            "file": "Titn.sol",
+            "function": "_credit"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "MergeTgt.sol",
+        "description": "onTokenTransfer trusts the 'from' parameter provided by the TGT token contract without independent verification. If TGT's transferAndCall implementation allows the caller to specify an arbitrary 'from' address, an attacker could credit claimable TITN to any address using someone else's TGT.",
+        "attack_scenario": "If TGT's transferAndCall passes msg.sender as 'from' correctly this is safe. But if TGT has a transferFromAndCall that passes the original token holder as 'from', a spender with approval could deposit TGT but credit TITN to the token holder's address (not the spender's), leading to misattribution of claimable balances.",
+        "invariant_logic": "claimableTitnPerUser[addr] should only increase when addr actually initiated and funded the TGT deposit",
+        "solidity_property": "function invariant_credit_attribution(address user) public view { /* claimableTitnPerUser[user] > 0 implies user voluntarily deposited TGT */ }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "onTokenTransfer"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "MergeTgt.sol",
+        "description": "setLaunchTime is one-shot (launchTime can only be set once) but there is no timelock or lower bound on when it's called relative to contract deployment. The owner could deploy the contract, wait an arbitrary time, and then set launch time. More critically, if owner never calls setLaunchTime, all functionality is permanently locked (deposits revert with MergeLocked, claims revert with wrong errors or underflow).",
+        "invariant_logic": "launchTime is either 0 (unset) or a past timestamp set exactly once. Once set, launchTime is immutable. If launchTime == 0, all user-facing functions (onTokenTransfer, claimTitn, withdrawRemainingTitn) must revert.",
+        "solidity_property": "function invariant_launch_immutable() public view { /* After setLaunchTime: launchTime > 0 && launchTime <= block.timestamp && launchTime never changes */ }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "setLaunchTime"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "onTokenTransfer"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "claimTitn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "The LockedStatus enum defines three states (Locked, OneWay, TwoWay) but only the Locked state has any functional effect. OneWay and TwoWay are treated identically in onTokenTransfer (both allow deposits). There is no TwoWay functionality implemented (no mechanism to return TGT to depositors), making the enum misleading and the TwoWay state potentially a missing feature.",
+        "attack_scenario": "Users or governance expect TwoWay mode to allow returning TGT after depositing, but no such function exists. If TwoWay was intended to enable reversible deposits, this is missing code. Users who deposited expecting reversal capability have no recourse.",
+        "invariant_logic": "If lockedStatus == TwoWay, users should be able to reverse their deposit (return TITN, receive TGT back). Currently, no such path exists.",
+        "solidity_property": "function invariant_twoway_implemented() public view { /* If lockedStatus == LockedStatus.TwoWay, there should exist a function to return deposited TGT */ }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "onTokenTransfer"
+          },
+          {
+            "file": "MergeTgt.sol",
+            "function": "setLockedStatus"
+          },
+          {
+            "file": "IMerge.sol",
+            "function": "LockedStatus"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MergeTgt.sol",
+        "description": "withdrawRemainingTitn distributes titnOut = claimableTitn + userProportionalShare but only decrements totalTitnClaimable by claimableTitn. If additional tokens are sent to the contract after the snapshot (e.g., by accident or by owner deposit), later callers of withdrawRemainingTitn get shares calculated on the original snapshot while the contract may have more or fewer tokens than expected. Additionally, totalTitnClaimed accumulates both base and bonus amounts, making it inconsistent with totalTitnClaimable for accounting purposes.",
+        "attack_scenario": "After the remainingTitnAfter1Year snapshot is taken, someone accidentally sends TITN to the contract. These extra tokens are not accounted for in the proportional distribution. Or conversely, if the last few users to call withdrawRemainingTitn cause the contract balance to reach zero before all users have claimed (due to rounding in the proportional calculation), the last user's transfer fails.",
+        "invariant_logic": "sum(titnOut for all users calling withdrawRemainingTitn) <= remainingTitnAfter1Year (accounting for rounding, the total distributed should not exceed the snapshot balance)",
+        "solidity_property": "function invariant_distribution_bounded() public view { /* totalTitnClaimed from withdrawRemainingTitn calls should not exceed remainingTitnAfter1Year */ }",
+        "inventory_refs": [
+          {
+            "file": "MergeTgt.sol",
+            "function": "withdrawRemainingTitn"
+          }
+        ]
+      }
+    ]
+  }
+}

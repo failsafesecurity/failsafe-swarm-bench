@@ -1,0 +1,353 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T00:53:32.930Z",
+    "duration_ms": 494650
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Signer.sol",
+        "description": "_deriveRentalOrderHash excludes rentalWallet from the EIP-712 encoding despite the type string declaring it. This means two RentalOrders differing only in rentalWallet produce the same hash, allowing stopRent callers to supply a different rentalWallet and manipulate which Safe is reclaimed from.",
+        "attack_scenario": "Attacker observes an active rental order hash H for Safe A. Attacker calls stopRent with the same order parameters but substitutes rentalWallet = Safe B (another protocol-deployed safe holding the same ERC1155 tokens). The hash still matches H because rentalWallet is excluded. _reclaimRentedItems delegates call from Safe B, transferring NFTs to the original lender instead of properly settling. Rental asset counts for Safe B are decremented while Safe A's counts remain stale, permanently breaking guard protections for Safe A.",
+        "invariant_logic": "hash(RentalOrder) MUST include ALL fields declared in the EIP-712 type string, specifically: seaportOrderHash, items, hooks, orderType, lender, renter, rentalWallet, startTimestamp, endTimestamp",
+        "solidity_property": "function invariant_rentalOrderHashIncludesWallet() public view { /* _deriveRentalOrderHash encoding must include order.rentalWallet between order.renter and order.startTimestamp */ assert(false); /* currently violated */ }",
+        "inventory_refs": [
+          {
+            "file": "Signer.sol",
+            "function": "_deriveRentalOrderHash"
+          },
+          {
+            "file": "Stop.sol",
+            "function": "stopRent"
+          },
+          {
+            "file": "Stop.sol",
+            "function": "_reclaimRentedItems"
+          },
+          {
+            "file": "Storage.sol",
+            "function": "removeRentals"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Signer.sol",
+        "description": "_deriveOrderMetadataHash omits metadata.orderType and keccak256(metadata.emittedExtraData) from the EIP-712 encoding, despite the type string 'OrderMetadata(uint8 orderType,uint256 rentDuration,Hook[] hooks,bytes emittedExtraData)' declaring them. The zone hash therefore does not cryptographically bind to the order type, meaning a fulfiller can substitute the orderType without invalidating the lender's original Seaport zone hash.",
+        "attack_scenario": "A lender signs a Seaport order intending orderType=BASE (renter pays lender). The fulfiller intercepts and changes orderType to PAY in the metadata. Since orderType is not in the metadata hash, the zone hash still validates. While current item-type validation prevents most exploits, any future code path that doesn't enforce structural item constraints could allow order type substitution, reversing payment flows. Additionally, emittedExtraData can be freely manipulated.",
+        "invariant_logic": "deriveOrderMetadataHash(m) == keccak256(abi.encode(ORDER_METADATA_TYPEHASH, m.orderType, m.rentDuration, keccak256(encodePacked(hookHashes)), keccak256(m.emittedExtraData)))",
+        "solidity_property": "function invariant_metadataHashIncludesOrderType() public view { /* OrderMetadata hash must include orderType as first field and keccak256(emittedExtraData) as last field */ assert(false); /* currently violated */ }",
+        "inventory_refs": [
+          {
+            "file": "Signer.sol",
+            "function": "_deriveOrderMetadataHash"
+          },
+          {
+            "file": "Create.sol",
+            "function": "_isValidOrderMetadata"
+          },
+          {
+            "file": "Create.sol",
+            "function": "_rentFromZone"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Signer.sol",
+        "description": "_RENTAL_ORDER_TYPEHASH is derived using abi.encode(rentalOrderTypeString, hookTypeString, itemTypeString) instead of abi.encodePacked. Per EIP-712, the struct type hash must be keccak256 of the concatenated type strings. abi.encode adds ABI padding between dynamic bytes, producing a completely different hash from the EIP-712 specification.",
+        "attack_scenario": "Any off-chain system computing the rental order type hash per EIP-712 spec will get a different value from the on-chain type hash. This breaks interoperability with standard EIP-712 verification tooling and could cause signature verification mismatches if a new front-end or integration uses the correct computation.",
+        "invariant_logic": "RENTAL_ORDER_TYPEHASH == keccak256(abi.encodePacked(rentalOrderTypeString, hookTypeString, itemTypeString))",
+        "solidity_property": "function invariant_typeHashUsesEncodePacked() public pure { bytes memory r = ...; bytes memory h = ...; bytes memory i = ...; assert(keccak256(abi.encodePacked(r, h, i)) == _RENTAL_ORDER_TYPEHASH); }",
+        "inventory_refs": [
+          {
+            "file": "Signer.sol",
+            "function": "_deriveRentalTypehashes"
+          },
+          {
+            "file": "Signer.sol",
+            "function": "_deriveRentalOrderHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Signer.sol",
+        "description": "_deriveHookHash encodes hook.extraData as raw bytes via abi.encode instead of keccak256(hook.extraData) as required by EIP-712 for dynamic 'bytes' types. This produces non-standard hashes that deviate from what EIP-712-compliant off-chain signers would produce.",
+        "attack_scenario": "The protocol signer signs payloads off-chain. If the off-chain signer correctly follows EIP-712 and hashes bytes fields with keccak256, the signatures will not match on-chain verification, causing all rental creation to fail. Alternatively, if both sides use the wrong encoding, an attacker who knows the extraData could craft different extraData values that produce hash collisions under the non-standard encoding.",
+        "invariant_logic": "deriveHookHash(h) == keccak256(abi.encode(HOOK_TYPEHASH, h.target, h.itemIndex, keccak256(h.extraData)))",
+        "solidity_property": "function invariant_hookHashEncodesExtraDataCorrectly() public view { Hook memory h; bytes32 expected = keccak256(abi.encode(_HOOK_TYPEHASH, h.target, h.itemIndex, keccak256(h.extraData))); assert(_deriveHookHash(h) == expected); }",
+        "inventory_refs": [
+          {
+            "file": "Signer.sol",
+            "function": "_deriveHookHash"
+          },
+          {
+            "file": "Signer.sol",
+            "function": "_deriveOrderMetadataHash"
+          },
+          {
+            "file": "Signer.sol",
+            "function": "_deriveRentalOrderHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Guard.sol",
+        "description": "The Guard's _checkTransaction only blocks known ERC721/ERC1155 function selectors. Tokens with non-standard transfer functions (e.g., custom transferNFT, permit-based approvals like EIP-4494) or tokens that implement additional transfer mechanisms are not caught. A renter could use unguarded function selectors to transfer rented assets out of the safe.",
+        "attack_scenario": "A rented NFT implements EIP-4494 permit(address,uint256,uint256,bytes). The renter calls permit() on the NFT from the safe to grant an approval, then the approved operator transfers the NFT out. The guard does not check the permit selector, so the transaction succeeds. The NFT leaves the rental safe and cannot be reclaimed by the lender.",
+        "invariant_logic": "For ALL functions F callable on a rented asset's contract: if F can result in transfer or approval of the rented asset, then Guard MUST block F when the asset is actively rented",
+        "solidity_property": "function invariant_noUnguardedTransferVector() public view { /* For every rented asset, no transaction from the safe should be able to transfer or approve that asset via any function selector */ }",
+        "inventory_refs": [
+          {
+            "file": "Guard.sol",
+            "function": "_checkTransaction"
+          },
+          {
+            "file": "Guard.sol",
+            "function": "checkTransaction"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Guard.sol",
+        "description": "When a hook is active for a target contract, the Guard forwards the entire transaction to the hook via _forwardToHook and bypasses all standard _checkTransaction checks. A malicious or buggy hook could allow any transaction through, including transfers of rented assets, module changes, or guard removal.",
+        "attack_scenario": "A guard admin sets a hook for a token contract address. The hook's onTransaction function has a bug and doesn't revert for transfer calls. The renter calls transferFrom on the rented token. The guard forwards to the hook (which doesn't block), bypassing _checkTransaction entirely. The rented NFT is transferred out of the safe.",
+        "invariant_logic": "When hook is active for target: hook.onTransaction() MUST enforce at minimum the same protections as _checkTransaction for rented assets",
+        "solidity_property": "function invariant_hookEnforcesMinimumGuarantees() public { /* If a hook is active, rented asset transfers must still be blocked */ }",
+        "inventory_refs": [
+          {
+            "file": "Guard.sol",
+            "function": "checkTransaction"
+          },
+          {
+            "file": "Guard.sol",
+            "function": "_forwardToHook"
+          },
+          {
+            "file": "Guard.sol",
+            "function": "_checkTransaction"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "Signer.sol",
+        "description": "The EIP-712 domain separator is computed at deployment as an immutable value using block.chainid. On a chain fork (e.g., ETH/ETC split), the domain separator remains the same on the forked chain, enabling cross-chain signature replay. Signatures intended for one chain would be valid on the fork.",
+        "invariant_logic": "domainSeparator MUST be recomputed if block.chainid != _CHAIN_ID stored at deployment",
+        "solidity_property": "function invariant_domainSeparatorMatchesChainId() public view { assert(_DOMAIN_SEPARATOR == _deriveDomainSeparator(_EIP_712_DOMAIN_TYPEHASH, _NAME_HASH, _VERSION_HASH) || block.chainid == _CHAIN_ID); }",
+        "inventory_refs": [
+          {
+            "file": "Signer.sol",
+            "function": "_recoverSignerFromPayload"
+          },
+          {
+            "file": "Signer.sol",
+            "function": "_deriveTypehashes"
+          },
+          {
+            "file": "Create.sol",
+            "function": "validateOrder"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Stop.sol",
+        "description": "In stopRent and stopRentBatch, hook removal (_removeHooks) and asset reclamation (_reclaimRentedItems) execute BEFORE the storage existence check in STORE.removeRentals. While the entire transaction reverts if the order doesn't exist, malicious hooks could perform external calls with side effects (e.g., consuming gas, logging, interacting with other protocols) that are only reversed by the final revert. More critically, if hooks have been modified between creation and stop, the stop could process different hooks than were validated at creation time.",
+        "attack_scenario": "A hook contract is initially approved for onStart and onStop. Between rental creation and stop, the GUARD_ADMIN changes the hook status. At stop time, the hooks array in the user-supplied order references the old hook which is no longer approved for onStop, causing the stop to revert and locking the rental assets permanently.",
+        "invariant_logic": "For any active rental: the hooks stored in the order MUST remain valid (onStop enabled) for the entire rental duration, OR the stop function must not require hook execution to succeed",
+        "solidity_property": "function invariant_hooksCannotBlockStop() public view { /* If a rental is active, all referenced hooks must allow onStop or the rental must be stoppable without hooks */ }",
+        "inventory_refs": [
+          {
+            "file": "Stop.sol",
+            "function": "stopRent"
+          },
+          {
+            "file": "Stop.sol",
+            "function": "_removeHooks"
+          },
+          {
+            "file": "Guard.sol",
+            "function": "updateHookStatus"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Guard.sol",
+        "description": "Whitelisted delegate call targets have unrestricted access to the safe's storage slots via SSTORE in delegatecall context. A whitelisted delegate could overwrite the guard's storage slot (slot keccak256('guard_manager.guard.address') in GnossisGuardManager), removing the guard entirely and allowing free transfer of all rented assets.",
+        "attack_scenario": "Admin whitelists a delegate call target that is later compromised or has an unnoticed vulnerability. The compromised contract is delegate-called from the rental safe, directly writing to the guard storage slot to set guard = address(0). All subsequent transactions bypass the guard, allowing the renter to transfer all rented NFTs out of the safe.",
+        "invariant_logic": "After any delegate call from the rental safe: ISafe(safe).getGuard() == guardPolicy AND ISafe(safe).isModuleEnabled(stopPolicy) == true",
+        "solidity_property": "function invariant_delegateCallPreservesGuard() public view { /* After any delegatecall, guard and module configuration must be unchanged */ }",
+        "inventory_refs": [
+          {
+            "file": "Guard.sol",
+            "function": "checkTransaction"
+          },
+          {
+            "file": "Guard.sol",
+            "function": "checkAfterExecution"
+          },
+          {
+            "file": "Storage.sol",
+            "function": "toggleWhitelistDelegate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Storage.sol",
+        "description": "rentedAssets[rentalId] is incremented by addRentals and decremented by removeRentals without checking that the decrement won't cause a desync with actual rental state. If the rentalWallet hash exclusion bug (INV-STATE-001) allows manipulated rentalWallet in stopRent, wrong rental IDs are decremented, leaving the original rental IDs positive forever. The guard would permanently block transfers of those assets from the original safe.",
+        "invariant_logic": "For all rentalIds: rentedAssets[rentalId] == sum of amounts from all active (un-stopped) rentals that reference that rentalId",
+        "solidity_property": "function invariant_rentedAssetsConsistent(RentalId id) public view { assert(STORE.rentedAssets(id) >= 0); /* More precisely: equals sum of active rental amounts for that id */ }",
+        "inventory_refs": [
+          {
+            "file": "Storage.sol",
+            "function": "addRentals"
+          },
+          {
+            "file": "Storage.sol",
+            "function": "removeRentals"
+          },
+          {
+            "file": "Storage.sol",
+            "function": "isRentedOut"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "Kernel.sol",
+        "description": "executeAction with Actions.ChangeExecutor or Actions.ChangeAdmin does not validate that target_ != address(0). Setting executor or admin to address(0) permanently bricks the kernel's administrative capabilities, preventing all future module installations, policy activations, and role grants.",
+        "invariant_logic": "executor != address(0) AND admin != address(0)",
+        "solidity_property": "function invariant_adminNotZero() public view { assert(kernel.executor() != address(0)); assert(kernel.admin() != address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "Kernel.sol",
+            "function": "executeAction"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Kernel.sol",
+        "description": "_deactivatePolicy calls policy_.requestPermissions() at deactivation time to determine which permissions to revoke. If the policy's requestPermissions() returns different values than at activation (e.g., due to module upgrades changing selectors), stale permissions remain granted and new permissions are incorrectly revoked.",
+        "invariant_logic": "Permissions revoked at deactivation MUST exactly match permissions granted at activation",
+        "solidity_property": "function invariant_permissionsSymmetric() public { /* For every policy P: if P is deactivated, all modulePermissions[k][P][sel] == false for all k, sel */ }",
+        "inventory_refs": [
+          {
+            "file": "Kernel.sol",
+            "function": "_deactivatePolicy"
+          },
+          {
+            "file": "Kernel.sol",
+            "function": "_activatePolicy"
+          },
+          {
+            "file": "Kernel.sol",
+            "function": "_setPolicyPermissions"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Create.sol",
+        "description": "For PAYEE orders, _rentFromZone skips all storage recording (no addRentals, no increaseDeposit, no event emission). PAYEE orders are validated structurally but have zero on-chain footprint. If the PAY counterpart fails or is never created, the PAYEE fulfiller receives consideration items (NFTs + ERC20s) from Seaport without any protocol-level tracking, making the assets unrecoverable via the protocol's stop mechanism.",
+        "invariant_logic": "Every PAYEE order MUST have a corresponding PAY order recorded in storage; OR PAYEE fulfillment must be atomic with PAY order creation",
+        "solidity_property": "function invariant_payeePairedWithPay() public view { /* For every PAYEE validation, a corresponding PAY order hash must exist in STORE.orders */ }",
+        "inventory_refs": [
+          {
+            "file": "Create.sol",
+            "function": "_rentFromZone"
+          },
+          {
+            "file": "Create.sol",
+            "function": "validateOrder"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "Guard.sol",
+        "description": "checkAfterExecution is left completely unimplemented (empty function body). This means there is no post-execution validation that the safe's guard and module configuration were preserved after a transaction. A crafted transaction could modify the safe's internal state in ways that _checkTransaction's pre-execution checks cannot predict.",
+        "invariant_logic": "After every safe transaction: safe.getGuard() == originalGuard AND safe.isModuleEnabled(stopPolicy) == true AND for all rented assets: the asset is still in the safe",
+        "solidity_property": "function invariant_postExecutionIntegrity() public view { /* checkAfterExecution should verify guard and module state unchanged */ }",
+        "inventory_refs": [
+          {
+            "file": "Guard.sol",
+            "function": "checkAfterExecution"
+          },
+          {
+            "file": "Guard.sol",
+            "function": "checkTransaction"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "PaymentEscrow.sol",
+        "description": "The skim function computes skimmedBalance as trueBalance - syncedBalance. If trueBalance < syncedBalance (possible with rebasing tokens, fee-on-transfer tokens, or tokens that can be force-burned), this subtraction underflows, making skim and all subsequent operations for that token permanently DoS'd.",
+        "invariant_logic": "IERC20(token).balanceOf(address(escrow)) >= balanceOf[token] at all times",
+        "solidity_property": "function invariant_trueBalanceGeSynced(address token) public view { assert(IERC20(token).balanceOf(address(ESCRW)) >= ESCRW.balanceOf(token)); }",
+        "inventory_refs": [
+          {
+            "file": "PaymentEscrow.sol",
+            "function": "skim"
+          },
+          {
+            "file": "PaymentEscrow.sol",
+            "function": "increaseDeposit"
+          },
+          {
+            "file": "PaymentEscrow.sol",
+            "function": "_decreaseDeposit"
+          }
+        ]
+      }
+    ]
+  }
+}

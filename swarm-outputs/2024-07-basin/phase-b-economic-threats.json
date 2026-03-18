@@ -1,0 +1,858 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "Stable2LUT1.sol",
+      "Stable2.sol",
+      "WellUpgradeable.sol",
+      "WellDeployer.sol",
+      "Logger.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T21:43:42.081Z",
+    "duration_ms": 393045
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "decodeWellData Copy-Paste Bug Allows Pool Drain via Catastrophic Decimal Miscalculation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The decodeWellData function has a copy-paste bug: the second conditional checks `decimal0 == 0` instead of `decimal1 == 0`. If a Well is deployed with decimal1 encoded as 0 (intending the default-to-18 behavior), decimal1 remains 0. getScaledReserves then multiplies reserves[1] by 10^18 instead of 10^0, inflating it by a factor of 10^18. This corrupts ALL downstream calculations: LP token supply, reserve calculations, rate/price calculations. An attacker can exploit the massively distorted pricing to drain the pool through mispriced swaps.",
+      "investigation_rationale": "The code explicitly tries to handle decimal=0 as a default-to-18 case but fails for the second token. This is a demonstrable code defect that breaks the fundamental pricing invariant when triggered. Any Well configured with decimal1=0 would have completely broken math, allowing trivial value extraction.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "The bug is in the code logic itself at Stable2.sol lines within decodeWellData. The code intends to default both decimals to 18 when 0 is passed, but the second check is wrong. Simulation scripts use abi.encode(18, 18) which bypasses the bug, but any deployment passing 0 for decimal1 triggers it.",
+      "affected_functions": [
+        "decodeWellData",
+        "getScaledReserves",
+        "calcLpTokenSupply",
+        "calcReserve",
+        "calcRate",
+        "calcReserveAtRatioSwap",
+        "calcReserveAtRatioLiquidity"
+      ],
+      "affected_contracts": [
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2.sol",
+          "function": "decodeWellData"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2.sol",
+        "lines": "231-243",
+        "pattern": "Second if-block checks `if (decimal0 == 0)` instead of `if (decimal1 == 0)` — decimal1 never defaults to 18"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A Well is deployed with data encoding decimal1 as 0 (e.g., abi.encode(6, 0) or abi.encode(0, 0))",
+        "The Well holds non-trivial reserves of both tokens"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "decimal1 remains 0 → reserves[1] scaled by 10^(18-0) = 10^18 instead of correct factor",
+        "manipulation_vector": "Massively inflated reserves[1] in scaled domain breaks StableSwap invariant calculations; LP supply, swap rates, and reserve-at-ratio all return wildly incorrect values",
+        "profit_hypothesis": "Attacker swaps into the pool at the distorted rate, receiving far more tokens than the correct invariant would allow. For a 1M/1M pool with one 6-decimal token, reserves[1] appears 10^18x larger, allowing near-complete pool drain."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What specific Well deployment configurations trigger decimal1=0?",
+          "Can existing Well deployments be affected, or only new ones?",
+          "How does the distorted pricing interact with Well swap/addLiquidity functions?"
+        ],
+        "validation_requirements": [
+          "Deploy a test Well with abi.encode(6, 0) and verify decimal1 stays 0",
+          "Calculate actual LP supply and swap rates under the bug vs correct values",
+          "Quantify maximum extractable value from a pool with the bug active"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal — just enough to execute a swap (requires validation)",
+        "estimated_execution_cost": "Single transaction gas cost (~0.01 ETH)",
+        "potential_profit_range": "Up to 100% of pool reserves (requires validation)",
+        "estimated_profit_margin": ">10000% ROI if pool has meaningful reserves",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None — attack targets the pool's internal math directly",
+        "optimal_timing": "Immediately after a vulnerable Well is deployed and funded",
+        "market_impact_assessment": "Complete pool drain, no external market dependency"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All LPs who deposited into the misconfigured Well",
+        "estimated_impact_per_user": "Up to 100% loss of deposited funds",
+        "total_value_at_risk": "Entire TVL of any Well deployed with decimal1=0"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "decodeWellData(abi.encode(6, 0)) → decimals[1] = 0, scaling factor = 10^18",
+        "calculation_validation": "Compare calcLpTokenSupply output with decimal1=0 vs decimal1=18",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "Silent Return of Zero from calcReserveAtRatio Functions Enables Protocol-Level Value Extraction",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Both calcReserveAtRatioSwap and calcReserveAtRatioLiquidity use a named return variable `reserve` which defaults to 0. If Newton's method fails to converge within 255 iterations (e.g., due to oscillation near LUT boundaries, extreme price targets, or precision issues), neither function reverts — they silently return 0. Downstream consumers (Beanstalk protocol, pumps/oracles) may interpret 0 as a valid reserve value, enabling attackers to exploit the resulting mispricing for value extraction.",
+      "investigation_rationale": "Unlike calcReserve (which has an explicit revert on non-convergence), these critical pricing functions lack any fallback. The 0 return could propagate through oracle updates, swap pricing, or liquidity calculations, creating exploitable mispricing. The contrast with calcReserve's proper handling confirms this is an oversight, not intentional design.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "calcReserveAtRatioSwap",
+        "calcReserveAtRatioLiquidity"
+      ],
+      "affected_contracts": [
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2.sol",
+          "function": "calcReserveAtRatioSwap"
+        },
+        {
+          "file": "Stable2.sol",
+          "function": "calcReserveAtRatioLiquidity"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2.sol",
+        "lines": "142-192 and 198-249",
+        "pattern": "Named return `uint256 reserve` with no revert/return after the 255-iteration for-loop; falls through to implicit return 0. Compare with calcReserve lines 109-128 which has explicit revert."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Input reserves/ratios cause Newton's method to oscillate without converging within PRICE_THRESHOLD for 255 iterations",
+        "A downstream protocol uses the returned value as a valid reserve for pricing or state transitions",
+        "Target price near LUT boundary conditions or in sparse LUT regions (large interpolation gaps)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Function returns default uint256(0) after exhausting iterations; no revert like calcReserve has",
+        "manipulation_vector": "Craft reserves/ratios that cause oscillation → function returns 0 → downstream protocol computes incorrect swap amounts or oracle values",
+        "profit_hypothesis": "If Beanstalk or other integrators use this value to determine swap reserves, a 0 return implies the token reserve should be 0, enabling near-free acquisition of pool assets"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Which specific input combinations cause non-convergence in practice?",
+          "How does Beanstalk use the return value from these functions?",
+          "Can an attacker reliably force non-convergence through on-chain manipulation of reserves?"
+        ],
+        "validation_requirements": [
+          "Fuzz test calcReserveAtRatioSwap/Liquidity to find non-converging inputs",
+          "Trace how the 0 return propagates through Well operations and Pump updates",
+          "Verify if extreme price targets near LUT boundaries (0.001083e6 or 10.7e6) trigger non-convergence"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Depends on how reserves must be manipulated to force non-convergence",
+        "estimated_execution_cost": "Single transaction gas cost",
+        "potential_profit_range": "Up to pool TVL if 0 reserve is accepted downstream",
+        "estimated_profit_margin": "Requires validation of downstream consumption",
+        "attack_duration": "Single transaction if non-convergence is reliably triggered"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "May need to push pool to extreme ratios to trigger LUT boundary issues",
+        "optimal_timing": "When pool reserves are near LUT boundary conditions",
+        "market_impact_assessment": "Depends on downstream protocol's handling of the 0 return"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users of the Well pool and dependent protocols (oracles, liquidations)",
+        "estimated_impact_per_user": "Potentially complete loss if oracle is corrupted",
+        "total_value_at_risk": "Pool TVL plus any positions dependent on the oracle"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "PRICE_THRESHOLD=100, max iterations=255, LUT boundaries [0.001083e6, 10.709509e6]",
+        "calculation_validation": "Fuzz with prices near LUT boundaries and sparse regions",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "Bricked UUPS Upgrade Mechanism Due to Wrong Parameter in _authorizeUpgrade Aquifer Query",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "_authorizeUpgrade passes _getImplementation() (ERC1967 implementation slot value) to IAquifer(aquifer).wellImplementation(), but the Aquifer maps proxy addresses to implementations — not implementation addresses. For freshly bored EIP-1167 clones, the ERC1967 slot is never initialized (address(0)). So wellImplementation(address(0)) returns address(0), which fails the require check against ___self. This permanently prevents any legitimate upgrade of WellUpgradeable proxies, breaking the core upgradeability promise.",
+      "investigation_rationale": "The notDelegatedOrIsMinimalProxy modifier correctly uses wellImplementation(address(this)) (the proxy address), confirming the developer understood the correct pattern. The _authorizeUpgrade function deviates by using _getImplementation(), which is the wrong key for the Aquifer's mapping. This makes the UUPS upgrade pattern non-functional.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "WellUpgradeable.sol _authorizeUpgrade uses _getImplementation() while notDelegatedOrIsMinimalProxy correctly uses address(this). Aquifer maps proxy→implementation, not implementation→anything.",
+      "affected_functions": [
+        "_authorizeUpgrade",
+        "upgradeTo",
+        "upgradeToAndCall"
+      ],
+      "affected_contracts": [
+        "WellUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "_authorizeUpgrade"
+        },
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "upgradeTo"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WellUpgradeable.sol",
+        "lines": "61-67",
+        "pattern": "IAquifer(aquifer).wellImplementation(_getImplementation()) queries Aquifer with ERC1967 slot (address(0) for fresh clones) instead of proxy address. Compare with notDelegatedOrIsMinimalProxy which correctly uses address(this)."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "WellUpgradeable is deployed as an EIP-1167 minimal proxy via Aquifer",
+        "ERC1967 implementation slot is not explicitly initialized (which is the default behavior)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "wellImplementation(_getImplementation()) where _getImplementation() returns address(0) for fresh proxies",
+        "manipulation_vector": "Not an attack per se — it's a DoS where legitimate upgrades cannot proceed",
+        "profit_hypothesis": "No direct profit — but if a critical vulnerability is discovered post-deployment, inability to upgrade means the pool cannot be patched, exposing all deposited funds to the vulnerability indefinitely"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are there any WellUpgradeable proxies currently deployed that cannot be upgraded?",
+          "What is the total TVL locked in non-upgradeable WellUpgradeable instances?",
+          "Does the Aquifer ever store a mapping where address(0) maps to a valid implementation?"
+        ],
+        "validation_requirements": [
+          "Deploy a WellUpgradeable proxy, verify _getImplementation() returns address(0)",
+          "Attempt to call upgradeTo and confirm it reverts",
+          "Verify the Aquifer's wellImplementation(address(0)) returns address(0)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — this is a DoS / bricked functionality issue",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Indirect: all future vulnerability fixes are blocked",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent until contract redeployment"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Always present from deployment",
+        "market_impact_assessment": "Protocol cannot patch critical bugs in production pools"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All LPs in WellUpgradeable pools",
+        "estimated_impact_per_user": "Indirect — cannot patch future vulnerabilities",
+        "total_value_at_risk": "Entire TVL of all WellUpgradeable pools (upgrade path blocked)"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "_getImplementation() slot state after init()",
+        "calculation_validation": "Deploy and test full upgrade flow end-to-end",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "updateReserve Arithmetic Underflow Causes DoS for Specific Price Targets",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In updateReserve, when targetPrice > currentPrice, the function computes `reserve - maxStepSize * (targetPrice - currentPrice) / (highPrice - lowPrice)`. If Newton's method overshoots and currentPrice drifts beyond the LUT range boundaries, the ratio (targetPrice - currentPrice) / (highPrice - lowPrice) can exceed 1, making the step larger than maxStepSize and potentially larger than the current reserve. This causes an arithmetic underflow revert in Solidity 0.8.x, permanently blocking calcReserveAtRatioSwap and calcReserveAtRatioLiquidity for those specific price targets.",
+      "investigation_rationale": "The step size is unbounded when the price delta exceeds the LUT price range. In early Newton iterations, the initial estimate from the LUT may be far from the target, causing large overshoots. This creates a DoS vector for legitimate operations like oracle updates and liquidation pricing.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "updateReserve",
+        "calcReserveAtRatioSwap",
+        "calcReserveAtRatioLiquidity"
+      ],
+      "affected_contracts": [
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2.sol",
+          "function": "updateReserve"
+        },
+        {
+          "file": "Stable2.sol",
+          "function": "calcReserveAtRatioSwap"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2.sol",
+        "lines": "272-281",
+        "pattern": "Subtraction `reserve - pd.maxStepSize * (pd.targetPrice - pd.currentPrice) / (pd.lutData.highPrice - pd.lutData.lowPrice)` can underflow when price delta exceeds LUT range"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Target price near LUT boundary where interpolation is sparse",
+        "Initial estimate from LUT is poor enough that first Newton step overshoots significantly",
+        "(targetPrice - currentPrice) > (highPrice - lowPrice) causing step > maxStepSize"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "step = maxStepSize * priceDelta / priceRange where priceDelta can exceed priceRange",
+        "manipulation_vector": "Attacker manipulates pool reserves to push price targets into sparse LUT regions, then any protocol operation calling calcReserveAtRatio reverts",
+        "profit_hypothesis": "DoS prevents oracle updates, liquidations, or rebalancing — attacker profits from positions that should have been liquidated or oracle prices that should have been updated"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Which specific price targets trigger the underflow?",
+          "Can an attacker push pool reserves to consistently trigger this DoS?",
+          "What protocol operations depend on calcReserveAtRatio and would be blocked?"
+        ],
+        "validation_requirements": [
+          "Fuzz updateReserve with various price/reserve combinations to find underflow conditions",
+          "Map the LUT sparse regions where overshooting is most likely",
+          "Test with prices near 0.001083e6 and 10.7e6 boundaries"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Capital to manipulate pool reserves to trigger boundary conditions",
+        "estimated_execution_cost": "Cost of swap(s) to push reserves",
+        "potential_profit_range": "Indirect — profit from blocked liquidations or stale oracles",
+        "estimated_profit_margin": "Depends on positions dependent on the blocked oracle",
+        "attack_duration": "Persistent until reserves are rebalanced away from boundary"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Sufficient capital to push pool to extreme ratios",
+        "optimal_timing": "During volatile markets when price targets naturally approach LUT boundaries",
+        "market_impact_assessment": "Blocked oracle updates could cascade to dependent protocols"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users with positions dependent on accurate oracle/pricing from this Well",
+        "estimated_impact_per_user": "Indirect — failed liquidations or stale pricing",
+        "total_value_at_risk": "Depends on dependent protocol exposure"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "LUT price gaps: largest gap is 0.001083e6 to 0.27702e6 (liquidity) / 0.213318e6 (swap)",
+        "calculation_validation": "Test updateReserve with priceDelta > priceRange",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "Missing onlyOwner Check on upgradeTo Allows Unauthorized Implementation Swap",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "upgradeTo and upgradeToAndCall in WellUpgradeable lack any msg.sender authorization. _authorizeUpgrade validates that the new implementation is registered in the Aquifer and is a valid ERC-1967 implementation, but never checks that the caller is the owner. If the _authorizeUpgrade parameter bug (H003) is fixed, anyone could upgrade any WellUpgradeable proxy to any Aquifer-registered implementation. Since Aquifer's boreWell is permissionless, an attacker could register a malicious implementation and upgrade the victim proxy to drain all funds.",
+      "investigation_rationale": "The OwnableUpgradeable contract is inherited and initialized, providing an owner role. But neither upgradeTo nor upgradeToAndCall applies the onlyOwner modifier. This is a clear missing access control check — the code has the mechanism but fails to use it. Currently masked by H003 (broken auth logic), but represents a critical vulnerability if the other bug is fixed.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "WellUpgradeable.sol inherits OwnableUpgradeable and calls __Ownable_init() in init(), but upgradeTo/upgradeToAndCall have no onlyOwner modifier. _authorizeUpgrade has no msg.sender check.",
+      "affected_functions": [
+        "upgradeTo",
+        "upgradeToAndCall",
+        "_authorizeUpgrade"
+      ],
+      "affected_contracts": [
+        "WellUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "upgradeTo"
+        },
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "upgradeToAndCall"
+        },
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "_authorizeUpgrade"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WellUpgradeable.sol",
+        "lines": "79-82 and 90-94",
+        "pattern": "upgradeTo and upgradeToAndCall are public with no onlyOwner modifier; _authorizeUpgrade (lines 56-77) contains no msg.sender check despite OwnableUpgradeable being initialized"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "The _authorizeUpgrade parameter bug (H003) is fixed (currently masks this vulnerability)",
+        "Aquifer.boreWell is permissionless (attacker can register arbitrary implementations)",
+        "The malicious implementation passes proxiableUUID check"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No msg.sender == owner() check in upgrade path",
+        "manipulation_vector": "Attacker registers malicious implementation via permissionless Aquifer.boreWell, then calls upgradeTo on victim proxy to replace the Well logic",
+        "profit_hypothesis": "Malicious implementation includes drain function to transfer all pool tokens to attacker. Profit = total pool TVL minus gas costs."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is Aquifer.boreWell truly permissionless?",
+          "Can a malicious implementation pass all _authorizeUpgrade checks?",
+          "What is the TVL in WellUpgradeable instances that would be at risk?"
+        ],
+        "validation_requirements": [
+          "Deploy a malicious WellUpgradeable implementation through Aquifer",
+          "Fix the _getImplementation bug and verify upgradeTo succeeds without onlyOwner",
+          "Confirm attacker can call upgradeTo and drain pool in single transaction"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas cost to bore malicious implementation + upgrade transaction (~0.05 ETH)",
+        "estimated_execution_cost": "Two transactions: boreWell + upgradeTo",
+        "potential_profit_range": "100% of pool TVL",
+        "estimated_profit_margin": ">10000% ROI on gas costs",
+        "attack_duration": "Two transactions, atomically executable"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None — direct contract interaction",
+        "optimal_timing": "Anytime after H003 fix is deployed but before onlyOwner is added",
+        "market_impact_assessment": "Complete pool drain"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All LPs in the targeted WellUpgradeable pool",
+        "estimated_impact_per_user": "100% loss of deposited funds",
+        "total_value_at_risk": "Entire TVL of all WellUpgradeable pools"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Aquifer permissionlessness, WellUpgradeable implementation registration requirements",
+        "calculation_validation": "End-to-end exploit PoC with a fixed _authorizeUpgrade",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "calcLpTokenSupply Returns Inaccurate Value on Non-Convergence Without Reverting",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "calcLpTokenSupply uses Newton's method with 255 max iterations and a convergence tolerance of 1. If the method fails to converge (e.g., with extremely imbalanced reserves), the function returns the last computed lpTokenSupply value without reverting. Unlike the named return variable in calcReserveAtRatio functions (which defaults to 0), this returns a potentially inaccurate but non-zero value. This imprecise D value propagates to calcReserveAtRatioSwap (which uses it for parityReserve and initial estimates), potentially causing incorrect reserve calculations that can be exploited.",
+      "investigation_rationale": "The calcReserve function correctly reverts on non-convergence, but calcLpTokenSupply does not. An imprecise LP supply value silently corrupts downstream calculations. Since calcLpTokenSupply is called in both ratio functions and in calcRate, an inaccurate value cascades through all pricing logic.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "calcLpTokenSupply",
+        "calcReserveAtRatioSwap",
+        "calcRate"
+      ],
+      "affected_contracts": [
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2.sol",
+          "function": "calcLpTokenSupply"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2.sol",
+        "lines": "76-97",
+        "pattern": "Named return `lpTokenSupply` retains last iteration value on loop exhaustion with no revert; contrast with calcReserve which has explicit `revert(\"did not find convergence\")`"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Extremely imbalanced reserves that slow Newton convergence beyond 255 iterations",
+        "Downstream function uses the imprecise lpTokenSupply for pricing or reserve calculations"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "lpTokenSupply returned after loop without convergence check — last iteration value may not satisfy invariant to precision",
+        "manipulation_vector": "Imprecise D value → incorrect parityReserve in calcReserveAtRatioSwap → incorrect initial estimates → final reserve value is wrong",
+        "profit_hypothesis": "Attacker creates extreme imbalance, then exploits incorrect pricing for profitable swaps"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What reserve ratios cause non-convergence in 255 iterations?",
+          "How imprecise is the returned value in non-convergence cases?",
+          "How does the imprecision propagate through calcReserveAtRatioSwap?"
+        ],
+        "validation_requirements": [
+          "Fuzz calcLpTokenSupply with extreme reserve ratios and track convergence",
+          "Measure deviation between last iteration value and true D for non-converging inputs",
+          "Quantify pricing error from imprecise D"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Capital to create extreme reserve imbalance",
+        "estimated_execution_cost": "Swap transaction gas costs",
+        "potential_profit_range": "Depends on magnitude of D imprecision",
+        "estimated_profit_margin": "Requires measurement of actual imprecision",
+        "attack_duration": "Multi-step: create imbalance then exploit"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Enough capital to push reserves to extreme ratios",
+        "optimal_timing": "When pool reserves are already imbalanced",
+        "market_impact_assessment": "Requires validation of imprecision magnitude"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "LPs and traders in the affected pool",
+        "estimated_impact_per_user": "Proportional to pricing error magnitude",
+        "total_value_at_risk": "Requires quantification of imprecision"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "A=100/100=1, N=2, convergence tolerance=1",
+        "calculation_validation": "Test with reserves like [1e18, 1e30] to see convergence behavior",
+        "execution_complexity": "medium",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "LUT Price Range Boundary Causes Permanent DoS for Extreme Reserve Ratios",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The Stable2LUT1 lookup table reverts with 'LUT: Invalid price' for prices outside [0.001083e6, 10.37089e6] (liquidity) and [0.001083e6, 10.709509e6] (swap). An attacker who pushes pool reserves to create a price ratio beyond ~10.7x triggers a permanent DoS for all calcReserveAtRatio calls until reserves are rebalanced. This blocks oracle updates, liquidation pricing, and any dependent protocol operations.",
+      "investigation_rationale": "The StableSwap invariant with A=1 (effective) allows price ratios well beyond 10.7x at extreme imbalances. The LUT range is narrower than the mathematical range of the curve, creating a gap where the pricing functions revert. This is a design limitation that can be weaponized.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "Stable2LUT1.sol first boundary check: price < 0.001083e6 → revert; last valid entries: 10.37089e6 (liquidity) and 10.709509e6 (swap)",
+      "affected_functions": [
+        "getRatiosFromPriceLiquidity",
+        "getRatiosFromPriceSwap",
+        "calcReserveAtRatioSwap",
+        "calcReserveAtRatioLiquidity"
+      ],
+      "affected_contracts": [
+        "Stable2LUT1.sol",
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2LUT1.sol",
+          "function": "getRatiosFromPriceLiquidity"
+        },
+        {
+          "file": "Stable2LUT1.sol",
+          "function": "getRatiosFromPriceSwap"
+        },
+        {
+          "file": "Stable2.sol",
+          "function": "calcReserveAtRatioSwap"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2LUT1.sol",
+        "lines": "14-16 and 438-440",
+        "pattern": "revert('LUT: Invalid price') for prices < 0.001083e6 or > 10.37089e6/10.709509e6; no graceful fallback for out-of-range prices"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Pool reserves can be pushed to create price ratio >10.7x or <0.001x",
+        "Dependent protocols rely on calcReserveAtRatio for continuous operation",
+        "No alternative pricing path exists when LUT reverts"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "LUT range [0.001083e6, 10.709509e6] is narrower than the mathematical range of the StableSwap curve",
+        "manipulation_vector": "Large unidirectional swap pushes price beyond LUT range → calcReserveAtRatio reverts → oracle/liquidation DoS",
+        "profit_hypothesis": "Attacker creates leveraged position, pushes price beyond LUT range to block liquidation, profits from undercollateralized position"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What reserve ratio creates a price > 10.7x for A=1?",
+          "How much capital is needed to push reserves beyond the LUT range?",
+          "What protocol operations would be blocked?"
+        ],
+        "validation_requirements": [
+          "Calculate the exact reserve ratio that produces price = 10.709509e6",
+          "Estimate swap size needed to reach that ratio from a balanced pool",
+          "Test that calcReserveAtRatioSwap reverts when called with out-of-range price"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Significant swap to reach >10.7x imbalance (needs calculation based on pool size)",
+        "estimated_execution_cost": "Single large swap transaction",
+        "potential_profit_range": "Indirect — profit from blocked liquidations or oracle manipulation",
+        "estimated_profit_margin": "Depends on dependent protocol exposure",
+        "attack_duration": "Persistent until counter-swaps rebalance the pool"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Capital proportional to pool TVL to push past 10.7x",
+        "optimal_timing": "During market stress when natural imbalances already exist",
+        "market_impact_assessment": "Blocked oracle updates could cascade"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocols dependent on the Well's oracle/pricing functions",
+        "estimated_impact_per_user": "Depends on protocol-specific exposure to stale oracle",
+        "total_value_at_risk": "Positions in dependent protocols that rely on accurate pricing"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Pool size, A parameter (effectively 1), LUT boundaries",
+        "calculation_validation": "Calculate reserve ratio for boundary prices",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "_calcRate Underflow at Extreme Reserve Ratios Breaks Pricing",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "_calcRate computes `rate = _reserves[i] - calcReserve(_reserves, i, lpTokenSupply, ...)` where _reserves[j] is incremented by PRICE_PRECISION (1e6). At extreme reserve ratios (where reserves are scaled to 18 decimals, making 1e6 negligible relative to reserves), the perturbation may not change calcReserve's output enough. If calcReserve returns a value >= reserves[i], the subtraction underflows and reverts. This breaks all price calculations at extreme ratios, blocking calcReserveAtRatioSwap/Liquidity iterations.",
+      "investigation_rationale": "The numerical derivative method used for rate calculation assumes that adding PRICE_PRECISION to reserve[j] meaningfully decreases reserve[i]. For very large reserves or extreme ratios, this assumption may fail, causing reverts in the pricing loop.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_calcRate",
+        "calcReserveAtRatioSwap",
+        "calcReserveAtRatioLiquidity"
+      ],
+      "affected_contracts": [
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2.sol",
+          "function": "_calcRate"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2.sol",
+        "lines": "258-266",
+        "pattern": "rate = _reserves[i] - calcReserve(_reserves, i, lpTokenSupply, abi.encode(18, 18)); underflows if calcReserve >= _reserves[i]"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Extreme reserve ratio where reserves[i] >> reserves[j]",
+        "PRICE_PRECISION (1e6) perturbation is negligible relative to reserves[j] at 18-decimal scaling",
+        "calcReserve returns unchanged or increased value for token i"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_reserves[j] += 1e6 (PRICE_PRECISION) on 18-decimal scaled reserves; for reserves > 1e24, the perturbation is < 1 part per million of the reserve",
+        "manipulation_vector": "Push reserves to extreme ratio → _calcRate reverts → calcReserveAtRatio functions fail",
+        "profit_hypothesis": "Indirect — creates DoS for pricing functions, similar to H007 but via different mechanism"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "At what reserve magnitudes does the 1e6 perturbation become negligible?",
+          "Can this be triggered independently or only in conjunction with LUT boundary issues?"
+        ],
+        "validation_requirements": [
+          "Test _calcRate with progressively larger reserves to find underflow threshold",
+          "Verify calcReserve behavior when perturbation is negligible"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Capital to push reserves to extreme magnitudes",
+        "estimated_execution_cost": "Swap transaction gas",
+        "potential_profit_range": "Indirect — DoS on pricing",
+        "estimated_profit_margin": "N/A — DoS attack",
+        "attack_duration": "Persistent while reserves remain extreme"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Very large capital relative to pool size",
+        "optimal_timing": "When pool is already imbalanced",
+        "market_impact_assessment": "Pricing functions become non-functional"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users of the affected Well",
+        "estimated_impact_per_user": "Blocked swaps and oracle updates",
+        "total_value_at_risk": "Pool TVL becomes inaccessible via normal operations"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "PRICE_PRECISION = 1e6, reserves scaled to 18 decimals",
+        "calculation_validation": "Test with reserves [1e30, 1e18] and verify _calcRate behavior",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Division by Zero in calcLpTokenSupply When Single Reserve is Zero",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "calcLpTokenSupply checks `if (reserves[0] == 0 && reserves[1] == 0) return 0` but not the case where only one reserve is zero. When one reserve is zero and the other is non-zero, sumReserves > 0, so the function proceeds. The dP calculation then divides by `scaledReserves[0] * N` or `scaledReserves[1] * N`, which is zero, causing an unhandled revert. This blocks any function depending on LP token supply when one reserve is depleted.",
+      "investigation_rationale": "A pool can reach a state where one reserve is zero through complete swaps or withdrawals. In this state, calcLpTokenSupply reverts, blocking calcReserveAtRatioSwap, calcRate, and any Well operation that depends on LP supply. This is an unhandled edge case that creates a DoS.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "calcLpTokenSupply",
+        "calcRate",
+        "calcReserveAtRatioSwap"
+      ],
+      "affected_contracts": [
+        "Stable2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Stable2.sol",
+          "function": "calcLpTokenSupply"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Stable2.sol",
+        "lines": "81-89",
+        "pattern": "Check for BOTH reserves zero: `if (reserves[0] == 0 && reserves[1] == 0) return 0;` but no check for single zero. dP = dP * lpTokenSupply / (scaledReserves[0] * N) divides by zero when scaledReserves[0] = 0"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "One pool reserve reaches exactly zero while the other is non-zero",
+        "A function calls calcLpTokenSupply with these reserves"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "dP = dP * lpTokenSupply / (scaledReserves[0] * N) where scaledReserves[0] can be 0",
+        "manipulation_vector": "Drain one token completely from pool via swaps → calcLpTokenSupply reverts → all dependent functions blocked",
+        "profit_hypothesis": "Indirect — pool becomes non-functional, blocking legitimate withdrawals and oracle updates"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can a pool actually reach a state where one reserve is exactly zero?",
+          "Does the Well contract prevent complete drain of one token?",
+          "What operations become blocked when calcLpTokenSupply reverts?"
+        ],
+        "validation_requirements": [
+          "Test calcLpTokenSupply with [0, 1e18] and verify it reverts",
+          "Check if Well swap logic prevents reaching zero reserves",
+          "Identify all functions that call calcLpTokenSupply"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Capital to buy all of one token from the pool",
+        "estimated_execution_cost": "Large swap gas cost",
+        "potential_profit_range": "Indirect — DoS plus potential profit from trapped liquidity",
+        "estimated_profit_margin": "N/A — primarily griefing attack",
+        "attack_duration": "Until liquidity is added back"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Must match or exceed one side of pool reserves",
+        "optimal_timing": "When pool has low liquidity",
+        "market_impact_assessment": "Pool becomes non-functional"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All LPs and traders in the pool",
+        "estimated_impact_per_user": "Cannot withdraw or perform operations",
+        "total_value_at_risk": "Remaining token reserves trapped in pool"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Well swap mechanics and minimum reserve constraints",
+        "calculation_validation": "Test calcLpTokenSupply([0, 1000000e18], data) behavior",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "WellUpgradeable init() Lacks Access Control Allowing Ownership Hijack via Re-initialization",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The init() function in WellUpgradeable uses reinitializer(2) but has no access control on who can call it. If a WellUpgradeable proxy was initially set up via initNoWellToken() (which uses initializer, setting initialized=1), then anyone can call init() since reinitializer(2) only requires that the initialized version is < 2. The init() function calls __Ownable_init() which sets msg.sender as the owner. An attacker calling init() becomes the owner of the Well, gaining control over any owner-protected functions.",
+      "investigation_rationale": "The two initialization paths create a sequence vulnerability: initNoWellToken() sets initialized=1, then init() with reinitializer(2) can be called by anyone. __Ownable_init() in OZ sets the caller as owner. If ownership gates any critical operations (even if upgrade path is currently broken), this represents a privilege escalation.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "WellUpgradeable.sol: initNoWellToken() uses `initializer` (sets version to 1), init() uses `reinitializer(2)` (requires version < 2). No msg.sender check on either.",
+      "affected_functions": [
+        "init",
+        "initNoWellToken"
+      ],
+      "affected_contracts": [
+        "WellUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "init"
+        },
+        {
+          "file": "WellUpgradeable.sol",
+          "function": "initNoWellToken"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WellUpgradeable.sol",
+        "lines": "29-43",
+        "pattern": "init() is external with reinitializer(2) but no access control; __Ownable_init() sets msg.sender as owner; initNoWellToken() sets version to 1, leaving init() callable"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "WellUpgradeable proxy was deployed with initNoWellToken() as the initial setup (version set to 1)",
+        "init() has not yet been called (version still < 2)",
+        "Ownership provides meaningful control over the Well"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "reinitializer(2) passes when current version is 1 (set by initNoWellToken's initializer modifier)",
+        "manipulation_vector": "Attacker calls init() on proxy → becomes owner via __Ownable_init() → controls all onlyOwner functions",
+        "profit_hypothesis": "If ownership controls upgrades (once H003 is fixed), attacker gets full upgrade control. If ownership gates other Well operations, attacker gains those controls."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are there WellUpgradeable proxies deployed with initNoWellToken() that haven't called init()?",
+          "What operations does the owner role control in the Well?",
+          "Does the deployer always immediately call init() after initNoWellToken()?"
+        ],
+        "validation_requirements": [
+          "Deploy proxy with initNoWellToken(), verify init() can be called by arbitrary address",
+          "Verify __Ownable_init() sets msg.sender as owner",
+          "Map all onlyOwner functions inherited from Well/OwnableUpgradeable"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas cost only (~0.01 ETH)",
+        "estimated_execution_cost": "Single transaction",
+        "potential_profit_range": "Depends on what ownership controls — potentially full pool TVL",
+        "estimated_profit_margin": ">10000% ROI if ownership provides meaningful control",
+        "attack_duration": "Single transaction for ownership takeover"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None — pure access control exploit",
+        "optimal_timing": "Immediately after proxy deployment, before legitimate init()",
+        "market_impact_assessment": "Full ownership takeover of the Well"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All LPs and the intended owner of the Well",
+        "estimated_impact_per_user": "Potential total loss if owner controls critical operations",
+        "total_value_at_risk": "Entire pool TVL"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Initialization sequence: initNoWellToken → init feasibility",
+        "calculation_validation": "Test re-initialization by attacker after initNoWellToken",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

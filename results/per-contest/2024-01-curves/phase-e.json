@@ -1,0 +1,36 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Malicious Contract Subject Can Permanently Freeze All Trading and Lock User Funds",
+      "severity": "high",
+      "summary": "The _transferFees function (called on every buy and sell) performs a mandatory ETH push-transfer to curvesTokenSubject on line 236: `(bool success2, ) = curvesTokenSubject.call{value: subjectFee}('');` followed by `if (!success2) revert CannotSendFunds();`. If curvesTokenSubject is a smart contract that reverts on receiving ETH, all calls to buyCurvesToken and sellCurvesToken will revert. This is completely independent of the broken access control modifiers in Security.sol and works even with pe",
+      "description": [
+        {
+          "file": "contracts/Curves.sol",
+          "line_start": 236,
+          "line_end": 237,
+          "desc": "_transferFees performs a mandatory push-transfer of subjectFee to curvesTokenSubject via .call{value: subjectFee} and reverts the entire transaction if the call fails. A smart contract subject whose receive() or fallback() reverts will block all buyCurvesToken and sellCurvesToken operations permanently, trapping users' ETH in the bonding curve with no recovery mechanism."
+        }
+      ],
+      "impact": "Permanent loss of all ETH invested by users who bought tokens for the malicious subject. Users cannot sell their tokens or recover their bonding curve deposits. The only escape (withdraw to ERC20) produces tokens that can never be redeemed for ETH. The attack cost is minimal (gas for deploying the contract and buying the first token at price 0).",
+      "proof_of_concept": "1. Attacker deploys a MaliciousSubject contract with a controllable receive() function (accepts ETH initially, reverts after a flag is set).\n2. MaliciousSubject calls buyCurvesToken(address(this), 1) to buy the first token for itself as curvesTokenSubject. The _buyCurvesToken check `supply > 0 || curvesTokenSubject == msg.sender` passes because msg.sender == curvesTokenSubject.\n3. Other users see the active curve (supply > 0) and buy tokens, investing ETH at increasing bonding curve prices. The MaliciousSubject's receive() accepts ETH during this phase.\n4. Once sufficient ETH is invested, the attacker calls lock() on MaliciousSubject, making receive() revert on all incoming ETH.\n5. All subsequent sellCurvesToken and buyCurvesToken calls revert because _transferFees attempts to send subjectFee to MaliciousSubject, which reverts.\n6. Users' ETH is permanently trapped in the Curves contract. The withdraw() function converts to worthless ERC20 tokens that cannot be sold back for ETH.\n7. There is no admin function in Curves.sol to extract arbitrary ETH from the contract.",
+      "remediation": "Use a pull-based pattern for subject fees: accumulate fees in a mapping and let subjects withdraw at their convenience. Alternatively, wrap the subject fee transfer in a try-catch that sends failed fees to a fallback destination (e.g., the protocol fee destination), or skip the transfer if it fails rather than reverting the entire transaction."
+    },
+    {
+      "title": "Complete Absence of Slippage Protection Enables Sandwich Attacks on All Sell Transactions",
+      "severity": "high",
+      "summary": "The sellCurvesToken function (line 282) computes the sell price at execution time based on the current curvesTokenSupply: `uint256 price = getPrice(supply - amount, amount)`. There is no parameter allowing the seller to specify a minimum acceptable price or a transaction deadline. The seller unconditionally receives whatever the bonding curve price is at the moment of execution.\n\nThe bonding curve formula (getPrice, line 180) follows a quadratic (sum of squares) curve, meaning price grows super-",
+      "description": [
+        {
+          "file": "contracts/Curves.sol",
+          "line_start": 282,
+          "line_end": 293,
+          "desc": "sellCurvesToken has no minPrice, minReceived, maxSlippage, or deadline parameter. The seller unconditionally accepts whatever price the current supply state dictates at execution time. An attacker can front-run the sell by selling their own tokens first (reducing supply and thus price), causing the victim to sell at a dramatically lower price, then buy back cheaply."
+        }
+      ],
+      "impact": "Direct theft of value from sellers. The attacker profits exactly what the victim loses (minus fees). Every sell transaction is vulnerable with no on-chain mitigation available to users. The quadratic bonding curve means even small supply manipulations cause large price impacts. With default 0% fees, the attack is maximally profitable; with fees up to ~10%, sell-side sandwiches remain profitable.",
+      "proof_of_concept": "1. Alice holds 5 tokens for subject S at supply=20 and submits sellCurvesToken(S, 5) to the mempool, expecting approximately getPrice(15, 5) in ETH.\n2. MEV bot Bob detects Alice's pending sell. Bob front-runs by selling his 10 tokens: sellCurvesToken(S, 10). Supply drops from 20 to 10.\n3. Alice's sell executes at supply=10: she receives getPrice(5, 5) instead of getPrice(15, 5). Due to the quadratic curve, this is dramatically less ETH.\n4. Bob back-runs by buying 10 tokens at the now-depressed price: buyCurvesToken(S, 10) at supply=5, which is much cheaper than his original position.\n5. Net result: Bob profits (minus fees), Alice receives significantly less ETH than expected with no recourse.\n\nThe quadratic bonding curve amplifies this: at supply=20, selling 5 tokens yields ~0.0336 ETH. At supply=10, selling 5 yields ~0.0039 ETH - an 88% reduction in proceeds for the victim.",
+      "remediation": "Add a minPrice parameter to sellCurvesToken: `function sellCurvesToken(address curvesTokenSubject, uint256 amount, uint256 minPrice)` and check `if (price < minPrice) revert SlippageExceeded()`. Also add a deadline parameter to prevent stale transactions from being executed at unfavorable prices. Consider adding the same protections to buyCurvesToken with a maxPrice parameter."
+    }
+  ]
+}

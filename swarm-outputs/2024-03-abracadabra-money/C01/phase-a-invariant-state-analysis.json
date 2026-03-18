@@ -1,0 +1,303 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T01:13:11.433Z",
+    "duration_ms": 486081
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "CauldronV4.sol",
+        "description": "cook() solvency check is bypassed when any unhandled action (e.g., ACTION_ACCRUE=8, or 0,1,3,9, or >=100) follows a BORROW or REMOVE_COLLATERAL. The default _additionalCookAction returns a zeroed CookStatus struct, overwriting needsSolvencyCheck to false. ACTION_ACCRUE (8) has no explicit handler in the if-else chain despite being defined as a constant.",
+        "attack_scenario": "Attacker calls cook([ACTION_BORROW, 8], ...). ACTION_BORROW sets needsSolvencyCheck=true. Action 8 (unhandled) falls to the else branch, calling _additionalCookAction which returns CookStatus{false,false}. status is overwritten, needsSolvencyCheck becomes false. The solvency check at cook's end is skipped entirely. Attacker borrows unlimited MIM with minimal collateral, draining the protocol.",
+        "invariant_logic": "For all cook executions: if any action in the batch set needsSolvencyCheck=true, the final solvency check MUST execute. Formally: (ACTION_BORROW or ACTION_REMOVE_COLLATERAL was executed) => _isSolvent(msg.sender, _exchangeRate) is checked before cook returns.",
+        "solidity_property": "function invariant_cook_solvency_enforced() public { uint8[] memory actions = new uint8[](2); actions[0] = 5; actions[1] = 8; /* after cook completes with borrow, _isSolvent must have been checked */ assert(_isSolvent(msg.sender, exchangeRate)); }",
+        "inventory_refs": [
+          {
+            "file": "CauldronV4.sol",
+            "function": "cook"
+          },
+          {
+            "file": "CauldronV4.sol",
+            "function": "_additionalCookAction"
+          },
+          {
+            "file": "BlastWrappers.sol",
+            "function": "BlastCauldronV4"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MagicLpAggregator.sol",
+        "description": "_getReserves() declares local variables (baseReserve, quoteReserve) via tuple destructuring of pair.getReserves(), but these are local variables that shadow the unnamed return values. The function always returns (0, 0) since the return variables are never assigned. This makes latestAnswer() always return 0.",
+        "attack_scenario": "If MagicLpAggregator is used as the oracle for a Cauldron, all LP token collateral is valued at 0. All borrowers appear insolvent and can be mass-liquidated, or new borrows are impossible since collateral value is zero. Complete loss of funds for LP token collateral providers.",
+        "invariant_logic": "_getReserves() return values must equal pair.getReserves(). latestAnswer() must return a positive value when pair has reserves and totalSupply > 0. Currently: latestAnswer() == int256(minAnswer * (0 + 0) / totalSupply) == 0 always.",
+        "solidity_property": "function invariant_oracle_nonzero() public view { (uint256 baseR, uint256 quoteR) = pair.getReserves(); if (baseR > 0 && quoteR > 0 && pair.totalSupply() > 0) { assert(latestAnswer() > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "MagicLpAggregator.sol",
+            "function": "_getReserves"
+          },
+          {
+            "file": "MagicLpAggregator.sol",
+            "function": "latestAnswer"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "FeeCollectable.sol",
+        "description": "setFeeParameters() validates the CURRENT state variable feeBips instead of the NEW input parameter _feeBips. The check 'if (feeBips > BIPS)' should be 'if (_feeBips > BIPS)'. This allows setting fee to any value (including >100%) as long as the current fee is valid.",
+        "attack_scenario": "Fee operator calls setFeeParameters(collector, 20000) when current feeBips is 0. The check passes (0 <= 10000). Now feeBips=20000 (200%). calculateFees() computes feeAmount = amountIn * 20000 / 10000 = 2x amountIn, causing underflow in userAmount = amountIn - feeAmount, or the fee exceeds the entire user amount.",
+        "invariant_logic": "After any call to setFeeParameters(_feeCollector, _feeBips): feeBips <= BIPS (10000). The new parameter _feeBips must be validated, not the old state.",
+        "solidity_property": "function invariant_feeBips_bounded() public view { assert(feeBips <= BIPS); }",
+        "inventory_refs": [
+          {
+            "file": "FeeCollectable.sol",
+            "function": "setFeeParameters"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "CauldronV4.sol",
+        "description": "In liquidate(), allBorrowShare is computed from BentoBox totals before the external swap, then recomputed after. The swap modifies BentoBox totals (via transfers/deposits), so the second computation can differ. The second value is what the liquidator actually pays, which may be more than what the swapper was told to provide.",
+        "attack_scenario": "Liquidator calls liquidate with a swapper. First allBorrowShare = X is passed to swapper as shareToMin. Swapper provides X shares. Then BentoBox totals change during swap. Second allBorrowShare = X+delta is computed. Liquidator must transfer X+delta shares, but only prepared X shares. Transaction reverts, or if delta is negative, protocol receives fewer shares than intended, creating bad debt.",
+        "invariant_logic": "allBorrowShare should be computed once and used consistently: allBorrowShare_pre_swap == allBorrowShare_post_swap for the same allBorrowAmount. Or the recomputation should be removed.",
+        "solidity_property": "function invariant_liquidation_share_stable() public { /* bentoBox.toShare(MIM, amount, true) should be stable across the swap execution */ }",
+        "inventory_refs": [
+          {
+            "file": "CauldronV4.sol",
+            "function": "liquidate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "BlastOnboardingBoot.sol",
+        "description": "_claimable() calculates user pool shares by summing raw MIM and USDB locked amounts (totalLocked = totals[MIM].locked + totals[USDB].locked). These are different tokens with potentially different values (I=0.998 means 1 MIM ≈ 0.998 USDB). Users who deposit more of the less-valuable token receive disproportionate shares.",
+        "attack_scenario": "If MIM depeg occurs (e.g., 1 MIM = 0.5 USDB), a user depositing 1000 MIM (worth 500 USDB) gets the same claim weight as a user depositing 1000 USDB. The MIM depositor claims more pool shares than their value contribution warrants, diluting USDB depositors.",
+        "invariant_logic": "Pool share allocation should be proportional to value contributed: userShares/totalPoolShares ≈ (userMIM*MIM_price + userUSDB*USDB_price) / (totalMIM*MIM_price + totalUSDB*USDB_price).",
+        "solidity_property": "function invariant_claimable_value_proportional(address user) public view { /* shares should reflect value, not raw amounts */ }",
+        "inventory_refs": [
+          {
+            "file": "BlastOnboardingBoot.sol",
+            "function": "_claimable"
+          },
+          {
+            "file": "BlastOnboardingBoot.sol",
+            "function": "claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "sellBase() and sellQuote() use tx.origin for fee rate calculation instead of msg.sender. This makes fees depend on the EOA that initiated the transaction, not the actual caller, enabling fee manipulation through contract intermediaries and breaking compatibility with account abstraction.",
+        "attack_scenario": "If the fee rate model provides preferential rates to whitelisted addresses, an attacker routes trades through a whitelisted EOA's transaction to get lower fees. Meta-transaction relayers would charge fees based on the relayer rather than the actual trader. Smart contract wallets always get the EOA's fee rate.",
+        "invariant_logic": "Fee rate determination should use msg.sender (the direct caller) or a passed parameter, never tx.origin. querySellBase(msg.sender, ...) should be used instead of querySellBase(tx.origin, ...).",
+        "solidity_property": "function invariant_fee_not_tx_origin() public { /* sellBase fee rate should match _MT_FEE_RATE_MODEL_.getFeeRate(msg.sender, _LP_FEE_RATE_) */ }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "sellBase"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "sellQuote"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "flashLoan"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "BlastOnboardingBoot.sol",
+        "description": "setReady() can toggle ready between true and false. Combined with setStaking() (blocked only when ready=true), an owner can: set ready=true → users claim → set ready=false → change staking contract → set ready=true. Early claimers staked to the old contract, later claimers to the new one. Early claimers may lose access to rewards.",
+        "invariant_logic": "Once ready is set to true and any user has claimed (claimed[user] == true), ready should not be set back to false. The ready transition should be one-way: false → true.",
+        "solidity_property": "function invariant_ready_irreversible() public view { /* if any claimed[user] is true, then ready must be true */ }",
+        "inventory_refs": [
+          {
+            "file": "BlastOnboardingBoot.sol",
+            "function": "setReady"
+          },
+          {
+            "file": "BlastOnboardingBoot.sol",
+            "function": "setStaking"
+          },
+          {
+            "file": "BlastOnboardingBoot.sol",
+            "function": "claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LockingMultiRewards.sol",
+        "description": "processExpiredLocks prevents processing lastLockIndex when locks.length > 1. This forces operators to process non-last locks first. If an operator submits incorrect ordering or processes multiple locks for the same user in one batch, array modifications (swap-and-pop) can cause unexpected behavior with stale indices.",
+        "invariant_logic": "Any expired lock should be independently processable regardless of index. Formally: locks[index].unlockTime <= block.timestamp && locks[index].amount > 0 → lock is processable.",
+        "solidity_property": "function invariant_expired_lock_processable(address user, uint256 index) public view { LockedBalance memory lock = _userLocks[user][index]; if (lock.unlockTime <= block.timestamp && lock.amount > 0) { /* should not revert */ } }",
+        "inventory_refs": [
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "processExpiredLocks"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Router.sol",
+        "description": "_validateDecimals performs quoteDecimals - baseDecimals as uint8 subtraction, which underflows (reverts in Solidity 0.8+) when baseDecimals > quoteDecimals. This prevents creating pools via Router where the base token has more decimals than the quote token, even if the difference is within acceptable range.",
+        "invariant_logic": "Decimal validation should check absolute difference: abs(int(quoteDecimals) - int(baseDecimals)) <= MAX_BASE_QUOTE_DECIMALS_DIFFERENCE. Both directions should be supported.",
+        "solidity_property": "function invariant_decimal_bidirectional(uint8 base, uint8 quote) public pure { uint8 diff = base > quote ? base - quote : quote - base; assert(diff <= MAX_BASE_QUOTE_DECIMALS_DIFFERENCE); }",
+        "inventory_refs": [
+          {
+            "file": "Router.sol",
+            "function": "_validateDecimals"
+          },
+          {
+            "file": "Router.sol",
+            "function": "createPool"
+          },
+          {
+            "file": "Router.sol",
+            "function": "createPoolETH"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "CauldronV4.sol",
+        "description": "Constructor and init() blacklist the BentoBox owner address at deployment/initialization time. If BentoBox ownership transfers afterwards, the new owner is NOT blacklisted and can be targeted via ACTION_CALL in cook(), potentially enabling unauthorized operations through the BentoBox owner's privileges.",
+        "invariant_logic": "blacklistedCallees must always include the current BentoBox owner: blacklistedCallees[Owned(address(bentoBox)).owner()] == true at all times, not just at init time.",
+        "solidity_property": "function invariant_bentobox_owner_always_blacklisted() public view { assert(blacklistedCallees[Owned(address(bentoBox)).owner()]); }",
+        "inventory_refs": [
+          {
+            "file": "CauldronV4.sol",
+            "function": "init"
+          },
+          {
+            "file": "CauldronV4.sol",
+            "function": "_call"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "DegenBox.sol",
+        "description": "transferMultiple() only validates tos[0] != address(0), but does not check subsequent recipients. Shares can be transferred to address(0) at indices > 0, permanently locking those shares.",
+        "invariant_logic": "For all i in [0, tos.length): tos[i] != address(0). Every recipient in a batch transfer must be non-zero.",
+        "solidity_property": "function invariant_no_zero_recipients(address[] memory tos) public pure { for (uint i = 0; i < tos.length; i++) { assert(tos[i] != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "DegenBox.sol",
+            "function": "transferMultiple"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "MagicLpAggregator.sol",
+        "description": "latestRoundData() returns zeros for all timestamp and round fields (roundId=0, startedAt=0, updatedAt=0, answeredInRound=0). Consumers that check oracle freshness (e.g., Chainlink staleness checks) will see permanently stale data. Combined with the _getReserves bug, this oracle provides no useful data.",
+        "invariant_logic": "latestRoundData() should return updatedAt == block.timestamp (since it's computed on-the-fly) and meaningful round IDs for compatibility with Chainlink-style consumers.",
+        "solidity_property": "function invariant_oracle_timestamps() public view { (, , , uint256 updatedAt, ) = aggregator.latestRoundData(); assert(updatedAt > 0 && block.timestamp - updatedAt < STALENESS_THRESHOLD); }",
+        "inventory_refs": [
+          {
+            "file": "MagicLpAggregator.sol",
+            "function": "latestRoundData"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "BlastOnboarding.sol",
+        "description": "State transitions must be strictly monotonic: Idle(0) → Opened(1) → Closed(2). The open() function requires onlyState(Idle) and the close() function requires onlyState(Opened). No backward transitions exist, and no function can reset state.",
+        "invariant_logic": "For any two consecutive state observations: state_new >= state_old. Once Closed, state remains Closed forever.",
+        "solidity_property": "function invariant_state_monotonic() public view { /* State enum value can only increase: Idle=0 -> Opened=1 -> Closed=2 */ }",
+        "inventory_refs": [
+          {
+            "file": "BlastOnboarding.sol",
+            "function": "open"
+          },
+          {
+            "file": "BlastOnboarding.sol",
+            "function": "close"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "MagicLP.sol",
+        "description": "MagicLP.init() can only be called once due to the _INITIALIZED_ flag, and the implementation contract sets _INITIALIZED_=true in the constructor. However, there is no check that the caller of init() is the Factory or an authorized deployer - anyone who deploys a clone can initialize it with arbitrary parameters.",
+        "invariant_logic": "After init() is called: _INITIALIZED_ == true AND collateral/oracle parameters are immutable. init() must revert on all subsequent calls.",
+        "solidity_property": "function invariant_init_once() public view { assert(_INITIALIZED_ == true); /* calling init again must revert */ }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "init"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "DegenBox.sol",
+        "description": "setStrategy requires a 3-day delay between queuing and activation (STRATEGY_DELAY). However, harvest() is callable by anyone with no access control. A malicious caller can trigger harvest() for a token with an active strategy, and the strategy's harvest() function receives msg.sender as a parameter, which an untrusted strategy could misuse.",
+        "invariant_logic": "Strategy changes must respect the STRATEGY_DELAY: block.timestamp >= strategyData[token].strategyStartDate when activating a strategy. harvest() should validate that strategy[token] != address(0).",
+        "solidity_property": "function invariant_strategy_delay() public view { if (pendingStrategy[token] != IStrategy(address(0))) { assert(block.timestamp >= strategyData[token].strategyStartDate); } }",
+        "inventory_refs": [
+          {
+            "file": "DegenBox.sol",
+            "function": "setStrategy"
+          },
+          {
+            "file": "DegenBox.sol",
+            "function": "harvest"
+          }
+        ]
+      }
+    ]
+  }
+}

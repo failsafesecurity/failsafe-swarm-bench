@@ -1,0 +1,438 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T05:46:15.828Z",
+    "duration_ms": 285410
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-listing",
+        "source": "Seller (msg.sender in listVesting)",
+        "path": [
+          "Marketplace.listVesting() - validates params, checks currency support",
+          "VestingManager.listVesting() - validates sell limits, allocation tracking",
+          "StepVesting.transferVesting(seller, manager, amount) - moves vesting from seller to VestingManager",
+          "Marketplace stores listing struct in listings mapping"
+        ],
+        "transformations": [
+          "baseAmount = (amount * price) / 10^decimals - minimum listing value check",
+          "sellLimit = bought + ((currentAlloc + sold - bought) * maxSellPercent) / BASE",
+          "grantor releaseRate = grantorVesting.totalAmount / numOfSteps (BUG: ignores stepsClaimed)",
+          "beneficiary(manager) releaseRate = (totalAmount - amountClaimed) / (numOfSteps - stepsClaimed)"
+        ],
+        "sinks": [
+          "VestingManager holds the vesting allocation on behalf of sellers",
+          "listings mapping stores listing metadata"
+        ],
+        "trust_changes": "Seller's vesting ownership transfers to VestingManager contract; Seller trusts marketplace to manage listing correctly",
+        "validation_points": [
+          "Price > 0",
+          "Amount > 0",
+          "Currency token is supported",
+          "baseAmount > 0 (avoids rounding to zero)",
+          "VestingManager: vesting is sellable",
+          "VestingManager: sufficient available balance",
+          "VestingManager: sold <= sellLimit"
+        ],
+        "exposure_risks": [
+          "Listing params (price, amount, discount) are publicly visible on-chain",
+          "Seller's allocation and sell history are visible via allocations mapping"
+        ],
+        "manipulation_risks": [
+          "discountPct has no upper bound validation - can set values >= BASE causing purchase reverts",
+          "Grantor releaseRate recalculated incorrectly using totalAmount/numOfSteps instead of (totalAmount-amountClaimed)/(numOfSteps-stepsClaimed)"
+        ]
+      },
+      {
+        "flow_id": "DF-002-purchase",
+        "source": "Buyer (msg.sender in spotPurchase)",
+        "path": [
+          "Marketplace.spotPurchase() - validates purchase params",
+          "Marketplace._validatePurchase() - checks listing status, whitelist, amounts",
+          "Marketplace._getFees() - fetches buyer/seller fee rates",
+          "Marketplace._getDiscountedPrice() - calculates discounted price per unit",
+          "Marketplace._handleTransfers() - moves currency tokens and calculates fees",
+          "Marketplace updates listing.balance and listing.status",
+          "VestingManager.completePurchase() - transfers vesting from manager to buyer"
+        ],
+        "transformations": [
+          "discountedPrice = pricePerUnit * (BASE - discount) / BASE",
+          "baseAmount = (amount * discountedPrice) / 10^decimals",
+          "buyerFeeTotal = baseAmount * bfee / BASE",
+          "sellerFeeTotal = baseAmount * sfee / BASE",
+          "referralFeeCost = buyerFeeTotal - (baseAmount * bfee * referralFee) / (BASE * BASE) -- NEVER PAID OUT"
+        ],
+        "sinks": [
+          "Seller receives: baseAmount - sellerFeeTotal",
+          "FeeCollector receives: buyerFeeTotal + sellerFeeTotal (including referral's share - BUG)",
+          "Buyer receives vesting allocation via VestingManager",
+          "Referral receives: NOTHING (referralFeeCost calculated but not transferred)"
+        ],
+        "trust_changes": "Buyer trusts price/discount calculation; Buyer's currency tokens flow to marketplace, seller, and feeCollector; Vesting ownership moves from VestingManager to buyer",
+        "validation_points": [
+          "Listing status == LIST",
+          "msg.sender != referral",
+          "Whitelist check (if applicable)",
+          "Amount >= minPurchaseAmt or amount == balance",
+          "SINGLE type: amount == total",
+          "amount <= balance",
+          "baseAmount > 0"
+        ],
+        "exposure_risks": [
+          "Purchase details (amount, referral) visible on-chain",
+          "Fee structure can be read from marketplace settings"
+        ],
+        "manipulation_risks": [
+          "Referral fee is never actually paid to referrer - funds retained by feeCollector",
+          "LINEAR discount can cause underflow revert if discountPct * amount / total >= BASE",
+          "Fee-on-transfer tokens would cause accounting mismatch - contract may have insufficient balance for subsequent transfers"
+        ]
+      },
+      {
+        "flow_id": "DF-003-unlist",
+        "source": "Seller or s2Admin (msg.sender in unlistVesting)",
+        "path": [
+          "Marketplace.unlistVesting() - validates status and authorization",
+          "If early unlist by seller: collect USDT penalty fee via safeTransferFrom",
+          "VestingManager.unlistVesting() - returns vesting to seller",
+          "StepVesting.transferVesting(manager, seller, amount)",
+          "Listing status set to DELIST, balance set to 0"
+        ],
+        "transformations": [
+          "penaltyFee transferred in USDT regardless of listing currency",
+          "allocations[seller][plan].sold -= amount (restores sell capacity)"
+        ],
+        "sinks": [
+          "Penalty fee goes to feeCollector in USDT",
+          "Vesting allocation returned to seller"
+        ],
+        "trust_changes": "VestingManager releases vesting back to seller; Penalty fee paid in a different token (USDT) than listing currency",
+        "validation_points": [
+          "Listing status must be LIST",
+          "Caller must be seller or s2Admin",
+          "Penalty fee balance check (only for non-admin early delist)"
+        ],
+        "exposure_risks": [
+          "Penalty fee amount and timing publicly visible"
+        ],
+        "manipulation_risks": [
+          "Admin can unlist any listing without penalty - centralization risk",
+          "Penalty fee is fixed in USDT wei regardless of listing value - disproportionate for small listings"
+        ]
+      },
+      {
+        "flow_id": "DF-004-vesting-transfer-chain",
+        "source": "VestingManager (authorized caller of transferVesting)",
+        "path": [
+          "StepVesting.transferVesting(grantor, beneficiary, amount)",
+          "Reduces grantor.totalAmount by amount",
+          "INCORRECTLY recalculates grantor.releaseRate = totalAmount / numOfSteps",
+          "_createVesting(beneficiary, amount, grantorStepsClaimed, true)",
+          "If beneficiary exists: adds to totalAmount, recalculates releaseRate with beneficiary's stepsClaimed",
+          "If beneficiary is new: inherits grantor's stepsClaimed"
+        ],
+        "transformations": [
+          "grantor.releaseRate = grantor.totalAmount / numOfSteps (BUG: should divide by numOfSteps - stepsClaimed)",
+          "beneficiary.releaseRate = (totalAmount - amountClaimed) / (numOfSteps - stepsClaimed)",
+          "For new beneficiary: releaseRate = amount / (numOfSteps - grantorStepsClaimed)"
+        ],
+        "sinks": [
+          "Updated vesting records for both grantor and beneficiary"
+        ],
+        "trust_changes": "VestingManager intermediary contaminates stepsClaimed values between unrelated sellers and buyers",
+        "validation_points": [
+          "Caller must be tokenIssuer, manager, or vestingDeployer",
+          "Beneficiary not zero address",
+          "Amount > 0",
+          "Grantor has sufficient unclaimed balance"
+        ],
+        "exposure_risks": [
+          "Vesting state is public - observable timing of claims and transfers"
+        ],
+        "manipulation_risks": [
+          "Grantor releaseRate bug allows over-claiming: rate based on totalAmount/numOfSteps instead of (totalAmount-amountClaimed)/(numOfSteps-stepsClaimed)",
+          "VestingManager as intermediary mixes stepsClaimed from different sellers - buyers may claim different amounts than expected based on intermediary state",
+          "After partial claims and transfers, amountClaimed can exceed totalAmount due to inflated releaseRate"
+        ]
+      },
+      {
+        "flow_id": "DF-005-fee-calculation",
+        "source": "Marketplace settings and vesting plan config",
+        "path": [
+          "_getFees(vestingPlan) - checks per-plan fees via VestingManager",
+          "Falls back to global buyerFee/sellerFee if plan-specific = -1",
+          "Fees applied as percentage of baseAmount",
+          "Referral fee calculated but not distributed"
+        ],
+        "transformations": [
+          "bfee: vpbf > -1 ? vpbf : globalBuyerFee",
+          "sfee: vpsf > -1 ? vpsf : globalSellerFee",
+          "buyerFeeTotal = baseAmount * bfee / BASE",
+          "sellerFeeTotal = baseAmount * sfee / BASE",
+          "referralFeeCost = buyerFeeTotal * (1 - referralFee/BASE) -- but NEVER transferred"
+        ],
+        "sinks": [
+          "feeCollector receives buyerFeeTotal + sellerFeeTotal (whole amount, referral share not deducted)",
+          "Referrer receives nothing despite referralFeeCost being calculated"
+        ],
+        "trust_changes": "Referral system is non-functional despite code infrastructure existing",
+        "validation_points": [
+          "Fee range: 0-5000 basis points (0-50%)",
+          "referralFee range: 1-10000 basis points"
+        ],
+        "exposure_risks": [
+          "Fee structure publicly readable"
+        ],
+        "manipulation_risks": [
+          "Admin can set fees up to 50% each side (100% total extraction)",
+          "Referral system emits events suggesting payment but no actual transfer occurs - could mislead integrators"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Sellers can list up to maxSellPercent of original allocation + 100% of marketplace-bought allocation",
+        "SINGLE listings require buying the entire amount at once",
+        "PARTIAL listings allow partial buys with a minimum purchase amount (or the full remaining balance)",
+        "Step vesting releases tokens linearly over numOfSteps periods",
+        "VestingManager acts as escrow holding listed vesting allocations",
+        "Early delisting incurs a flat USDT penalty fee",
+        "Discounts: NO (none), LINEAR (proportional to amount/total), FIX (flat percentage)"
+      ],
+      "economic_incentives": [
+        "Buyer fee: 0-50% of purchase amount - charged on top of base price",
+        "Seller fee: 0-50% of purchase amount - deducted from seller's proceeds",
+        "Referral system: designed to give portion of buyer fee to referrer but NEVER ACTUALLY PAYS OUT",
+        "Penalty fee: flat USDT amount for early delisting - discourages listing churn",
+        "Token issuer controls maxSellPercent - limits secondary market supply"
+      ],
+      "governance_mechanisms": [
+        "s2Admin: can freeze marketplace, update all settings, unlist any vesting, add currencies",
+        "Token Issuer: controls maxSellPercent for their vesting plans, can create/transfer vestings arbitrarily",
+        "VestingDeployer: deploys new vesting contracts, sets sellable status",
+        "No timelock on any admin actions - immediate effect",
+        "No multisig requirement for admin operations"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Grantor's releaseRate after transferVesting is calculated as totalAmount/numOfSteps instead of (totalAmount-amountClaimed)/(numOfSteps-stepsClaimed)",
+          "expected_behavior": "Release rate should reflect remaining tokens divided by remaining steps",
+          "actual_behavior": "Release rate is inflated because it divides by total steps instead of remaining steps. After partial claims and a transfer, grantor can claim more tokens per step than they should, potentially exceeding their unclaimed balance.",
+          "risk_level": "high",
+          "exploitation_potential": "A seller who has claimed some steps can transfer a small amount, get an inflated releaseRate, then claim more tokens per remaining step than entitled. Over multiple intermediate steps, amountClaimed can exceed totalAmount. The final step underflows and reverts, but intermediate overclaim extracts real tokens from the vesting contract. Proof: seller with totalAmount=1000, amountClaimed=500, stepsClaimed=5, numOfSteps=10 transfers 200. New totalAmount=800, releaseRate=800/10=80. Remaining unclaimed=300, remaining steps=5. At steps 6-9 (4 steps): 80*4=320>300. The 20 extra tokens are drained from the contract."
+        },
+        {
+          "scenario": "Referral rewards calculated but never transferred to referrer",
+          "expected_behavior": "Referrer should receive referralFeeCost from buyer fees",
+          "actual_behavior": "referralFeeCost is calculated and emitted in events, but the entire buyerFeeTotal + sellerFeeTotal is sent to feeCollector. No transfer to the referral address occurs. The referral system is completely non-functional.",
+          "risk_level": "high",
+          "exploitation_potential": "Not exploitable per se, but represents lost functionality and misleading event emissions. Integrators building referral programs on this contract will have incorrect accounting. feeCollector receives referral rewards they shouldn't get."
+        },
+        {
+          "scenario": "VestingManager intermediary contaminates stepsClaimed across sellers",
+          "expected_behavior": "Buyer should inherit vesting timing proportional to the seller's progress",
+          "actual_behavior": "VestingManager (as vesting intermediary) accumulates a single stepsClaimed value from all sellers. First seller's stepsClaimed becomes manager's value. Subsequent sellers' stepsClaimed values are ignored. Buyers inherit the manager's potentially stale/wrong stepsClaimed, allowing earlier or later claiming than expected.",
+          "risk_level": "high",
+          "exploitation_potential": "An attacker can observe the manager's current stepsClaimed. If it's low (from an early listing), buying tokens from a late-stage seller lets the buyer claim a larger portion immediately. If the manager's stepsClaimed is high, buying from an early-stage seller means slower vesting than intended."
+        },
+        {
+          "scenario": "discountPct has no upper bound validation",
+          "expected_behavior": "discountPct should be capped at BASE (10000) or a reasonable maximum",
+          "actual_behavior": "Any value > 0 is accepted for LINEAR/FIX discounts. For FIX: if discountPct >= BASE, (BASE - discountPct) underflows (reverts in 0.8.x). For LINEAR: if amount * discountPct / total >= BASE, same underflow. Sellers can create listings that always revert on purchase.",
+          "risk_level": "medium",
+          "exploitation_potential": "Griefing: create listings that appear valid but revert on purchase, wasting buyer gas. Could also be used to inflate listing count metrics. For discountPct very close to but below BASE, extremely cheap purchases could be made."
+        },
+        {
+          "scenario": "Fee-on-transfer or rebasing tokens used as currency",
+          "expected_behavior": "Contract should account for actual received amounts after transfer fees",
+          "actual_behavior": "Contract calculates exact amounts and transfers them sequentially. If currency token has transfer fees, the contract receives less than expected from buyer, but still attempts to transfer full amounts to seller and feeCollector, causing reverts or using previously deposited funds.",
+          "risk_level": "medium",
+          "exploitation_potential": "If a fee-on-transfer token is added as supported currency, trades will either revert or drain previously stuck tokens from the contract."
+        },
+        {
+          "scenario": "PARTIAL listing remainder becomes less than minPurchaseAmt, creating dust",
+          "expected_behavior": "Either enforce clean divisibility or handle dust cleanup",
+          "actual_behavior": "The check allows buying the full remaining balance even if below minPurchaseAmt (_amount == listing.balance). However, an intermediate purchase could leave a balance above 0 but below minPurchaseAmt, and below meaningful economic value, effectively locking the seller's remaining allocation unless someone buys exactly the balance.",
+          "risk_level": "low",
+          "exploitation_potential": "An attacker buys most of a PARTIAL listing, leaving a tiny remainder that nobody wants to buy. Seller must unlist (potentially paying penalty) to recover the dust. Not directly profitable for attacker but griefs seller."
+        },
+        {
+          "scenario": "Both buyer and seller fees set to maximum 50% each (5000 bps)",
+          "expected_behavior": "Clear documentation of total fee impact",
+          "actual_behavior": "Buyer pays baseAmount + 50% = 1.5x baseAmount. Seller receives baseAmount - 50% = 0.5x baseAmount. Platform takes 100% of baseAmount as fees. This is technically allowed.",
+          "risk_level": "medium",
+          "exploitation_potential": "Admin can extract 100% of trade value as fees, effectively rugpulling marketplace users. No timelock prevents this."
+        },
+        {
+          "scenario": "Setting maxSellPercent to 0 after users have listed tokens",
+          "expected_behavior": "Existing listings should still be honored or properly handled",
+          "actual_behavior": "Existing listings continue to work (they're already listed). But sellers cannot create new listings. If they unlist and try to relist, they may not be able to because sellLimit would be 0 (unless they bought tokens). Token issuer can effectively freeze secondary trading at will.",
+          "risk_level": "medium",
+          "exploitation_potential": "Token issuer can front-run market conditions to prevent selling, trapping users in vesting schedules."
+        },
+        {
+          "scenario": "Zero-step vesting (_stepsClaimed == numOfSteps) receives transfer",
+          "expected_behavior": "All tokens immediately claimable",
+          "actual_behavior": "In _createVesting for new beneficiary: releaseRate = amount / (numOfSteps - numOfSteps) = division by zero. This would revert, preventing transfer to a fully-vested new beneficiary.",
+          "risk_level": "medium",
+          "exploitation_potential": "Near end-of-vesting transfers to new addresses become impossible. Existing beneficiaries with stepsClaimed=numOfSteps CAN receive (releaseRate set to 0, handled by final step catch-all), but new beneficiaries cannot."
+        },
+        {
+          "scenario": "Marketplace frozen with tokens listed",
+          "expected_behavior": "Users should have a way to recover listed tokens",
+          "actual_behavior": "Both listing and unlisting require isFreeze modifier to pass. When frozen, sellers cannot unlist. Admin can unlist on their behalf since admin also needs !isMarketplaceFreeze. Both operations are blocked during freeze, locking all listed tokens indefinitely.",
+          "risk_level": "high",
+          "exploitation_potential": "Admin can freeze marketplace, permanently locking all listed vesting allocations. Even the admin cannot unlist during freeze due to the isFreeze modifier applying to unlistVesting."
+        }
+      ],
+      "assumption_violations": [
+        "Assumes VestingManager is a single entity with consistent stepsClaimed - violated when multiple sellers at different steps interact",
+        "Assumes releaseRate * remainingSteps == remaining tokens - violated after transferVesting due to incorrect recalculation",
+        "Assumes currency tokens have standard ERC20 behavior with no transfer fees",
+        "Assumes decimals() function returns consistent values and exists on all vesting tokens",
+        "Assumes admin is trustworthy and won't set exploitative fee parameters",
+        "Assumes token issuers won't maliciously manipulate maxSellPercent mid-trade",
+        "Assumes unlistVesting is accessible during marketplace freeze (it is NOT - both list and unlist check isFreeze)"
+      ],
+      "game_theory_risks": [
+        "Referral system emits rewards in events but pays nothing - referrers have no actual incentive despite apparent mechanism",
+        "Token issuers can change maxSellPercent dynamically - information asymmetry between issuer and sellers",
+        "Admin can frontrun user transactions by freezing marketplace, changing fees, or adding/removing currencies",
+        "Sellers can create non-purchasable listings (extreme discountPct) to pollute marketplace",
+        "Buyers can strategically purchase small amounts from PARTIAL listings to leave uneconomic dust",
+        "Due to VestingManager stepsClaimed contamination, early marketplace entrants set the stepsClaimed for all subsequent buyers - first-mover advantage"
+      ],
+      "integration_risks": [
+        "External ERC20 tokens as currency: no validation of decimals(), no handling of fee-on-transfer, no handling of rebasing",
+        "Upgradeable Marketplace contract has no initializer guard beyond Initializable - storage layout must be carefully managed",
+        "VestingManager's getVestingTokenAddress requires onlyMarketplace modifier - other integrators cannot query token addresses",
+        "doesFunctionExist uses staticcall which returns true for contracts with fallback functions - unreliable detection",
+        "SafeERC20 is used for transfers but doesn't protect against tokens that don't revert but return false (handled by SafeERC20 though)",
+        "No reentrancy guards on any contract - vulnerable if used with ERC777 or callback-enabled tokens"
+      ],
+      "calculation_errors": [
+        {
+          "location": "StepVesting.transferVesting - grantor releaseRate",
+          "error": "grantorVesting.releaseRate = grantorVesting.totalAmount / numOfSteps",
+          "correct_formula": "grantorVesting.releaseRate = (grantorVesting.totalAmount - grantorVesting.amountClaimed) / (numOfSteps - grantorVesting.stepsClaimed)",
+          "impact": "Inflated release rate causes over-claiming. Grantor can extract more tokens than entitled before final step reverts."
+        },
+        {
+          "location": "Marketplace._handleTransfers - referral distribution",
+          "error": "referralFeeCost is calculated but never transferred to referral. feeCollectorTotal = buyerFeeTotal + sellerFeeTotal (should subtract referralFeeCost when referral exists)",
+          "correct_formula": "feeCollectorTotal = buyerFeeTotal + sellerFeeTotal - referralFeeCost; transfer referralFeeCost to _referral",
+          "impact": "Referrers never receive rewards. feeCollector receives more than intended."
+        },
+        {
+          "location": "Marketplace._handleTransfers - referral formula semantics",
+          "error": "referralFeeCost = buyerFeeTotal - (baseAmount * bfee * referralFee) / (BASE * BASE) simplifies to buyerFeeTotal * (1 - referralFee/BASE)",
+          "correct_formula": "If referralFee means percentage going TO referrer, should be buyerFeeTotal * referralFee / BASE",
+          "impact": "With referralFee=1000 (10%), the formula gives 90% to referrer instead of 10%. Naming/logic inversion."
+        }
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "USDT (penalty fee token)",
+          "behaviors": [
+            "fee_on_transfer:possible",
+            "rebasing:false",
+            "permit:false",
+            "non_standard_return:possible"
+          ],
+          "decimals": 6,
+          "notes": "Used only for penalty fees during early delisting. SafeERC20 handles non-standard return. However, if real USDT is used on certain chains, consider approval race conditions.",
+          "approval_model": "bounded",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "currency (listing payment token)",
+          "behaviors": [
+            "fee_on_transfer:unchecked",
+            "rebasing:unchecked",
+            "permit:unknown",
+            "pausable:unknown",
+            "blacklist:unknown"
+          ],
+          "decimals": -1,
+          "notes": "Any token can be added as currency by admin via addCoin(). No validation of decimals or transfer behavior. Fee-on-transfer tokens would break accounting. Decimals check was commented out in addCoin().",
+          "approval_model": "unknown",
+          "transfer_model": "assumed_standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "vesting token (ERC20 in StepVesting)",
+          "behaviors": [
+            "rebasing:unchecked",
+            "permit:unknown"
+          ],
+          "decimals": -1,
+          "notes": "Token used for vesting. decimals() checked via doesFunctionExist but only for listing validation. No validation that decimals are reasonable (0-18). Used for price base calculation.",
+          "approval_model": "unknown",
+          "transfer_model": "assumed_standard",
+          "accounting_model": "balanceOf"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "vesting_conservation",
+          "state_vars": [
+            "_vestings[addr].totalAmount",
+            "_vestings[addr].amountClaimed",
+            "token.balanceOf(vestingContract)"
+          ],
+          "description": "Sum of all (totalAmount - amountClaimed) across beneficiaries should equal token balance held by vesting contract. VIOLATED when grantor releaseRate bug causes amountClaimed > totalAmount."
+        },
+        {
+          "name": "listing_balance_consistency",
+          "state_vars": [
+            "listing.balance",
+            "listing.total",
+            "listing.status"
+          ],
+          "description": "listing.balance <= listing.total. When balance == 0, status should be SOLDOUT or DELIST. When status is LIST, balance > 0."
+        },
+        {
+          "name": "sell_allocation_limit",
+          "state_vars": [
+            "allocations[user][plan].sold",
+            "allocations[user][plan].bought",
+            "vestingSettings[plan].maxSellPercent"
+          ],
+          "description": "sold <= bought + (originalAllocation * maxSellPercent / BASE) where originalAllocation = total(user) + sold - bought"
+        },
+        {
+          "name": "marketplace_currency_flow",
+          "state_vars": [
+            "buyer_payment_in",
+            "seller_payment_out",
+            "fee_collector_out",
+            "referral_out"
+          ],
+          "description": "buyer_payment_in == seller_payment_out + fee_collector_out + referral_out. VIOLATED: referral_out is always 0 but fee_collector gets the full fee amount."
+        },
+        {
+          "name": "release_rate_accuracy",
+          "state_vars": [
+            "_vestings[addr].releaseRate",
+            "_vestings[addr].totalAmount",
+            "_vestings[addr].amountClaimed",
+            "_vestings[addr].stepsClaimed",
+            "numOfSteps"
+          ],
+          "description": "releaseRate should equal (totalAmount - amountClaimed) / (numOfSteps - stepsClaimed) for non-final state. VIOLATED after transferVesting on grantor side."
+        }
+      ]
+    }
+  }
+}

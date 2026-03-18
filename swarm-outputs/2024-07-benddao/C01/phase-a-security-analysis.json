@@ -1,0 +1,270 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T03:01:01.106Z",
+    "duration_ms": 220163
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin Configuration",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "Configurator.setGlobalPause",
+          "Configurator.createPool",
+          "Configurator.setAssetActive",
+          "YieldRegistry.setYieldAccountImplementation",
+          "YieldRegistry.rescue",
+          "YieldStakingBase.setNftActive",
+          "YieldStakingBase.setBotAdmin"
+        ],
+        "failure_modes": [
+          "Admin private key compromise",
+          "Malicious admin actions"
+        ],
+        "attack_vectors": [
+          "Draining yield accounts via rescue()",
+          "Pausing protocol to prevent withdrawals",
+          "Setting malicious oracle aggregators"
+        ]
+      },
+      {
+        "boundary": "User Operations",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "YieldStakingBase.stake",
+          "YieldStakingBase.unstake",
+          "YieldStakingBase.repay",
+          "PoolManager.dispatch"
+        ],
+        "failure_modes": [
+          "Undercollateralized borrowing",
+          "Reentrancy attacks",
+          "Flash loan manipulation"
+        ],
+        "attack_vectors": [
+          "Exploiting incorrect account resolution to DoS liquidations",
+          "Refusing WETH approval to block botAdmin repay"
+        ]
+      },
+      {
+        "boundary": "Oracle Data",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "PriceOracle.getAssetPriceFromChainlink",
+          "PriceOracle.getAssetPriceFromBendNFTOracle"
+        ],
+        "failure_modes": [
+          "Stale price data",
+          "Oracle manipulation"
+        ],
+        "attack_vectors": [
+          "Borrowing against stale, overvalued collateral",
+          "Unfair liquidations due to stale prices"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "ACTIVE",
+        "to_state": "UNSTAKE",
+        "trigger": "YieldStakingBase.unstake",
+        "conditions": [
+          "Caller is nftOwner or botAdmin",
+          "State is ACTIVE"
+        ],
+        "invariants": [
+          "Yield shares are deducted",
+          "Withdrawal is requested from yield protocol"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "UNSTAKE",
+        "to_state": "CLAIMED/REPAID",
+        "trigger": "YieldStakingBase.repay",
+        "conditions": [
+          "Caller is nftOwner or botAdmin",
+          "State is UNSTAKE",
+          "Withdrawal is ready"
+        ],
+        "invariants": [
+          "Debt is repaid to lending pool",
+          "NFT is unlocked",
+          "Stake data is deleted"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-112",
+        "pattern": "Broken Access Control / Logic Error",
+        "locations": [
+          "YieldStakingBase._unstake",
+          "YieldStakingBase._repay",
+          "YieldEthStakingEtherfi.protocolRequestWithdrawal",
+          "YieldEthStakingLido.protocolRequestWithdrawal"
+        ],
+        "severity": "critical",
+        "evidence": "In `_unstake` and `_repay`, `vars.yieldAccout` is resolved using `yieldAccounts[msg.sender]`. When `botAdmin` calls these functions to liquidate a position, it uses the bot's yield account instead of the user's (`sd.yieldAccount`). This causes underflows when deducting shares (`accountYieldShares[address(vars.yieldAccout)] -= sd.yieldShare;`) and attempts to withdraw from the wrong account.",
+        "exploitation_method": "An attacker can take an over-leveraged position. When the health factor drops, the `botAdmin` will attempt to call `unstake` and `repay` but the transactions will revert. The position becomes unliquidatable, leaving the protocol with bad debt.",
+        "affected_assets": [
+          "Lending Pool Assets",
+          "Protocol Health"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "Denial of Service",
+        "locations": [
+          "YieldStakingBase._repay"
+        ],
+        "severity": "high",
+        "evidence": "If `vars.extraAmount > 0`, the contract attempts to pull WETH from the user: `underlyingAsset.safeTransferFrom(vars.nftOwner, address(this), vars.extraAmount);`. If `botAdmin` is calling `repay` for liquidation, this will revert if the user has not approved the contract to spend their WETH or lacks sufficient balance.",
+        "exploitation_method": "A malicious user can intentionally revoke WETH approval or keep their WETH balance at zero. When their position becomes unhealthy and the yield doesn't cover the debt + fine, the `botAdmin`'s call to `repay` will revert, permanently preventing liquidation.",
+        "affected_assets": [
+          "Lending Pool Assets"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Oracle Manipulation / Stale Price",
+        "locations": [
+          "PriceOracle.getAssetPriceFromChainlink"
+        ],
+        "severity": "high",
+        "evidence": "The function checks `updatedAt != 0` and `answeredInRound >= roundId`, but fails to check if the price is recent (e.g., `block.timestamp - updatedAt <= MAX_DELAY`).",
+        "exploitation_method": "If the Chainlink oracle stops updating, the protocol will continue to use the stale price. Attackers can exploit this by borrowing against assets whose actual market value has dropped significantly below the stale oracle price.",
+        "affected_assets": [
+          "All Pool Assets"
+        ]
+      },
+      {
+        "swc_id": "SWC-132",
+        "pattern": "Locked Ether / Tokens",
+        "locations": [
+          "YieldStakingBase._repay"
+        ],
+        "severity": "medium",
+        "evidence": "The `unstakeFine` is added to `nftDebtWithFine` and collected from the claimed yield or the user's WETH balance. However, the fine remains in the `YieldStakingBase` contract as WETH, and there is no function to sweep or withdraw WETH from the contract.",
+        "exploitation_method": "Not directly exploitable for profit by an attacker, but causes a permanent loss of funds for the protocol as collected fines are permanently locked.",
+        "affected_assets": [
+          "Protocol Revenue (Unstake Fines)"
+        ]
+      },
+      {
+        "swc_id": "SWC-112",
+        "pattern": "Centralization Risk / Arbitrary Execution",
+        "locations": [
+          "YieldRegistry.rescue",
+          "YieldAccount.rescue"
+        ],
+        "severity": "high",
+        "evidence": "`YieldRegistry.rescue` allows the `POOL_ADMIN` to execute arbitrary calls (`target.functionCall(data)`) from any `YieldAccount`.",
+        "exploitation_method": "A compromised or malicious `POOL_ADMIN` can use this function to transfer all staked assets (stETH, eETH, sDAI) out of every user's `YieldAccount`, resulting in a complete loss of user funds.",
+        "affected_assets": [
+          "User Staked Assets"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Configurator.sol",
+          "function": "setGlobalPause(bool)",
+          "guards": [
+            "onlyEmergencyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Configurator.sol",
+          "function": "createPool(string)",
+          "guards": [
+            "onlyPoolAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "PriceOracle.sol",
+          "function": "setAssetChainlinkAggregators(address[],address[])",
+          "guards": [
+            "onlyOracleAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "YieldRegistry.sol",
+          "function": "rescue(address,address,bytes)",
+          "guards": [
+            "onlyPoolAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "YieldStakingBase.sol",
+          "function": "setNftStakeParams(address,uint16,uint16)",
+          "guards": [
+            "onlyPoolAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Chainlink",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "PriceOracle.sol",
+              "lines": "81-89",
+              "function": "getAssetPriceFromChainlink"
+            }
+          ],
+          "compositional_usage": [
+            "Direct",
+            "BaseCurrencyConversion"
+          ]
+        },
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "PriceOracle.sol",
+              "lines": "92-102",
+              "function": "getAssetPriceFromBendNFTOracle"
+            }
+          ],
+          "compositional_usage": [
+            "NFTPrice * BaseCurrencyPrice"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,237 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Zero authorizedSigner Enables Unrestricted Voucher Forgery and Channel Drain",
+      "severity": "high",
+      "summary": "openChannel does not validate that authorizedSigner != address(0). Since ecrecover returns address(0) for any invalid signature, if authorizedSigner is zero, any caller can craft a garbage 65-byte signature that recovers to address(0), passing the signer check in settle(). The attacker can then drain the entire channel deposit to the payee address.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 186,
+          "line_end": 212,
+          "desc": "openChannel stores authorizedSigner without checking != address(0); settle at line 253 compares recovered signer to authorizedSigner; _recoverSigner returns address(0) for invalid signatures"
+        }
+      ],
+      "impact": "CRITICAL: Any channel opened with authorizedSigner=address(0) — whether by mistake, UI bug, or social engineering — can have its entire deposit drained in a single transaction by anyone who knows the channelId (which is emitted in events). The attacker needs zero capital. The attack is a single transaction with minimal gas cost. Funds are irrecoverably transferred to the payee address. The vulnerability also exists in close() for the voucher signer check (though close() additionally requires a valid payer signature, making it harder to exploit via that path).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Missing Access Control on initiateClose Enables Protocol-Wide Griefing DoS",
+      "severity": "high",
+      "summary": "initiateClose() has no msg.sender check — any external address can call it on any active channel. This forces the channel into an irreversible 1-hour grace period countdown, after which anyone can call finalize() to close the channel and refund unsettled deposits to the payer. An automated bot can continuously grief all active channels at minimal gas cost.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 260,
+          "line_end": 271,
+          "desc": "initiateClose has no msg.sender validation; no require(msg.sender == channel.payer || msg.sender == channel.payee)"
+        }
+      ],
+      "impact": "HIGH severity. Any active payment channel can be force-closed by any external address. The payee has only 1 hour to settle all outstanding vouchers before unsettled funds are returned to the payer. In a coordinated attack on all channels simultaneously, payees may be unable to settle all vouchers in time, especially under network congestion. This constitutes a protocol-wide denial of service. The financial impact is the total unsettled voucher value across all active channels. Even if payees manage to settle in time, the forced closure disrupts ongoing service relationships and requires new channels to be opened.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unused Deadline Parameter in openChannel Provides False Transaction Expiry Protection",
+      "severity": "high",
+      "summary": "openChannel accepts a 'deadline' parameter and declares a DeadlineExpired error, but the deadline is never validated against block.timestamp. This is demonstrably incorrect code: users relying on deadline protection have none. The parameter creates a false sense of security.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 181,
+          "line_end": 212,
+          "desc": "Parameter 'uint256 deadline' accepted at line 185 but never referenced in function body; DeadlineExpired error declared at line 148 but never used anywhere in contract"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect is a clear code bug — dead parameter and unreachable error. Impact: (1) Users who rely on deadline protection for transaction freshness have none; (2) Stale transactions can execute at any future time; (3) On MEV-susceptible chains, delayed execution could result in deposits under unfavorable conditions (e.g., changed exchange rates affecting the value proposition of the payment channel). The financial impact is indirect but real — it removes a standard DeFi safety mechanism that users reasonably expect when a deadline parameter is present in the API.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cooperative Close Missing Voucher Expiry Check Enables Use of Expired Vouchers",
+      "severity": "high",
+      "summary": "The close() function does not check voucher.expiry against block.timestamp, unlike settle() which enforces expiry. This allows expired vouchers to be used during cooperative close, enabling a party holding old expired vouchers and a payer close signature to finalize at a stale amount, potentially depriving the payee of more recent higher-value settlements.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 288,
+          "line_end": 336,
+          "desc": "close() never references voucher.expiry; settle() at line 237 checks 'block.timestamp > voucher.expiry'; asymmetric validation between parallel code paths"
+        }
+      ],
+      "impact": "Financial impact: Payee loses the difference between the expired voucher's cumulativeAmount and the actual earned cumulativeAmount. In the example scenario, if the true earned amount is 100 but the expired voucher is for 50, the payee loses 50 tokens. The channel is irrevocably finalized, so there is no recovery mechanism. This directly violates the payment guarantee that the protocol should provide to service providers (payees).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cooperative Close Missing Nonce Validation Allows Settlement Regression with Stale Vouchers",
+      "severity": "high",
+      "summary": "The close() function does not validate voucher.nonce against settledNonces[channelId], unlike settle() which requires nonce > settledNonces. This allows a voucher with a nonce lower than or equal to the current settled nonce to be used in cooperative close, as long as its cumulativeAmount >= channel.settled (to avoid underflow). Combined with the missing expiry check, this enables using arbitrarily old vouchers.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 288,
+          "line_end": 336,
+          "desc": "close() never references settledNonces; settle() at line 238 checks 'voucher.nonce <= settledNonces[voucher.channelId]'; no nonce validation in cooperative close path"
+        }
+      ],
+      "impact": "The payee can lose the difference between their latest earned cumulative amount and the stale voucher's cumulativeAmount. In the scenario above, this is 40 out of 80 earned tokens (50% loss). The attack requires the payer (who controls both the authorizedSigner signature and payer signature) to act maliciously. Since close() doesn't require the payee's signature, this is effectively a unilateral payer action. The channel is permanently finalized, so recovery is impossible.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cooperative Close Payer Signature Lacks Domain Binding Enabling Cross-Chain/Instance Replay",
+      "severity": "high",
+      "summary": "The payer close signature in close() signs keccak256(abi.encodePacked('CLOSE', channelId, cumulativeAmount)) without including contract address or chain ID. If the same TempoStreamChannel is deployed on multiple chains and a channelId collision occurs, the payer's close signature from one chain can be replayed on another chain to force-close a different channel.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 313,
+          "line_end": 321,
+          "desc": "closeHash = keccak256(abi.encodePacked('CLOSE', channelId, cumulativeAmount)) — no address(this) or block.chainid included"
+        }
+      ],
+      "impact": "If exploited, an attacker could force-close a channel on a target chain using a payer close signature obtained from a different chain, bypassing the grace period. The financial impact depends on the cumulativeAmount in the replayed signature vs. the actual settled amount on the target chain. The payer's refund on the target chain would be calculated as deposit - cumulativeAmount (from the replayed signature), which may not reflect the payer's intent for that chain's channel.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cooperative Close Does Not Update channel.settled or settledNonces Leaving Inconsistent State",
+      "severity": "high",
+      "summary": "The close() function sets channel.finalized=true and transfers tokens but never updates channel.settled to voucher.cumulativeAmount or settledNonces to voucher.nonce. While the channel is finalized (preventing further on-chain operations), off-chain indexers, subgraphs, and any future code reading these values will get stale data. If any upgrade path or wrapper contract reads settled/settledNonces for accounting, it will produce incorrect results.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 322,
+          "line_end": 335,
+          "desc": "close() computes delta from channel.settled but never writes channel.settled = voucher.cumulativeAmount; settledNonces never updated in close()"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect causes incorrect on-chain state after cooperative close. While the channel is finalized preventing further on-chain exploitation, the stale state impacts: (1) getAvailableBalance() returns incorrect non-zero value for closed channels, (2) getChannel() returns incorrect settled amount, (3) off-chain indexers and subgraphs reading storage get wrong accounting data, (4) any future contract migration or wrapper reading these values will produce incorrect results. The ChannelFinalized event does contain correct data, providing a partial mitigation for event-based indexers.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cooperative Close Delta Validation Uses Incorrect Bound (deposit instead of deposit-settled)",
+      "severity": "high",
+      "summary": "In close(), the delta check is 'delta > 0 && delta <= channel.deposit' instead of the correct 'delta <= channel.deposit - channel.settled'. This allows the payee transfer condition to pass for delta values that exceed the channel's available balance. While the subsequent payerRefund underflow provides implicit protection, this is incorrect business logic that relies on coincidental arithmetic rather than explicit validation.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 324,
+          "line_end": 326,
+          "desc": "if (delta > 0 && delta <= channel.deposit) — should be delta <= channel.deposit - channel.settled; compare with settle() line 248"
+        }
+      ],
+      "impact": "Currently LOW impact due to implicit arithmetic protection. The code defect is real but masked. Financial risk exists only in future code modifications. The incorrect check represents a violation of defense-in-depth principles — explicit validation should be correct regardless of implicit protections. The code also lacks an explicit InsufficientDeposit revert in close() that settle() provides, making debugging harder.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Anyone can top up any channel (including during grace period), enabling accounting grief and unwanted fund flows",
+      "severity": "high",
+      "summary": "addDeposit() is callable by any address, with no restriction to the channel payer, and it does not block deposits during an active grace period. This allows third parties to alter a channel’s economic state (deposit size) and downstream distributions (finalize refund) without participant consent.",
+      "description": [
+        {
+          "file": "contracts/TempoStreamChannel.sol",
+          "line_start": 131,
+          "line_end": 160,
+          "desc": "addDeposit(): no check msg.sender == channel.payer; no check channel.gracePeriodEnd == 0"
+        },
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: getAvailableBalance(bytes32)"
+        }
+      ],
+      "impact": "MEDIUM severity. The primary impact is unauthorized state mutation (channel.deposit) by third parties, with downstream effects on refund calculations and off-chain balance queries. Financial impact is typically attacker-adverse (they lose funds), but indirect economic impact through service manipulation or accounting confusion is real. The defect is clear: the NatSpec documents payer-only intent but code enforces no access control, and no grace-period guard exists.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Off-chain systems can be misled by stale/ambiguous channel state due to lack of depositor identity and closure-state introspection via view functions",
+      "severity": "high",
+      "summary": "The contract’s view surface (getChannel/getAvailableBalance/getDomainSeparator) plus emitted events may be insufficient for robust off-chain accounting: ChannelDeposit event omits depositor; close() does not update channel.settled/settledNonces; and getAvailableBalance reports deposit-settled even during grace period, potentially misleading automated service gating and dispute logic.",
+      "description": [
+        {
+          "file": "contracts/TempoStreamChannel.sol",
+          "line_start": 253,
+          "line_end": 302,
+          "desc": "View functions expose only deposit/settled; ChannelDeposit event lacks depositor; close() finalizes without updating settled/nonce, so getChannel can diverge from actual paid amount"
+        },
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: getAvailableBalance(bytes32)"
+        }
+      ],
+      "impact": "The primary impact is incorrect on-chain state after cooperative close, making view functions unreliable for off-chain consumers. This is a genuine code defect (inconsistency between settle() and close() state updates) regardless of whether off-chain systems are affected. Secondary impact: ChannelDeposit event lacks depositor identity, creating attribution gaps for permissionless deposits. The severity of exploitation depends on off-chain integration patterns (UNVERIFIABLE), but the code defect exists independently.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Payer Can Unilaterally Cooperative-Close Channel, Stealing Unsettled Payee Earnings",
+      "severity": "high",
+      "summary": "The close() function is labeled 'cooperative close' but does NOT require the payee's signature. It only requires signatures from authorizedSigner and payer. Since the payer typically controls the authorizedSigner (or IS the authorizedSigner), the payer can unilaterally finalize the channel at any time with cumulativeAmount = channel.settled (or 0), bypassing the grace period entirely. The payee receives nothing for any unsettled service already provided.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 280,
+          "line_end": 330,
+          "desc": "close() verifies signer==authorizedSigner and payerSigner==payer but never checks payee consent. Payer controls both required signatures."
+        }
+      ],
+      "impact": "CRITICAL. This breaks the fundamental payment guarantee of the protocol. The payee (service provider) has no protection against a dishonest payer who consumes services and then immediately closes the channel without paying. The grace period mechanism is rendered useless since the cooperative close path bypasses it entirely without requiring payee consent. Any payer who controls their authorizedSigner key (the default and expected case) can steal all unsettled service value from any payee.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Token Accounting Mismatch Creates Cross-Channel Insolvency",
+      "severity": "high",
+      "summary": "openChannel and addDeposit record the nominal transfer amount in channel.deposit without measuring actual tokens received (no balance-before/after pattern). For fee-on-transfer tokens, the contract receives fewer tokens than recorded. Over multiple channels using the same fee-on-transfer token, the contract becomes insolvent — last channels to settle or finalize cannot be fully paid because actual token balance < sum of (deposit - settled).",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 195,
+          "line_end": 198,
+          "desc": "token.safeTransferFrom(msg.sender, address(this), deposit) followed by channel.deposit = deposit — no balanceBefore/balanceAfter measurement"
+        }
+      ],
+      "impact": "HIGH severity. The defect causes: (1) Single-channel insolvency: any channel using a fee-on-transfer token where settle+finalize tries to distribute the full nominal deposit will revert, potentially trapping funds permanently. (2) Cross-channel insolvency: with multiple channels sharing the same fee-on-transfer token, early settlers extract tokens belonging to later channels. (3) DoS: finalize and settle operations revert when the contract lacks sufficient balance, potentially locking funds permanently if no partial withdrawal mechanism exists.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Signature Malleability in Voucher Verification",
+      "severity": "high",
+      "summary": "The internal `_recoverSigner` function does not check for ECDSA signature malleability (s-value bounds), allowing third parties to mutate valid signatures and front-run or disrupt settlements.",
+      "description": [
+        {
+          "file": "TempoStreamChannel.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Missing check for `uint256(s) <= 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0`"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect is real: the code violates EIP-2 and established ECDSA best practices by not enforcing s-value canonicalization. Impact includes: (1) gas griefing — legitimate submitters' transactions can be front-run and reverted, (2) off-chain system disruption — indexers or systems tracking signature hashes may be confused by duplicate valid signatures for the same message, (3) no direct fund theft — funds always flow to the correct parties (payee/payer). The nonce mechanism in settle() prevents double-spending, and finalized flag in close() prevents double-closure. The severity is reduced by the Tempo chain's lack of public mempool but the code defect exists independently.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    }
+  ]
+}

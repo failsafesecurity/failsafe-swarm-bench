@@ -1,0 +1,472 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T05:26:20.160Z",
+    "duration_ms": 466050
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-send-process-message",
+        "source": "User calls Bridge.sendMessage on source chain",
+        "path": [
+          "sendMessage: validates srcOwner, destOwner, destChainId, msg.value",
+          "sendMessage: assigns id, from=msg.sender, srcChainId=block.chainid",
+          "sendMessage: computes msgHash = hashMessage(message_)",
+          "SignalService.sendSignal(msgHash) stores signal in slot",
+          "Relayer observes MessageSent event",
+          "processMessage on dest chain: hashMessage, check status==NEW",
+          "_proveSignalReceived: verify Merkle proof via SignalService",
+          "Store ProofReceipt with receivedAt and preferredExecutor",
+          "After invocationDelay: _invokeMessageCall to message.to",
+          "Pay fee to msg.sender, refund to refundTo"
+        ],
+        "transformations": [
+          "Message fields overwritten: id, from, srcChainId",
+          "msgHash = keccak256(abi.encode('TAIKO_MESSAGE', message))",
+          "failureSignal = msgHash ^ bytes32(uint256(Status.FAILED))"
+        ],
+        "sinks": [
+          "SignalService storage slot on source chain",
+          "messageStatus mapping on destination chain",
+          "proofReceipt mapping on destination chain",
+          "ETH transfer to message.to, msg.sender (fee), refundTo"
+        ],
+        "trust_changes": "Source chain signal is trusted via Merkle proof against synced state/signal root. After proof, message data is trusted for invocation.",
+        "validation_points": [
+          "sendMessage: destChainEnabled, msg.value == value + fee",
+          "processMessage: sameChain(destChainId), status == NEW",
+          "processMessage: _proveSignalReceived (Merkle proof)",
+          "processMessage: invocationDelay timing check",
+          "_invokeMessageCall: selector == onMessageInvocation for contracts"
+        ],
+        "exposure_risks": [
+          "Message data is public on-chain (no privacy)",
+          "ProofReceipt reveals preferredExecutor"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: suspendMessages then unsuspendMessages sets proofReceipt.receivedAt to block.timestamp, causing processMessage to skip Merkle proof verification entirely for any arbitrary msgHash",
+          "Gas griefing: relayer provides insufficient gas causing RETRIABLE status, consuming the fee",
+          "If refundTo is a reverting contract, processMessage is permanently DOSed"
+        ]
+      },
+      {
+        "flow_id": "DF-002-recall-message",
+        "source": "User calls Bridge.recallMessage on source chain",
+        "path": [
+          "recallMessage: hashMessage, check status==NEW",
+          "Check isSignalSent to verify message was actually sent",
+          "Prove failure signal received from dest chain via _proveSignalReceived",
+          "Store proofReceipt, wait for invocationDelay",
+          "Set status to RECALLED",
+          "If from supports IRecallableSender: callback onMessageRecalled with value",
+          "Else: send value to srcOwner"
+        ],
+        "transformations": [
+          "failureSignal = signalForFailedMessage(msgHash) = msgHash ^ uint256(FAILED)"
+        ],
+        "sinks": [
+          "messageStatus set to RECALLED",
+          "ETH returned to srcOwner or via IRecallableSender callback"
+        ],
+        "trust_changes": "Failure signal must be proven via Merkle proof from dest chain. IRecallableSender callback gains execution context.",
+        "validation_points": [
+          "sameChain(srcChainId)",
+          "isSignalSent check (verifies message was originally sent)",
+          "_proveSignalReceived for failure signal"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Suspend/unsuspend bypass also applies to recallMessage, but isSignalSent check provides additional protection verifying message was legitimately sent",
+          "IRecallableSender callback receives ETH and execution control within bridge context"
+        ]
+      },
+      {
+        "flow_id": "DF-003-signal-multihop-verification",
+        "source": "Bridge calls SignalService.proveSignalReceived via _proveSignalReceived",
+        "path": [
+          "Decode HopProof[] from _proof bytes",
+          "For each hop: _verifyHopProof verifies Merkle proof against rootHash",
+          "LibTrieProof.verifyMerkleProof: accountProof -> storageRoot, then storageProof",
+          "Update chain/signal variables for next hop",
+          "_cacheChainData optionally caches state/signal roots",
+          "Final verification: value matches _loadSignalValue for computed signal"
+        ],
+        "transformations": [
+          "signal = signalForChainData(chainId, kind, blockId) = keccak256(abi.encode(chainId, kind, blockId))",
+          "getSignalSlot = keccak256(abi.encodePacked('SIGNAL', chainId, app, signal))",
+          "Each hop transforms: chainId=hop.chainId, app=signalService, signal=signalForChainData(...), value=hop.rootHash"
+        ],
+        "sinks": [
+          "Signal values in storage slots via sstore",
+          "topBlockId mapping updated on cache",
+          "ChainDataSynced events emitted on cache"
+        ],
+        "trust_changes": "Trust transitions from remote chain's state root (synced by authorized parties) through Merkle proof verification down to specific signal values. Each hop trusts the previous hop's proven root.",
+        "validation_points": [
+          "validSender: _app != address(0)",
+          "nonZeroValue: _signal != 0, _value != 0",
+          "Last hop chainId must equal block.chainid",
+          "Mid hop chainId must not be 0 or block.chainid",
+          "LibTrieProof: accountProof and storageProof Merkle verification",
+          "Final check: value != 0 && value == stored signal value"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If authorized party syncs malicious state/signal root, all proofs become untrustworthy",
+          "Caching of chain data during proof could write attacker-influenced roots if proof is partially valid",
+          "Mid-hop chain ID validation prevents loops to current chain but doesn't prevent circular paths through other chains"
+        ]
+      },
+      {
+        "flow_id": "DF-004-erc20-vault-bridge-flow",
+        "source": "User calls ERC20Vault.sendToken",
+        "path": [
+          "Validate amount, token, blacklist",
+          "_handleMessage: if bridged token, burn; if canonical, transferFrom to vault",
+          "For canonical: measure balanceChange via before/after balanceOf",
+          "Encode (ctoken, user, to, balanceChange) as message data",
+          "Call Bridge.sendMessage with encoded data",
+          "On dest chain: Bridge calls ERC20Vault.onMessageInvocation",
+          "Decode (ctoken, from, to, amount) from data",
+          "checkProcessMessageContext verifies bridge caller and source vault",
+          "_transferTokens: if canonical on this chain, safeTransfer; else mint bridged",
+          "Send ETH (msg.value) to recipient"
+        ],
+        "transformations": [
+          "balanceChange = balanceOf(after) - balanceOf(before) for fee-on-transfer tokens",
+          "Message data double-encoded: abi.encodeCall(onMessageInvocation, abi.encode(...))"
+        ],
+        "sinks": [
+          "Tokens locked in vault (canonical) or burned (bridged) on source",
+          "Tokens minted (bridged) or released (canonical) on destination",
+          "ETH sent to recipient on destination"
+        ],
+        "trust_changes": "Source vault encodes canonical token data which destination vault trusts implicitly. Cross-chain trust boundary at bridge message verification.",
+        "validation_points": [
+          "sendToken: amount > 0, token != address(0), not blacklisted",
+          "onMessageInvocation: checkProcessMessageContext (bridge caller, source vault match)",
+          "onMessageInvocation: to != address(0), to != address(this)"
+        ],
+        "exposure_risks": [
+          "Canonical token metadata (decimals, symbol, name) is trusted from source chain message"
+        ],
+        "manipulation_risks": [
+          "If bridge proof bypass (DF-001) is exploited, attacker can craft arbitrary onMessageInvocation data to drain vault's canonical token holdings",
+          "Attacker-controlled ctoken with chainId == block.chainid could drain any ERC20 held by vault (requires proof bypass)",
+          "Fee-on-transfer token on destination chain: transferred amount to recipient is less than decoded amount, but vault accounting considers it fully transferred"
+        ]
+      },
+      {
+        "flow_id": "DF-005-bridged-erc20-migration",
+        "source": "Owner calls ERC20Vault.changeBridgedToken",
+        "path": [
+          "Validate new btoken: not zero, no existing canonical mapping, not blacklisted, same owner",
+          "If old btoken exists: verify ctoken metadata matches, blacklist old token",
+          "Set migration: old token migrates OUT to new token, new token migrates IN from old",
+          "Update bridgedToCanonical and canonicalToBridged mappings",
+          "Users call burn on old token -> triggers mint on new token (migration)"
+        ],
+        "transformations": [
+          "bridgedToCanonical[_btokenNew] = _ctoken (BUG: bridgedToCanonical[btokenOld_] never deleted)",
+          "btokenBlacklist[btokenOld_] = true"
+        ],
+        "sinks": [
+          "bridgedToCanonical mapping (stale entry for old token persists)",
+          "canonicalToBridged mapping (updated to new token)",
+          "btokenBlacklist mapping"
+        ],
+        "trust_changes": "Owner-controlled migration. Old token holders must voluntarily migrate by calling burn.",
+        "validation_points": [
+          "onlyOwner",
+          "ctoken metadata match verification",
+          "Owner match between vault and new btoken"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "BUG: delete bridgedToCanonical[_btokenNew] is a no-op; bridgedToCanonical[btokenOld_] is never cleaned up, leaving stale mapping data",
+          "If migration is set but new token has a bug, user tokens could be lost during burn->mint flow"
+        ]
+      },
+      {
+        "flow_id": "DF-006-suspend-unsuspend-bypass",
+        "source": "bridge_watchdog calls suspendMessages then unsuspendMessages",
+        "path": [
+          "suspendMessages(hashes, true): sets proofReceipt[hash].receivedAt = type(uint64).max",
+          "suspendMessages(hashes, false): sets proofReceipt[hash].receivedAt = uint64(block.timestamp)",
+          "processMessage: reads receivedAt != 0, sets isMessageProven = true",
+          "processMessage: SKIPS _proveSignalReceived entirely",
+          "processMessage: after invocationDelay, executes message without any proof"
+        ],
+        "transformations": [
+          "proofReceipt.receivedAt set to block.timestamp without proof verification",
+          "proofReceipt.preferredExecutor remains address(0) from default"
+        ],
+        "sinks": [
+          "Message executed on destination chain without Merkle proof",
+          "ETH/tokens transferred based on unverified message data"
+        ],
+        "trust_changes": "CRITICAL: Trust boundary violation. The suspend/unsuspend mechanism bypasses the Merkle proof verification that is the core security of cross-chain messaging.",
+        "validation_points": [
+          "MISSING: No proof verification after unsuspend",
+          "MISSING: No check that the message was legitimately proven before suspend"
+        ],
+        "exposure_risks": [
+          "Any msgHash that was suspended+unsuspended can be processed without proof",
+          "Since messageStatus defaults to NEW (0) for all hashes, ANY crafted message matching a suspended-then-unsuspended hash can be executed"
+        ],
+        "manipulation_risks": [
+          "Compromised bridge_watchdog can enable processing of completely fabricated messages",
+          "Attacker crafts message M, computes hash H, compromised watchdog suspend+unsuspend H, attacker processes M after delay"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Messages must be proven via Merkle proofs before execution on destination chain",
+        "Messages progress through lifecycle: NEW → DONE/RETRIABLE → (DONE/FAILED) on dest, NEW → RECALLED on source",
+        "Invocation delay on L1 provides time buffer for suspicious message detection",
+        "PreferredExecutor (original prover) gets priority execution window before others",
+        "Token vaults hold canonical tokens and mint/burn bridged representations",
+        "Bridge watchdog can suspend/unsuspend messages and ban addresses",
+        "Only onMessageInvocation selector allowed for contract target calls"
+      ],
+      "economic_incentives": [
+        "Message fee incentivizes relayers to process messages (paid on execution)",
+        "PreferredExecutor mechanism: prover gets invocationExtraDelay head start for fee collection",
+        "On L2 (invocationDelay=0): fee paid immediately to processor, no split incentive",
+        "On L1 (invocationDelay>0): prover pays gas to prove, must wait and call again to collect fee",
+        "No fee for retryMessage - original fee already consumed"
+      ],
+      "governance_mechanisms": [
+        "Owner controls: pause/unpause, address resolution, token migration, authorized addresses",
+        "bridge_watchdog: can suspend messages and ban addresses",
+        "bridge_pauser: can pause the bridge",
+        "Authorized addresses (TaikoL1): can sync chain data to SignalService"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "suspendMessages followed by unsuspendMessages for any msgHash",
+          "expected_behavior": "Unsuspended messages should still require Merkle proof verification before processing",
+          "actual_behavior": "proofReceipt.receivedAt is set to block.timestamp, causing processMessage to consider the message already proven and skip _proveSignalReceived entirely. Since messageStatus defaults to NEW(0) for all hashes, any crafted message matching the hash can be processed.",
+          "risk_level": "high",
+          "exploitation_potential": "A compromised bridge_watchdog can suspend+unsuspend arbitrary message hashes, enabling execution of completely fabricated bridge messages. This can drain bridge ETH holdings and trigger arbitrary vault operations (minting bridged tokens, releasing canonical tokens). Requires bridge_watchdog key compromise."
+        },
+        {
+          "scenario": "changeBridgedToken deletes wrong mapping key",
+          "expected_behavior": "bridgedToCanonical[btokenOld_] should be deleted when replacing with btokenNew",
+          "actual_behavior": "delete bridgedToCanonical[_btokenNew] is executed instead (no-op since btokenNew has no mapping yet). bridgedToCanonical[btokenOld_] persists with stale data.",
+          "risk_level": "medium",
+          "exploitation_potential": "Storage inconsistency. Old bridged token retains its canonical mapping even after being replaced and blacklisted. While the blacklist prevents direct usage via sendToken, the stale mapping could cause confusion in off-chain indexers or future contract upgrades that don't account for blacklisted tokens."
+        },
+        {
+          "scenario": "processMessage with msg.sender == destOwner uses gasleft() as gasLimit",
+          "expected_behavior": "Message should be invoked with sufficient gas for the intended operation",
+          "actual_behavior": "gasLimit = gasleft() which includes overhead for remaining processMessage logic. If destOwner provides barely enough gas, the external call may succeed but post-call operations could fail, or the external call gets less gas than expected due to the 63/64 rule and overhead deductions.",
+          "risk_level": "low",
+          "exploitation_potential": "destOwner could inadvertently cause their own message to fail by providing insufficient gas. Not exploitable by third parties since it only affects the destOwner path."
+        },
+        {
+          "scenario": "refundTo set to a reverting contract",
+          "expected_behavior": "Message should still be processable",
+          "actual_behavior": "LibAddress.sendEther reverts if the ETH transfer fails. If refundTo is a contract that always reverts on receive, processMessage permanently fails for that message.",
+          "risk_level": "medium",
+          "exploitation_potential": "Self-griefing: user sets refundTo to a reverting contract, locking their message in NEW status. The message value and fee are stuck in the bridge. On source chain, user cannot recall since the message technically hasn't failed on dest chain (it was never processed)."
+        },
+        {
+          "scenario": "processMessage for message with _message.value > 0 to a banned/special address",
+          "expected_behavior": "Value refunded to the appropriate party",
+          "actual_behavior": "refundAmount = _message.value, status set to DONE. If msg.sender != refundTo, fee goes to msg.sender and refundAmount goes to refundTo. Correct behavior but the message is permanently DONE - no recall possible.",
+          "risk_level": "low",
+          "exploitation_potential": "If an address is banned after a message is sent but before processing, the value goes to refundTo instead of the intended recipient. This is by design but could surprise users."
+        },
+        {
+          "scenario": "Multi-hop proof with circular chain references (A->B->C->A pattern)",
+          "expected_behavior": "Validation should prevent circular or meaningless hop paths",
+          "actual_behavior": "Mid-hop validation only checks hop.chainId != 0 and hop.chainId != block.chainid. Circular paths through other chains (e.g., chainA -> chainB -> chainC -> current) are allowed as long as Merkle proofs verify.",
+          "risk_level": "low",
+          "exploitation_potential": "Circular paths increase proof complexity and gas cost but don't provide direct exploit. Each hop must have valid Merkle proofs, so the integrity is maintained. However, it could be used for gas griefing."
+        },
+        {
+          "scenario": "ERC20Vault.onMessageInvocation with fee-on-transfer canonical token",
+          "expected_behavior": "Recipient receives the expected token amount",
+          "actual_behavior": "_transferTokens calls IERC20(token_).safeTransfer(_to, _amount). For fee-on-transfer tokens, the actual amount received by _to is less than _amount. The vault's balance decreases by _amount, but _to receives less.",
+          "risk_level": "medium",
+          "exploitation_potential": "If canonical token has fees, repeated bridge operations drain vault reserves. Source chain correctly tracks balanceChange, but destination assumes full transfer. Over many cycles, vault on canonical chain becomes underfunded."
+        },
+        {
+          "scenario": "BridgedERC20Base.burn called by account during outbound migration with reentrant migratingAddress",
+          "expected_behavior": "nonReentrant prevents reentrancy",
+          "actual_behavior": "burn calls IBridgedERC20(migratingAddress).mint(_account, _amount) then _burnToken. The nonReentrant guard protects against reentrancy. However, if the migratingAddress.mint triggers a callback (e.g., via ERC777-style hooks in the new token), the mint could interact with external state before _burnToken executes.",
+          "risk_level": "low",
+          "exploitation_potential": "Limited by nonReentrant modifier on burn. Cross-contract reentrancy would require the new bridged token to have callback mechanisms, which BridgedERC20 does not."
+        },
+        {
+          "scenario": "Bridge._invokeMessageCall with data length between 1-3 bytes",
+          "expected_behavior": "Short data should be handled safely",
+          "actual_behavior": "If _message.data.length < 4, the selector check is bypassed and excessivelySafeCall is made with the short data. For contract targets, this invokes the fallback function with arbitrary short data.",
+          "risk_level": "low",
+          "exploitation_potential": "Attacker could trigger fallback functions on contract targets with arbitrary short payloads. Impact is limited since the target contract's fallback must be designed to handle this, and the call is bounded by gasLimit."
+        },
+        {
+          "scenario": "nextMessageId overflow (uint128)",
+          "expected_behavior": "ID should increment without collision",
+          "actual_behavior": "nextMessageId is uint128, max value ~3.4e38. At one message per block (12s), overflow takes ~1.3e30 years. Practically impossible.",
+          "risk_level": "low",
+          "exploitation_potential": "None practical."
+        }
+      ],
+      "assumption_violations": [
+        "bridge_watchdog is assumed honest for suspend/unsuspend. If compromised, proof verification can be bypassed entirely on processMessage (no isSignalSent check like recallMessage has)",
+        "SignalService authorized addresses (TaikoL1) are assumed to sync correct chain data. Malicious sync would compromise all proof verification.",
+        "Address resolver is assumed to return correct addresses. Malicious resolver could redirect bridge/vault/signal_service to attacker contracts.",
+        "Canonical token contracts are assumed to behave like standard ERC20/ERC721/ERC1155. Non-standard tokens (rebasing, fee-on-transfer, pausable) may break vault accounting.",
+        "Transient storage (tstore/tload) is used on chainid==1 for context and reentrancy. If L1 hard forks to a chain that removes EIP-1153, context and reentrancy protection break."
+      ],
+      "game_theory_risks": [
+        "Two-step prove-then-execute on L1: Prover bears gas cost without guaranteed fee. Another party could wait for proof then execute during the preferredExecutor window by front-running with the same preferredExecutor address (impossible since preferredExecutor is set to msg.sender of prover).",
+        "Relayer fee competition: Multiple relayers may race to prove messages. Loser wastes gas. preferredExecutor mitigates by giving prover execution priority.",
+        "retryMessage has no fee incentive. RETRIABLE messages may stay stuck if no one is willing to pay gas for retry. destOwner must step in.",
+        "Gas limit manipulation: processMessage for non-destOwner uses _message.gasLimit. If gasLimit is set too low, message permanently fails and gets stuck in RETRIABLE loop until destOwner calls with _isLastAttempt=true.",
+        "Bridge watchdog can indefinitely suspend messages by never unsuspending. Funds are effectively frozen with no timeout/escape mechanism."
+      ],
+      "integration_risks": [
+        "SignalService depends on LibTrieProof which uses Optimism's MerkleTrie/SecureMerkleTrie. Bugs in Merkle proof verification could allow forged proofs.",
+        "ExcessivelySafeCall limits return data to 64 bytes. If message target depends on return data > 64 bytes, behavior is undefined.",
+        "ERC20Vault uses SafeERC20 for transfers but trusts that IERC20Metadata calls (decimals, symbol, name) don't revert maliciously. A canonical token with reverting metadata could prevent bridging setup.",
+        "BridgedERC20 uses ERC20SnapshotUpgradeable and ERC20VotesUpgradeable, which have storage overhead. Snapshot creation is limited to owner/snapshooter.",
+        "USDCAdapter uses transferFrom in _burnToken, requiring user approval to the adapter. If USDC adds blacklisting of the adapter address, burns break."
+      ],
+      "calculation_errors": [
+        "In ERC20Vault.changeBridgedToken: 'delete bridgedToCanonical[_btokenNew]' should be 'delete bridgedToCanonical[btokenOld_]'. Current code is a no-op deletion (btokenNew has no mapping yet by the validation check above) while old token's mapping persists.",
+        "In Bridge.processMessage: 'unchecked { invocationDelay += invocationExtraDelay; }' - while current hardcoded values are safe, if getInvocationDelays is overridden in a derived contract with large values, unchecked addition could wrap around to a small value, reducing the security delay."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "BridgedERC20",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "snapshot",
+            "pausable",
+            "mint_burn_restricted"
+          ],
+          "decimals": -1,
+          "notes": "Decimals inherited from source token (__srcDecimals). Minting restricted to erc20_vault or migratingAddress. Burning restricted to erc20_vault or self-burn during migration. Has ERC20Votes and ERC20Snapshot. _beforeTokenTransfer reverts if paused or if _to==address(this).",
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "BridgedERC721",
+          "behaviors": [
+            "rebasing:false",
+            "pausable",
+            "mint_burn_restricted"
+          ],
+          "decimals": 0,
+          "notes": "Minting/burning restricted to erc721_vault. _beforeTokenTransfer reverts if paused or _to==address(this).",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "BridgedERC1155",
+          "behaviors": [
+            "rebasing:false",
+            "pausable",
+            "mint_burn_restricted"
+          ],
+          "decimals": 0,
+          "notes": "Minting/burning restricted to erc1155_vault. _beforeTokenTransfer reverts if paused or _to==address(this). mintBatch available.",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "USDCAdapter (wraps USDC)",
+          "behaviors": [
+            "pausable",
+            "mint_burn_restricted",
+            "blacklist"
+          ],
+          "decimals": 6,
+          "notes": "Adapter pattern wrapping native USDC. _burnToken uses transferFrom(user, adapter, amount) then burn(amount), requiring user approval. Mint calls usdc.mint directly. Subject to USDC's own blacklisting and pausability.",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "Canonical ERC20 (arbitrary)",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:false"
+          ],
+          "decimals": -1,
+          "notes": "ERC20Vault._handleMessage accounts for fee-on-transfer via balance delta measurement. However, destination-side _transferTokens does safeTransfer of the full recorded amount without re-measuring delta. Rebasing tokens could cause vault underfunding over time."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "message_status_lifecycle_dest",
+          "state_vars": [
+            "messageStatus[msgHash]"
+          ],
+          "rule": "On destination chain: NEW -> DONE | NEW -> RETRIABLE -> DONE | NEW -> RETRIABLE -> FAILED. Status never decreases."
+        },
+        {
+          "name": "message_status_lifecycle_source",
+          "state_vars": [
+            "messageStatus[msgHash]"
+          ],
+          "rule": "On source chain: NEW -> RECALLED. Only one transition possible."
+        },
+        {
+          "name": "bridge_eth_conservation",
+          "state_vars": [
+            "address(bridge).balance",
+            "sum(message.value + message.fee) for all NEW messages"
+          ],
+          "rule": "Bridge ETH balance >= sum of (value + fee) for all unprocessed messages. Violated if processMessage runs without valid proof (suspend/unsuspend bypass)."
+        },
+        {
+          "name": "vault_token_conservation",
+          "state_vars": [
+            "vault.balanceOf(token) for canonical tokens",
+            "bridgedToken.totalSupply() for bridged tokens"
+          ],
+          "rule": "Canonical tokens held by vault on source chain should equal total supply of corresponding bridged tokens across all destination chains. Violated by fee-on-transfer tokens or proof bypass."
+        },
+        {
+          "name": "signal_slot_determinism",
+          "state_vars": [
+            "getSignalSlot(chainId, app, signal)"
+          ],
+          "rule": "Signal storage slot is deterministically computed as keccak256(abi.encodePacked('SIGNAL', chainId, app, signal)). Same inputs always produce same slot."
+        },
+        {
+          "name": "canonical_bridged_bijection",
+          "state_vars": [
+            "bridgedToCanonical",
+            "canonicalToBridged"
+          ],
+          "rule": "For active (non-blacklisted) bridged tokens: bridgedToCanonical[btoken].addr != address(0) <=> canonicalToBridged[chainId][ctoken] == btoken. VIOLATED: changeBridgedToken fails to delete bridgedToCanonical[btokenOld_], breaking bijection."
+        },
+        {
+          "name": "proof_required_before_execution",
+          "state_vars": [
+            "proofReceipt[msgHash].receivedAt",
+            "messageStatus[msgHash]"
+          ],
+          "rule": "A message should only be executed if its Merkle proof has been verified through SignalService. VIOLATED: suspend+unsuspend sets receivedAt without proof verification, allowing execution of unproven messages."
+        }
+      ]
+    }
+  }
+}

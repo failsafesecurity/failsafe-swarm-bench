@@ -1,0 +1,256 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T00:21:15.333Z",
+    "duration_ms": 350282
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "release() restores slashed amount to stake.amount but never updates userTotalStaked, permanently deflating the staker's reported total stake after a successful appeal",
+        "attack_scenario": "User stakes 100 GTC. Gets slashed for 50 GTC (userTotalStaked drops to 50). Appeal succeeds and RELEASER releases 50 GTC back. stake.amount returns to 100, but userTotalStaked remains at 50. External systems (Passport scoring) reading userTotalStaked permanently undervalue the innocent user's reputation. The user can never restore their userTotalStaked to the correct value without withdrawing and re-staking.",
+        "invariant_logic": "For all operations: userTotalStaked[staker] == sum(selfStakes[staker].amount) + sum_over_all_stakees(communityStakes[staker][stakee].amount)",
+        "solidity_property": "function invariant_userTotalStaked(address staker, address[] memory stakees) public view { uint88 total = selfStakes[staker].amount; for (uint i = 0; i < stakees.length; i++) { total += communityStakes[staker][stakees[i]].amount; } assert(userTotalStaked[staker] == total); }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "release"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "slash"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "selfStake"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "withdrawSelfStake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Intermediate multiplication overflow in slash(): percent * stake.amount is computed as uint88 * uint88, which overflows uint88 for stakes above ~3.09M GTC at 100% slash, causing slash() to revert and making large stakers un-slashable at high percentages",
+        "attack_scenario": "Attacker acquires 4M GTC and self-stakes the full amount. When the SLASHER attempts to slash at 100% (or any percentage above ~77%), the expression (percent * selfStakes[staker].amount) overflows uint88 and reverts. The attacker is effectively immune to high-percentage slashing, defeating the protocol's Sybil resistance mechanism. The SLASHER would need to issue many small-percentage slashes as a workaround, which compounds rather than sums and is gas-inefficient.",
+        "invariant_logic": "uint256(percent) * uint256(stake.amount) / 100 must be used instead of (percent * stake.amount) / 100 to avoid intermediate overflow; equivalently: percent * amount <= type(uint88).max for all slashable stakes",
+        "solidity_property": "function invariant_slashNoOverflow(uint88 percent, uint88 amount) public pure { assert(uint256(percent) * uint256(amount) <= type(uint88).max); }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "slash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "IdentityStaking.sol",
+        "description": "currentSlashRound must monotonically increase and never wrap around; it determines burn finality and release eligibility. An overflow at uint16 max (65535) would permanently disable lockAndBurn.",
+        "attack_scenario": "If currentSlashRound could somehow decrease (e.g., through a malicious upgrade), previously burned rounds could be re-targeted, causing the contract to attempt transferring tokens it no longer holds. While the uint16 overflow at 65535 is ~16K years away, any upgrade that modifies this value incorrectly would be catastrophic.",
+        "invariant_logic": "After any state transition: currentSlashRound_new > currentSlashRound_old; currentSlashRound >= 1 always",
+        "solidity_property": "function invariant_roundMonotonic(uint16 oldRound) public view { assert(currentSlashRound >= oldRound); assert(currentSlashRound >= 1); }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "lockAndBurn"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "_authorizeUpgrade"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "totalSlashed[round] for unburned rounds must equal the sum of all individual stake slashedAmounts attributed to that round. The stale-slash migration in slash() moves amounts between rounds, and release() decrements both; any desync means either burned too much (loss) or too little (tokens stuck).",
+        "attack_scenario": "If totalSlashed for the active round becomes larger than the sum of individual slashedAmounts (e.g., through repeated slash/release/re-slash cycles), lockAndBurn would attempt to transfer more tokens to burnAddress than were actually slashed, potentially draining legitimate stakers' funds. Conversely, if totalSlashed is too low, slashed tokens remain in the contract permanently.",
+        "invariant_logic": "For round R where R >= currentSlashRound - 1: totalSlashed[R] == sum(stake.slashedAmount for all stakes where stake.slashedInRound == R)",
+        "solidity_property": "function invariant_totalSlashedConsistency(uint16 round) public view { assert(round >= currentSlashRound - 1); /* off-chain: verify totalSlashed[round] matches sum of all individual slashedAmounts in round */ }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "slash"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "release"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "lockAndBurn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Contract token balance solvency: the GTC balance of the contract must be at least the sum of all stake amounts plus all unburned slashed amounts. lockAndBurn does not zero totalSlashed[burnedRound] after transferring tokens, so stale mapping entries persist but must never be used for further transfers.",
+        "invariant_logic": "token.balanceOf(address(this)) >= sum_all(stake.amount) + totalSlashed[currentSlashRound] + totalSlashed[currentSlashRound - 1]",
+        "solidity_property": "function invariant_solvency() public view { /* sum all active stake.amount values + totalSlashed for current and previous round <= token.balanceOf(address(this)) */ }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "lockAndBurn"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "slash"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "release"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "withdrawSelfStake"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "withdrawCommunityStake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Burned round finality: once a round has been burned via lockAndBurn, its slashed funds must never be releasable. The release() check 'slashRound < currentSlashRound - 1' enforces this, but stakes whose slashedInRound points to a burned round still carry stale slashedAmount values that are silently discarded on re-slash rather than explicitly cleared.",
+        "attack_scenario": "If the release() round check were ever bypassed (e.g., via a faulty upgrade), a RELEASER could release funds from a burned round, causing totalSlashed[burnedRound] to underflow (revert) or the contract to return tokens that were already burned, leading to insolvency.",
+        "invariant_logic": "release() must reject any slashRound R where R < currentSlashRound - 1; equivalently: only currentSlashRound and currentSlashRound - 1 are valid release targets",
+        "solidity_property": "function invariant_noReleaseBurnedRound(uint16 slashRound) public view { assert(slashRound >= currentSlashRound - 1); }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "release"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "lockAndBurn"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Appeal window enforcement: the minimum time between burns (burnRoundMinimumDuration, 90 days) must elapse between consecutive lockAndBurn calls to ensure slashed users have time to appeal. Since lockAndBurn is permissionless, the only protection is the timestamp check.",
+        "invariant_logic": "block.timestamp - lastBurnTimestamp >= burnRoundMinimumDuration before any lockAndBurn succeeds; lastBurnTimestamp is updated on every successful lockAndBurn",
+        "solidity_property": "function invariant_appealPeriod() public view { /* Cannot verify directly, but: after lockAndBurn, lastBurnTimestamp == block.timestamp; next lockAndBurn requires block.timestamp >= lastBurnTimestamp + burnRoundMinimumDuration */ }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "lockAndBurn"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Post-unlock slashing vulnerability: stakes can be slashed even after their unlockTime has passed but before withdrawal. A user who has not withdrawn after unlock is still exposed to slashing with no time-lock protection, creating an asymmetric risk window.",
+        "attack_scenario": "User's stake unlocks. Before they withdraw (even 1 block later), SLASHER submits a slash. The user's unlocked-but-not-withdrawn funds are slashed. The user has no recourse except the appeal process. This is by design but creates a significant risk: users who do not immediately withdraw after unlock remain indefinitely exposed to slashing.",
+        "invariant_logic": "slash() does NOT check unlockTime; any stake with amount > 0 is slashable regardless of lock status. Users must understand: unlocked != safe.",
+        "solidity_property": "function invariant_postUnlockSlashable(address staker) public view { /* Even if selfStakes[staker].unlockTime < block.timestamp, selfStakes[staker].amount can be slashed */ }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "slash"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "withdrawSelfStake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Slash round merging destroys per-round granularity: when a stake slashed in round N-1 is re-slashed in round N, the entire slashedAmount is moved to round N. This prevents granular release of just the new or just the old slash, and the RELEASER must always reference the latest slashedInRound for a given stake.",
+        "attack_scenario": "SLASHER slashes a user in round 5 (unjustly) and round 6 (justly). On re-slash in round 6, the round 5 slashed amount is merged into round 6. RELEASER cannot release just the unjust round 5 slash without also affecting the round 6 tracking. They must release a specific amount from round 6, requiring off-chain accounting to distinguish just vs unjust portions.",
+        "invariant_logic": "After slash: if old slashedInRound == currentSlashRound - 1, then totalSlashed[old] -= oldSlashedAmount AND totalSlashed[current] += oldSlashedAmount; slashedInRound is always set to currentSlashRound",
+        "solidity_property": "function invariant_slashRoundMerge(address staker) public view { assert(selfStakes[staker].slashedInRound == 0 || selfStakes[staker].slashedInRound >= currentSlashRound - 1 || selfStakes[staker].slashedAmount == 0); }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "slash"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "release"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "IdentityStaking.sol",
+        "description": "lockAndBurn does not zero totalSlashed[burnedRound] after transferring tokens. The stale value persists in storage. While currently no function path can re-access a burned round for transfers, this violates clean state management and could become exploitable after an upgrade.",
+        "invariant_logic": "After lockAndBurn for round R: totalSlashed[R] should ideally be 0; currently it retains its pre-burn value. No subsequent function reads totalSlashed[R] for R < currentSlashRound - 1, but the data is inconsistent.",
+        "solidity_property": "function invariant_burnedRoundClean(uint16 burnedRound) public view { if (burnedRound < currentSlashRound - 1) { assert(totalSlashed[burnedRound] == 0); /* CURRENTLY FAILS - stale data */ } }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "lockAndBurn"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "IdentityStaking.sol",
+        "description": "Withdrawal operations must be blocked while paused (whenNotPaused modifier present). However, staking operations are also blocked when paused, meaning a paused state prevents users from both depositing AND withdrawing. If the contract is paused indefinitely (e.g., admin key compromise), all staked funds are permanently locked.",
+        "invariant_logic": "When paused: no selfStake, communityStake, withdrawSelfStake, withdrawCommunityStake, slash, release, lockAndBurn can execute. Unpause requires PAUSER_ROLE. Fund recovery depends entirely on PAUSER_ROLE availability.",
+        "solidity_property": "function invariant_pauseBlocksAll() public view { /* If paused(), all user-facing functions revert */ }",
+        "inventory_refs": [
+          {
+            "file": "IdentityStaking.sol",
+            "function": "pause"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "unpause"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "withdrawSelfStake"
+          },
+          {
+            "file": "IdentityStaking.sol",
+            "function": "withdrawCommunityStake"
+          }
+        ]
+      }
+    ]
+  }
+}

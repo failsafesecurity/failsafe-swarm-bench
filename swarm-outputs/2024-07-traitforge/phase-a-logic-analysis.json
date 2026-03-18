@@ -1,0 +1,534 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T17:13:28.581Z",
+    "duration_ms": 177996
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-minting-eth-flow",
+        "source": "User ETH via mintToken/mintWithBudget",
+        "path": [
+          "User calls mintToken/mintWithBudget with ETH",
+          "calculateMintPrice() determines cost",
+          "_mintInternal mints token and calls _distributeFunds",
+          "_distributeFunds sends all ETH to nukeFundAddress",
+          "NukeFund.receive() splits: 10% devShare, 90% fund"
+        ],
+        "transformations": [
+          "mintPrice calculation based on generation mint count and priceIncrement",
+          "NukeFund splits msg.value by taxCut (10%)"
+        ],
+        "sinks": [
+          "NukeFund.fund (90%)",
+          "devAddress/owner/daoAddress (10%)"
+        ],
+        "trust_changes": "ETH transitions from user-controlled to protocol-controlled upon mint; NukeFund receive() trusts any sender",
+        "validation_points": [
+          "msg.value >= mintPrice check in mintToken",
+          "balance >= totalAmount in _distributeFunds"
+        ],
+        "exposure_risks": [
+          "NukeFund receive() is public, anyone can send ETH and trigger dev share distribution"
+        ],
+        "manipulation_risks": [
+          "If taxCut is set to 0 by owner, division by zero in NukeFund.receive()",
+          "If taxCut is set to 1, 100% goes to devShare and 0% to fund"
+        ]
+      },
+      {
+        "flow_id": "DF-002-entropy-generation-flow",
+        "source": "Block data (block.number, blockhash, block.timestamp)",
+        "path": [
+          "writeEntropyBatch1/2/3 generates pseudo-random values from block.number and index",
+          "Values stored in entropySlots[770]",
+          "getNextEntropy() called by TraitForgeNft during mint",
+          "getEntropy() extracts 6-digit value from slot via position slicing",
+          "Entropy assigned to tokenEntropy[tokenId]"
+        ],
+        "transformations": [
+          "keccak256(block.number, i) % 10^78",
+          "Slot slicing: (slotValue / 10^(72-position)) % 1000000",
+          "Padding: entropy * 10^(6-numberOfDigits(entropy))"
+        ],
+        "sinks": [
+          "tokenEntropy mapping in TraitForgeNft",
+          "Used for role determination, forge potential, nuke factor, performance factor"
+        ],
+        "trust_changes": "Entropy generated from miner-influenceable block data; once stored, treated as immutable truth for game mechanics",
+        "validation_points": [
+          "Batch 1 checks pseudoRandomValue != 999999",
+          "Batch 3 does NOT check for 999999"
+        ],
+        "exposure_risks": [
+          "getPublicEntropy is public view - all future entropies are predictable once slots are written",
+          "entropySlots can be read via storage slots directly"
+        ],
+        "manipulation_risks": [
+          "Miners can influence block.number to manipulate entropy values",
+          "All batches written in same block get identical block.number input - values vary only by index i",
+          "Users can predict next entropy and front-run or time mints for desirable traits",
+          "writeEntropyBatch3 doesn't check for 999999, allowing the special alpha value to be placed incorrectly"
+        ]
+      },
+      {
+        "flow_id": "DF-003-forging-data-flow",
+        "source": "User calls forgeWithListed with forgerTokenId and mergerTokenId",
+        "path": [
+          "Validates forger is listed, caller owns merger, different owners, same generation",
+          "Resets forging counts if year elapsed",
+          "Increments forgingCounts for both tokens",
+          "Calls nftContract.forge() to mint new entity",
+          "New entropy = (forgerEntropy + mergerEntropy) / 2",
+          "ETH split: devFee to nukeFund, forgerShare to forger owner",
+          "Listing cancelled for forger"
+        ],
+        "transformations": [
+          "New entropy averaged from parents",
+          "Fee split: forgingFee/taxCut to nukeFund, remainder to forger owner"
+        ],
+        "sinks": [
+          "New token minted to merger owner",
+          "ETH to nukeFund and forger owner"
+        ],
+        "trust_changes": "Forger owner address read from nftContract.ownerOf at time of forge - could change between listing and forging if not properly guarded",
+        "validation_points": [
+          "Listing isListed check",
+          "ownerOf checks",
+          "Generation matching",
+          "Forge potential checks"
+        ],
+        "exposure_risks": [
+          "Forger's forge count not validated against forgePotential in forgeWithListed - only checked during listForForging"
+        ],
+        "manipulation_risks": [
+          "Race condition: forger lists, year resets count to 0, forger can forge more times than forgePotential if listing persists across year boundary",
+          "Excess ETH sent to forgeWithListed is not refunded"
+        ]
+      },
+      {
+        "flow_id": "DF-004-nuke-claim-flow",
+        "source": "User calls nuke(tokenId)",
+        "path": [
+          "Validates caller is owner/approved",
+          "Validates contract is approved for transfer",
+          "Validates token maturity (minimumDaysHeld)",
+          "calculateNukeFactor: initialNukeFactor = entropy/40, age-based adjustment",
+          "claimAmount = min(fund * nukeFactor / MAX_DENOMINATOR, fund / maxAllowedClaimDivisor)",
+          "fund -= claimAmount",
+          "Token is burned",
+          "ETH sent to caller"
+        ],
+        "transformations": [
+          "Age calculation: daysOld * performanceFactor * MAX_DENOMINATOR * ageMultiplier / 365",
+          "NukeFactor: (adjustedAge * defaultNukeFactorIncrease / MAX_DENOMINATOR) + entropy/40",
+          "ClaimAmount: fund * finalNukeFactor / MAX_DENOMINATOR capped at fund/maxAllowedClaimDivisor"
+        ],
+        "sinks": [
+          "ETH to msg.sender",
+          "fund balance decremented",
+          "Token burned"
+        ],
+        "trust_changes": "Fund balance decremented before ETH transfer (no reentrancy issue due to nonReentrant), but burn calls back to TraitForgeNft which may have side effects",
+        "validation_points": [
+          "isApprovedOrOwner",
+          "getApproved/isApprovedForAll",
+          "canTokenBeNuked maturity check"
+        ],
+        "exposure_risks": [
+          "If ageMultiplier is 0 (uninitialized), adjustedAge is always 0, nuke factor is only entropy/40"
+        ],
+        "manipulation_risks": [
+          "If ageMultiplier is not set, calculateAge returns 0, making nuke factor purely entropy-based and ignoring age",
+          "Token with entropy 999999 gives initialNukeFactor = 999999/40 = 24999, which is near the 50000 cap, allowing near-max claims quickly",
+          "lastTokenTransferredTimestamp is 0 for tokens never transferred (only minted), so canTokenBeNuked uses creation-era timestamp making minimumDaysHeld trivially met for old minted tokens"
+        ]
+      },
+      {
+        "flow_id": "DF-005-trading-eth-flow",
+        "source": "Buyer calls buyNFT with ETH",
+        "path": [
+          "Validates msg.value == listing.price",
+          "nukeFundContribution = msg.value / taxCut",
+          "sellerProceeds = msg.value - nukeFundContribution",
+          "Transfer nukeFundContribution to nukeFund",
+          "Transfer sellerProceeds to seller",
+          "Transfer NFT to buyer"
+        ],
+        "transformations": [
+          "Tax split: msg.value/taxCut to nukeFund, remainder to seller"
+        ],
+        "sinks": [
+          "NukeFund receives contribution",
+          "Seller receives proceeds",
+          "Buyer receives NFT"
+        ],
+        "trust_changes": "ETH flows to seller address stored in listing - if seller is a contract, re-entrancy is possible within the nonReentrant scope",
+        "validation_points": [
+          "msg.value == listing.price (exact match required)",
+          "listing.seller != address(0)"
+        ],
+        "exposure_risks": [
+          "listing.isActive not checked in buyNFT - only seller and price checked"
+        ],
+        "manipulation_risks": [
+          "After buyNFT deletes the listing, listedTokenIds[tokenId] still points to the old listingCount index - stale mapping",
+          "The _beforeTokenTransfer hook in TraitForgeNft will try to cancel forging listing when NFT is transferred from EntityTrading to buyer"
+        ]
+      },
+      {
+        "flow_id": "DF-006-devfund-reward-flow",
+        "source": "ETH sent to DevFund via receive()",
+        "path": [
+          "amountPerWeight = msg.value / totalDevWeight",
+          "remaining = msg.value - amountPerWeight * totalDevWeight (dust)",
+          "totalRewardDebt += amountPerWeight",
+          "Devs call claim() to collect pending",
+          "pending = pendingRewards + (totalRewardDebt - rewardDebt) * weight"
+        ],
+        "transformations": [
+          "Integer division truncation: dust goes to owner",
+          "Reward accumulation per weight unit"
+        ],
+        "sinks": [
+          "Dev addresses via claim()",
+          "Owner receives dust/remainder"
+        ],
+        "trust_changes": "ETH held by contract until claimed; balance must cover all pending rewards",
+        "validation_points": [
+          "safeRewardTransfer caps at contract balance"
+        ],
+        "exposure_risks": [
+          "If a dev is removed but doesn't claim, their pendingRewards are stored but weight is 0 - they can still claim"
+        ],
+        "manipulation_risks": [
+          "Owner can add/update/remove devs at any time, potentially diluting or stealing unclaimed rewards",
+          "No timelock or governance on dev weight changes"
+        ]
+      },
+      {
+        "flow_id": "DF-007-alpha-entropy-selection",
+        "source": "initializeAlphaIndices called on generation increment",
+        "path": [
+          "hashValue from blockhash(block.number-1) and block.timestamp",
+          "slotIndexSelection = (hashValue % 258) + 512",
+          "numberIndexSelection = hashValue % 13",
+          "Stored as slotIndexSelectionPoint and numberIndexSelectionPoint",
+          "getEntropy returns 999999 when indices match"
+        ],
+        "transformations": [
+          "Hash-based pseudo-random selection of special 999999 entropy position"
+        ],
+        "sinks": [
+          "slotIndexSelectionPoint and numberIndexSelectionPoint state variables"
+        ],
+        "trust_changes": "Miner-influenceable block data determines which token gets the 999999 golden entropy",
+        "validation_points": [
+          "onlyOwner modifier - but called from _incrementGeneration in TraitForgeNft which is not owner"
+        ],
+        "exposure_risks": [
+          "initializeAlphaIndices is onlyOwner but TraitForgeNft calls it in _incrementGeneration - this will REVERT unless TraitForgeNft is owner of EntropyGenerator"
+        ],
+        "manipulation_risks": [
+          "Miner can manipulate blockhash to influence alpha placement",
+          "If slots 512-769 haven't been initialized yet (batch3 not called), the alpha position maps to uninitialized slot"
+        ]
+      },
+      {
+        "flow_id": "DF-008-token-transfer-hook",
+        "source": "Any ERC721 transfer (including mint, burn, trade)",
+        "path": [
+          "_beforeTokenTransfer in TraitForgeNft",
+          "Checks entityForgingContract.getListedTokenIds(firstTokenId)",
+          "If listed, fetches listing details and cancels if conditions match",
+          "Updates lastTokenTransferredTimestamp"
+        ],
+        "transformations": [
+          "Timestamp update on transfer for nuke maturity tracking"
+        ],
+        "sinks": [
+          "lastTokenTransferredTimestamp mapping",
+          "EntityForging listing state"
+        ],
+        "trust_changes": "TraitForgeNft calls entityForgingContract.cancelListingForForging - requires TraitForgeNft to be authorized",
+        "validation_points": [
+          "from != to check for timestamp update",
+          "listing.tokenId, listing.account, listing.isListed checks"
+        ],
+        "exposure_risks": [
+          "On mint (from=address(0)), lastTokenTransferredTimestamp is not set since from!=to is true but transfer is from zero address"
+        ],
+        "manipulation_risks": [
+          "lastTokenTransferredTimestamp is set on mint via _beforeTokenTransfer (from=0, to=user), but canTokenBeNuked in NukeFund checks getTokenLastTransferredTimestamp which returns lastTokenTransferredTimestamp - if this is set to current timestamp on mint, the minimumDaysHeld works correctly. But if token is never transferred after mint, this timestamp captures mint time."
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Max 10000 tokens per generation, max 10 generations = 100000 total tokens",
+        "Tokens are either forgers (entropy % 3 == 0) or mergers (entropy % 3 != 0)",
+        "Forge potential determined by 5th digit of entropy: (entropy / 10) % 10",
+        "Minting price increases linearly within a generation",
+        "Nuke fund accumulates 90% of all minting fees",
+        "Nuke payouts based on age and entropy-derived nuke factor",
+        "Forging requires same generation for both parents",
+        "New forged entity is one generation higher than parents"
+      ],
+      "economic_incentives": [
+        "Hold tokens longer for higher nuke factor (age-based)",
+        "Higher entropy tokens have higher initial nuke factor",
+        "Forgers earn fees from merger owners who want new entities",
+        "10% tax on all economic activities feeds the nuke fund",
+        "Developers receive weighted share of dev fund distributions"
+      ],
+      "governance_mechanisms": [
+        "Owner can change all critical parameters (taxCut, prices, addresses)",
+        "No timelock on parameter changes",
+        "Owner can pause/unpause all contracts",
+        "Owner controls dev fund weight allocation"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "ageMultiplier is never set (defaults to 0)",
+          "expected_behavior": "Age should meaningfully contribute to nuke factor",
+          "actual_behavior": "calculateAge always returns 0 because daysOld * perfomanceFactor * MAX_DENOMINATOR * 0 / 365 = 0, making nuke factor purely entropy/40",
+          "risk_level": "high",
+          "exploitation_potential": "Tokens with high entropy (e.g., 999999) can be immediately nuked for high payouts without needing to hold them for extended periods, defeating the age-based incentive mechanism"
+        },
+        {
+          "scenario": "initializeAlphaIndices called from _incrementGeneration in TraitForgeNft",
+          "expected_behavior": "Alpha indices should be reinitialized each generation",
+          "actual_behavior": "initializeAlphaIndices has onlyOwner modifier on EntropyGenerator. Unless TraitForgeNft is set as the owner of EntropyGenerator, this call will REVERT, preventing generation increments entirely",
+          "risk_level": "high",
+          "exploitation_potential": "Generation advancement is completely blocked. No new generations can be minted after the first 10000 tokens. This is a critical functional break. The onlyAllowedCaller modifier should have been used instead of onlyOwner."
+        },
+        {
+          "scenario": "Entropy value of 0 from getEntropy",
+          "expected_behavior": "numberOfDigits(0) should return valid count",
+          "actual_behavior": "numberOfDigits(0) returns 0, causing paddedEntropy = 0 * 10^(6-0) = 0 * 10^6 = 0. However, the 10^6 exponent creates issues if entropy is 0",
+          "risk_level": "medium",
+          "exploitation_potential": "Token with 0 entropy has: isForger = (0%3==0) = true, forgePotential = (0/10)%10 = 0, performanceFactor = 0%10 = 0, nukeFactor = 0/40 = 0. ForgePotential of 0 means it can never forge despite being a forger. Performance factor of 0 means age calculation is always 0."
+        },
+        {
+          "scenario": "Forger's forge potential not rechecked in forgeWithListed",
+          "expected_behavior": "Both forger and merger should be validated against their forge potential limits at time of forging",
+          "actual_behavior": "forgingCounts[forgerTokenId]++ happens without checking against forgePotential. The check was only done at listing time, but year-based reset could have occurred",
+          "risk_level": "high",
+          "exploitation_potential": "A forger lists when forgingCounts < forgePotential. After listing, year passes and count resets to 0. Multiple forgeWithListed calls can be made, each incrementing the count. The forger can forge many more times than forgePotential because count was reset after the listing check."
+        },
+        {
+          "scenario": "mintWithBudget loop only checks _tokenIds < maxTokensPerGen",
+          "expected_behavior": "Should check generationMintCounts against maxTokensPerGen",
+          "actual_behavior": "Compares _tokenIds (global counter) against maxTokensPerGen (10000). After first generation, _tokenIds > 10000, so the loop condition fails and no more tokens can be minted via mintWithBudget",
+          "risk_level": "high",
+          "exploitation_potential": "mintWithBudget becomes completely non-functional after generation 1 since _tokenIds will exceed 10000. Users can only use mintToken for generations 2+."
+        },
+        {
+          "scenario": "NukeFund.receive() with taxCut set to 0",
+          "expected_behavior": "Should handle gracefully",
+          "actual_behavior": "Division by zero: msg.value / 0 reverts",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner setting taxCut to 0 would brick all minting, trading, and forging since fund distribution would revert. Same for EntityForging and EntityTrading."
+        },
+        {
+          "scenario": "Token with entropy 999999 (alpha)",
+          "expected_behavior": "Special high-value token",
+          "actual_behavior": "initialNukeFactor = 999999/40 = 24999. With nukeFactorMaxParam = 50000, the token could claim fund * 24999 / 100000 = ~25% of fund immediately (or up to 50% if age contributes). The alpha token is extremely valuable for nuking.",
+          "risk_level": "high",
+          "exploitation_potential": "Predictable alpha position via getPublicEntropy. Attacker can calculate when 999999 will be minted and time their mint to capture it, then immediately nuke for ~25% of the fund."
+        },
+        {
+          "scenario": "lastTokenTransferredTimestamp is 0 for never-transferred tokens",
+          "expected_behavior": "canTokenBeNuked should account for tokens that were minted but never transferred",
+          "actual_behavior": "getTokenLastTransferredTimestamp returns lastTokenTransferredTimestamp which IS set during _beforeTokenTransfer on mint (from=address(0) to user, from != to so it gets set). So the timestamp is set to mint time.",
+          "risk_level": "low",
+          "exploitation_potential": "No issue - timestamp is properly set on mint via _beforeTokenTransfer hook"
+        },
+        {
+          "scenario": "Excess ETH in forgeWithListed not refunded",
+          "expected_behavior": "Excess ETH above forgingFee should be refunded to caller",
+          "actual_behavior": "Only msg.value >= forgingFee is checked. Any excess ETH is trapped in the EntityForging contract forever.",
+          "risk_level": "medium",
+          "exploitation_potential": "Users lose excess ETH sent with forging transactions. The ETH is permanently locked in the EntityForging contract with no withdrawal function."
+        },
+        {
+          "scenario": "Forged entity entropy averaging can produce non-forger from two special tokens",
+          "expected_behavior": "Forged entity properties should be well-defined",
+          "actual_behavior": "newEntropy = (forgerEntropy + mergerEntropy) / 2 with integer division. The resulting token's role, forge potential, etc. are derived from this averaged entropy which may have unexpected properties",
+          "risk_level": "low",
+          "exploitation_potential": "Players can predict the resulting entropy and properties of forged entities, gaming the system for desired traits"
+        },
+        {
+          "scenario": "EntityTrading.buyNFT does not check listing.isActive",
+          "expected_behavior": "Should verify the listing is active before allowing purchase",
+          "actual_behavior": "Only checks listing.seller != address(0) and msg.value == listing.price. After a listing is deleted, the default Listing has seller=address(0) and price=0, so sending 0 ETH would pass the price check but fail the seller check. However, there's no explicit isActive validation.",
+          "risk_level": "low",
+          "exploitation_potential": "Not directly exploitable due to seller != address(0) check, but missing isActive check is poor practice"
+        },
+        {
+          "scenario": "cancelListingForForging does not delete listedTokenIds mapping",
+          "expected_behavior": "Both listings and listedTokenIds should be cleaned up",
+          "actual_behavior": "_cancelListingForForging only deletes listings[listedTokenIds[tokenId]] but does not delete listedTokenIds[tokenId]. The stale listedTokenIds mapping could cause getListedTokenIds to return a non-zero value for a cancelled listing.",
+          "risk_level": "medium",
+          "exploitation_potential": "In _beforeTokenTransfer, getListedTokenIds returns stale value, but the subsequent check verifies listing details match. However, if a new listing occupies the same index, it could cause incorrect cancellation of a different token's listing."
+        },
+        {
+          "scenario": "writeEntropyBatch1 can be called again after batches are complete if lastInitializedIndex wraps",
+          "expected_behavior": "Each batch should only be writable once",
+          "actual_behavior": "lastInitializedIndex starts at 0, batch1 sets it to 256, batch2 to 512, batch3 to 770. The require checks prevent re-calling. However, the entropy slots are never re-initialized between generations despite indices resetting via getNextEntropy slot wrap-around.",
+          "risk_level": "medium",
+          "exploitation_potential": "After all 10010 entropies are used (770 slots * 13), getNextEntropy wraps currentSlotIndex to 0, reusing the same entropy values. All subsequent tokens across future generations have predictable, repeated entropy values."
+        },
+        {
+          "scenario": "NukeFund.nuke burns token AFTER calculating claim amount",
+          "expected_behavior": "Burning should not affect claim calculation",
+          "actual_behavior": "The burn calls _burn which triggers _beforeTokenTransfer which updates timestamps and potentially cancels forging listings. The burn also calls airdropContract.subUserAmount. If any of these external calls fail or have unexpected behavior, the nuke could revert.",
+          "risk_level": "medium",
+          "exploitation_potential": "If airdropContract is malicious or broken, nuke operations could be blocked, trapping funds"
+        },
+        {
+          "scenario": "calculateMintPrice uses currentGeneration but _mintInternal may increment generation",
+          "expected_behavior": "Price should be consistent with the generation being minted in",
+          "actual_behavior": "In mintWithBudget, calculateMintPrice is called in the while loop. _mintInternal can call _incrementGeneration which changes currentGeneration and priceIncrement. The next iteration's calculateMintPrice uses the new generation's count (0) and higher priceIncrement, potentially resulting in a price that equals startPrice (since count is 0) but with a higher base.",
+          "risk_level": "low",
+          "exploitation_potential": "Price drops to startPrice when generation increments within mintWithBudget, allowing users to mint the first token of a new generation at a discount"
+        },
+        {
+          "scenario": "DevFund totalRewardDebt accumulation with no devs then devs added",
+          "expected_behavior": "Rewards should only accumulate for registered devs",
+          "actual_behavior": "When totalDevWeight > 0, totalRewardDebt += amountPerWeight. If devs are added after funds arrive, they start with rewardDebt = totalRewardDebt, missing previous rewards. But if funds arrive when no devs exist, everything goes to owner. Correct behavior.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit, but timing of dev registration matters"
+        },
+        {
+          "scenario": "Forging count check is off-by-one: forgingCounts[forgerTokenId] <= forgePotential in listForForging",
+          "expected_behavior": "Should allow exactly forgePotential forges",
+          "actual_behavior": "forgingCounts starts at 0, check is forgingCounts <= forgePotential. With forgePotential=1: count=0 passes (0<=1), count=1 passes (1<=1), then forge increments to 2. Next listing check: 2<=1 fails. So token can forge twice with potential of 1. Should be forgingCounts < forgePotential.",
+          "risk_level": "high",
+          "exploitation_potential": "Every forger can forge one more time than their forgePotential digit indicates. A forger with forgePotential=1 can forge twice, forgePotential=5 can forge 6 times, etc."
+        }
+      ],
+      "assumption_violations": [
+        "EntropyGenerator.initializeAlphaIndices assumes it's called by the contract owner, but TraitForgeNft._incrementGeneration calls it - TraitForgeNft must be the owner of EntropyGenerator or this breaks entirely",
+        "mintWithBudget assumes _tokenIds < maxTokensPerGen is the correct loop termination but _tokenIds is a global counter that only increases, breaking after generation 1",
+        "NukeFund assumes ageMultiplier is set to a non-zero value; default 0 makes age meaningless",
+        "EntropyGenerator assumes 770 slots * 13 numbers = 10010 entropies are sufficient; with 10000 tokens per generation and up to 10 generations, that's potentially 100000+ tokens but only 10010 unique entropies before recycling",
+        "EntityForging assumes forge potential check at listing time is sufficient - does not recheck at forge time",
+        "The system assumes NukeFund, DevFund addresses are correctly set before minting begins; no validation that these are set"
+      ],
+      "game_theory_risks": [
+        "Entropy predictability: since getPublicEntropy is public view, sophisticated players can predict which mint will yield high-value tokens (especially 999999) and time their mints accordingly",
+        "Nuke fund drainage: With multiple high-entropy tokens, coordinated nuking can rapidly drain the fund. Each nuke takes up to 50% of remaining fund, so serial nuking geometrically reduces the fund",
+        "Forging arbitrage: forger sets high fee, merger pays fee, new token may be immediately nukeable for more than the forging fee if fund is large enough",
+        "Front-running: miners or MEV bots can observe mintToken transactions and front-run to claim desirable entropy values",
+        "Airdrop gaming: airdropContract.addUserAmount is called with entropy value, incentivizing users to mint high-entropy tokens before airdrop starts",
+        "Generation transition sniping: first token of new generation costs only startPrice since generationMintCounts resets to 0"
+      ],
+      "integration_risks": [
+        "NukeFund.receive() can revert if devAddress/daoAddress/owner is a contract that rejects ETH, bricking all minting",
+        "airdropContract external calls in _mintInternal and burn could revert, blocking minting and nuking",
+        "entityForgingContract.cancelListingForForging called from _beforeTokenTransfer could revert, blocking all token transfers",
+        "If entityForgingContract or entropyGenerator are not properly set, minting reverts",
+        "DevFund receive() sends remainder to owner - if owner is a contract that reverts on receive, all fund distribution is blocked"
+      ],
+      "calculation_errors": [
+        "Forging count off-by-one: forgingCounts[tokenId] <= forgePotential should be < forgePotential, allowing one extra forge per token",
+        "mintWithBudget loop condition uses _tokenIds instead of generationMintCounts[currentGeneration], breaking for generations > 1",
+        "numberOfDigits(0) returns 0, causing paddedEntropy = 0 * 10^6 which is 0 but the exponent 10^(6-0) = 10^6 is technically fine since 0 * anything = 0",
+        "calculateAge: if ageMultiplier is 0, the entire age calculation is 0 regardless of how long the token is held",
+        "entropy averaging in forge: (forgerEntropy + mergerEntropy) / 2 loses 1 bit of precision due to integer division, minor but could affect role determination",
+        "priceIncrement is permanently modified in _incrementGeneration (priceIncrement += priceIncrementByGen), affecting all future generations cumulatively"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "TraitForgeNft (TFGNFT)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "pausable",
+            "mint_burn_restricted"
+          ],
+          "decimals": 0,
+          "notes": "ERC721Enumerable NFT. Minting restricted to internal functions and forge(). Burning restricted to approved/owner. Transfer hook cancels forging listings and updates timestamps. No fee-on-transfer."
+        },
+        {
+          "address_or_symbol": "ETH (native)",
+          "behaviors": [],
+          "decimals": 18,
+          "notes": "Native ETH used for all value transfers. No ERC20 tokens in the protocol. ETH flows: minting fees -> NukeFund -> devAddress; forging fees -> nukeFund + forger; trading fees -> nukeFund + seller; nuke claims <- NukeFund."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "fund_balance_conservation",
+          "state_vars": [
+            "NukeFund.fund",
+            "address(NukeFund).balance"
+          ],
+          "description": "NukeFund.fund should always be <= address(NukeFund).balance. The difference accounts for devShare portion that may not yet be distributed."
+        },
+        {
+          "name": "generation_mint_count_bound",
+          "state_vars": [
+            "generationMintCounts[gen]",
+            "maxTokensPerGen"
+          ],
+          "description": "generationMintCounts[gen] should never exceed maxTokensPerGen for any generation"
+        },
+        {
+          "name": "token_generation_bound",
+          "state_vars": [
+            "tokenGenerations[tokenId]",
+            "maxGeneration"
+          ],
+          "description": "No token should have a generation greater than maxGeneration"
+        },
+        {
+          "name": "entropy_slot_bounds",
+          "state_vars": [
+            "currentSlotIndex",
+            "currentNumberIndex"
+          ],
+          "description": "currentSlotIndex should be < 770 and currentNumberIndex should be < 13"
+        },
+        {
+          "name": "forging_count_bound",
+          "state_vars": [
+            "forgingCounts[tokenId]",
+            "forgePotential"
+          ],
+          "description": "VIOLATED: forgingCounts can exceed forgePotential by 1 due to <= comparison instead of <"
+        },
+        {
+          "name": "claim_amount_cap",
+          "state_vars": [
+            "claimAmount",
+            "fund",
+            "maxAllowedClaimDivisor"
+          ],
+          "description": "claimAmount should never exceed fund / maxAllowedClaimDivisor (50% of fund by default)"
+        },
+        {
+          "name": "dev_reward_solvency",
+          "state_vars": [
+            "totalRewardDebt",
+            "totalDevWeight",
+            "sum(devInfo[].pendingRewards)",
+            "address(DevFund).balance"
+          ],
+          "description": "Sum of all pending rewards should not exceed contract balance. safeRewardTransfer provides a soft cap."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,324 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T04:54:14.997Z",
+    "duration_ms": 343376
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Registry.sol",
+        "description": "The onlyVaultMaintainer modifier uses logical OR (||) instead of AND (&&), requiring the caller to be BOTH the vault maintainer AND hold EMERGENCY_ROLE. All other similar modifiers (onlyVaultGoverner, onlyVaultMaintainerWithoutTimeLock) correctly use AND (&&) to allow EITHER role. This effectively locks addConnector, updateConnectorTrustedTokens, and removeTrustedPosition unless maintainer also has emergency role.",
+        "attack_scenario": "The vault maintainer (a timelocked address) cannot add connectors, update trusted tokens, or remove trusted positions unless they also hold the global EMERGENCY_ROLE. This breaks the intended access control separation, potentially rendering core vault administration impossible and locking the protocol in a stale configuration.",
+        "invariant_logic": "onlyVaultMaintainer should pass if (msg.sender == maintainer) OR (hasRole(EMERGENCY_ROLE)), i.e., use && not || in the revert condition",
+        "solidity_property": "function invariant_vaultMaintainerAccess(uint256 vaultId, address caller) public view { bool isMaintainer = caller == vaults[vaultId].maintainer; bool isEmergency = hasRole(EMERGENCY_ROLE, caller); // Current: requires isMaintainer && isEmergency (bug) // Correct: requires isMaintainer || isEmergency assert(!(isMaintainer && !isEmergency)); // This SHOULD pass but currently fails }",
+        "inventory_refs": [
+          {
+            "file": "Registry.sol",
+            "function": "onlyVaultMaintainer modifier"
+          },
+          {
+            "file": "Registry.sol",
+            "function": "addConnector"
+          },
+          {
+            "file": "Registry.sol",
+            "function": "updateConnectorTrustedTokens"
+          },
+          {
+            "file": "Registry.sol",
+            "function": "removeTrustedPosition"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "AccountingManager.sol",
+        "description": "calculateWithdrawShares can be called between fulfillCurrentWithdrawGroup and completion of executeWithdraw (when isStarted=true, isFullfilled=true). The calculated totalCBAmount is accumulated but then destroyed when executeWithdraw completes and calls 'delete currentWithdrawGroup'. This causes the next withdraw group to have incorrect totalCBAmount (missing the amounts calculated during this window), leading to incorrect pro-rata distribution.",
+        "attack_scenario": "Manager calls calculateWithdrawShares after fulfilling but before fully executing the current group. The new calculations add to totalCBAmount. When executeWithdraw finishes and deletes the struct, these amounts are lost. The next group's totalCBAmountFullfilled will not include these requests, causing incorrect baseTokenAmount calculations in executeWithdraw (division produces wrong proportions).",
+        "invariant_logic": "forall groups G: G.totalCBAmountFullfilled == sum(withdrawQueue[G.firstId..G.lastId].amount)",
+        "solidity_property": "function invariant_withdrawGroupConsistency() public view { if (currentWithdrawGroup.isFullfilled && currentWithdrawGroup.isStarted) { assert(currentWithdrawGroup.totalCBAmount == 0 || currentWithdrawGroup.lastId == withdrawQueue.middle); } }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "calculateWithdrawShares"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "fulfillCurrentWithdrawGroup"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "executeWithdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MorphoBlueConnector.sol",
+        "description": "_getPositionTVL adds borrowAmount positively to TVL (supplyAmount + borrowAmount + collateralInLoanToken). Borrowed tokens are also tracked as held tokens via _updateTokenInRegistry in the borrow function. This double-counts borrowed amounts: once as held token balance and once in the Morpho position TVL, inflating total vault TVL by 2x the borrow value.",
+        "attack_scenario": "A strategy borrows X tokens from Morpho Blue with collateral C. Total TVL becomes: X (held tokens) + (0 + X + C_in_loan) from Morpho position = 2X + C_value. Correct TVL should be: X (held) + (C_value - X) from Morpho = C_value. TVL inflation of 2X allows minting excess shares to depositors or extracting inflated performance fees.",
+        "invariant_logic": "morpho_position_tvl == supply_value + collateral_value_in_loan_token - borrow_value (NOT + borrow_value)",
+        "solidity_property": "function invariant_morphoTVL(Id id) public view { Position memory pos = morphoBlue.position(id, address(this)); Market memory market = morphoBlue.market(id); uint256 borrowAmount = uint256(pos.borrowShares).toAssetsUp(market.totalBorrowAssets, market.totalBorrowShares); uint256 supplyAmount = uint256(pos.supplyShares).toAssetsUp(market.totalSupplyAssets, market.totalSupplyShares); uint256 collateralInLoan = convertCToL(pos.collateral, morphoBlue.idToMarketParams(id).oracle, morphoBlue.idToMarketParams(id).collateralToken); assert(positionTVL == supplyAmount + collateralInLoan - borrowAmount); }",
+        "inventory_refs": [
+          {
+            "file": "MorphoBlueConnector.sol",
+            "function": "_getPositionTVL"
+          },
+          {
+            "file": "MorphoBlueConnector.sol",
+            "function": "borrow"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "NoyaGovernanceBase.sol",
+        "description": "The onlyManager modifier grants access to registry.flashLoan() — a single global address that can call manager-restricted functions across ALL vaults and connectors. This includes executeDeposit, executeWithdraw, calculateDepositShares, calculateWithdrawShares, fee collection, swap operations, and all connector strategy functions.",
+        "attack_scenario": "If the flash loan contract is compromised or has a vulnerability, an attacker gains manager-level access to every vault in the system. They could manipulate deposit/withdraw queues, collect fees, execute arbitrary swaps, move funds between connectors, or manipulate positions across all vaults simultaneously.",
+        "invariant_logic": "flashLoan address should only have access to flash-loan-specific operations, not full manager access across all vaults",
+        "solidity_property": "function invariant_flashLoanScope() public view { address fl = registry.flashLoan(); // fl should NOT be able to call: executeDeposit, executeWithdraw, collectPerformanceFees, etc. // Currently fl CAN call all onlyManager functions }",
+        "inventory_refs": [
+          {
+            "file": "NoyaGovernanceBase.sol",
+            "function": "onlyManager modifier"
+          },
+          {
+            "file": "Registry.sol",
+            "function": "setFlashLoanAddress"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AerodromeConnector.sol",
+        "description": "_getPositionTVL only accounts for unstaked LP token balance (IERC20(pool).balanceOf) but not LP tokens staked in the gauge via the stake() function. Once LP tokens are staked, they become invisible to TVL calculation, causing systematic under-reporting of vault TVL.",
+        "attack_scenario": "After staking Aerodrome LP tokens into the gauge, the TVL drops by the staked amount. This deflates share price, allowing new depositors to buy shares cheaply. When LP is later unstaked, TVL jumps back, generating artificial profit that benefits latecomers and enables fee extraction. Strategy managers could also use this to show lower TVL and avoid performance fee triggers.",
+        "invariant_logic": "aerodrome_position_tvl == value_of(unstaked_lp + gauge_staked_lp)",
+        "solidity_property": "function invariant_aeroTVLIncludesStaked(address pool) public view { address gauge = voter.gauges(pool); uint256 totalLP = IERC20(pool).balanceOf(address(this)) + IGauge(gauge).balanceOf(address(this)); uint256 reportedTVL = _getPositionTVL(/* ... */); assert(reportedTVL >= totalLP * reserveValue / totalSupply); }",
+        "inventory_refs": [
+          {
+            "file": "AerodromeConnector.sol",
+            "function": "_getPositionTVL"
+          },
+          {
+            "file": "AerodromeConnector.sol",
+            "function": "stake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AccountingManager.sol",
+        "description": "The withdraw group state machine must follow: (isStarted=false,isFullfilled=false) → startCurrentWithdrawGroup → (true,false) → fulfillCurrentWithdrawGroup → (true,true) → executeWithdraw completes → delete → (false,false). No state (isStarted=false, isFullfilled=true) should be reachable. The calculateWithdrawShares guard only blocks when (isStarted=true, isFullfilled=false) but allows calculations during (true,true), creating the orphaned calculation bug.",
+        "attack_scenario": "Violation of the state machine allows calculateWithdrawShares to execute during the fulfilled-but-not-executed state, adding amounts to totalCBAmount that are subsequently destroyed. This corrupts the pro-rata distribution for subsequent withdrawal groups.",
+        "invariant_logic": "currentWithdrawGroup.isFullfilled == true implies currentWithdrawGroup.isStarted == true; AND during (isStarted=true, isFullfilled=true), calculateWithdrawShares SHOULD be blocked to prevent orphaned calculations",
+        "solidity_property": "function invariant_withdrawGroupStateMachine() public view { assert(!(currentWithdrawGroup.isFullfilled == true && currentWithdrawGroup.isStarted == false)); if (currentWithdrawGroup.isStarted && currentWithdrawGroup.isFullfilled) { assert(currentWithdrawGroup.totalCBAmount == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "startCurrentWithdrawGroup"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "fulfillCurrentWithdrawGroup"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "executeWithdraw"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "calculateWithdrawShares"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONOTON-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "Keepers.sol",
+        "description": "The nonce in Keepers must strictly increment by exactly 1 on each successful execution. This prevents replay attacks where the same signed transaction is executed multiple times. The nonce is incremented before the external call, preventing reentrancy-based replay.",
+        "invariant_logic": "post(nonce) == pre(nonce) + 1 for every successful execute() call; nonce is incremented before external call",
+        "solidity_property": "function invariant_nonceMonotonicity(uint256 preNonce) public view { assert(nonce >= preNonce); assert(nonce == preNonce || nonce == preNonce + 1); }",
+        "inventory_refs": [
+          {
+            "file": "Keepers.sol",
+            "function": "execute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AccountingManager.sol",
+        "description": "Queue pointer ordering invariant: depositQueue.first <= depositQueue.middle <= depositQueue.last must always hold. Similarly withdrawQueue.first <= withdrawQueue.middle <= withdrawQueue.last. The resetMiddle function can move middle backwards but has bounds checks. If these invariants break, deposits/withdrawals could be processed out of order or double-processed.",
+        "invariant_logic": "depositQueue.first <= depositQueue.middle <= depositQueue.last AND withdrawQueue.first <= withdrawQueue.middle <= withdrawQueue.last",
+        "solidity_property": "function invariant_queueOrdering() public view { assert(depositQueue.first <= depositQueue.middle); assert(depositQueue.middle <= depositQueue.last); assert(withdrawQueue.first <= withdrawQueue.middle); assert(withdrawQueue.middle <= withdrawQueue.last); }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "deposit"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "calculateDepositShares"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "executeDeposit"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "resetMiddle"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "UniswapValueOracle.sol",
+        "description": "The getValue function silently truncates amount to uint128 via 'uint128 amountIn128 = uint128(amount)'. For tokens with amounts exceeding uint128.max (approx 3.4e38), the truncation produces an incorrect lower value, leading to severe TVL underreporting that affects share price calculations.",
+        "invariant_logic": "amount == uint128(amount) for all inputs to getValue, OR getValue should handle amounts > uint128.max correctly",
+        "solidity_property": "function invariant_noTruncation(uint256 amount) public view { assert(amount <= type(uint128).max || /* revert expected */); }",
+        "inventory_refs": [
+          {
+            "file": "UniswapValueOracle.sol",
+            "function": "getValue"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "AccountingManager.sol",
+        "description": "Deposit and withdrawal share calculations require recordTime <= oldestUpdateTime (from TVLHelper.getLatestUpdateTime). The dummy holding position at index 0 has positionTimestamp = type(uint256).max. If no other positions exist, getLatestUpdateTime returns type(uint256).max, allowing immediate calculation with no TVL freshness check. With positions, a single stale cross-chain position could block ALL calculations indefinitely.",
+        "invariant_logic": "getLatestUpdateTime should return a meaningful timestamp that reflects actual data freshness, not type(uint256).max when no positions exist",
+        "solidity_property": "function invariant_latestUpdateTimeBounded() public view { uint256 t = TVLHelper.getLatestUpdateTime(vaultId, registry); assert(t <= block.timestamp + 1 days); }",
+        "inventory_refs": [
+          {
+            "file": "TVLHelper.sol",
+            "function": "getLatestUpdateTime"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "calculateDepositShares"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "calculateWithdrawShares"
+          },
+          {
+            "file": "Registry.sol",
+            "function": "addVault"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "AccountingManager.sol",
+        "description": "Performance fee collection has a strict time window: 12 hours < (block.timestamp - profitStoredTime) < 48 hours. If collectPerformanceFees is not called within this 36-hour window after recordProfitForFee, the fee shares are permanently lost (preformanceFeeSharesWaitingForDistribution becomes unclaimable). A new recordProfitForFee call would recalculate but profit could have changed.",
+        "invariant_logic": "collectPerformanceFees must be called when: profitStoredTime + 12h <= block.timestamp <= profitStoredTime + 48h",
+        "solidity_property": "function invariant_perfFeeWindow() public view { if (preformanceFeeSharesWaitingForDistribution > 0) { assert(block.timestamp - profitStoredTime <= 48 hours); } }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "recordProfitForFee"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "collectPerformanceFees"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AccountingManager.sol",
+        "description": "sendTokensToTrustedAddress allows ANY active connector to transfer ANY token and ANY amount from the AccountingManager without limits. The only check is registry.isAnActiveConnector. There is no verification that the transfer serves a legitimate purpose, is bounded by deposit amounts, or matches expected operations. Combined with the flashLoan having manager access, this creates a path to drain the accounting manager.",
+        "invariant_logic": "tokens transferred from AccountingManager to connectors should be bounded by processedBaseTokenAmount from deposit execution or retrieveData amounts for withdrawals",
+        "solidity_property": "function invariant_accountingManagerBalance() public view { assert(baseToken.balanceOf(address(this)) >= depositQueue.totalAWFDeposit); }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "sendTokensToTrustedAddress"
+          },
+          {
+            "file": "BaseConnector.sol",
+            "function": "addLiquidity"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "AccountingManager.sol",
+        "description": "The depositWaitingTime and withdrawWaitingTime can be set to 0 by the maintainer via changeDepositWaitingTime/changeWithdrawWaitingTime. With zero waiting time, share calculations could be immediately executed in the same block, eliminating the time-delay security mechanism designed to prevent share price manipulation and front-running.",
+        "invariant_logic": "depositWaitingTime > 0 AND withdrawWaitingTime > 0 to ensure meaningful delay between calculation and execution",
+        "solidity_property": "function invariant_waitingTimeNonZero() public view { assert(depositWaitingTime > 0); assert(withdrawWaitingTime > 0); }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "changeDepositWaitingTime"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "changeWithdrawWaitingTime"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "AccountingManager.sol",
+        "description": "The _update override locks user shares proportional to withdrawRequestsByAddress but the withdraw queue entries store msg.sender as owner. If a user creates multiple withdrawal requests and some are in different groups, partial execution of one group reduces withdrawRequestsByAddress while other locked requests may still reference stale amounts. Additionally, the user cannot cancel queued withdrawals, permanently locking shares until execution.",
+        "invariant_logic": "withdrawRequestsByAddress[user] == sum of all pending (unexecuted) withdrawal request shares for that user",
+        "solidity_property": "function invariant_lockedSharesConsistency(address user) public view { uint256 totalLocked = 0; for (uint256 i = withdrawQueue.first; i < withdrawQueue.last; i++) { if (withdrawQueue.queue[i].owner == user) totalLocked += withdrawQueue.queue[i].shares; } assert(withdrawRequestsByAddress[user] == totalLocked); }",
+        "inventory_refs": [
+          {
+            "file": "AccountingManager.sol",
+            "function": "_update"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "AccountingManager.sol",
+            "function": "executeWithdraw"
+          }
+        ]
+      }
+    ]
+  }
+}

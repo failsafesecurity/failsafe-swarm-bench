@@ -1,0 +1,313 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T05:23:14.539Z",
+    "duration_ms": 282059
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "L2 Anchor Mechanism",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "TaikoL2.anchor"
+        ],
+        "failure_modes": [
+          "Incorrect L1 state root anchored if GOLDEN_TOUCH_ADDRESS is compromised",
+          "Basefee manipulation if parentGasUsed is maliciously reported"
+        ],
+        "attack_vectors": [
+          "Compromise of the GOLDEN_TOUCH_ADDRESS private key",
+          "Consensus failure leading to invalid block anchoring"
+        ]
+      },
+      {
+        "boundary": "Cross-Chain Message Execution",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "CrossChainOwned.onMessageInvocation"
+        ],
+        "failure_modes": [
+          "Execution of arbitrary admin commands if bridge is compromised",
+          "Reentrancy if bridge context is spoofed"
+        ],
+        "attack_vectors": [
+          "Bridge contract compromise",
+          "Source chain owner account compromise"
+        ]
+      },
+      {
+        "boundary": "Token Grant Withdrawal via Signature",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "TimelockTokenPool.withdraw(address,bytes)"
+        ],
+        "failure_modes": [
+          "Signature replay across different chains or contract instances",
+          "Signature replay over time to force premature withdrawals"
+        ],
+        "attack_vectors": [
+          "Capturing a valid withdrawal signature from the mempool and replaying it to force the recipient to withdraw tokens against their current intent"
+        ]
+      },
+      {
+        "boundary": "Airdrop Claiming",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "ERC20Airdrop.claimAndDelegate",
+          "ERC20Airdrop2.claim",
+          "ERC721Airdrop.claim"
+        ],
+        "failure_modes": [
+          "Denial of Service via front-running delegation signatures",
+          "Invalid Merkle proofs bypassing validation"
+        ],
+        "attack_vectors": [
+          "Front-running the delegateBySig call to consume the nonce and DoS the claim transaction",
+          "Merkle tree leaf collision (mitigated by proper encoding)"
+        ]
+      },
+      {
+        "boundary": "SGX Quote Verification",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "AutomataDcapV3Attestation.verifyAttestation",
+          "AutomataDcapV3Attestation.verifyParsedQuote"
+        ],
+        "failure_modes": [
+          "Acceptance of revoked or invalid SGX quotes",
+          "Certificate chain spoofing"
+        ],
+        "attack_vectors": [
+          "Exploiting ASN.1 parsing vulnerabilities in PEMCertChainLib",
+          "Providing a maliciously crafted PCK certificate chain"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Previous L2 Block State",
+        "to_state": "New L2 Block State with Anchored L1 Data",
+        "trigger": "TaikoL2.anchor",
+        "conditions": [
+          "msg.sender == GOLDEN_TOUCH_ADDRESS",
+          "publicInputHash matches the hash of the previous 255 blocks",
+          "block.basefee matches the calculated EIP-1559 basefee"
+        ],
+        "invariants": [
+          "gasExcess is correctly updated based on parentGasUsed",
+          "publicInputHash maintains the integrity of the blockhash ring buffer"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Tokens Locked",
+        "to_state": "Tokens Withdrawn",
+        "trigger": "TimelockTokenPool.withdraw",
+        "conditions": [
+          "Current timestamp > unlockStart + unlockCliff",
+          "amountToWithdraw > 0"
+        ],
+        "invariants": [
+          "amountWithdrawn cannot exceed amountUnlocked",
+          "costPaid is proportional to the amount withdrawn"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Airdrop Unclaimed",
+        "to_state": "Airdrop Claimed",
+        "trigger": "ERC20Airdrop.claimAndDelegate",
+        "conditions": [
+          "Current timestamp is within claimStart and claimEnd",
+          "Valid Merkle proof provided",
+          "Valid delegation signature provided"
+        ],
+        "invariants": [
+          "isClaimed[hash] is set to true to prevent double claiming"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-121",
+        "pattern": "Missing Protection against Signature Replay Attacks",
+        "locations": [
+          "TimelockTokenPool.sol: withdraw(address,bytes)"
+        ],
+        "severity": "high",
+        "evidence": "The hash used for ECDSA.recover is `keccak256(abi.encodePacked(\"Withdraw unlocked Taiko token to: \", _to))`. It lacks a domain separator (chain ID, contract address) and a nonce.",
+        "exploitation_method": "An attacker can capture a valid signature from the mempool or blockchain and replay it on other chains, other instances of the contract, or the same contract at a later time to force the recipient to withdraw tokens to the `_to` address against their will.",
+        "affected_assets": [
+          "User's unlocked Taiko tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (DoS) via Front-Running",
+        "locations": [
+          "ERC20Airdrop.sol: claimAndDelegate"
+        ],
+        "severity": "high",
+        "evidence": "The function calls `IVotes(token).delegateBySig(delegatee, nonce, expiry, v, r, s);` using a signature provided in the calldata. There is no alternative `claim` function without delegation.",
+        "exploitation_method": "An attacker extracts the delegation signature from the mempool and calls `token.delegateBySig` directly. The token's nonce for the user is consumed. When the user's `claimAndDelegate` transaction executes, it reverts because the nonce is invalid, permanently blocking the user from claiming their airdrop unless a new signature is obtained.",
+        "affected_assets": [
+          "User's airdrop allocation"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (DoS) via Division by Zero",
+        "locations": [
+          "ERC20Airdrop2.sol: getBalance",
+          "ERC20Airdrop2.sol: init"
+        ],
+        "severity": "medium",
+        "evidence": "In `getBalance`, the calculation `balance * (block.timestamp.min(claimEnd + withdrawalWindow) - claimEnd) / withdrawalWindow` divides by `withdrawalWindow`. The `init` function does not validate that `_withdrawalWindow > 0`.",
+        "exploitation_method": "If the contract is initialized with `_withdrawalWindow = 0`, all calls to `withdraw` will revert due to a division by zero error, permanently locking all airdrop funds in the contract.",
+        "affected_assets": [
+          "All airdrop tokens in the ERC20Airdrop2 contract"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "TaikoL2EIP1559Configurable.sol",
+          "function": "setConfigAndExcess(Config,uint64)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes EIP-1559 basefee calculation parameters"
+        },
+        {
+          "contract": "TimelockTokenPool.sol",
+          "function": "grant(address,Grant)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allocates tokens to a recipient"
+        },
+        {
+          "contract": "TimelockTokenPool.sol",
+          "function": "void(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Cancels unvested tokens for a recipient"
+        },
+        {
+          "contract": "MerkleClaimable.sol",
+          "function": "setConfig(uint64,uint64,bytes32)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Updates airdrop merkle root and claim periods"
+        },
+        {
+          "contract": "AutomataDcapV3Attestation.sol",
+          "function": "setMrSigner(bytes32,bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "AutomataDcapV3Attestation.sol",
+          "function": "setMrEnclave(bytes32,bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "AutomataDcapV3Attestation.sol",
+          "function": "addRevokedCertSerialNum(uint256,bytes[])",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "AutomataDcapV3Attestation.sol",
+          "function": "configureTcbInfoJson(string,TCBInfoStruct.TCBInfo)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "TaikoL2.sol",
+          "function": "withdraw(address,address)",
+          "guards": [
+            "onlyFromOwnerOrNamed"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Withdraws ETH or ERC20 tokens from the L2 anchor contract"
+        },
+        {
+          "contract": "EssentialContract.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Pauses contract functionality via _authorizePause"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "TaikoL2.sol",
+              "lines": "120-160",
+              "function": "anchor"
+            }
+          ],
+          "compositional_usage": [
+            "Cross-chain state verification via L1 state root anchoring"
+          ]
+        }
+      ]
+    }
+  }
+}

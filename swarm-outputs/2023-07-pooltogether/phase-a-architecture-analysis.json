@@ -1,0 +1,1901 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "architecture_entry_points",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.1 Asset Inventory - Financial assets, state assets, privilege assets, reputation assets",
+      "1.3 System Architecture Mapping - Contract hierarchies, dependencies, upgrade patterns, access control",
+      "2.1 Entry Point Enumeration - Public/external functions, callbacks, parameter analysis"
+    ],
+    "timestamp": "2026-03-08T17:05:50.680Z",
+    "duration_ms": 147894
+  },
+  "analysis": {
+    "asset_inventory": {
+      "financial_assets": [
+        "ERC20 prizeToken balances held by PrizePool (prize liquidity, reserve, unaccounted contributions)",
+        "ERC20 underlying asset balances held by each Vault (transiently during deposit/withdraw and possibly idle balances)",
+        "ERC4626 yieldVault shares/assets held by each Vault (principal backing; source of yield)",
+        "Vault ERC20 share token supply (represents depositor principal claims; also minted during liquidation/yield fee minting)",
+        "Claim fees accrued in PrizePool as claimerRewards (withdrawable prizeToken)",
+        "Yield fee accrual in Vault as _yieldFeeTotalSupply (claimable as newly minted Vault shares)",
+        "Any ERC20 approvals set by Vault: (1) underlying asset approval to yieldVault (max), (2) underlying asset approval to liquidationPair (max)"
+      ],
+      "state_assets": [
+        "TieredLiquidityDistributor: _tiers mapping (tier drawId, prizeSize, prizeTokenPerShare snapshots)",
+        "TieredLiquidityDistributor: numberOfTiers, prizeTokenPerShare, lastClosedDrawId, _reserve",
+        "PrizePool: vaultAccumulator + totalAccumulator ring buffer observations and metadata (contribution smoothing accounting)",
+        "PrizePool: claimedPrizes mapping (vault=>winner=>drawId=>tier=>prizeIndex=>bool)",
+        "PrizePool: claimerRewards mapping (fee balances)",
+        "PrizePool: draw lifecycle state (_winningRandomNumber, claimCount, canaryClaimCount, largestTierClaimed, _lastClosedDrawStartedAt, _lastClosedDrawAwardedAt, _totalWithdrawn)",
+        "Vault: TWAB balances and totalSupply stored in TwabController (authoritative ledger for Vault share balances)",
+        "Vault: configuration state (_claimer, _liquidationPair, _yieldFeePercentage, _yieldFeeRecipient, _yieldFeeTotalSupply, _lastRecordedExchangeRate, _assetUnit, _hooks)",
+        "TwabController: userObservations/totalSupplyObservations ring buffers and details, delegates mapping",
+        "VaultFactory: allVaults array, deployedVaults mapping"
+      ],
+      "privilege_assets": [
+        "PrizePool drawManager authority (closeDraw, withdrawReserve; and de-facto control of reserve/prize distribution cadence)",
+        "PrizePool drawManager initialization race surface (setDrawManager callable by anyone until set)",
+        "Vault owner authority (Ownable): setClaimer, setLiquidationPair, setYieldFeePercentage, setYieldFeeRecipient, and inherited ownership transfer functions",
+        "LiquidationPair privileged caller for Vault.liquidate (only liquidation pair may mint shares for yield liquidation)",
+        "Vault claimer authority (address allowed to batch-claim prizes via Vault.claimPrizes)",
+        "User-controlled hook configuration in Vault (_hooks mapping), enabling arbitrary external calls during prize claim flow",
+        "TwabController has no explicit access control on mint/burn/transfer/sponsor beyond using msg.sender as vault key; integrity relies on Vault not exposing those calls to arbitrary external actors"
+      ],
+      "reputation_assets": [
+        "Fairness/correctness of winner selection (TWAB history correctness, tier odds, vault portion, winning random number integrity)",
+        "Protocol solvency perception: Vault collateralization invariant (exchangeRate >= assetUnit) and PrizePool accountedBalance invariant vs real token balances",
+        "Governance-like influence via delegation/sponsorship in TwabController (affects chance-weighting / eligibility)",
+        "Claimer auction pricing credibility (VRGDA fee computation and max fee enforcement relative to prize size)"
+      ]
+    },
+    "system_architecture": {
+      "contracts_analyzed": [
+        "TieredLiquidityDistributor.sol",
+        "PrizePool.sol",
+        "Vault.sol",
+        "TwabController.sol",
+        "TwabLib.sol",
+        "DrawAccumulatorLib.sol",
+        "Claimer.sol",
+        "LinearVRGDALib.sol",
+        "TierCalculationLib.sol",
+        "ObservationLib.sol",
+        "UD34x4.sol",
+        "VaultFactory.sol",
+        "OverflowSafeComparatorLib.sol",
+        "IVaultHooks.sol"
+      ],
+      "inheritance_hierarchy": "PrizePool inherits TieredLiquidityDistributor. Vault inherits OpenZeppelin ERC4626 and ERC20Permit, implements ILiquidationSource, and inherits owner-manager-contracts/Ownable. Claimer inherits OpenZeppelin Multicall. TwabController is standalone but depends on TwabLib/ObservationLib ring-buffer logic. Libraries: TwabLib uses ObservationLib + RingBufferLib; DrawAccumulatorLib uses RingBufferLib and PRBMath SD59x18; TieredLiquidityDistributor/PrizePool use PRBMath types and TierCalculationLib; Vault uses OpenZeppelin SafeERC20/Math and external yieldVault (IERC4626) + PrizePool + TwabController.",
+      "external_dependencies": [
+        "OpenZeppelin: IERC20, SafeERC20, ERC4626, ERC20, ERC20Permit (draft), Math, Multicall",
+        "PRB-Math: SD59x18, UD60x18, UD2x18, SD1x18",
+        "Solmate: SignedWadMath (wadExp, wadLn, wadMul, wadDiv, unsafeWadMul, etc.)",
+        "ring-buffer-lib/RingBufferLib",
+        "owner-manager-contracts/Ownable",
+        "v5-liquidator: LiquidationPair and ILiquidationSource interface package",
+        "forge-std/console2.sol (debug import in PrizePool; should be removed/guarded for production builds)",
+        "External ERC4626 yield vaults (IERC4626) integrated by Vault",
+        "External PrizePool used by Vault and Claimer",
+        "External TwabController used by Vault and PrizePool"
+      ],
+      "upgrade_patterns": "No proxy/diamond upgrade patterns detected in provided contracts. All contracts are deployed via constructors (immutable configuration prevalent). VaultFactory deploys new Vault instances permissionlessly.",
+      "access_control_structure": "PrizePool: onlyDrawManager modifier gates closeDraw and withdrawReserve; drawManager is settable once via setDrawManager (no auth, front-runnable until set). Vault: onlyOwner gates administrative setters (setClaimer, setLiquidationPair, setYieldFeePercentage, setYieldFeeRecipient); liquidation() gated to msg.sender == _liquidationPair; claimPrizes() gated to msg.sender == _claimer; hooks are user-settable. TwabController: no explicit roles; write functions are callable by anyone but affect balances under the key of msg.sender vault address (integrity depends on vault contract being the only one calling for itself)."
+    },
+    "entry_points": [
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getTierPrizeSize",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getTierPrizeCount(uint8)",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getTierPrizeCount(uint8,uint8)",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier",
+          "uint8 _numberOfTiers"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getTotalShares",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getTierRemainingLiquidity",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getOpenDrawId",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "estimatedPrizeCount()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "estimatedPrizeCount(uint8)",
+        "visibility": "external",
+        "parameters": [
+          "uint8 numTiers"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "canaryPrizeCountFractional",
+        "visibility": "external",
+        "parameters": [
+          "uint8 numTiers"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "canaryPrizeCount()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "canaryPrizeCount(uint8)",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _numTiers"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "reserve",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TieredLiquidityDistributor.sol",
+        "function": "getTierOdds",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier",
+          "uint8 _numTiers"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "setDrawManager",
+        "visibility": "external",
+        "parameters": [
+          "address _drawManager"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "drawManager"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "contributePrizeTokens",
+        "visibility": "external",
+        "parameters": [
+          "address _prizeVault",
+          "uint256 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "vaultAccumulator[_prizeVault] (ring buffer state/observations)",
+          "totalAccumulator (ring buffer state/observations)"
+        ],
+        "external_calls": [
+          "prizeToken.balanceOf(address(this))",
+          "DrawAccumulatorLib.add(vaultAccumulator[_prizeVault], ...)",
+          "DrawAccumulatorLib.add(totalAccumulator, ...)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "withdrawReserve",
+        "visibility": "external",
+        "parameters": [
+          "address _to",
+          "uint104 _amount"
+        ],
+        "modifiers": [
+          "onlyDrawManager"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_reserve",
+          "_totalWithdrawn"
+        ],
+        "external_calls": [
+          "prizeToken.safeTransfer(_to, _amount)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "closeDraw",
+        "visibility": "external",
+        "parameters": [
+          "uint256 winningRandomNumber_"
+        ],
+        "modifiers": [
+          "onlyDrawManager"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "TieredLiquidityDistributor._tiers (canary and possibly new tiers reset)",
+          "TieredLiquidityDistributor.prizeTokenPerShare",
+          "TieredLiquidityDistributor.numberOfTiers",
+          "TieredLiquidityDistributor.lastClosedDrawId",
+          "TieredLiquidityDistributor._reserve",
+          "_winningRandomNumber",
+          "claimCount",
+          "canaryClaimCount",
+          "largestTierClaimed",
+          "_lastClosedDrawStartedAt",
+          "_lastClosedDrawAwardedAt"
+        ],
+        "external_calls": [
+          "DrawAccumulatorLib.getDisbursedBetween(totalAccumulator, ...)",
+          "TieredLiquidityDistributor._computeNewDistributions(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "claimPrize",
+        "visibility": "external",
+        "parameters": [
+          "address _winner",
+          "uint8 _tier",
+          "uint32 _prizeIndex",
+          "address _prizeRecipient",
+          "uint96 _fee",
+          "address _feeRecipient"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "claimedPrizes[msg.sender][_winner][lastClosedDrawId][_tier][_prizeIndex]",
+          "claimCount OR canaryClaimCount",
+          "largestTierClaimed",
+          "TieredLiquidityDistributor._tiers[_tier] (via _consumeLiquidity)",
+          "TieredLiquidityDistributor._reserve (possibly via _consumeLiquidity)",
+          "claimerRewards[_feeRecipient] (if _fee != 0)",
+          "_totalWithdrawn"
+        ],
+        "external_calls": [
+          "twabController.getTwabBetween(_vault,_user,...)",
+          "twabController.getTotalSupplyTwabBetween(_vault,...)",
+          "prizeToken.safeTransfer(_prizeRecipient, amount)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "withdrawClaimRewards",
+        "visibility": "external",
+        "parameters": [
+          "address _to",
+          "uint256 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "claimerRewards[msg.sender]",
+          "_totalWithdrawn"
+        ],
+        "external_calls": [
+          "prizeToken.safeTransfer(_to, _amount)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "increaseReserve",
+        "visibility": "external",
+        "parameters": [
+          "uint104 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "_reserve"
+        ],
+        "external_calls": [
+          "prizeToken.safeTransferFrom(msg.sender, address(this), _amount)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getWinningRandomNumber",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getLastClosedDrawId",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getTotalContributedBetween",
+        "visibility": "external",
+        "parameters": [
+          "uint16 _startDrawIdInclusive",
+          "uint16 _endDrawIdInclusive"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "DrawAccumulatorLib.getDisbursedBetween(totalAccumulator, ...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getContributedBetween",
+        "visibility": "external",
+        "parameters": [
+          "address _vault",
+          "uint16 _startDrawIdInclusive",
+          "uint16 _endDrawIdInclusive"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "DrawAccumulatorLib.getDisbursedBetween(vaultAccumulator[_vault], ...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getTierAccrualDurationInDraws",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "totalWithdrawn",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "accountedBalance",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "DrawAccumulatorLib.newestObservation(totalAccumulator)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "lastClosedDrawStartedAt",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "lastClosedDrawEndedAt",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "lastClosedDrawAwardedAt",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "hasOpenDrawFinished",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "openDrawStartedAt",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "openDrawEndsAt",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "reserveForOpenDraw",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "DrawAccumulatorLib.getDisbursedBetween(totalAccumulator, ...)",
+          "TieredLiquidityDistributor._computeNewDistributions(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getTotalContributionsForClosedDraw",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "DrawAccumulatorLib.getDisbursedBetween(totalAccumulator, ...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "wasClaimed",
+        "visibility": "external",
+        "parameters": [
+          "address _vault",
+          "address _winner",
+          "uint8 _tier",
+          "uint32 _prizeIndex"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "balanceOfClaimRewards",
+        "visibility": "external",
+        "parameters": [
+          "address _claimer"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "isWinner",
+        "visibility": "external",
+        "parameters": [
+          "address _vault",
+          "address _user",
+          "uint8 _tier",
+          "uint32 _prizeIndex"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "twabController.getTwabBetween(_vault,_user,...)",
+          "twabController.getTotalSupplyTwabBetween(_vault,...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "calculateTierTwabTimestamps",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getVaultUserBalanceAndTotalSupplyTwab",
+        "visibility": "external",
+        "parameters": [
+          "address _vault",
+          "address _user",
+          "uint256 _drawDuration"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "twabController.getTwabBetween(_vault,_user,...)",
+          "twabController.getTotalSupplyTwabBetween(_vault,...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "getVaultPortion",
+        "visibility": "external",
+        "parameters": [
+          "address _vault",
+          "uint16 _startDrawId",
+          "uint16 _endDrawId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "DrawAccumulatorLib.getDisbursedBetween(totalAccumulator, ...)",
+          "DrawAccumulatorLib.getDisbursedBetween(vaultAccumulator[_vault], ...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "PrizePool.sol",
+        "function": "nextNumberOfTiers",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "availableYieldBalance",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))",
+          "ERC4626.totalAssets() (via super.totalAssets())"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "availableYieldFeeBalance",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "balanceOf",
+        "visibility": "public",
+        "parameters": [
+          "address _account"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "twabController.balanceOf(address(this), _account)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "decimals",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "totalAssets",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))",
+          "ERC4626.totalAssets() (via super.totalAssets())"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "totalSupply",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "twabController.totalSupply(address(this))"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "exchangeRate",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "isVaultCollateralized",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "maxDeposit",
+        "visibility": "public",
+        "parameters": [
+          "address"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "maxMint",
+        "visibility": "public",
+        "parameters": [
+          "address"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "mintYieldFee",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _shares",
+          "address _recipient"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "_yieldFeeTotalSupply",
+          "TwabController userObservations/totalSupplyObservations for recipient (via _mint)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "TwabController.mint(_recipient, uint96(_shares))",
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "deposit",
+        "visibility": "public",
+        "parameters": [
+          "uint256 _assets",
+          "address _receiver"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "TwabController balances (mint to _receiver)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "IERC20(asset).balanceOf(address(this))",
+          "IERC20(asset).transferFrom(_caller, address(this), ...)",
+          "yieldVault.deposit(_assets, address(this))",
+          "TwabController.mint(_receiver, uint96(_shares))",
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "depositWithPermit",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _assets",
+          "address _receiver",
+          "uint256 _deadline",
+          "uint8 _v",
+          "bytes32 _r",
+          "bytes32 _s"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 permit allowance on underlying asset (external token state)",
+          "TwabController balances (mint)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "IERC20Permit(asset).permit(...)",
+          "IERC20(asset).transferFrom(...)",
+          "yieldVault.deposit(...)",
+          "TwabController.mint(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "mint",
+        "visibility": "public",
+        "parameters": [
+          "uint256 _shares",
+          "address _receiver"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "TwabController balances (mint)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))",
+          "IERC20(asset).transferFrom(...)",
+          "yieldVault.deposit(...)",
+          "TwabController.mint(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "mintWithPermit",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _shares",
+          "address _receiver",
+          "uint256 _deadline",
+          "uint8 _v",
+          "bytes32 _r",
+          "bytes32 _s"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 permit allowance on underlying asset (external token state)",
+          "TwabController balances (mint)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))",
+          "IERC20Permit(asset).permit(...)",
+          "IERC20(asset).transferFrom(...)",
+          "yieldVault.deposit(...)",
+          "TwabController.mint(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "sponsor",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _assets",
+          "address _receiver"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "TwabController balances (mint)",
+          "TwabController delegates mapping for _receiver (if not already sponsorship)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "deposit(...)",
+          "TwabController.delegateOf(address(this), _receiver)",
+          "TwabController.SPONSORSHIP_ADDRESS()",
+          "TwabController.sponsor(_receiver)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "sponsorWithPermit",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _assets",
+          "address _receiver",
+          "uint256 _deadline",
+          "uint8 _v",
+          "bytes32 _r",
+          "bytes32 _s"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 permit allowance on underlying asset (external token state)",
+          "TwabController balances (mint)",
+          "TwabController delegates mapping (maybe)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "IERC20Permit(asset).permit(...)",
+          "deposit(...)",
+          "TwabController.sponsor(_receiver)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "withdraw",
+        "visibility": "public",
+        "parameters": [
+          "uint256 _assets",
+          "address _receiver",
+          "address _owner"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 allowance for shares if _caller!=_owner (inherited allowance state in ERC20)",
+          "TwabController balances (burn from _owner)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "yieldVault.withdraw(_assets, address(this), address(this))",
+          "IERC20(asset).transfer(_receiver, _assets)",
+          "TwabController.burn(_owner, uint96(_shares))",
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "redeem",
+        "visibility": "public",
+        "parameters": [
+          "uint256 _shares",
+          "address _receiver",
+          "address _owner"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 allowance for shares if _caller!=_owner",
+          "TwabController balances (burn)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "yieldVault.withdraw(...)",
+          "IERC20(asset).transfer(...)",
+          "TwabController.burn(...)",
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "liquidatableBalanceOf",
+        "visibility": "public",
+        "parameters": [
+          "address _token"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "liquidate",
+        "visibility": "public",
+        "parameters": [
+          "address _account",
+          "address _tokenIn",
+          "uint256 _amountIn",
+          "address _tokenOut",
+          "uint256 _amountOut"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "_yieldFeeTotalSupply (if yieldFeePercentage != 0)",
+          "TwabController balances (mint to _account)",
+          "_lastRecordedExchangeRate"
+        ],
+        "external_calls": [
+          "PrizePool.prizeToken()",
+          "PrizePool.contributePrizeTokens(address(this), _amountIn)",
+          "IERC20(asset).balanceOf(address(this))",
+          "yieldVault.deposit(_vaultAssets, address(this)) (conditional)",
+          "TwabController.mint(_account, uint96(_amountOut))",
+          "yieldVault.maxWithdraw(address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "targetOf",
+        "visibility": "external",
+        "parameters": [
+          "address _token"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "liquidationPair.tokenIn()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "claimPrizes",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier",
+          "address[] _winners",
+          "uint32[][] _prizeIndices",
+          "uint96 _feePerClaim",
+          "address _feeRecipient"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "PrizePool claimedPrizes/tiers/reserve/claimerRewards/_totalWithdrawn (via PrizePool.claimPrize)",
+          "External hook contracts may mutate arbitrary state (user-chosen)"
+        ],
+        "external_calls": [
+          "PrizePool.claimPrize(...) in nested loops",
+          "IVaultHooks.beforeClaimPrize(...) (optional)",
+          "IVaultHooks.afterClaimPrize(...) (optional)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "setClaimer",
+        "visibility": "external",
+        "parameters": [
+          "address claimer_"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_claimer"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "setHooks",
+        "visibility": "external",
+        "parameters": [
+          "VaultHooks hooks"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "_hooks[msg.sender]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "setLiquidationPair",
+        "visibility": "external",
+        "parameters": [
+          "LiquidationPair liquidationPair_"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_liquidationPair",
+          "ERC20 underlying asset allowance to liquidation pair (external token state)"
+        ],
+        "external_calls": [
+          "IERC20(asset).approve(previousLP,0)",
+          "IERC20(asset).approve(newLP,type(uint256).max)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "setYieldFeePercentage",
+        "visibility": "external",
+        "parameters": [
+          "uint256 yieldFeePercentage_"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_yieldFeePercentage"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "setYieldFeeRecipient",
+        "visibility": "external",
+        "parameters": [
+          "address yieldFeeRecipient_"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_yieldFeeRecipient"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "yieldFeeRecipient",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "yieldFeePercentage",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "yieldFeeTotalSupply",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "twabController",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "yieldVault",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "liquidationPair",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "prizePool",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "claimer",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Vault.sol",
+        "function": "getHooks",
+        "visibility": "external",
+        "parameters": [
+          "address _account"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getAccount",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getTotalSupplyAccount",
+        "visibility": "external",
+        "parameters": [
+          "address vault"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "balanceOf",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "totalSupply",
+        "visibility": "external",
+        "parameters": [
+          "address vault"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "totalSupplyDelegateBalance",
+        "visibility": "external",
+        "parameters": [
+          "address vault"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "delegateOf",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "delegateBalanceOf",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getBalanceAt",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user",
+          "uint32 targetTime"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getBalanceAt(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getTotalSupplyAt",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "uint32 targetTime"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getBalanceAt(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getTwabBetween",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user",
+          "uint32 startTime",
+          "uint32 endTime"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getTwabBetween(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getTotalSupplyTwabBetween",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "uint32 startTime",
+          "uint32 endTime"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getTwabBetween(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getNewestObservation",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getNewestObservation(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getOldestObservation",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getOldestObservation(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getNewestTotalSupplyObservation",
+        "visibility": "external",
+        "parameters": [
+          "address vault"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getNewestObservation(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getOldestTotalSupplyObservation",
+        "visibility": "external",
+        "parameters": [
+          "address vault"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getOldestObservation(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "getTimestampPeriod",
+        "visibility": "external",
+        "parameters": [
+          "uint32 time"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.getTimestampPeriod(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "isTimeSafe",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user",
+          "uint32 time"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.isTimeSafe(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "isTimeRangeSafe",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "address user",
+          "uint32 startTime",
+          "uint32 endTime"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.isTimeRangeSafe(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "isTotalSupplyTimeSafe",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "uint32 time"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.isTimeSafe(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "isTotalSupplyTimeRangeSafe",
+        "visibility": "external",
+        "parameters": [
+          "address vault",
+          "uint32 startTime",
+          "uint32 endTime"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "TwabLib.isTimeRangeSafe(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "mint",
+        "visibility": "external",
+        "parameters": [
+          "address _to",
+          "uint96 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "userObservations[msg.sender][_to]",
+          "totalSupplyObservations[msg.sender]"
+        ],
+        "external_calls": [
+          "TwabLib.increaseBalances(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "burn",
+        "visibility": "external",
+        "parameters": [
+          "address _from",
+          "uint96 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "userObservations[msg.sender][_from]",
+          "totalSupplyObservations[msg.sender]"
+        ],
+        "external_calls": [
+          "TwabLib.decreaseBalances(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "transfer",
+        "visibility": "external",
+        "parameters": [
+          "address _from",
+          "address _to",
+          "uint96 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "userObservations[msg.sender][_from]",
+          "userObservations[msg.sender][_to]",
+          "delegates[msg.sender][*] (indirect via delegate accounting)",
+          "totalSupplyObservations[msg.sender] (delegateBalance adjustments depending on sponsorship transitions)"
+        ],
+        "external_calls": [
+          "TwabLib.increaseBalances(...)",
+          "TwabLib.decreaseBalances(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "delegate",
+        "visibility": "external",
+        "parameters": [
+          "address _vault",
+          "address _to"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "delegates[_vault][msg.sender]",
+          "userObservations[_vault][delegate] delegateBalance adjustments",
+          "totalSupplyObservations[_vault] delegateBalance adjustments (if sponsorship/zero involved)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "TwabController.sol",
+        "function": "sponsor",
+        "visibility": "external",
+        "parameters": [
+          "address _from"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "delegates[msg.sender][_from]",
+          "delegate balances and possibly total supply delegateBalance"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Claimer.sol",
+        "function": "claimPrizes",
+        "visibility": "external",
+        "parameters": [
+          "Vault vault",
+          "uint8 tier",
+          "address[] winners",
+          "uint32[][] prizeIndices",
+          "address _feeRecipient"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "External: PrizePool claim state (via Vault.claimPrizes -> PrizePool.claimPrize)",
+          "External: Vault hooks side-effects (optional)"
+        ],
+        "external_calls": [
+          "prizePool.numberOfTiers()",
+          "prizePool.claimCount()",
+          "prizePool.estimatedPrizeCount()",
+          "prizePool.lastClosedDrawAwardedAt()",
+          "vault.claimPrizes(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "Claimer.sol",
+        "function": "computeTotalFees(uint8,uint256)",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier",
+          "uint256 _claimCount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "prizePool.numberOfTiers()",
+          "prizePool.claimCount()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Claimer.sol",
+        "function": "computeTotalFees(uint8,uint256,uint256)",
+        "visibility": "external",
+        "parameters": [
+          "uint8 _tier",
+          "uint256 _claimCount",
+          "uint256 _claimedCount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "prizePool.numberOfTiers()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Claimer.sol",
+        "function": "computeFeePerClaim",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _maxFee",
+          "uint256 _claimCount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "prizePool.claimCount()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Claimer.sol",
+        "function": "computeMaxFee",
+        "visibility": "public",
+        "parameters": [
+          "uint8 _tier"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "prizePool.numberOfTiers()",
+          "prizePool.getTierPrizeSize(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VaultFactory.sol",
+        "function": "deployVault",
+        "visibility": "external",
+        "parameters": [
+          "IERC20 _asset",
+          "string _name",
+          "string _symbol",
+          "TwabController _twabController",
+          "IERC4626 _yieldVault",
+          "PrizePool _prizePool",
+          "address _claimer",
+          "address _yieldFeeRecipient",
+          "uint256 _yieldFeePercentage",
+          "address _owner"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "allVaults",
+          "deployedVaults[_vault]"
+        ],
+        "external_calls": [
+          "new Vault(...)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "VaultFactory.sol",
+        "function": "totalVaults",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      }
+    ],
+    "inventories": {
+      "upgradeability_surface": [
+        {
+          "contract": "TieredLiquidityDistributor.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Abstract-like base with internal mutators; used via inheritance by PrizePool. No proxy storage concerns."
+        },
+        {
+          "contract": "PrizePool.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Constructor-initialized with multiple immutables. Critical one-time setDrawManager is not access-controlled until set."
+        },
+        {
+          "contract": "Vault.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Constructor initializes immutables and approves yieldVault max allowance. Inherits Ownable; ensure inherited ownership management functions are externally reachable (transferOwnership, renounceOwnership) depending on owner-manager-contracts implementation."
+        },
+        {
+          "contract": "TwabController.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "No upgrade mechanism. Write functions are externally callable; security relies on vaults calling with msg.sender as vault key."
+        },
+        {
+          "contract": "Claimer.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "No upgrade mechanism. Inherits OZ Multicall (external aggregate call surface)."
+        },
+        {
+          "contract": "VaultFactory.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Permissionless factory; no upgrade mechanism."
+        }
+      ]
+    }
+  }
+}

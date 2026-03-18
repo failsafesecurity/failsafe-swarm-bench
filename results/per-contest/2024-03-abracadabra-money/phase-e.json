@@ -1,0 +1,52 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "LockingMultiRewards: Expired-but-Unprocessed Locks Retain Full Boost Multiplier, Enabling Reward Theft from Other Stakers",
+      "severity": "high",
+      "summary": "The LockingMultiRewards contract applies a boost multiplier (e.g., 3x via lockingBoostMultiplerInBips=30000) to locked token balances when computing each user's effective balance for reward distribution. However, the system has no mechanism to automatically reduce this boost when a lock expires. The balanceOf(user) function at line 239-242 always returns `bal.unlocked + (bal.locked * lockingBoostMultiplerInBips / BIPS)` regardless of whether the user's locks have passed their unlockTime. The loc",
+      "description": [
+        {
+          "file": "src/staking/LockingMultiRewards.sol",
+          "line_start": 235,
+          "line_end": 242,
+          "desc": "balanceOf() (line 239-242) and totalSupply() (line 235-237) compute boosted values using _balances[user].locked and lockedSupply unconditionally, with no check on whether the underlying locks have expired. These values are only decremented inside processExpiredLocks() (lines 441-445), which is restricted to operators. The reward accounting in _updateRewardsForUser() (line 557-568) uses balanceOf() and totalSupply() directly, meaning expired-but-unprocessed locks continue to earn at the full boosted rate indefinitely."
+        }
+      ],
+      "impact": "Direct theft of staking rewards from other users. The magnitude scales with: (a) the boost multiplier (default 3x), (b) the locked amount, (c) the delay between lock expiration and operator processing, and (d) the reward rate. With a 3x boost and even a 1-week processing delay, an attacker with a significant locked position can steal 25-60% of a period's rewards that rightfully belong to other stakers. This is not a theoretical dust-level issue -- it produces economically significant losses proportional to the total reward distribution.",
+      "proof_of_concept": "Setup: lockingBoostMultiplerInBips=30000 (3x boost), rewardsDuration=7 days, lockDuration=13 weeks, reward rate=10,000 tokens/week.\n\n1. Alice locks 1,000 staking tokens. Her balanceOf = 1,000 * 3 = 3,000 (boosted).\n2. Bob stakes 3,000 tokens unlocked. His balanceOf = 3,000.\n3. totalSupply = 6,000. Each earns 50% of rewards = 5,000 tokens/week.\n4. Week 14: Alice's lock expires (unlockTime <= block.timestamp).\n5. If processExpiredLocks were called immediately: Alice's balanceOf drops to 1,000, totalSupply=4,000. Alice earns 25% (2,500/week), Bob earns 75% (7,500/week).\n6. Instead, Alice deliberately calls getRewards() before the operator processes her lock. Her balanceOf is still 3,000 (boosted). She earns 50% (5,000/week).\n7. Alice repeats getRewards() calls for as long as the operator delays processing. Each call crystallizes the inflated rewards into _userRewardLock items.\n8. Even after the operator processes the expired lock, the already-crystallized rewards cannot be clawed back.\n9. Bob lost 2,500 tokens/week for each week of delay (the difference between his 50% share with Alice's inflated balance vs his rightful 75% share).",
+      "remediation": "Modify balanceOf() and totalSupply() to account for expired locks. Either: (1) Iterate over user locks in balanceOf() and exclude expired ones from the boost calculation (gas-expensive), or (2) Allow users to call processExpiredLocks on their own locks (remove onlyOperators restriction for self-processing), or (3) Introduce a time-weighted boost that linearly decays to 1x at unlockTime, or (4) Store a per-user 'lastBoostUpdateTime' and adjust rewards pro-rata when locks expire."
+    },
+    {
+      "title": "MagicLP flashLoan Fee-Free Path Enables Reserve/Target Desynchronization via _sync() Without Target Update",
+      "severity": "high",
+      "summary": "Beyond the known fee-bypass issue (Swarm C02 TECH-H002 and C01 flashLoan findings), the fee-free flash loan path creates a more subtle state corruption: reserves are updated via _sync() while targets and RState remain unchanged. An attacker who returns tokens in a different ratio (e.g., more base, less quote, but both above original reserves) shifts the reserve ratio without any corresponding target or RState adjustment. In the PMM model, the relationship between reserves and targets determines ",
+      "description": [
+        {
+          "file": "src/mimswap/MagicLP.sol",
+          "line_start": 290,
+          "line_end": 353,
+          "desc": "When a flash loan borrower returns both tokens at or above reserve levels, neither the sell-quote (line 308) nor sell-base (line 330) blocks execute. No fees are charged, no targets or RState are updated, but _sync() at line 350 updates reserves to the new (potentially different) balances. This creates a desynchronization between reserves and targets without any pricing curve adjustment."
+        }
+      ],
+      "impact": "Gradual LP value extraction through repeated fee-free flash loans that shift reserves without corresponding target/RState updates. While each individual extraction may be small, the attack is repeatable at no cost (zero flash loan fees) and compounds. LPs suffer from mispriced swaps enabled by the reserve/target desynchronization.",
+      "proof_of_concept": "1. Pool starts at RState=ONE, BASE_RESERVE=1000, QUOTE_RESERVE=1000, targets=1000/1000.\n2. Attacker flash-borrows 100 base, 100 quote.\n3. In callback, attacker returns 150 base + 100 quote (both >= reserves).\n4. Neither fee block executes. _sync() sets reserves to (1150, 1100). Targets remain (1000, 1000). RState remains ONE.\n5. Now reserves != targets but RState=ONE. The 150 excess base tokens push the effective price: getPMMState() returns B=1150, Q=1100 with B0=1000, Q0=1000 and R=ONE.\n6. adjustedTarget does nothing for R=ONE, so the pricing functions use B0=1000 < B=1150, creating mispricing.\n7. Attacker sells quote into the pool at a favorable rate (the pool undervalues quote relative to the distorted base surplus).\n8. Net result: attacker extracts value from LPs via the pricing distortion.",
+      "remediation": "Same as the fee-bypass fix: enforce that flash loan borrowers must pay fees. Additionally, if any token was borrowed, require that exactly one of the swap-fee blocks executes, ensuring targets and RState are properly updated alongside reserves."
+    },
+    {
+      "title": "BlastOnboarding Locked Tokens Permanently Irrecoverable to Users if Bootstrap Path Fails",
+      "severity": "high",
+      "summary": "Users who lock tokens in BlastOnboarding have exactly one path to recover value: the bootstrap must complete, the owner must setReady(true), and the user must claim() to receive staked LP shares. However, multiple failure modes can permanently prevent this: (1) bootstrap() requires State.Closed and pool==address(0), but if the owner never calls close(), state stays Opened and bootstrap cannot execute; (2) if bootstrap() reverts due to router issues, pool creation failures, or insufficient liquid",
+      "description": [
+        {
+          "file": "src/blast/BlastOnboarding.sol",
+          "line_start": 101,
+          "line_end": 141,
+          "desc": "The withdraw() function (line 132) only decrements unlocked balances. There is no unlock() function. The rescue() function (line 205) blocks supported tokens. Once tokens are locked via deposit(lock=true) or lock(), the only user-accessible recovery path is the bootstrap->claim flow. If this flow fails or is never completed, locked tokens are permanently stuck."
+        }
+      ],
+      "impact": "Permanent loss of all locked user funds if the bootstrap/claim flow cannot be completed. The amount at risk is the total of all locked MIM and USDB deposits. While the admin is trusted and CAN work around some failure modes (de-list + rescue), doing so breaks withdraw() for all other users with unlocked balances of that token, and requires manual off-chain accounting for fair distribution.",
+      "proof_of_concept": "1. During the Opened state, users deposit and lock MIM/USDB tokens.\n2. The project encounters issues (technical failure, insufficient deposits, team inability to complete bootstrap).\n3. Owner calls close() but bootstrap() reverts due to insufficient liquidity.\n4. Users' locked tokens are now in State.Closed with no path forward:\n   - withdraw() only works on unlocked balances\n   - There is no unlock() function\n   - rescue() blocks supported tokens\n   - State cannot revert to Opened\n5. Locked tokens are permanently stuck in the contract.\n\nAlternatively:\n1. Owner loses private key after calling open() but before close().\n2. State is permanently Opened.\n3. Users can withdraw unlocked balances but locked tokens have no recovery path.",
+      "remediation": "Add an unlock() function callable by users after a timeout (e.g., if state has been Closed for >30 days without bootstrap, or if state has been Opened for >90 days). Alternatively, modify rescue() to allow rescuing supported tokens when state is Closed and pool is still address(0) (bootstrap never succeeded)."
+    }
+  ]
+}

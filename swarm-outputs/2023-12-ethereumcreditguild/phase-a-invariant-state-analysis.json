@@ -1,0 +1,363 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T17:09:16.576Z",
+    "duration_ms": 505422
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "SurplusGuildMinter.sol",
+        "description": "getRewards() checks the `slashed` condition against the default-initialized (zero) userStake.lastGaugeLoss BEFORE loading the actual userStake from storage. This means any staker on a term that has ever had a gauge loss will be incorrectly slashed, even if they staked after the loss.",
+        "attack_scenario": "A term experiences a loss at time T1. User stakes at T2 > T1, correctly recording lastGaugeLoss = T1. Later, getRewards() is called (directly or via stake/unstake). The `slashed` flag is set by comparing `lastGaugeLoss (T1) > userStake.lastGaugeLoss (0, default)`, which is true. The user's entire stake is zeroed out, their CREDIT in the surplus buffer is lost, and they cannot unstake to recover funds.",
+        "invariant_logic": "slashed == (GuildToken.lastGaugeLoss(term) > _stakes[user][term].lastGaugeLoss) where _stakes[user][term] is the ACTUAL stored value, not the default-initialized return variable",
+        "solidity_property": "function invariant_slashCheck(address user, address term) public view { UserStake memory stored = _stakes[user][term]; uint256 lgl = GuildToken(guild).lastGaugeLoss(term); bool shouldSlash = (stored.stakeTime != 0) && (lgl > uint256(stored.lastGaugeLoss)); /* assert slashed matches shouldSlash */ }",
+        "inventory_refs": [
+          {
+            "file": "SurplusGuildMinter.sol",
+            "function": "getRewards"
+          },
+          {
+            "file": "SurplusGuildMinter.sol",
+            "function": "stake"
+          },
+          {
+            "file": "SurplusGuildMinter.sol",
+            "function": "unstake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LendingTerm.sol",
+        "description": "forgive() does not check if the loan is currently in auction (callTime != 0). If a governor calls forgive() on a loan that has been called and is in an active auction, it sets closeTime, making the auction unable to complete via onBid() (which requires closeTime == 0). This permanently increments nAuctionsInProgress in AuctionHouse, blocking setAuctionHouse and potentially other operations.",
+        "attack_scenario": "A loan is called and enters auction in AuctionHouse. Governor calls LendingTerm.forgive(loanId), which sets closeTime and decrements issuance. The auction in AuctionHouse can never complete because LendingTerm.onBid() reverts on the closeTime == 0 check. nAuctionsInProgress is permanently stuck > 0.",
+        "invariant_logic": "forgive(loanId) SHOULD require loans[loanId].callTime == 0 OR the auction must be settled before forgive is allowed",
+        "solidity_property": "function invariant_forgiveNotCalled(bytes32 loanId) public view { if (loans[loanId].closeTime != 0 && loans[loanId].callTime != 0) { assert(AuctionHouse(refs.auctionHouse).getAuction(loanId).endTime != 0); } }",
+        "inventory_refs": [
+          {
+            "file": "LendingTerm.sol",
+            "function": "forgive"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "onBid"
+          },
+          {
+            "file": "AuctionHouse.sol",
+            "function": "bid"
+          },
+          {
+            "file": "AuctionHouse.sol",
+            "function": "forgive"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LendingTermOffboarding.sol",
+        "description": "canOffboard[term] persists across re-onboarding cycles if cleanup() was not called. If a term is offboarded (canOffboard = true), then re-onboarded without calling cleanup (e.g., loans still open), anyone can immediately call offboard() again without any new poll, bypassing the democratic offboarding process.",
+        "attack_scenario": "Term T is offboarded after a quorum poll (canOffboard[T] = true). Governance re-onboards T while loans are still active (cleanup not yet called). An attacker immediately calls offboard(T) since canOffboard[T] is still true. The term is deprecated again without any new poll. Additionally, nOffboardingsInProgress is incremented a second time but can only be decremented once via cleanup, permanently pausing PSM redemptions.",
+        "invariant_logic": "canOffboard[term] SHOULD be reset to false when a term is re-onboarded (addGauge), OR offboard() SHOULD verify that the term is currently deprecated from the same offboarding round",
+        "solidity_property": "function invariant_canOffboardConsistency(address term) public view { if (GuildToken(guildToken).isGauge(term)) { assert(canOffboard[term] == false || lastPollBlock[term] + POLL_DURATION_BLOCKS >= block.number); } }",
+        "inventory_refs": [
+          {
+            "file": "LendingTermOffboarding.sol",
+            "function": "offboard"
+          },
+          {
+            "file": "LendingTermOffboarding.sol",
+            "function": "cleanup"
+          },
+          {
+            "file": "LendingTermOffboarding.sol",
+            "function": "supportOffboard"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LendingTermOffboarding.sol",
+        "description": "nOffboardingsInProgress counter can become permanently elevated if a term is offboarded, re-onboarded (without cleanup), and offboarded again. The counter is incremented in offboard() but only decremented in cleanup(), which also sets canOffboard = false. A re-offboard cycle increments the counter twice but cleanup can only decrement it once, leaving a permanent residual that keeps PSM redemptions paused.",
+        "attack_scenario": "1) offboard(T): nOffboardingsInProgress = 1, PSM paused. 2) Re-onboard T without cleanup. 3) offboard(T) again: nOffboardingsInProgress = 2. 4) cleanup(T): nOffboardingsInProgress = 1, canOffboard[T] = false. No further cleanup is possible, so nOffboardingsInProgress stays at 1. PSM redemptions remain permanently paused.",
+        "invariant_logic": "nOffboardingsInProgress == count of terms where (isDeprecatedGauge(term) && canOffboard[term] && issuance(term) > 0 or cleanup not yet called)",
+        "solidity_property": "function invariant_offboardingCounter() public view { /* nOffboardingsInProgress should equal the number of unique terms that have been offboarded but not cleaned up */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingTermOffboarding.sol",
+            "function": "offboard"
+          },
+          {
+            "file": "LendingTermOffboarding.sol",
+            "function": "cleanup"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "ProfitManager.sol",
+        "description": "In notifyPnL() during loss handling, if the loss (after consuming surplus buffer) exceeds the remaining creditTotalSupply, the creditMultiplier calculation underflows and reverts: `(creditMultiplier * (creditTotalSupply - loss)) / creditTotalSupply`. This can occur when creditMultiplier has been heavily reduced from prior losses, causing `principal = borrowAmount * borrowCreditMultiplier / creditMultiplier` to be amplified beyond the current total supply. The loss can never be processed, leaving the system in an inconsistent state.",
+        "attack_scenario": "After multiple losses, creditMultiplier drops to 0.01e18. A loan opened when creditMultiplier was 1e18 defaults. Principal = borrowAmount * 1e18 / 0.01e18 = borrowAmount * 100. If borrowAmount was a significant portion of issuance, principal could exceed the current total CREDIT supply, causing an underflow revert in notifyPnL. The loss is unprocessable, and the loan cannot be closed through the auction system.",
+        "invariant_logic": "loss_after_surplus_buffer <= CreditToken.totalSupply() after burning surplus buffer; equivalently, newCreditMultiplier >= 0",
+        "solidity_property": "function invariant_lossNotExceedSupply(int256 amount) public view { if (amount < 0) { uint256 loss = uint256(-amount); uint256 buf = surplusBuffer + termSurplusBuffer[gauge]; if (loss > buf) { loss -= buf; assert(loss <= CreditToken(credit).totalSupply() - buf); } } }",
+        "inventory_refs": [
+          {
+            "file": "ProfitManager.sol",
+            "function": "notifyPnL"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LendingTerm.sol",
+        "description": "Loan lifecycle state machine must follow: Open -> Called -> Closed OR Open -> Closed (repay/forgive). The transition Open -> Closed via forgive() is allowed even when the loan is in the Called state (callTime != 0), creating an illegal Closed+InAuction state where the auction can never settle. Loans in auction MUST only be closed through onBid().",
+        "invariant_logic": "For all loanIds: if loans[loanId].closeTime != 0 && loans[loanId].callTime != 0 then AuctionHouse.auctions[loanId].endTime != 0 (auction must be settled before or at the same time as loan close)",
+        "solidity_property": "function invariant_loanLifecycle(bytes32 loanId) public view { Loan memory loan = loans[loanId]; if (loan.closeTime != 0 && loan.callTime != 0) { assert(AuctionHouse(refs.auctionHouse).getAuction(loanId).endTime != 0); } }",
+        "inventory_refs": [
+          {
+            "file": "LendingTerm.sol",
+            "function": "forgive"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "onBid"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "_call"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "ProfitManager.sol",
+        "description": "When notifyPnL reports profit and the gauge's weight is 0, amountForGuild CREDIT tokens are computed and subtracted from the total to calculate amountForCredit, but the gaugeProfitIndex is never updated. These CREDIT tokens remain stuck in ProfitManager with no claimant, permanently reducing distributions to CREDIT holders without benefiting GUILD holders.",
+        "invariant_logic": "If amountForGuild > 0 and getGaugeWeight(gauge) == 0, then amountForGuild CREDIT tokens are locked in ProfitManager with no way to claim them",
+        "solidity_property": "function invariant_guildProfitNotLost(address gauge) public view { uint256 gaugeWeight = GuildToken(guild).getGaugeWeight(gauge); /* If gaugeWeight == 0, any pending amountForGuild should be redirected, not lost */ }",
+        "inventory_refs": [
+          {
+            "file": "ProfitManager.sol",
+            "function": "notifyPnL"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "GuildToken.sol",
+        "description": "Users who vote for a lending term that is fully utilizing its debt ceiling cannot decrement their gauge weight (and therefore cannot transfer or burn tokens). The _decrementGaugeWeight override requires `issuance <= debtCeilingAfterDecrement`. If the term's issuance equals its debt ceiling, NO voter can remove weight. This locks all GUILD tokens voting for that term, including during _decrementWeightUntilFree which is triggered on transfer/burn.",
+        "attack_scenario": "A lending term borrows up to its full debt ceiling. All GUILD voters for this term have their tokens locked — they cannot transfer, burn, or decrement weight. They must wait until borrowers repay or call loans. A malicious borrower could combine with a voter to keep the term at max utilization, griefing other voters.",
+        "invariant_logic": "A user SHOULD always be able to transfer their non-gauge-allocated tokens. Gauge weight decrement should not be blocked by external lending term state unless there's a pending loss.",
+        "solidity_property": "function invariant_voterCanExit(address user, address gauge) public view { /* If user wants to decrement, there should exist a valid path to do so. Debt ceiling check should not permanently lock tokens. */ }",
+        "inventory_refs": [
+          {
+            "file": "GuildToken.sol",
+            "function": "_decrementGaugeWeight"
+          },
+          {
+            "file": "ERC20Gauges.sol",
+            "function": "_decrementWeightUntilFree"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "ProfitManager.sol",
+        "description": "creditMultiplier can only decrease. There is no floor protection. If creditMultiplier reaches 0 or near-0, multiple operations across the protocol would fail due to division by zero or extreme amplification: getLoanDebt, getMintAmountOut, minBorrow, and the creditMultiplier update formula itself. The system has no graceful degradation mechanism for this edge case.",
+        "invariant_logic": "creditMultiplier > 0 AND creditMultiplier <= 1e18 (should never exceed initial value, should never reach zero)",
+        "solidity_property": "function invariant_creditMultiplierBounded() public view { assert(creditMultiplier > 0); assert(creditMultiplier <= 1e18); }",
+        "inventory_refs": [
+          {
+            "file": "ProfitManager.sol",
+            "function": "notifyPnL"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "getLoanDebt"
+          },
+          {
+            "file": "SimplePSM.sol",
+            "function": "getMintAmountOut"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "ProfitManager.sol",
+        "description": "setProfitSharingConfig validates that splits sum to 1e18 at 18-decimal precision, but stores them as uint32 with 9-decimal precision (dividing by 1e9). This truncation means the stored splits may not reconstruct to exactly 1e18 when multiplied back. The creditSplit is computed as a residual (1e18 - others), creating a discrepancy between configured and effective profit distribution that compounds over many distributions.",
+        "invariant_logic": "uint256(surplusBufferSplit)*1e9 + uint256(guildSplit)*1e9 + uint256(otherSplit)*1e9 + creditSplit == 1e18 should hold, but truncation means individual splits lose up to 1e9 - 1 precision each",
+        "solidity_property": "function invariant_splitPrecision() public view { (uint256 s, uint256 c, uint256 g, uint256 o, ) = getProfitSharingConfig(); assert(s + c + g + o == 1e18); }",
+        "inventory_refs": [
+          {
+            "file": "ProfitManager.sol",
+            "function": "setProfitSharingConfig"
+          },
+          {
+            "file": "ProfitManager.sol",
+            "function": "notifyPnL"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LendingTerm.sol",
+        "description": "issuance tracking must remain consistent with the sum of borrowAmount for all open (non-closed) loans. If forgive() is called on a loan in auction, issuance is decremented. If the auction somehow settles later (not possible due to closeTime check, but as a cross-contract invariant), issuance would be double-decremented. The invariant should always hold: issuance == sum(loans[id].borrowAmount for all id where closeTime == 0).",
+        "invariant_logic": "issuance == sum of loan.borrowAmount for all loans where loan.closeTime == 0",
+        "solidity_property": "function invariant_issuanceConsistency() public view { /* For all known loanIds: sum borrowAmount where closeTime == 0 should equal issuance */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingTerm.sol",
+            "function": "_borrow"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "_repay"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "_partialRepay"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "onBid"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "forgive"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "AuctionHouse.sol",
+        "description": "nAuctionsInProgress must accurately reflect the number of auctions where startTime != 0 and endTime == 0. If LendingTerm.forgive() is called on a loan with an active auction, the auction becomes unsettleable (onBid reverts), permanently inflating nAuctionsInProgress. This blocks LendingTerm.setAuctionHouse() which requires nAuctionsInProgress == 0.",
+        "invariant_logic": "nAuctionsInProgress == count of auctions where (startTime != 0 && endTime == 0). Every auction that starts must eventually end.",
+        "solidity_property": "function invariant_auctionCount() public view { /* nAuctionsInProgress should match actual unsettled auctions. Each unsettled auction must have a valid path to settlement. */ }",
+        "inventory_refs": [
+          {
+            "file": "AuctionHouse.sol",
+            "function": "startAuction"
+          },
+          {
+            "file": "AuctionHouse.sol",
+            "function": "bid"
+          },
+          {
+            "file": "AuctionHouse.sol",
+            "function": "forgive"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "ERC20Gauges.sol",
+        "description": "totalWeight and totalTypeWeight must always equal the sum of getGaugeWeight for all non-deprecated gauges. When _removeGauge subtracts weight from totals but preserves individual weights, and _addGauge re-adds preserved weights to totals, any inconsistency between these operations could cause totalWeight to drift. Additionally, _decrementWeightUntilFree in GuildToken goes through the override that checks debt ceiling, which could cause the greedy algorithm to revert mid-way, leaving weights partially freed.",
+        "invariant_logic": "totalWeight == sum(getGaugeWeight[g] for g in liveGauges) AND totalTypeWeight[t] == sum(getGaugeWeight[g] for g in liveGauges where gaugeType[g] == t)",
+        "solidity_property": "function invariant_totalWeight() public view { uint256 sum = 0; address[] memory live = liveGauges(); for (uint i = 0; i < live.length; i++) { sum += getGaugeWeight[live[i]]; } assert(totalWeight == sum); }",
+        "inventory_refs": [
+          {
+            "file": "ERC20Gauges.sol",
+            "function": "_addGauge"
+          },
+          {
+            "file": "ERC20Gauges.sol",
+            "function": "_removeGauge"
+          },
+          {
+            "file": "ERC20Gauges.sol",
+            "function": "_decrementGaugeWeight"
+          },
+          {
+            "file": "ERC20Gauges.sol",
+            "function": "_incrementGaugeWeight"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ERC20RebaseDistributor.sol",
+        "description": "In updateTotalRebasingShares, when shares decrease significantly (most rebasing supply exits), the adjusted target share price calculation `currentRebasingSharePrice + (delta * START_REBASING_SHARE_PRICE) / percentChange` can produce a value exceeding uint224 max if percentChange is very small (close to 0). This would cause safeCastTo224 to revert, blocking the exit of the last few rebasers, effectively trapping their funds.",
+        "invariant_logic": "targetNewSharePrice must fit in uint224 after any share adjustment. Equivalently: the exit path for rebasing users must never revert due to overflow in share price recalculation.",
+        "solidity_property": "function invariant_rebaseExitAlwaysPossible(address account) public view { if (rebasingState[account].isRebasing == 1) { /* _exitRebase(account) should never revert due to arithmetic overflow in updateTotalRebasingShares */ } }",
+        "inventory_refs": [
+          {
+            "file": "ERC20RebaseDistributor.sol",
+            "function": "updateTotalRebasingShares"
+          },
+          {
+            "file": "ERC20RebaseDistributor.sol",
+            "function": "_exitRebase"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-015",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LendingTerm.sol",
+        "description": "Loan states are mutually exclusive and must follow a strict lifecycle: Uninitialized (borrowTime=0) -> Open (borrowTime>0, callTime=0, closeTime=0) -> optionally Called (callTime>0, closeTime=0) -> Closed (closeTime>0). No backward transitions are possible. Repay and partialRepay require Open state. Call requires Open state. onBid requires Called state. But forgive() allows transition from Called to Closed, bypassing onBid, which violates the expected Called -> Closed-via-onBid path.",
+        "invariant_logic": "For all loanIds: (borrowTime == 0) XOR (borrowTime > 0 && closeTime == 0 && callTime == 0) XOR (borrowTime > 0 && closeTime == 0 && callTime > 0) XOR (borrowTime > 0 && closeTime > 0). Transitions: only forward, and Called->Closed only via onBid.",
+        "solidity_property": "function invariant_loanStateExclusive(bytes32 loanId) public view { Loan memory l = loans[loanId]; if (l.borrowTime == 0) { assert(l.callTime == 0 && l.closeTime == 0); } if (l.callTime > 0) { assert(l.borrowTime > 0 && l.borrowTime <= l.callTime); } if (l.closeTime > 0) { assert(l.borrowTime > 0 && l.borrowTime <= l.closeTime); } }",
+        "inventory_refs": [
+          {
+            "file": "LendingTerm.sol",
+            "function": "_borrow"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "_repay"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "_call"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "onBid"
+          },
+          {
+            "file": "LendingTerm.sol",
+            "function": "forgive"
+          }
+        ]
+      }
+    ]
+  }
+}

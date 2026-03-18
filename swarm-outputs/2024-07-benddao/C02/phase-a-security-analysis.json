@@ -1,0 +1,235 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T03:00:08.420Z",
+    "duration_ms": 166473
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User Input (Borrowers, Lenders, Liquidators)",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "depositERC20",
+          "withdrawERC20",
+          "crossBorrowERC20",
+          "crossRepayERC20",
+          "isolateBorrow",
+          "isolateRepay",
+          "isolateAuction",
+          "isolateRedeem",
+          "isolateLiquidate",
+          "crossLiquidateERC20",
+          "crossLiquidateERC721",
+          "flashLoanERC20",
+          "flashLoanERC721"
+        ],
+        "failure_modes": [
+          "Reentrancy attacks during callbacks",
+          "Logic errors in state updates",
+          "Math overflows/underflows",
+          "Access control bypasses"
+        ],
+        "attack_vectors": [
+          "Front-running liquidation transactions",
+          "Exploiting incorrect msgSender assignments",
+          "Manipulating health factors via flash loans"
+        ]
+      },
+      {
+        "boundary": "Oracle Data (Price Feeds)",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "calculateUserAccountData",
+          "calculateNftLoanData",
+          "calculateNftLoanLiquidatePrice"
+        ],
+        "failure_modes": [
+          "Stale price data",
+          "Manipulated spot prices",
+          "Incorrect decimal scaling"
+        ],
+        "attack_vectors": [
+          "Flash loan price manipulation (if spot prices used)",
+          "Borrowing against artificially inflated collateral"
+        ]
+      },
+      {
+        "boundary": "Admin / Governance",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "collectFeeToTreasury"
+        ],
+        "failure_modes": [
+          "Compromised admin keys",
+          "Malicious governance actions"
+        ],
+        "attack_vectors": [
+          "Draining treasury fees",
+          "Pausing protocol maliciously"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Active Loan",
+        "to_state": "Auction State",
+        "trigger": "isolateAuction",
+        "conditions": [
+          "Health factor < 1 (borrowAmount > thresholdPrice)",
+          "Bid amount >= borrowAmount",
+          "Bid amount >= liquidatePrice"
+        ],
+        "invariants": [
+          "Loan status changes to AUCTION",
+          "Bidder funds transferred to escrow"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Auction State",
+        "to_state": "Liquidated (Loan Deleted)",
+        "trigger": "isolateLiquidate",
+        "conditions": [
+          "Auction duration has ended",
+          "Total bid + extra amount >= borrow amount"
+        ],
+        "invariants": [
+          "Loan data is deleted",
+          "NFT is transferred to the winner",
+          "Debt is burned and liquidity is restored"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "User has ETH",
+        "to_state": "User has supplied WETH",
+        "trigger": "depositERC20 (with NATIVE_TOKEN_ADDRESS)",
+        "conditions": [
+          "msg.value > 0",
+          "Asset is active and not frozen"
+        ],
+        "invariants": [
+          "ETH is wrapped to WETH",
+          "User supply balance increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Incorrect Access Control / Asset Theft",
+        "locations": [
+          "IsolateLogic.sol: executeIsolateLiquidate"
+        ],
+        "severity": "critical",
+        "evidence": "In `executeIsolateLiquidate`, the NFT is transferred to `params.msgSender` (the caller) instead of `loanData.lastBidder` (the highest bidder). The highest bidder's funds (`loanData.bidAmount`) are used to repay the loan, but the caller receives the NFT.",
+        "exploitation_method": "An attacker monitors the mempool for an auction that has ended. They call `isolateLiquidate` before the legitimate highest bidder does. The protocol uses the highest bidder's escrowed funds to clear the debt and transfers the NFT to the attacker for free.",
+        "affected_assets": [
+          "ERC721 Collateral (NFTs)"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Broken Native Token Flow",
+        "locations": [
+          "VaultLogic.sol: wrapNativeTokenInWallet",
+          "VaultLogic.sol: unwrapNativeTokenInWallet"
+        ],
+        "severity": "high",
+        "evidence": "`wrapNativeTokenInWallet` wraps ETH to WETH and transfers it to the user. Immediately after, `SupplyLogic.executeDepositERC20` attempts to pull the WETH back from the user using `transferFrom`. This requires the user to have pre-approved the Proxy for WETH, which they won't have done if they are depositing native ETH.",
+        "exploitation_method": "Normal users attempting to deposit, repay, or liquidate using native ETH (`msg.value`) will have their transactions revert due to missing WETH allowance, completely breaking the native token integration.",
+        "affected_assets": [
+          "Native ETH"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Logic Error / Incorrect Accounting",
+        "locations": [
+          "IsolateLogic.sol: executeIsolateRedeem"
+        ],
+        "severity": "medium",
+        "evidence": "In `executeIsolateRedeem`, the protocol decreases the borrow balance of `params.msgSender` (`VaultLogic.erc20DecreaseIsolateScaledBorrow(debtGroupData, params.msgSender, vars.amountScaled)`) instead of the actual borrower (`tokenData.owner`).",
+        "exploitation_method": "If a user uses a proxy or an approved operator to redeem their NFT, the transaction will revert due to an underflow because the proxy/operator has 0 borrow balance. If the operator does have a borrow balance, their balance is incorrectly reduced instead of the actual borrower's.",
+        "affected_assets": [
+          "User Borrow Balances"
+        ]
+      },
+      {
+        "swc_id": "SWC-103",
+        "pattern": "Economic Risk / Unliquidatable Bad Debt",
+        "locations": [
+          "IsolateLogic.sol: executeIsolateAuction"
+        ],
+        "severity": "medium",
+        "evidence": "The first bid in an isolate auction must be `>= vars.borrowAmount`. If the NFT floor price drops significantly and the accumulated debt (`borrowAmount`) exceeds the NFT's market value, no liquidator will bid because they would immediately take a loss.",
+        "exploitation_method": "Not directly exploitable by an attacker, but causes systemic risk. Underwater positions will never be liquidated, leaving the protocol with permanent bad debt and locked lender funds.",
+        "affected_assets": [
+          "Lender Liquidity (ERC20)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "BVault.sol",
+          "function": "collectFeeToTreasury(uint32,address[])",
+          "guards": [
+            "checkCallerIsPoolAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Mints accrued fees as supply to the treasury address."
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "GenericLogic.sol",
+              "lines": "100-150",
+              "function": "calculateUserAccountData"
+            },
+            {
+              "file": "GenericLogic.sol",
+              "lines": "180-200",
+              "function": "calculateNftLoanData"
+            },
+            {
+              "file": "GenericLogic.sol",
+              "lines": "220-250",
+              "function": "calculateNftLoanLiquidatePrice"
+            }
+          ],
+          "compositional_usage": [
+            "Health Factor Calculation",
+            "Liquidation Thresholds",
+            "Cross-margin LTV"
+          ]
+        }
+      ]
+    }
+  }
+}

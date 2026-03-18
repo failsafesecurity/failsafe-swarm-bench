@@ -1,0 +1,496 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T04:51:24.166Z",
+    "duration_ms": 479427
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "AccountingLibrary.sol",
+        "description": "For any ACTIVE debt position, the sum of all credit positions referencing it must equal the debt position's futureValue. This is the fundamental accounting invariant of the protocol.",
+        "attack_scenario": "If violated, credit can be created without corresponding debt or vice versa, allowing lenders to claim more than owed or borrowers to escape debt obligations. An attacker could exploit inconsistent credit/debt reductions to create phantom value.",
+        "invariant_logic": "forall debtPositionId where getLoanStatus(debtPositionId) == ACTIVE: SUM(creditPositions[cpId].credit for all cpId where creditPositions[cpId].debtPositionId == debtPositionId) == debtPositions[debtPositionId].futureValue",
+        "solidity_property": "function invariant_creditDebtSum(uint256 debtPositionId) public view { if (state.getLoanStatus(debtPositionId) == LoanStatus.ACTIVE) { uint256 totalCredit = sumCreditsForDebt(debtPositionId); assert(totalCredit == state.data.debtPositions[debtPositionId].futureValue); } }",
+        "inventory_refs": [
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "createDebtAndCreditPositions"
+          },
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "createCreditPosition"
+          },
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "reduceDebtAndCredit"
+          },
+          {
+            "file": "Compensate.sol",
+            "function": "executeCompensate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LoanLibrary.sol",
+        "description": "A loan in REPAID status (futureValue == 0) must have liquidityIndexAtRepayment > 0, ensuring the claim exchange rate is properly recorded. Conversely, an ACTIVE loan must have liquidityIndexAtRepayment == 0.",
+        "attack_scenario": "If liquidityIndexAtRepayment is 0 for a REPAID loan, the claim calculation divides by 0 or yields incorrect amounts. If liquidityIndexAtRepayment is non-zero for an ACTIVE loan (except during LiquidateWithReplacement transition), lenders could prematurely claim with a stale rate.",
+        "invariant_logic": "(futureValue == 0) implies (liquidityIndexAtRepayment > 0) AND (futureValue > 0) implies (liquidityIndexAtRepayment == 0)",
+        "solidity_property": "function invariant_repaymentIndex(uint256 debtPositionId) public view { DebtPosition memory dp = state.getDebtPosition(debtPositionId); if (dp.futureValue == 0) { assert(dp.liquidityIndexAtRepayment > 0); } else { assert(dp.liquidityIndexAtRepayment == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "Repay.sol",
+            "function": "executeRepay"
+          },
+          {
+            "file": "Liquidate.sol",
+            "function": "executeLiquidate"
+          },
+          {
+            "file": "LiquidateWithReplacement.sol",
+            "function": "executeLiquidateWithReplacement"
+          },
+          {
+            "file": "Claim.sol",
+            "function": "executeClaim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Size.sol",
+        "description": "After any operation that creates new debt (buyCreditMarket with RESERVED_ID, sellCreditMarket with RESERVED_ID, liquidateWithReplacement), the borrower's collateral ratio must be >= max(crOpening, user.openingLimitBorrowCR).",
+        "attack_scenario": "If the CR check is bypassed, a borrower could take on debt with insufficient collateral, potentially leaving lenders with unrecoverable positions. This could happen if new debt creation paths miss the validateUserIsNotBelowOpeningLimitBorrowCR check.",
+        "invariant_logic": "post(newDebtCreation) => collateralRatio(borrower) >= max(crOpening, users[borrower].openingLimitBorrowCR)",
+        "solidity_property": "function invariant_openingCR(address borrower) public view { uint256 cr = state.collateralRatio(borrower); uint256 openingLimit = Math.max(state.riskConfig.crOpening, state.data.users[borrower].openingLimitBorrowCR); assert(cr >= openingLimit || state.data.debtToken.balanceOf(borrower) == 0); }",
+        "inventory_refs": [
+          {
+            "file": "Size.sol",
+            "function": "buyCreditMarket"
+          },
+          {
+            "file": "Size.sol",
+            "function": "sellCreditMarket"
+          },
+          {
+            "file": "Size.sol",
+            "function": "liquidateWithReplacement"
+          },
+          {
+            "file": "Size.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RiskLibrary.sol",
+        "description": "A credit position is only transferrable (buyable/sellable on market) if the associated loan is ACTIVE AND the borrower's collateral ratio is >= crLiquidation. This prevents trading of distressed debt that could leave buyers with worthless positions.",
+        "attack_scenario": "If transferability is not properly gated, an attacker could buy credit positions on loans about to default at a discount, then self-liquidate to extract collateral, or sell underwater credit to unsuspecting buyers.",
+        "invariant_logic": "isCreditPositionTransferrable(cpId) == true implies (getLoanStatus(cpId) == ACTIVE AND collateralRatio(debtPosition.borrower) >= crLiquidation)",
+        "solidity_property": "function invariant_transferrable(uint256 cpId) public view { if (state.isCreditPositionTransferrable(cpId)) { assert(state.getLoanStatus(cpId) == LoanStatus.ACTIVE); DebtPosition memory dp = state.getDebtPositionByCreditPositionId(cpId); assert(state.collateralRatio(dp.borrower) >= state.riskConfig.crLiquidation); } }",
+        "inventory_refs": [
+          {
+            "file": "RiskLibrary.sol",
+            "function": "isCreditPositionTransferrable"
+          },
+          {
+            "file": "BuyCreditMarket.sol",
+            "function": "validateBuyCreditMarket"
+          },
+          {
+            "file": "SellCreditMarket.sol",
+            "function": "validateSellCreditMarket"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "AccountingLibrary.sol",
+        "description": "nextDebtPositionId and nextCreditPositionId must strictly increase and never overlap. Debt IDs are in [0, CREDIT_POSITION_ID_START) and credit IDs are in [CREDIT_POSITION_ID_START, RESERVED_ID). IDs must not be reusable.",
+        "attack_scenario": "If position IDs can overlap or be reused, an attacker could manipulate position mappings to claim collateral from unrelated positions or redirect debt obligations.",
+        "invariant_logic": "old(nextDebtPositionId) < nextDebtPositionId AND nextDebtPositionId < CREDIT_POSITION_ID_START AND old(nextCreditPositionId) < nextCreditPositionId AND nextCreditPositionId < RESERVED_ID",
+        "solidity_property": "function invariant_positionIdMonotonicity() public view { assert(state.data.nextDebtPositionId >= DEBT_POSITION_ID_START); assert(state.data.nextDebtPositionId < CREDIT_POSITION_ID_START); assert(state.data.nextCreditPositionId >= CREDIT_POSITION_ID_START); assert(state.data.nextCreditPositionId < RESERVED_ID); }",
+        "inventory_refs": [
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "createDebtAndCreditPositions"
+          },
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "createCreditPosition"
+          },
+          {
+            "file": "LoanLibrary.sol",
+            "function": "isDebtPositionId"
+          },
+          {
+            "file": "LoanLibrary.sol",
+            "function": "isCreditPositionId"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "UpdateConfig.sol",
+        "description": "crLiquidation can only decrease via updateConfig (new value must be strictly less than current). This is a one-way ratchet that protects borrowers from retroactive liquidation threshold increases but permanently prevents tightening risk parameters.",
+        "attack_scenario": "If crLiquidation could increase, existing borrowers who were safe could suddenly become liquidatable without any action on their part, causing unfair mass liquidations. However, the inability to increase it also means the protocol cannot respond to market stress by tightening parameters to protect lenders.",
+        "invariant_logic": "post(updateConfig('crLiquidation', v)) => v < old(crLiquidation) AND crLiquidation >= PERCENT",
+        "solidity_property": "function invariant_crLiquidationMonotonic(uint256 oldCrLiquidation) public view { assert(state.riskConfig.crLiquidation <= oldCrLiquidation); assert(state.riskConfig.crLiquidation >= PERCENT); }",
+        "inventory_refs": [
+          {
+            "file": "UpdateConfig.sol",
+            "function": "executeUpdateConfig"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "RiskLibrary.sol",
+        "description": "crOpening must always be strictly greater than crLiquidation. This ensures a buffer zone between the borrowing threshold and the liquidation threshold, preventing positions from being immediately liquidatable upon creation.",
+        "attack_scenario": "If crOpening <= crLiquidation, a borrower could create a position exactly at the liquidation threshold, which could be immediately liquidatable due to price movement or rounding, creating an instant-liquidation attack vector or destabilizing the protocol.",
+        "invariant_logic": "crOpening > crLiquidation AND crOpening >= PERCENT AND crLiquidation >= PERCENT",
+        "solidity_property": "function invariant_crOrdering() public view { assert(state.riskConfig.crOpening > state.riskConfig.crLiquidation); assert(state.riskConfig.crOpening >= PERCENT); assert(state.riskConfig.crLiquidation >= PERCENT); }",
+        "inventory_refs": [
+          {
+            "file": "Initialize.sol",
+            "function": "validateInitializeRiskConfigParams"
+          },
+          {
+            "file": "UpdateConfig.sol",
+            "function": "executeUpdateConfig"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "YieldCurveLibrary.sol",
+        "description": "When a yield curve uses a non-zero marketRateMultiplier, the variable pool borrow rate must have been updated within the staleRateInterval. A staleRateInterval of 0 with non-zero multiplier should always revert, effectively disabling the oracle feature.",
+        "attack_scenario": "If a stale borrow rate is used, the APR calculation for loans could be wildly incorrect. An attacker could wait for the rate to become stale (e.g., the rate updater bot goes down), then create loans at manipulated rates, extracting value from counterparties.",
+        "invariant_logic": "if marketRateMultiplier != 0: variablePoolBorrowRateStaleRateInterval > 0 AND (block.timestamp - variablePoolBorrowRateUpdatedAt) <= variablePoolBorrowRateStaleRateInterval",
+        "solidity_property": "function invariant_rateNotStale() public view { /* This is enforced per-call in getAdjustedAPR; a global check would verify variablePoolBorrowRateUpdatedAt is recent */ if (state.oracle.variablePoolBorrowRateStaleRateInterval > 0) { assert(block.timestamp - state.oracle.variablePoolBorrowRateUpdatedAt <= state.oracle.variablePoolBorrowRateStaleRateInterval); } }",
+        "inventory_refs": [
+          {
+            "file": "YieldCurveLibrary.sol",
+            "function": "getAdjustedAPR"
+          },
+          {
+            "file": "Size.sol",
+            "function": "setVariablePoolBorrowRate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RiskLibrary.sol",
+        "description": "After any credit reduction, the remaining credit must be either exactly 0 (fully consumed) or >= minimumCreditBorrowAToken. This prevents dust credit positions that could be uneconomical to claim or trade.",
+        "attack_scenario": "If sub-minimum credit positions exist, they could be used to grief the system (many tiny positions consuming storage/gas), or create positions that are too small to profitably liquidate, leaving bad debt.",
+        "invariant_logic": "forall creditPositionId: creditPositions[cpId].credit == 0 OR creditPositions[cpId].credit >= minimumCreditBorrowAToken",
+        "solidity_property": "function invariant_minimumCredit(uint256 cpId) public view { CreditPosition memory cp = state.getCreditPosition(cpId); assert(cp.credit == 0 || cp.credit >= state.riskConfig.minimumCreditBorrowAToken); }",
+        "inventory_refs": [
+          {
+            "file": "RiskLibrary.sol",
+            "function": "validateMinimumCredit"
+          },
+          {
+            "file": "RiskLibrary.sol",
+            "function": "validateMinimumCreditOpening"
+          },
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "reduceCredit"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Compensate.sol",
+        "description": "Only the borrower of the debt being repaid can execute compensate. The compensating credit position (when not RESERVED_ID) must have its lender == the borrower of the debt to repay. This prevents unauthorized debt manipulation.",
+        "attack_scenario": "If a non-borrower could compensate, they could manipulate debt positions of other users, potentially reducing debt without the borrower's consent or redirecting credit obligations.",
+        "invariant_logic": "msg.sender == debtPositionToRepay.borrower AND (creditPositionToCompensateId == RESERVED_ID OR creditPositionToCompensate.lender == debtPositionToRepay.borrower)",
+        "solidity_property": "function invariant_compensateAccess() public view { /* enforced in validateCompensate */ }",
+        "inventory_refs": [
+          {
+            "file": "Compensate.sol",
+            "function": "validateCompensate"
+          },
+          {
+            "file": "Compensate.sol",
+            "function": "executeCompensate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Compensate.sol",
+        "description": "When compensating with an existing credit position, the compensating credit's due date must be >= the debt-to-repay's due date. This prevents maturity mismatch where the lender receives credit maturing AFTER the original debt, extending their exposure without consent.",
+        "attack_scenario": "If the due date check is bypassed, a borrower could compensate with a long-dated credit position, effectively extending the lender's exposure without their consent. The lender would have to wait longer to claim their funds.",
+        "invariant_logic": "debtPositionToRepay.dueDate >= debtPositionOfCompensatingCredit.dueDate",
+        "solidity_property": "function invariant_compensateDueDate(uint256 repayDpId, uint256 compensateCpId) public view { DebtPosition memory repayDp = state.getDebtPosition(repayDpId); DebtPosition memory compensateDp = state.getDebtPositionByCreditPositionId(compensateCpId); assert(repayDp.dueDate >= compensateDp.dueDate); }",
+        "inventory_refs": [
+          {
+            "file": "Compensate.sol",
+            "function": "validateCompensate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Liquidate.sol",
+        "description": "A debt position can only be liquidated if: (1) the borrower is underwater (CR < crLiquidation) AND the loan is not REPAID, OR (2) the loan status is OVERDUE. Both conditions must be checked atomically against current oracle prices.",
+        "attack_scenario": "If liquidation preconditions are not enforced, healthy positions could be liquidated, causing unjust loss of collateral for borrowers. Conversely, if conditions are too lax, underwater positions might not be liquidatable, leaving bad debt.",
+        "invariant_logic": "canLiquidate(dpId) iff (isDebtPositionId(dpId) AND ((isUserUnderwater(borrower) AND status != REPAID) OR status == OVERDUE))",
+        "solidity_property": "function invariant_liquidationPrecondition(uint256 dpId) public view { bool liquidatable = state.isDebtPositionLiquidatable(dpId); DebtPosition memory dp = state.getDebtPosition(dpId); LoanStatus status = state.getLoanStatus(dpId); bool expectedLiquidatable = state.isDebtPositionId(dpId) && ((state.isUserUnderwater(dp.borrower) && status != LoanStatus.REPAID) || status == LoanStatus.OVERDUE); assert(liquidatable == expectedLiquidatable); }",
+        "inventory_refs": [
+          {
+            "file": "RiskLibrary.sol",
+            "function": "isDebtPositionLiquidatable"
+          },
+          {
+            "file": "Liquidate.sol",
+            "function": "validateLiquidate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SelfLiquidate.sol",
+        "description": "Self-liquidation is only permitted when the borrower's CR is below 100% (at a loss), meaning the credit is worth more than the pro-rata collateral. This ensures self-liquidation is only used as a loss-cutting mechanism for lenders, not as a way to extract excess collateral.",
+        "attack_scenario": "If self-liquidation is allowed when CR >= 100%, a lender could self-liquidate to extract collateral worth more than their credit, effectively stealing from the borrower or other creditors of the same borrower.",
+        "invariant_logic": "selfLiquidatable(cpId) implies collateralRatio(borrower) < PERCENT AND collateralRatio(borrower) < crLiquidation",
+        "solidity_property": "function invariant_selfLiquidateAtLoss(uint256 cpId) public view { if (state.isCreditPositionSelfLiquidatable(cpId)) { DebtPosition memory dp = state.getDebtPositionByCreditPositionId(cpId); assert(state.collateralRatio(dp.borrower) < PERCENT); } }",
+        "inventory_refs": [
+          {
+            "file": "SelfLiquidate.sol",
+            "function": "validateSelfLiquidate"
+          },
+          {
+            "file": "RiskLibrary.sol",
+            "function": "isCreditPositionSelfLiquidatable"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "AccountingLibrary.sol",
+        "description": "The swap fee percent for any valid tenor must be strictly less than 100% (PERCENT). This is necessary to prevent division by zero or negative denominators in fee calculations (PERCENT - swapFeePercent). The constraint swapFeeAPR * maxTenor < PERCENT * YEAR must hold.",
+        "attack_scenario": "If swapFeePercent >= PERCENT, the getCreditAmountIn function would underflow at (PERCENT - swapFeePercent), causing reverts or incorrect fee calculations. During initialization, swapFeeAPR is not validated against tenor range, potentially allowing a misconfigured deployment where market orders are permanently broken.",
+        "invariant_logic": "swapFeeAPR * maxTenor < PERCENT * YEAR, equivalently: getSwapFeePercent(tenor) < PERCENT for all valid tenors",
+        "solidity_property": "function invariant_swapFeePercent() public view { uint256 maxSwapFeePercent = Math.mulDivUp(state.feeConfig.swapFeeAPR, state.riskConfig.maxTenor, YEAR); assert(maxSwapFeePercent < PERCENT); }",
+        "inventory_refs": [
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "getSwapFeePercent"
+          },
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "getCreditAmountIn"
+          },
+          {
+            "file": "UpdateConfig.sol",
+            "function": "executeUpdateConfig"
+          },
+          {
+            "file": "Initialize.sol",
+            "function": "validateInitializeFeeConfigParams"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Size.sol",
+        "description": "After a compensate operation, the compensator (msg.sender == borrower) must not be underwater (CR >= crLiquidation). This post-condition prevents compensate from being used to manipulate positions into an immediately-liquidatable state.",
+        "attack_scenario": "If the underwater check is missing, a borrower could use compensate to restructure their debt in a way that leaves them worse off (e.g., creating new debt via RESERVED_ID path) while extracting collateral via the capped fragmentation fee bypass.",
+        "invariant_logic": "post(compensate) => collateralRatio(msg.sender) >= crLiquidation",
+        "solidity_property": "function invariant_postCompensateNotUnderwater(address compensator) public view { assert(state.collateralRatio(compensator) >= state.riskConfig.crLiquidation || state.data.debtToken.balanceOf(compensator) == 0); }",
+        "inventory_refs": [
+          {
+            "file": "Size.sol",
+            "function": "compensate"
+          },
+          {
+            "file": "RiskLibrary.sol",
+            "function": "validateUserIsNotUnderwater"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Compensate.sol",
+        "description": "The fragmentation fee in compensate is charged in collateral tokens and capped by the user's collateral balance. If the user has insufficient collateral, they pay less than the full fee. Combined with the underwater check, this should not be exploitable, but the fee collection is not guaranteed.",
+        "attack_scenario": "A borrower could structure their position to minimize collateral before compensating (within CR constraints), reducing the effective fragmentation fee paid. While the underwater check limits this, it could lead to fee revenue shortfall for the protocol.",
+        "invariant_logic": "fragmentationFeeCharged = min(debtTokenAmountToCollateralTokenAmount(fragmentationFee), collateralToken.balanceOf(msg.sender)) AND post(compensate) NOT isUserUnderwater(msg.sender)",
+        "solidity_property": "function invariant_compensateFeePaid() public view { /* The fee is structurally capped; verify post-condition underwater check holds */ }",
+        "inventory_refs": [
+          {
+            "file": "Compensate.sol",
+            "function": "executeCompensate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Multicall.sol",
+        "description": "During multicall, borrowAToken cap is not validated per-deposit. Instead, at the end of multicall, the net increase in borrowAToken supply must be <= the net decrease in debtToken supply (when above cap). This allows deposit+repay batching but could temporarily exceed the cap mid-execution.",
+        "attack_scenario": "If the end-of-multicall validation is bypassed or incorrectly implemented, users could permanently exceed the borrowATokenCap by batching deposits without corresponding debt reduction, breaking the protocol's risk bounds.",
+        "invariant_logic": "post(multicall): if borrowATokenSupplyAfter > borrowATokenCap then (borrowATokenSupplyAfter - borrowATokenSupplyBefore) <= (debtTokenSupplyBefore - debtTokenSupplyAfter)",
+        "solidity_property": "function invariant_multicallCap(uint256 bBefore, uint256 dBefore, uint256 bAfter, uint256 dAfter) public view { if (bAfter > state.riskConfig.borrowATokenCap) { uint256 bIncrease = bAfter > bBefore ? bAfter - bBefore : 0; uint256 dDecrease = dBefore > dAfter ? dBefore - dAfter : 0; assert(bIncrease <= dDecrease); } }",
+        "inventory_refs": [
+          {
+            "file": "Multicall.sol",
+            "function": "multicall"
+          },
+          {
+            "file": "CapsLibrary.sol",
+            "function": "validateBorrowATokenIncreaseLteDebtTokenDecrease"
+          },
+          {
+            "file": "Deposit.sol",
+            "function": "executeDeposit"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "SellCreditMarket.sol",
+        "description": "Only the current lender of a credit position can sell it on the market. When selling an existing credit position, msg.sender must equal creditPosition.lender.",
+        "attack_scenario": "If a non-owner could sell someone else's credit position, they could steal the cash proceeds while the rightful lender loses their credit claim. This would be a direct theft of lending positions.",
+        "invariant_logic": "sellCreditMarket(creditPositionId != RESERVED_ID) requires msg.sender == creditPositions[creditPositionId].lender",
+        "solidity_property": "function invariant_sellCreditOwnership(uint256 cpId) public view { /* enforced in validateSellCreditMarket */ }",
+        "inventory_refs": [
+          {
+            "file": "SellCreditMarket.sol",
+            "function": "validateSellCreditMarket"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Claim.sol",
+        "description": "A credit position can only be claimed once: the loan must be in REPAID status AND the credit must be > 0. After claim, the credit is set to 0, preventing double-claiming.",
+        "attack_scenario": "If double-claiming is possible, a lender could drain the protocol's borrowAToken reserves by claiming the same credit position multiple times, stealing funds from other lenders.",
+        "invariant_logic": "pre(claim): getLoanStatus(cpId) == REPAID AND credit > 0; post(claim): credit == 0",
+        "solidity_property": "function invariant_claimOnce(uint256 cpId) public view { /* After claim, credit must be 0 */ if (state.getLoanStatus(cpId) == LoanStatus.REPAID) { /* credit should be 0 or awaiting claim */ } }",
+        "inventory_refs": [
+          {
+            "file": "Claim.sol",
+            "function": "validateClaim"
+          },
+          {
+            "file": "Claim.sol",
+            "function": "executeClaim"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-003",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "Deposit.sol",
+        "description": "ETH deposits use address(this).balance instead of msg.value for the actual deposit amount. In a multicall context, forced ETH (via selfdestruct) could inflate the deposit amount beyond what the user actually sent.",
+        "attack_scenario": "An attacker forces ETH to the Size contract via selfdestruct, then the next user making an ETH deposit via multicall gets credited for more collateral than they paid for. The attacker sacrifices ETH but benefits whichever user deposits next.",
+        "invariant_logic": "In executeDeposit with msg.value > 0: amount == address(this).balance, which SHOULD equal msg.value but may exceed it due to forced ETH",
+        "solidity_property": "function invariant_ethDepositIntegrity() public view { /* Cannot be statically verified; requires runtime monitoring */ }",
+        "inventory_refs": [
+          {
+            "file": "Deposit.sol",
+            "function": "executeDeposit"
+          },
+          {
+            "file": "Multicall.sol",
+            "function": "multicall"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidateWithReplacement.sol",
+        "description": "LiquidateWithReplacement reuses the same debtPositionId by first repaying (futureValue->0, REPAID) then restoring (futureValue->original, ACTIVE) with a new borrower. The dueDate is preserved. This is the ONLY path where REPAID->ACTIVE transition occurs. The replacement borrower must pass the opening CR check.",
+        "attack_scenario": "If the replacement borrower's CR is not validated, keepers could assign debt to insolvent replacement borrowers, creating immediately-liquidatable positions in a loop, draining protocol fees. The opening CR check on the replacement borrower is critical.",
+        "invariant_logic": "post(liquidateWithReplacement): collateralRatio(params.borrower) >= max(crOpening, users[params.borrower].openingLimitBorrowCR) AND debtPosition.dueDate == old(debtPosition.dueDate) AND debtPosition.liquidityIndexAtRepayment == 0",
+        "solidity_property": "function invariant_replacementBorrowerCR(address newBorrower) public view { uint256 openingLimit = Math.max(state.riskConfig.crOpening, state.data.users[newBorrower].openingLimitBorrowCR); assert(state.collateralRatio(newBorrower) >= openingLimit || state.data.debtToken.balanceOf(newBorrower) == 0); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidateWithReplacement.sol",
+            "function": "executeLiquidateWithReplacement"
+          },
+          {
+            "file": "Size.sol",
+            "function": "liquidateWithReplacement"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Initialize.sol",
+        "description": "swapFeeAPR is not validated against the tenor range during initialization (marked as N/A). If swapFeeAPR is set such that swapFeeAPR * maxTenor >= PERCENT * YEAR, the getCreditAmountIn function will underflow, breaking all SellCreditMarket operations with fragmentation.",
+        "attack_scenario": "A misconfigured initialization could set swapFeeAPR too high relative to maxTenor. All subsequent sell credit market operations with credit fractionalization would revert due to underflow in (PERCENT - swapFeePercent), effectively bricking the protocol's core lending functionality.",
+        "invariant_logic": "swapFeeAPR * maxTenor < PERCENT * YEAR (must be verified at initialization, currently not enforced)",
+        "solidity_property": "function invariant_initSwapFee() public view { assert(Math.mulDivDown(state.feeConfig.swapFeeAPR, state.riskConfig.maxTenor, YEAR) < PERCENT); }",
+        "inventory_refs": [
+          {
+            "file": "Initialize.sol",
+            "function": "validateInitializeFeeConfigParams"
+          },
+          {
+            "file": "AccountingLibrary.sol",
+            "function": "getCreditAmountIn"
+          }
+        ]
+      }
+    ]
+  }
+}

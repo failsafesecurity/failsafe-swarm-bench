@@ -1,0 +1,392 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T03:04:33.190Z",
+    "duration_ms": 431239
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "FlashLoan.sol",
+        "description": "flashLoanERC20 lacks nonReentrant modifier, allowing arbitrary protocol operations during callback with stale availableLiquidity accounting",
+        "attack_scenario": "Attacker flash loans a large amount. During callback, availableLiquidity is not decremented. Attacker calls borrow/deposit/liquidate which use stale availableLiquidity for validation and interest rate calculations. Interest rates are manipulated to be artificially low (inflated denominator in utilization calculation), allowing borrowing at favorable rates or manipulating liquidation thresholds.",
+        "invariant_logic": "flashLoanERC20.executing implies reentrancyLock == LOCKED OR availableLiquidity reflects actual pool balance minus outstanding flash loans",
+        "solidity_property": "function invariant_flashloan_reentrancy() public view { assert(reentrancyLock == Constants.REENTRANCYLOCK__LOCKED || !flashLoanActive); }",
+        "inventory_refs": [
+          {
+            "file": "FlashLoan.sol",
+            "function": "flashLoanERC20"
+          },
+          {
+            "file": "FlashLoanLogic.sol",
+            "function": "executeFlashLoanERC20"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferOutOnFlashLoan"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "IsolateLogic.sol",
+        "description": "executeIsolateRedeem decreases isolate borrow from params.msgSender instead of the actual loan borrower (tokenData.owner / original onBehalf). This corrupts per-user borrow accounting.",
+        "attack_scenario": "User A has an isolate loan in auction. User B (who also has isolate borrows in the same group) calls isolateRedeem. The borrow is decreased from User B's account instead of User A's. User B's borrow accounting is corrupted (reduced without actual repayment of their debt), while User A's per-user borrow balance remains inflated. User B effectively gets free debt reduction. The loan's scaledAmount is correctly reduced but the per-user groupData.userScaledIsolateBorrow tracks the wrong user.",
+        "invariant_logic": "In isolateRedeem: the account whose userScaledIsolateBorrow is decreased MUST equal the account whose userScaledIsolateBorrow was increased in the original isolateBorrow for this loan",
+        "solidity_property": "function invariant_redeem_borrower() public view { // For each redeemed loan, assert: decreasedAccount == loanData.originalBorrower }",
+        "inventory_refs": [
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateRedeem"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20DecreaseIsolateScaledBorrow"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "BVault.sol",
+        "description": "withdrawERC20 with native token uses the original user-supplied amount for unwrapNativeTokenInWallet, but executeWithdrawERC20 may reduce params.amount to userBalance. The unwrap amount exceeds actual withdrawn amount, causing revert.",
+        "attack_scenario": "User has 5 WETH supply and calls withdrawERC20 with amount=10 and native token flag. executeWithdrawERC20 caps to 5 and transfers 5 WETH to receiver. Then unwrapNativeTokenInWallet tries to pull 10 WETH from msgSender, which fails. Native token partial withdrawals always revert. Additionally, if receiver != msgSender, the unwrap pulls WETH from the wrong address.",
+        "invariant_logic": "unwrapNativeTokenInWallet.amount MUST equal the actual amount withdrawn by executeWithdrawERC20, AND the WETH must be held by msgSender (receiver must equal msgSender for native path)",
+        "solidity_property": "function invariant_native_withdraw_amount() public view { assert(unwrapAmount == actualWithdrawnAmount && receiver == msgSender); }",
+        "inventory_refs": [
+          {
+            "file": "BVault.sol",
+            "function": "withdrawERC20"
+          },
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeWithdrawERC20"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "unwrapNativeTokenInWallet"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "IsolateLogic.sol",
+        "description": "Isolate loan status must follow valid lifecycle: 0→ACTIVE→AUCTION→(ACTIVE via redeem | deleted via liquidate), and ACTIVE→0 via full repay. No transition may skip states.",
+        "attack_scenario": "If a loan could transition from ACTIVE directly to liquidated (skipping AUCTION), the NFT owner would have no chance to redeem. If a loan in AUCTION could be repaid (bypassing redeem), auction bidders lose their bids without recourse. The validateIsolateRepayLoan correctly requires LOAN_STATUS_ACTIVE, preventing repay during auction.",
+        "invariant_logic": "loanStatus transitions: (0 → ACTIVE only via borrow), (ACTIVE → AUCTION only via first auction bid with HF < 1), (AUCTION → ACTIVE only via redeem), (AUCTION → deleted only via liquidate after auction end), (ACTIVE → 0 only via full repay)",
+        "solidity_property": "function invariant_loan_lifecycle(uint8 oldStatus, uint8 newStatus) public pure { if (oldStatus == 0) assert(newStatus == LOAN_STATUS_ACTIVE); if (oldStatus == LOAN_STATUS_ACTIVE) assert(newStatus == LOAN_STATUS_AUCTION || newStatus == 0); if (oldStatus == LOAN_STATUS_AUCTION) assert(newStatus == LOAN_STATUS_ACTIVE || newStatus == 0); }",
+        "inventory_refs": [
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateBorrow"
+          },
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateRepay"
+          },
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateAuction"
+          },
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateRedeem"
+          },
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateLiquidate"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "FlashLoanLogic.sol",
+        "description": "ERC721 flash loan does not check tokenData.lockerAddr, allowing NFTs locked by yield managers or isolate lending to be flash-loaned out of the pool, breaking the locker guarantee.",
+        "attack_scenario": "An NFT is deposited in isolate mode and locked (lockerAddr set) for yield staking. The NFT owner calls flashLoanERC721. Since lockerAddr is not checked, the NFT is transferred to the flash loan receiver. During the callback, the yield manager may attempt operations assuming the NFT is in the pool, leading to inconsistent state. The flash loan receiver could also manipulate the NFT (e.g., trigger airdrop claims) that should be restricted while locked.",
+        "invariant_logic": "flashLoanERC721 MUST require tokenData.lockerAddr == address(0) for each token being flash loaned",
+        "solidity_property": "function invariant_flashloan_locker_check(address nftAsset, uint256 tokenId) public view { DataTypes.ERC721TokenData storage td = assetData.erc721TokenData[tokenId]; assert(td.lockerAddr == address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "FlashLoanLogic.sol",
+            "function": "executeFlashLoanERC721"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateFlashLoanERC721Basic"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "InterestLogic.sol",
+        "description": "Supply index and borrow index must be monotonically non-decreasing. A decrease would mean lenders lose value or borrowers' debt shrinks unexpectedly.",
+        "attack_scenario": "If supplyIndex could decrease (e.g., via overflow or incorrect calculation), existing depositors would see their withdrawable balance decrease. If borrowIndex decreased, borrowers could repay less than they owe, extracting value from lenders. The calculateLinearInterest and calculateCompoundedInterest always return >= RAY, ensuring monotonicity when multiplied with the current index.",
+        "invariant_logic": "forall t1 < t2: supplyIndex(t2) >= supplyIndex(t1) AND borrowIndex(t2) >= borrowIndex(t1)",
+        "solidity_property": "function invariant_index_monotonicity(uint128 oldSupplyIdx, uint128 newSupplyIdx, uint128 oldBorrowIdx, uint128 newBorrowIdx) public pure { assert(newSupplyIdx >= oldSupplyIdx); assert(newBorrowIdx >= oldBorrowIdx); }",
+        "inventory_refs": [
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateSupplyIndex"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateBorrowIndex"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "IsolateLogic.sol",
+        "description": "Isolate auction redeem and liquidate have mutually exclusive time windows: redeem only before auctionEndTimestamp, liquidate only after. If both could execute in the same block, funds could be double-spent.",
+        "attack_scenario": "If the timing constraints were not enforced, a borrower could redeem (paying partial debt + fine) AND the highest bidder could liquidate (claiming the NFT) in the same transaction window. The NFT would be claimed by the liquidator while the borrower's redeem payment is wasted. The strict inequality (redeem: <=, liquidate: >) ensures exactly one is valid at any given timestamp.",
+        "invariant_logic": "(block.timestamp <= auctionEndTimestamp) XOR (block.timestamp > auctionEndTimestamp): redeem requires the former, liquidate requires the latter",
+        "solidity_property": "function invariant_auction_timing(uint40 bidStartTimestamp, uint40 auctionDuration) public view { uint40 end = bidStartTimestamp + auctionDuration; assert((block.timestamp <= end) != (block.timestamp > end)); }",
+        "inventory_refs": [
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateRedeem"
+          },
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateLiquidate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "FlashLoanLogic.sol",
+        "description": "Flash loan ERC20 does not update availableLiquidity on transfer out/in, creating a window where interest rate calculations use inflated available liquidity (lower utilization), enabling rate manipulation.",
+        "attack_scenario": "Attacker flash loans a large amount during the callback window. Since availableLiquidity is not reduced, any operation in the callback that calls updateInterestRates will compute utilization using inflated liquidity (lower utilization ratio). Attacker triggers a borrow in the callback, which records a lower borrow rate than market conditions warrant. The under-charged interest benefits the attacker at the expense of lenders.",
+        "invariant_logic": "At all times during protocol execution: availableLiquidity must reflect the actual claimable liquidity (total balance minus bid amounts minus outstanding flash loans)",
+        "solidity_property": "function invariant_avail_liquidity(address asset) public view { uint256 actual = IERC20(asset).balanceOf(address(this)); assert(assetData.availableLiquidity + assetData.totalBidAmout <= actual); }",
+        "inventory_refs": [
+          {
+            "file": "FlashLoanLogic.sol",
+            "function": "executeFlashLoanERC20"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferOutOnFlashLoan"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "updateInterestRates"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SupplyLogic.sol",
+        "description": "A user with outstanding cross-margin debt (healthFactor > 1) must not be able to withdraw collateral or change supply mode to isolate if it would push healthFactor below 1. The health factor check must occur AFTER state changes.",
+        "attack_scenario": "If health factor were checked before the withdrawal state change, a user could pass the check and then withdraw, leaving an undercollateralized position. The protocol correctly checks HF after erc20DecreaseCrossSupply/erc721DecreaseCrossSupply, ensuring the post-withdrawal state is healthy.",
+        "invariant_logic": "After any user-initiated collateral reduction (withdraw, supply mode change): healthFactor(user) >= HEALTH_FACTOR_LIQUIDATION_THRESHOLD OR user has no debt",
+        "solidity_property": "function invariant_post_withdrawal_health(address user) public view { ResultTypes.UserAccountResult memory r = GenericLogic.calculateUserAccountDataForHeathFactor(poolData, user, oracle); assert(r.totalDebtInBaseCurrency == 0 || r.healthFactor >= Constants.HEALTH_FACTOR_LIQUIDATION_THRESHOLD); }",
+        "inventory_refs": [
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeWithdrawERC20"
+          },
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeWithdrawERC721"
+          },
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeSetERC721SupplyMode"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "InterestLogic.sol",
+        "description": "supplyIndex and borrowIndex are stored as uint128. Overflow during toUint128() cast causes permanent DoS for all operations on the affected asset, as updateInterestIndexs would always revert.",
+        "attack_scenario": "If an asset goes long periods without any interaction (index update), the accumulated interest could push the computed next index past uint128 max (3.4e38). Since initial index is 1e27 (RAY), this requires ~3.4e11x growth. At extreme rates (e.g., 1000% APY) or with intentional manipulation of rate models, the index could approach this limit. Once hit, all supply/borrow/repay/liquidate operations on this asset permanently fail.",
+        "invariant_logic": "nextSupplyIndex <= type(uint128).max AND nextBorrowIndex <= type(uint128).max",
+        "solidity_property": "function invariant_index_fits_uint128() public view { uint256 nextIdx = MathUtils.calculateLinearInterest(assetData.supplyRate, assetData.lastUpdateTimestamp).rayMul(assetData.supplyIndex); assert(nextIdx <= type(uint128).max); }",
+        "inventory_refs": [
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateSupplyIndex"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateBorrowIndex"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VaultLogic.sol",
+        "description": "ERC721 token supply mode (cross vs isolate) and ownership tracking must be mutually consistent: totalScaledCrossSupply + totalScaledIsolateSupply must equal total deposited NFTs, and each token's supplyMode must match the counter it was added to.",
+        "attack_scenario": "If the cross/isolate supply counters become inconsistent with actual token data (e.g., a token is counted in both cross and isolate), the protocol could allow double-counting of collateral. Cross-mode NFTs count toward cross-margin health factor, while isolate-mode NFTs back individual loans. An NFT counted in both would inflate the user's total collateral value.",
+        "invariant_logic": "forall token: (tokenData.supplyMode == CROSS implies token counted in totalScaledCrossSupply) AND (tokenData.supplyMode == ISOLATE implies token counted in totalScaledIsolateSupply) AND NOT both",
+        "solidity_property": "function invariant_nft_supply_mode_consistency(address asset, uint256 tokenId) public view { DataTypes.ERC721TokenData storage td = assetData.erc721TokenData[tokenId]; if (td.owner != address(0)) { assert(td.supplyMode == Constants.SUPPLY_MODE_CROSS || td.supplyMode == Constants.SUPPLY_MODE_ISOLATE); } }",
+        "inventory_refs": [
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc721IncreaseCrossSupply"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc721IncreaseIsolateSupply"
+          },
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeSetERC721SupplyMode"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SupplyLogic.sol",
+        "description": "An ERC721 in isolate supply mode with an active loan (loanStatus != 0) or a non-zero lockerAddr must not be withdrawable or have its supply mode changed. Withdrawal while a loan exists would leave unbacked debt.",
+        "attack_scenario": "If the locker/loan status checks were missing, an NFT owner could: 1) Deposit NFT in isolate mode, 2) Borrow against it, 3) Withdraw the NFT while the loan is still active. The loan would reference a collateral NFT that no longer exists in the pool, and the debt would be effectively unbacked. The protocol correctly checks both loanData.loanStatus == 0 and tokenData.lockerAddr == address(0) before allowing isolate withdrawal or mode change.",
+        "invariant_logic": "withdrawERC721(isolate) requires loanStatus == 0 AND lockerAddr == address(0); setERC721SupplyMode requires loanStatus == 0 AND lockerAddr == address(0)",
+        "solidity_property": "function invariant_isolate_nft_locked(address nftAsset, uint256 tokenId) public view { DataTypes.IsolateLoanData storage ld = poolData.loanLookup[nftAsset][tokenId]; DataTypes.ERC721TokenData storage td = assetData.erc721TokenData[tokenId]; if (ld.loanStatus != 0 || td.lockerAddr != address(0)) { assert(td.supplyMode == Constants.SUPPLY_MODE_ISOLATE && td.owner != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeWithdrawERC721"
+          },
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeSetERC721SupplyMode"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateWithdrawERC721"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidationLogic.sol",
+        "description": "Cross liquidation of ERC721 collateral converts excess debt payment (remainDebtToLiquidate) into borrower supply without verifying that this does not create unbacked supply shares. The totalScaledCrossSupply increases without corresponding availableLiquidity increase for the remainder portion.",
+        "attack_scenario": "When liquidating ERC721 collateral, if the collateral value exceeds user's total debt, the excess (remainDebtToLiquidate) is added as borrower's supply via erc20IncreaseCrossSupply. The liquidator's full payment goes to erc20TransferInLiquidity which increases availableLiquidity. The supply increase for remainDebtToLiquidate is correctly backed by the over-payment tokens in the pool. However, the remain amount computation depends on integer rounding in _calculateDebtAmountFromERC721Collateral which uses collateralTotalDebtToCover / userCollateralBalance (rounds down), potentially under-computing the debt-to-cover per item and leaving a small accounting gap.",
+        "invariant_logic": "After ERC721 liquidation: erc20TransferInLiquidity(actualDebtToLiquidate) >= sum(repaidDebt) + sum(remainDebtToLiquidate_as_supply)",
+        "solidity_property": "function invariant_liquidation_balance(uint256 transferred, uint256 repaid, uint256 remainSupply) public pure { assert(transferred >= repaid + remainSupply); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidationLogic.sol",
+            "function": "executeCrossLiquidateERC721"
+          },
+          {
+            "file": "LiquidationLogic.sol",
+            "function": "_calculateDebtAmountFromERC721Collateral"
+          },
+          {
+            "file": "LiquidationLogic.sol",
+            "function": "_repayUserERC20Debt"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "InterestLogic.sol",
+        "description": "Interest indices must be updated before any operation that depends on current balances (borrow, repay, liquidate, withdraw). The lastUpdateTimestamp guard prevents double-updates within the same block but a stale index before balance reads would under/over-count debt.",
+        "attack_scenario": "If a borrow operation reads the user's debt without first updating the borrow index, the calculated debt would be based on a stale index. In the same block, if another operation already updated the index, the debt would jump. An attacker could exploit the ordering: first trigger an index update (e.g., via a tiny deposit), observe the new rates, then borrow at the old index if the borrow operation doesn't update first. The protocol consistently calls updateInterestIndexs() before any balance-dependent logic.",
+        "invariant_logic": "Before any balance read or modification: assetData.lastUpdateTimestamp == block.timestamp (indices are current)",
+        "solidity_property": "function invariant_index_freshness() public view { assert(assetData.lastUpdateTimestamp == block.timestamp); }",
+        "inventory_refs": [
+          {
+            "file": "SupplyLogic.sol",
+            "function": "executeDepositERC20"
+          },
+          {
+            "file": "BorrowLogic.sol",
+            "function": "executeCrossBorrowERC20"
+          },
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateBorrow"
+          },
+          {
+            "file": "LiquidationLogic.sol",
+            "function": "executeCrossLiquidateERC20"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "IsolateLogic.sol",
+        "description": "Isolate auction first bid must only transition from ACTIVE to AUCTION when borrowAmount exceeds thresholdPrice (health factor < 1). Subsequent bids must exceed the previous bid by a minimum delta (1% of borrowAmount). Without these constraints, healthy loans could be forced into auction.",
+        "attack_scenario": "If the health factor check on first auction bid were missing, an attacker could start an auction on any active isolate loan regardless of its health. The NFT owner would be forced to pay bid fines to redeem, even though their loan was healthy. The first-bid check (borrowAmount > thresholdPrice) and the min-delta check on subsequent bids prevent griefing.",
+        "invariant_logic": "First bid: loanStatus == ACTIVE AND borrowAmount > thresholdPrice AND bidAmount >= borrowAmount AND bidAmount >= liquidatePrice. Subsequent bids: bidAmount >= previousBid + minBidDelta AND block.timestamp <= auctionEndTimestamp",
+        "solidity_property": "function invariant_auction_first_bid(uint256 borrowAmount, uint256 thresholdPrice) public pure { assert(borrowAmount > thresholdPrice); }",
+        "inventory_refs": [
+          {
+            "file": "IsolateLogic.sol",
+            "function": "executeIsolateAuction"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateAuctionLoan"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "GenericLogic.sol",
+        "description": "Health factor calculation must include ALL user collateral and ALL user debt across all groups. If any supplied asset or borrowed asset is omitted, the health factor would be overstated, preventing necessary liquidations.",
+        "attack_scenario": "If calculateUserAccountData failed to iterate all supplied or borrowed assets (e.g., due to a stale EnumerableSet), a user's total debt could be underestimated. Their health factor would appear higher than reality, preventing liquidation even when the position is insolvent. The protocol relies on accountCheckAndSetBorrowedAsset/accountCheckAndSetSuppliedAsset to maintain these sets correctly after every balance change.",
+        "invariant_logic": "accountData.suppliedAssets contains exactly the assets where user has non-zero cross supply; accountData.borrowedAssets contains exactly the assets where user has non-zero cross borrow across all groups",
+        "solidity_property": "function invariant_account_sets(address user) public view { address[] memory supplied = accountData.suppliedAssets.values(); for (uint i = 0; i < supplied.length; i++) { assert(getUserTotalSupply(supplied[i], user) > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "GenericLogic.sol",
+            "function": "calculateUserAccountData"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "accountCheckAndSetBorrowedAsset"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "accountCheckAndSetSuppliedAsset"
+          }
+        ]
+      }
+    ]
+  }
+}

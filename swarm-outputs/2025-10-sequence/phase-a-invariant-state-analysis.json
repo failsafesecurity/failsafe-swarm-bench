@@ -1,0 +1,372 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T07:37:29.469Z",
+    "duration_ms": 358868
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "BaseSig.sol",
+        "description": "ecrecover failure returns address(0), yet the recovered weight is still added to the total in FLAG_SIGNATURE_HASH and FLAG_SIGNATURE_ETH_SIGN branches. If address(0) is present as a signer leaf in the Merkle configuration tree, any invalid ECDSA signature would count as a valid signature from address(0), granting its weight without any private key.",
+        "attack_scenario": "A wallet configuration accidentally or intentionally includes address(0) as a signer with non-zero weight. An attacker provides any invalid compact signature (r=0, s=0). ecrecover returns address(0), weight is added, and the imageHash includes the address(0) leaf. If address(0)'s weight meets or exceeds the threshold, the attacker gains full control without any valid key.",
+        "invariant_logic": "forall signatures in FLAG_SIGNATURE_HASH | FLAG_SIGNATURE_ETH_SIGN: ecrecover(hash, v, r, s) != address(0) OR weight is NOT incremented",
+        "solidity_property": "function invariant_ecrecover_nonzero(bytes32 opHash, uint8 v, bytes32 r, bytes32 s) public pure { address addr = ecrecover(opHash, v, r, s); assert(addr != address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "BaseSig.sol",
+            "function": "recoverBranch"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "BaseSig.sol",
+        "description": "Chained signature checkpoints must be strictly decreasing to ensure configuration updates form a valid chain from newest to oldest. The latest configuration validates the actual payload, and each predecessor validates a config-update linking to the next. If checkpoint ordering is violated, an attacker could replay an old, less-secure configuration.",
+        "attack_scenario": "An attacker constructs a chained signature where an old configuration with fewer/weaker signers appears at a position that implies it is the current config, bypassing stronger signer requirements of a newer config. The decreasing checkpoint check prevents this by ensuring the chain goes from current (highest checkpoint, verified first) to oldest.",
+        "invariant_logic": "In recoverChained: for consecutive sub-signatures i, i+1: checkpoint[i] > checkpoint[i+1] (strictly decreasing)",
+        "solidity_property": "function invariant_chained_checkpoints(uint256 current, uint256 previous) public pure { assert(previous == type(uint256).max || current < previous); }",
+        "inventory_refs": [
+          {
+            "file": "BaseSig.sol",
+            "function": "recoverChained"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "Nonce.sol",
+        "description": "Nonces within each space must strictly increase by exactly 1 per consumption. This prevents replay attacks and ensures transaction ordering. The unchecked increment could wrap uint256 at maximum, allowing nonce reuse from 0.",
+        "attack_scenario": "If the nonce reaches type(uint256).max and wraps to 0 via unchecked increment, all previously used nonces in that space become valid again, enabling complete replay of every historical transaction in that nonce space.",
+        "invariant_logic": "post(_consumeNonce(space, nonce)): readNonce(space) == nonce + 1 AND nonce < type(uint256).max",
+        "solidity_property": "function invariant_nonce_increment(uint256 space, uint256 nonce) public view { uint256 current = readNonce(space); assert(current == nonce + 1); assert(nonce < type(uint256).max); }",
+        "inventory_refs": [
+          {
+            "file": "Nonce.sol",
+            "function": "_consumeNonce"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "SessionManager.sol",
+        "description": "Session calls MUST NOT use ABORT_ON_ERROR behavior. If abort is allowed, a failing call could stop execution before the incrementUsageLimit call's effects are committed, but since incrementUsageLimit is the first call with REVERT_ON_ERROR, the real risk is that subsequent calls with abort could skip later validation-critical calls while limits are already consumed.",
+        "attack_scenario": "A session key holder crafts a batch where an early call (after incrementUsageLimit) uses ABORT_ON_ERROR. If that call fails, all subsequent calls are skipped, but usage limits are already incremented. More critically, if abort were allowed on incrementUsageLimit itself, usage limit enforcement could be bypassed entirely.",
+        "invariant_logic": "forall calls in session payload: call.behaviorOnError != BEHAVIOR_ABORT_ON_ERROR",
+        "solidity_property": "function invariant_no_abort(uint256 behavior) public pure { assert(behavior != 2); }",
+        "inventory_refs": [
+          {
+            "file": "SessionManager.sol",
+            "function": "recoverSapientSignature"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "ExplicitSessionManager.sol",
+        "description": "The incrementUsageLimit call MUST be the first call in the batch, MUST have REVERT_ON_ERROR behavior, MUST NOT be onlyFallback, and its calldata MUST exactly match the expected usage limits computed during validation. This prevents session key holders from bypassing usage limit tracking.",
+        "attack_scenario": "If the increment call could use IGNORE_ERROR or be marked onlyFallback, it could silently fail or be skipped, allowing session keys to execute calls without incrementing their usage counters, effectively gaining unlimited usage.",
+        "invariant_logic": "IF sessionUsageLimits.length > 0 THEN payload.calls[0].to == SessionManager AND payload.calls[0].behaviorOnError == REVERT_ON_ERROR AND !payload.calls[0].onlyFallback AND keccak256(payload.calls[0].data) == keccak256(expectedIncrementData)",
+        "solidity_property": "function invariant_increment_first_call(address to, uint256 behavior, bool onlyFallback, bytes32 dataHash, bytes32 expectedHash) public view { assert(to == address(this) && behavior == 1 && !onlyFallback && dataHash == expectedHash); }",
+        "inventory_refs": [
+          {
+            "file": "ExplicitSessionManager.sol",
+            "function": "_validateLimitUsageIncrement"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "ExplicitSessionManager.sol",
+        "description": "Usage limits can only increase, never decrease. The incrementUsageLimit function enforces that the new amount is >= the current stored amount. This prevents a session key from resetting its own usage to regain spent limits.",
+        "attack_scenario": "If a session key holder could decrement usage limits, they could reset cumulative spending/call counters and exceed the intended permission boundaries set by the wallet owner.",
+        "invariant_logic": "forall limits in incrementUsageLimit: limits[i].usageAmount >= getLimitUsage(wallet, limits[i].usageHash)",
+        "solidity_property": "function invariant_usage_monotonic(address wallet, bytes32 usageHash, uint256 newAmount) public view { assert(newAmount >= getLimitUsage(wallet, usageHash)); }",
+        "inventory_refs": [
+          {
+            "file": "ExplicitSessionManager.sol",
+            "function": "incrementUsageLimit"
+          },
+          {
+            "file": "PermissionValidator.sol",
+            "function": "validatePermission"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "CRITICAL",
+        "category": "time_resource",
+        "target_contract": "Recovery.sol",
+        "description": "Recovery payloads can only be executed after the required time delta has elapsed since queuing AND after the minimum timestamp. The timelock prevents instant hostile takeover via recovery. Once queued, a payload cannot be re-queued (AlreadyQueued check) and cannot be cancelled, making the timelock the sole protection window.",
+        "attack_scenario": "If the timelock could be bypassed, a compromised recovery signer could immediately execute a config update to take over the wallet without giving the legitimate owner time to respond (e.g., by updating config to remove the compromised recovery signer).",
+        "invariant_logic": "recoverBranch returns verified=true ONLY IF timestampForQueuedPayload[wallet][signer][payloadHash] != 0 AND block.timestamp - queuedAt >= requiredDeltaTime AND queuedAt >= minTimestamp",
+        "solidity_property": "function invariant_recovery_timelock(uint256 queuedAt, uint256 requiredDeltaTime, uint256 minTimestamp) public view { assert(queuedAt != 0 && queuedAt >= minTimestamp && block.timestamp - queuedAt >= requiredDeltaTime); }",
+        "inventory_refs": [
+          {
+            "file": "Recovery.sol",
+            "function": "_recoverBranch"
+          },
+          {
+            "file": "Recovery.sol",
+            "function": "queuePayload"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SessionManager.sol",
+        "description": "Session keys MUST NOT be able to make delegate calls or calls to the wallet itself. Delegate calls would allow session keys to modify wallet storage arbitrarily, and self-calls could invoke privileged functions like updateImageHash or selfExecute.",
+        "attack_scenario": "A session key holder crafts a transaction with delegateCall=true pointing to malicious code, which executes in the wallet's context and drains all assets or updates the image hash to attacker's config.",
+        "invariant_logic": "forall calls in session payload: call.delegateCall == false AND call.to != wallet",
+        "solidity_property": "function invariant_session_no_delegate_or_self(bool delegateCall, address to, address wallet) public pure { assert(!delegateCall && to != wallet); }",
+        "inventory_refs": [
+          {
+            "file": "SessionManager.sol",
+            "function": "recoverSapientSignature"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SessionSig.sol",
+        "description": "A session configuration MUST contain exactly one identity signer and at most one blacklist. Implicit sessions require the blacklist to be present in the configuration. If implicit calls exist (attestationCount > 0) but no blacklist is configured, the transaction must revert.",
+        "attack_scenario": "Without the blacklist requirement, an attacker could construct a session config without a blacklist, bypassing implicit session restrictions. Without the unique identity signer constraint, multiple identity signers could lead to ambiguous attestation validation.",
+        "invariant_logic": "(attestationCount > 0) => hasBlacklistInConfig AND countOf(identitySigner) == 1",
+        "solidity_property": "function invariant_session_config(uint8 attestationCount, bool hasBlacklist, address identitySigner) public pure { if (attestationCount > 0) assert(hasBlacklist); assert(identitySigner != address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "SessionSig.sol",
+            "function": "recoverSignature"
+          },
+          {
+            "file": "SessionSig.sol",
+            "function": "recoverConfiguration"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Stage1Auth.sol",
+        "description": "The Stage1 to Stage2 implementation transition is one-way and irreversible upon first imageHash update. Stage1 validates imageHash via CREATE2 address derivation; Stage2 validates via storage. Once _updateImageHash is called, the implementation is upgraded to Stage2, and the CREATE2-based validation is permanently abandoned.",
+        "attack_scenario": "If the transition could be reversed to Stage1, an attacker could exploit the CREATE2-based validation which is deterministic based on factory/salt, potentially finding configurations that validate against the fixed address derivation rather than the updated stored imageHash.",
+        "invariant_logic": "post(_updateImageHash on Stage1Auth): implementation == STAGE_2_IMPLEMENTATION AND no function exists to revert to Stage1Auth",
+        "solidity_property": "function invariant_stage_transition() public view { if (Storage.readBytes32(IMAGE_HASH_KEY) != bytes32(0)) { assert(_getImplementation() == STAGE_2_IMPLEMENTATION); } }",
+        "inventory_refs": [
+          {
+            "file": "Stage1Auth.sol",
+            "function": "_updateImageHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PermissionValidator.sol",
+        "description": "Permission rule validation reads calldata at rule.offset via LibBytes.readBytes32 which does NOT perform bounds checking. If rule.offset exceeds call.data.length, the read returns zero bytes. A rule checking for equality with bytes32(0) at an out-of-bounds offset would pass, potentially allowing calls that don't contain the expected parameter data.",
+        "attack_scenario": "A permission rule is configured to check that a parameter at offset 100 equals 0x00. An attacker sends a call with data shorter than 100 bytes. The out-of-bounds read returns 0, matching the expected value, and the permission check passes even though the call doesn't contain the expected parameter structure.",
+        "invariant_logic": "forall rules in permission.rules: rule.offset + 32 <= call.data.length (ensuring in-bounds read)",
+        "solidity_property": "function invariant_rule_offset_bounds(uint256 offset, uint256 dataLength) public pure { assert(offset + 32 <= dataLength); }",
+        "inventory_refs": [
+          {
+            "file": "PermissionValidator.sol",
+            "function": "validatePermission"
+          },
+          {
+            "file": "LibBytes.sol",
+            "function": "readBytes32"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "BaseAuth.sol",
+        "description": "Static signatures have an expiry timestamp. The signature is valid only when block.timestamp < timestamp. A static signature with timestamp 0 or a past timestamp is expired and must be rejected. Additionally, if an address is specified (non-zero), only that caller can use the static signature.",
+        "attack_scenario": "If expiry is not enforced, a static signature could be used indefinitely even after the wallet owner intended it to expire, allowing unauthorized operations long after the intended validity window.",
+        "invariant_logic": "staticSignature is valid IFF timestamp > block.timestamp AND (addr == address(0) OR addr == msg.sender)",
+        "solidity_property": "function invariant_static_sig_expiry(uint256 timestamp, address addr, address caller) public view { if (timestamp > 0) { assert(timestamp > block.timestamp); } if (addr != address(0)) { assert(addr == caller); } }",
+        "inventory_refs": [
+          {
+            "file": "BaseAuth.sol",
+            "function": "signatureValidation"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Hooks.sol",
+        "description": "Hooks execute via delegatecall in the wallet's context and can read/write any storage slot. A malicious or compromised hook has full control over the wallet. Hook addition/removal is restricted to onlySelf, and adding a hook for an already-registered selector is prevented. However, there is no mechanism to pause or emergency-remove hooks without going through the onlySelf path.",
+        "attack_scenario": "A wallet owner installs a hook that appears benign but contains a backdoor. The hook, running via delegatecall, can call _updateImageHash or _setImplementation to take over the wallet, since it executes in the wallet's storage context with no restrictions on which storage slots it modifies.",
+        "invariant_logic": "addHook(selector, impl): pre(_readHook(selector) == address(0)) AND caller == address(this). removeHook(selector): pre(_readHook(selector) != address(0)) AND caller == address(this). fallback delegatecall only if _readHook(msg.sig) != address(0).",
+        "solidity_property": "function invariant_hook_integrity(bytes4 selector) public view { address hook = _readHook(selector); /* hook must have been explicitly set by wallet owner via onlySelf */ }",
+        "inventory_refs": [
+          {
+            "file": "Hooks.sol",
+            "function": "addHook"
+          },
+          {
+            "file": "Hooks.sol",
+            "function": "fallback"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "BaseSig.sol",
+        "description": "The snapshot/checkpointer mechanism enforces that if a checkpointer provides a snapshot with a non-zero imageHash, either the recovered imageHash must match the snapshot OR the recovered checkpoint must be greater than the snapshot's checkpoint. This prevents using outdated configurations that the checkpointer has recorded as superseded.",
+        "attack_scenario": "Without snapshot enforcement, an attacker with access to an old valid configuration (before a signer was removed) could use that old configuration to sign transactions, even though the wallet's configuration has been updated. The checkpointer records the update, and the snapshot check prevents the old config from being used.",
+        "invariant_logic": "IF snapshot.imageHash != 0 AND snapshot.imageHash != recoveredImageHash THEN checkpoint > snapshot.checkpoint",
+        "solidity_property": "function invariant_snapshot(bytes32 snapshotImageHash, bytes32 recoveredImageHash, uint256 snapshotCheckpoint, uint256 recoveredCheckpoint) public pure { if (snapshotImageHash != bytes32(0) && snapshotImageHash != recoveredImageHash) { assert(recoveredCheckpoint > snapshotCheckpoint); } }",
+        "inventory_refs": [
+          {
+            "file": "BaseSig.sol",
+            "function": "recover"
+          },
+          {
+            "file": "BaseSig.sol",
+            "function": "recoverChained"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-015",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ERC4337v07.sol",
+        "description": "ERC4337 entry points (validateUserOp, executeUserOp) MUST only be callable by the immutable entrypoint address. If the entrypoint is address(0), ERC4337 is disabled entirely. The validateUserOp performs signature validation via isValidSignature, but executeUserOp trusts the entrypoint has already validated, executing selfExecute without re-authentication.",
+        "attack_scenario": "If msg.sender is not properly validated against the entrypoint, an attacker could call executeUserOp directly to execute arbitrary payloads via selfExecute (which has no signature check, only onlySelf). Since executeUserOp calls this.selfExecute(), and msg.sender of selfExecute becomes address(this), it bypasses signature validation.",
+        "invariant_logic": "validateUserOp: msg.sender == entrypoint AND entrypoint != address(0). executeUserOp: msg.sender == entrypoint AND entrypoint != address(0).",
+        "solidity_property": "function invariant_entrypoint(address caller, address ep) public pure { assert(ep != address(0) && caller == ep); }",
+        "inventory_refs": [
+          {
+            "file": "ERC4337v07.sol",
+            "function": "validateUserOp"
+          },
+          {
+            "file": "ERC4337v07.sol",
+            "function": "executeUserOp"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-016",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "ExplicitSessionManager.sol",
+        "description": "Explicit session permissions have a deadline field. If deadline is non-zero and block.timestamp exceeds it, the session must be rejected. A deadline of 0 means no expiry. This prevents session keys from being used after their intended validity period.",
+        "attack_scenario": "A session key with expired deadline continues to execute transactions because the deadline check is bypassed or not properly enforced, allowing a previously-authorized but now-revoked session key to drain funds.",
+        "invariant_logic": "IF sessionPermissions.deadline != 0 THEN block.timestamp <= sessionPermissions.deadline",
+        "solidity_property": "function invariant_session_deadline(uint64 deadline) public view { if (deadline != 0) { assert(block.timestamp <= deadline); } }",
+        "inventory_refs": [
+          {
+            "file": "ExplicitSessionManager.sol",
+            "function": "_validateExplicitCall"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-017",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "SessionManager.sol",
+        "description": "Session transactions are restricted to nonce space <= MAX_SPACE (type(uint80).max - 1). This prevents session keys from using high nonce spaces that might be reserved for other purposes and limits the session's operational domain.",
+        "attack_scenario": "A session key uses a nonce space beyond MAX_SPACE, potentially conflicting with nonce spaces used by other wallet mechanisms or bypassing space-based access controls.",
+        "invariant_logic": "payload.space <= MAX_SPACE (type(uint80).max - 1)",
+        "solidity_property": "function invariant_session_space(uint256 space) public pure { assert(space <= type(uint80).max - 1); }",
+        "inventory_refs": [
+          {
+            "file": "SessionManager.sol",
+            "function": "recoverSapientSignature"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-018",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "BaseSig.sol",
+        "description": "In chained signatures, each sub-signature MUST meet its own threshold (weight >= threshold). If any chain link has insufficient weight, the entire chained signature must be rejected. This ensures that each historical configuration update was properly authorized.",
+        "attack_scenario": "If a chain link with insufficient weight is accepted, an attacker could forge a chain of configurations where an intermediate link uses a weak/unauthorized config, leading to acceptance of an unauthorized current configuration.",
+        "invariant_logic": "forall sub-signatures in chain: weight >= threshold",
+        "solidity_property": "function invariant_chain_weight(uint256 weight, uint256 threshold) public pure { assert(weight >= threshold); }",
+        "inventory_refs": [
+          {
+            "file": "BaseSig.sol",
+            "function": "recoverChained"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-019",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ImplicitSessionManager.sol",
+        "description": "Implicit session calls MUST have zero native token value, MUST NOT be delegate calls, the session signer MUST match the attestation's approvedSigner, neither signer nor target can be blacklisted, and the target contract must return the correct magic value from acceptImplicitRequest. This provides defense-in-depth for implicit authorization.",
+        "attack_scenario": "An implicit session signer sends ETH value with a call, draining the wallet's ETH. Or the signer calls a blacklisted contract (e.g., the wallet itself or a known attack contract) to perform unauthorized operations.",
+        "invariant_logic": "implicit call: value == 0 AND !delegateCall AND sessionSigner == attestation.approvedSigner AND !isBlacklisted(sessionSigner) AND !isBlacklisted(call.to) AND target.acceptImplicitRequest() == expectedMagic",
+        "solidity_property": "function invariant_implicit_call(uint256 value, bool delegateCall, address signer, address approvedSigner) public pure { assert(value == 0 && !delegateCall && signer == approvedSigner); }",
+        "inventory_refs": [
+          {
+            "file": "ImplicitSessionManager.sol",
+            "function": "_validateImplicitCall"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-020",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Recovery.sol",
+        "description": "Once a recovery payload is queued for a given (wallet, signer, payloadHash), it cannot be re-queued (AlreadyQueued). However, there is no mechanism to cancel queued payloads. The only defense against a queued malicious payload is to update the wallet's configuration to remove the recovery signer before the timelock expires.",
+        "attack_scenario": "A recovery signer's key is compromised. The attacker queues a malicious config update. The wallet owner cannot cancel the queued payload directly; they must update the wallet config to remove the compromised recovery signer before the timelock expires. If the owner fails to act within the timelock period, the attacker can execute the recovery.",
+        "invariant_logic": "timestampForQueuedPayload[wallet][signer][payloadHash] is set exactly once (write-once, never cleared)",
+        "solidity_property": "function invariant_queue_once(address wallet, address signer, bytes32 payloadHash) public view { /* once set to non-zero, never returns to zero */ }",
+        "inventory_refs": [
+          {
+            "file": "Recovery.sol",
+            "function": "queuePayload"
+          },
+          {
+            "file": "Recovery.sol",
+            "function": "_recoverBranch"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Genesis pool can be reinitialized by token owner, stranding prior contributor funds",
+      "severity": "high",
+      "summary": "`GenesisPoolManager.depositNativeToken` allows the whitelisted token owner to call into an existing pool and invoke `setGenesisPoolInfo` again (GenesisPoolManager.sol:100-137). This reinitializes launch parameters in-place while old contributor balances and tokens remain in storage/contract balance. Because claim logic and future deposits now use the new `genesisInfo` (including potentially a different `fundingToken`), prior contributor assets can become unclaimable or be forced into a materiall",
+      "description": [
+        {
+          "file": "contracts/GenesisPool.sol",
+          "line_start": 73,
+          "line_end": 87,
+          "desc": "`setGenesisPoolInfo` fully overwrites `genesisInfo`/`allocationInfo` and resets `poolStatus` without clearing prior `userDeposits`, `totalDeposits`, or already-held funding assets."
+        }
+      ],
+      "impact": "Contributors can suffer permanent lock or effective loss of deposited funding assets, and pool accounting can be rewritten after users have already committed capital.",
+      "proof_of_concept": "1. Contributors deposit funding token A into an active genesis pool during `PRE_LISTING`/`PRE_LAUNCH`.\n2. Before final launch, the token owner calls `depositNativeToken` again with new `GenesisInfo` (e.g., different funding token B / changed parameters).\n3. Manager forwards this to `setGenesisPoolInfo`, resetting pool configuration and status while old deposits remain.\n4. Pool proceeds under new parameters; prior token-A contributors cannot cleanly recover funds under normal flow, and accounting is now inconsistent with assets held.",
+      "remediation": "Make initialization one-time per pool instance: block `setGenesisPoolInfo` once any user deposit exists or once pool leaves the initial state. If parameters must change, require deploying a fresh pool and refunding old contributors first. Enforce immutable `fundingToken` for an existing pool and add explicit state-transition guards."
+    },
+    {
+      "title": "Genesis LP share conversion rounding allows over-withdrawal and LP theft",
+      "severity": "high",
+      "summary": "Genesis users withdraw through `GaugeV2._withdraw` (GaugeV2.sol:272-323), which forwards chosen LP amounts to `GenesisPool.deductAmount`. Because conversion is floored and state uses static `totalDeposits`, a user can choose withdrawal chunk sizes that decrement `userDeposits` much less than the LP value removed. Repeating this drains excess LP from the gauge beyond the attacker's fair share. This extracted LP is taken from other genesis participants' collateral (including token owner share once",
+      "description": [
+        {
+          "file": "contracts/GenesisPool.sol",
+          "line_start": 330,
+          "line_end": 346,
+          "desc": "`deductAmount` converts withdrawn LP to `userDeposits` using floor division (`userAmount = totalDeposits * gaugeTokenAmount / (liquidity/2)`), enabling strategic partial withdrawals that burn too few deposit units."
+        }
+      ],
+      "impact": "Direct theft of LP assets from other genesis participants and potential insolvency of the genesis-backed gauge position.",
+      "proof_of_concept": "1. Attacker contributes funding to a genesis pool and receives a non-zero genesis LP share after launch.\n2. Attacker repeatedly calls `GaugeV2.withdraw(amount)` using carefully chosen partial `amount` values.\n3. Each call transfers LP tokens out, but `deductAmount` rounds down `userAmount`, reducing recorded deposit ownership too slowly.\n4. Over many calls, attacker withdraws substantially more LP than their fair pro-rata entitlement, leaving remaining users undercollateralized.",
+      "remediation": "Track and debit user shares in LP units directly (not via lossy token-unit conversion), or use precise fixed-point accounting with round-up on deductions and invariant checks (`withdrawn <= user_entitlement`). Also enforce strict per-user amount bounds against current claimable genesis LP before transfer."
+    },
+    {
+      "title": "Pre-seeding genesis pair liquidity can brick launch and permanently lock pool funds",
+      "severity": "high",
+      "summary": "While a pool is in genesis mode, `RouterV2.addLiquidity` only rejects empty genesis pairs. However, `Pair.mint` is publicly callable and allows anyone to initialize reserves directly (Pair.sol:336-350). During launch, `GenesisPool` adds liquidity with `amountAMin=0` and `amountBMin=0` (GenesisPool.sol:224-239), so manipulated pre-seeded reserves control consumed amounts. An attacker can force launch reverts (`ILM`) or force tiny consumption of one side, leaving large native/funding balances stra",
+      "description": [
+        {
+          "file": "contracts/RouterV2.sol",
+          "line_start": 384,
+          "line_end": 389,
+          "desc": "Genesis protection only blocks first-router-liquidity when `totalSupply == 0`; direct permissionless `Pair.mint` can pre-seed reserves and bypass this assumption before genesis launch."
+        }
+      ],
+      "impact": "Permanent lock of contributor/token-owner assets and launch failure or severe misallocation caused by an external pre-seeding attacker.",
+      "proof_of_concept": "1. After genesis pair creation/approval but before launch, attacker transfers tokens to pair and calls `Pair.mint` with a skewed ratio.\n2. At launch, manager calls `GenesisPool.launch`, which routes through `RouterV2.addLiquidity`.\n3. Because pair is no longer empty, genesis gate is bypassed; router computes amounts from attacker-controlled reserves.\n4. Launch either reverts (pool stuck in pre-launch state, user funds locked) or succeeds with extreme under-consumption, permanently stranding most contributor assets in the genesis contract.",
+      "remediation": "Enforce genesis constraints at pair/factory level (block `mint`/`swap` on genesis pairs until official launch), and add hard checks in launch flow that pair `totalSupply` and reserves are zero before adding liquidity. Also pass non-zero slippage bounds and explicitly refund/handle unused tokens."
+    },
+    {
+      "title": "Fee-on-transfer token assumptions can make genesis pools insolvent or unlaunchable",
+      "severity": "high",
+      "summary": "Genesis pool accounting assumes exact transfers for both native and funding assets. `depositToken` records `_amount` into `userDeposits`, `totalDeposits`, and allocation fields immediately after `safeTransferFrom`, without measuring actual received balance deltas. Likewise native funding is transferred in manager by nominal `proposedNativeAmount` (GenesisPoolManager.sol:128). For fee-on-transfer tokens, contract balances are lower than accounting. This can make launch transfers fail (insufficien",
+      "description": [
+        {
+          "file": "contracts/GenesisPool.sol",
+          "line_start": 131,
+          "line_end": 152,
+          "desc": "Deposits are accounted at requested amount, not actual amount received, so transfer-fee tokens desynchronize accounting from balances."
+        }
+      ],
+      "impact": "Permanent lock or shortfall of contributor funds in genesis pools, including launch failure states with no clean recovery path.",
+      "proof_of_concept": "1. A genesis pool is created with a transfer-fee native token or transfer-fee connector funding token.\n2. Contributors deposit as normal; protocol books full nominal amounts, but contract receives less.\n3. At launch, `addLiquidity` may revert due missing token balance, leaving pool stuck and user deposits locked; or in NOT_QUALIFIED flow, early claimers are paid while later claimers revert due depleted balance.\n4. Users incur permanent losses from protocol insolvency/lock rather than explicit market risk.",
+      "remediation": "Use balance-delta accounting for all token transfers (measure pre/post balances and credit only actual received amount). Explicitly reject fee-on-transfer tokens for genesis native/funding assets unless fully supported, and add invariant checks before launch/refund operations."
+    },
+    {
+      "title": "Zero-weight epochs permanently strand minted emissions in GaugeManager",
+      "severity": "high",
+      "summary": "When `IVoter(voter).totalWeight()` is zero, `GaugeManager.notifyRewardAmount` still pulls `amount` from minter but keeps `_ratio=0`, so global `index` is unchanged. Subsequent per-gauge distribution logic computes rewards only from `delta = index - supplyIndex` (GaugeManager.sol:412-421). With no index advance, transferred tokens never become `claimable` and are never returned to minter, resulting in permanent emission loss inside GaugeManager.",
+      "description": [
+        {
+          "file": "contracts/GaugeManager.sol",
+          "line_start": 290,
+          "line_end": 299,
+          "desc": "`notifyRewardAmount` transfers emissions in even when `totalWeight == 0` but does not advance `index`, leaving rewards without any claimable path."
+        }
+      ],
+      "impact": "Permanent loss/lock of platform emission assets for any zero-weight epoch, potentially compounding over time into material reward shortfall.",
+      "proof_of_concept": "1. At an epoch boundary, all pool weights are zero (e.g., startup epoch, or all voters reset/abstain).\n2. `Minter.update_period` calls `GaugeManager.notifyRewardAmount`, transferring newly minted emissions to GaugeManager.\n3. Because `totalWeight == 0`, index is not increased and no gauge accrues claimable rewards.\n4. Emission tokens remain trapped in GaugeManager permanently, reducing protocol reward solvency.",
+      "remediation": "Do not pull rewards when `totalWeight == 0`; either revert and keep funds in minter, or escrow and explicitly roll forward into a later epoch once weight is non-zero. Add a recovery path for undistributed base token balances."
+    }
+  ]
+}

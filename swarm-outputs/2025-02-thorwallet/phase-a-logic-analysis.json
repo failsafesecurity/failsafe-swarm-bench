@@ -1,0 +1,427 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:29:22.443Z",
+    "duration_ms": 315744
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-TGT-DEPOSIT",
+        "source": "TGT token ERC677 transferAndCall",
+        "path": [
+          "TGT.transferAndCall(MergeTgt, amount)",
+          "MergeTgt.onTokenTransfer(from, amount, data)",
+          "quoteTitn(amount) computes titnOut",
+          "claimableTitnPerUser[from] += titnOut",
+          "totalTitnClaimable += titnOut"
+        ],
+        "transformations": [
+          "TGT amount → TITN amount via time-decayed conversion rate",
+          "Full rate (0-90d): tgtAmount * TITN_ARB / TGT_TO_EXCHANGE",
+          "Decay rate (90-360d): tgtAmount * TITN_ARB * remainingTime / (TGT_TO_EXCHANGE * 270d)",
+          "Post-360d: 0"
+        ],
+        "sinks": [
+          "claimableTitnPerUser mapping",
+          "totalTitnClaimable accumulator"
+        ],
+        "trust_changes": "Trusts TGT contract to supply correct 'from' address; no verification of from parameter integrity beyond msg.sender == TGT address",
+        "validation_points": [
+          "msg.sender == address(tgt)",
+          "lockedStatus != Locked && launchTime != 0",
+          "amount != 0",
+          "block.timestamp - launchTime <= 360 days"
+        ],
+        "exposure_risks": [
+          "No maximum TGT deposit cap enforcement - total TGT deposited can exceed TGT_TO_EXCHANGE",
+          "titnOut can be 0 at boundary (timeSinceLaunch approaching 360d) while deposit still succeeds"
+        ],
+        "manipulation_risks": [
+          "Total TITN allocated can exceed TITN_ARB if deposited TGT exceeds TGT_TO_EXCHANGE causing insolvency",
+          "No minimum output protection - user deposits TGT but may receive 0 TITN near 360d boundary",
+          "Front-running: attacker monitors mempool for deposits and front-runs to exhaust TITN allocation"
+        ]
+      },
+      {
+        "flow_id": "DF-02-CLAIM-TITN",
+        "source": "User calls claimTitn(amount)",
+        "path": [
+          "User calls claimTitn(amount)",
+          "Verify amount <= claimableTitnPerUser[msg.sender]",
+          "Verify block.timestamp - launchTime < 360 days",
+          "Update claimedTitnPerUser, claimableTitnPerUser, totalTitnClaimed, totalTitnClaimable",
+          "titn.safeTransfer(msg.sender, amount)"
+        ],
+        "transformations": [
+          "Direct TITN transfer equal to claimed amount"
+        ],
+        "sinks": [
+          "User wallet receives TITN",
+          "State accounting updated"
+        ],
+        "trust_changes": "Contract trusts that TITN balance is sufficient for transfer",
+        "validation_points": [
+          "amount <= claimableTitnPerUser[msg.sender]",
+          "block.timestamp - launchTime < 360 days"
+        ],
+        "exposure_risks": [
+          "If totalTitnClaimable exceeds actual TITN balance (due to over-allocation from unlimited TGT deposits), safeTransfer will revert for later claimants"
+        ],
+        "manipulation_risks": [
+          "First-come-first-served: if TITN is over-allocated, early claimers drain the contract leaving nothing for later users",
+          "No launchTime > 0 check; relies on inability to have claimable amounts if launchTime is 0"
+        ]
+      },
+      {
+        "flow_id": "DF-03-WITHDRAW-REMAINING",
+        "source": "User calls withdrawRemainingTitn() after 360 days",
+        "path": [
+          "Check launchTime > 0 and >= 360 days elapsed",
+          "First caller initializes remainingTitnAfter1Year and initialTotalClaimable",
+          "Compute unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable",
+          "Compute userProportionalShare = (claimableTitn * unclaimedTitn) / initialTotalClaimable",
+          "Transfer claimableTitn + userProportionalShare to user",
+          "Zero out user's claimable balance"
+        ],
+        "transformations": [
+          "Base claim: user's claimableTitnPerUser",
+          "Bonus: proportional share of (contractBalance - totalClaimable) based on user's share of totalClaimable"
+        ],
+        "sinks": [
+          "User wallet receives TITN",
+          "User claimable zeroed"
+        ],
+        "trust_changes": "First caller sets immutable snapshot values that affect all subsequent callers",
+        "validation_points": [
+          "launchTime > 0",
+          "block.timestamp - launchTime >= 360 days",
+          "claimableTitn > 0"
+        ],
+        "exposure_risks": [
+          "remainingTitnAfter1Year is set by first caller - race condition on initialization",
+          "Owner can withdraw() TITN before initialization, corrupting proportional calculation"
+        ],
+        "manipulation_risks": [
+          "Owner drains TITN via withdraw() before first withdrawRemainingTitn call causing underflow in unclaimedTitn calculation",
+          "First caller can be manipulated/front-run to set unfavorable snapshot",
+          "If owner re-deposits TITN between initialization and subsequent user claims, contract balance grows but snapshot is fixed"
+        ]
+      },
+      {
+        "flow_id": "DF-04-CROSS-CHAIN-BRIDGE",
+        "source": "User initiates LayerZero OFT send",
+        "path": [
+          "Source chain: OFT._debit() → _burn(sender, amount) [bypasses transfer restrictions]",
+          "LayerZero message relay",
+          "Destination chain: Titn._credit(to, amountLD) → _mint(to, amountLD)",
+          "isBridgedTokenHolder[to] = true (permanent flag)"
+        ],
+        "transformations": [
+          "Token burned on source, minted on destination",
+          "Recipient permanently flagged as bridged token holder"
+        ],
+        "sinks": [
+          "Destination chain mint",
+          "isBridgedTokenHolder mapping"
+        ],
+        "trust_changes": "Recipient becomes permanently restricted sender on non-Arbitrum chains; on Arbitrum all non-exempt senders already restricted",
+        "validation_points": [
+          "LayerZero endpoint authentication in OFT base"
+        ],
+        "exposure_risks": [
+          "isBridgedTokenHolder flag is permanent - no function to clear it",
+          "Bridging to any chain marks recipient, restricting them even after they dispose of all bridged tokens"
+        ],
+        "manipulation_risks": [
+          "Attacker can bridge small amount to arbitrary address to permanently flag them as bridged token holder, restricting their transfers on non-Arbitrum chains",
+          "Address(0) redirect to 0xdead in _credit - could be used to permanently lock tokens if LayerZero misconfigures _to"
+        ]
+      },
+      {
+        "flow_id": "DF-05-OWNER-WITHDRAW",
+        "source": "Owner calls withdraw(token, amount)",
+        "path": [
+          "Owner calls withdraw(IERC20, uint256)",
+          "token.safeTransfer(owner(), amount)"
+        ],
+        "transformations": [
+          "Direct transfer to owner"
+        ],
+        "sinks": [
+          "Owner wallet"
+        ],
+        "trust_changes": "N/A - fully trusted operation",
+        "validation_points": [
+          "onlyOwner modifier only"
+        ],
+        "exposure_risks": [
+          "Owner can withdraw ALL TITN at any time including user-claimable amounts",
+          "No restriction on token type or amount - can drain TGT and TITN",
+          "Can be used before withdrawRemainingTitn initialization to corrupt proportional math"
+        ],
+        "manipulation_risks": [
+          "Rug pull vector: owner drains TITN, users cannot claim",
+          "Targeted attack: owner partially drains to cause underflow in withdrawRemainingTitn"
+        ]
+      },
+      {
+        "flow_id": "DF-06-TITN-TRANSFER",
+        "source": "Any TITN holder calls transfer/transferFrom",
+        "path": [
+          "Titn.transfer/transferFrom called",
+          "_validateTransfer(from, to) checks restrictions",
+          "If not restricted, super.transfer/transferFrom executes"
+        ],
+        "transformations": [
+          "Standard ERC20 transfer"
+        ],
+        "sinks": [
+          "Recipient address"
+        ],
+        "trust_changes": "N/A",
+        "validation_points": [
+          "from != owner()",
+          "from or to == transferAllowedContract",
+          "isBridgedTokensTransferLocked",
+          "isBridgedTokenHolder[from] || block.chainid == 42161",
+          "to != lzEndpoint"
+        ],
+        "exposure_risks": [
+          "Only one transferAllowedContract at a time - other integrations are blocked",
+          "lzEndpoint check is likely ineffective for OFT bridging (which uses _burn internally)"
+        ],
+        "manipulation_risks": [
+          "On Arbitrum, all users are restricted regardless of how they obtained tokens (native or bridged)",
+          "Anyone can force-flag an address as isBridgedTokenHolder by bridging dust to them"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "TGT to TITN conversion follows a time-decayed rate: full rate for 90 days, linear decay over next 270 days to zero",
+        "Users deposit TGT and accumulate claimable TITN, which they claim separately",
+        "After 360 days, unclaimed TITN plus bonus from unallocated TITN is distributed proportionally",
+        "Bridged token holders on non-Arbitrum chains and all holders on Arbitrum have transfer restrictions",
+        "Owner has complete control over lock status, transfer allowed contracts, and can withdraw any token"
+      ],
+      "economic_incentives": [
+        "Early TGT depositors get better conversion rate (full rate in first 90 days)",
+        "Linear decay from day 90 to day 360 incentivizes earlier participation",
+        "Post-360-day proportional bonus incentivizes NOT claiming before 360 days (to get bonus share)",
+        "Transfer restrictions on bridged tokens prevent immediate selling on destination chains"
+      ],
+      "governance_mechanisms": [
+        "Owner controls LockedStatus (Locked/OneWay/TwoWay) - only OneWay and TwoWay allow deposits",
+        "Owner sets launchTime (one-time, irreversible)",
+        "Owner controls transferAllowedContract and bridgedTokenTransferLocked on TITN",
+        "Owner can withdraw any amount of any token from MergeTgt at any time"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Total TGT deposited exceeds TGT_TO_EXCHANGE (579M TGT), causing total TITN allocated to exceed TITN_ARB",
+          "expected_behavior": "Contract should enforce a cap on total TGT accepted or total TITN allocated",
+          "actual_behavior": "No cap is enforced. Any amount of TGT can be deposited. totalTitnClaimable can exceed TITN_ARB, making the contract insolvent",
+          "risk_level": "high",
+          "exploitation_potential": "If total TGT deposited * rate > TITN_ARB, early claimers drain all TITN; late claimers get nothing. Also causes underflow in withdrawRemainingTitn (remainingTitnAfter1Year < initialTotalClaimable)"
+        },
+        {
+          "scenario": "User deposits TGT when timeSinceLaunch is very close to but less than 360 days",
+          "expected_behavior": "User should be protected from receiving negligible TITN for their TGT",
+          "actual_behavior": "quoteTitn returns near-zero value; user's TGT is locked in contract with effectively zero TITN claimable. No minimum output check exists",
+          "risk_level": "medium",
+          "exploitation_potential": "User loses TGT with no meaningful TITN return. No slippage protection."
+        },
+        {
+          "scenario": "At exactly block.timestamp - launchTime == 360 days, onTokenTransfer allows deposit but quoteTitn returns 0",
+          "expected_behavior": "Deposit should be rejected if output is 0",
+          "actual_behavior": "Deposit is accepted (360 days is NOT > 360 days). quoteTitn returns 0 because timeSinceLaunch is not < 360 days. User loses TGT for 0 TITN",
+          "risk_level": "medium",
+          "exploitation_potential": "Off-by-one at the boundary: deposits at exactly 360 days are accepted but yield 0 TITN"
+        },
+        {
+          "scenario": "Owner calls withdraw() to drain TITN before first withdrawRemainingTitn call",
+          "expected_behavior": "Contract should protect user funds from owner extraction of allocated TITN",
+          "actual_behavior": "Owner can drain all TITN. When first user calls withdrawRemainingTitn, remainingTitnAfter1Year could be 0 or very low, causing underflow when computing unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable",
+          "risk_level": "high",
+          "exploitation_potential": "Rug pull: owner drains TITN before or after 360 days, rendering all claims impossible"
+        },
+        {
+          "scenario": "isBridgedTokenHolder flag set permanently with no way to clear it",
+          "expected_behavior": "Flag should be clearable when user is no longer holding bridged tokens, or by admin",
+          "actual_behavior": "Once _credit is called for an address, isBridgedTokenHolder[_to] = true forever. No function exists to reset it",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker bridges dust amount to target address on non-Arbitrum chain, permanently restricting target's ability to transfer TITN when bridgedTokenTransferLocked is true. Griefing attack."
+        },
+        {
+          "scenario": "withdrawRemainingTitn called when remainingTitnAfter1Year is 0 (first caller when balance is 0)",
+          "expected_behavior": "Should handle gracefully or revert with meaningful error",
+          "actual_behavior": "remainingTitnAfter1Year stays 0, if-check will re-execute on every call. unclaimedTitn = 0 - initialTotalClaimable underflows and reverts if initialTotalClaimable > 0. Function is permanently broken",
+          "risk_level": "medium",
+          "exploitation_potential": "If contract balance is 0 at 360 days (e.g., owner drained), the initialization sets remainingTitnAfter1Year=0 which causes perpetual re-initialization attempts that all revert"
+        },
+        {
+          "scenario": "totalTitnClaimable accounting inconsistency in withdrawRemainingTitn",
+          "expected_behavior": "totalTitnClaimed and totalTitnClaimable should reflect actual movements accurately",
+          "actual_behavior": "totalTitnClaimed += titnOut (includes proportional bonus), but totalTitnClaimable -= claimableTitn (only base amount). The proportional bonus is never tracked in totalTitnClaimable, creating a divergence between claimed and claimable totals",
+          "risk_level": "low",
+          "exploitation_potential": "Accounting inconsistency; not directly exploitable but could mislead off-chain monitoring or integrations relying on these values"
+        },
+        {
+          "scenario": "LockedStatus.TwoWay is defined but never functionally differs from OneWay in code",
+          "expected_behavior": "TwoWay should enable additional functionality (e.g., reverse exchange from TITN to TGT)",
+          "actual_behavior": "Both OneWay and TwoWay allow deposits. No code path differentiates them. The TwoWay enum value is unused",
+          "risk_level": "low",
+          "exploitation_potential": "No immediate exploitation, but suggests incomplete implementation or dead code"
+        },
+        {
+          "scenario": "Multiple users race to be first caller of withdrawRemainingTitn - snapshot values depend on exact state at time of first call",
+          "expected_behavior": "Snapshot should be deterministic and fair",
+          "actual_behavior": "First caller sets remainingTitnAfter1Year and initialTotalClaimable. If someone claims via claimTitn right before 360d, this reduces both balance and totalTitnClaimable consistently. But owner actions (withdraw/deposit) can create inconsistencies",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner or MEV bot can manipulate contract state in the same block as initialization to set favorable/unfavorable snapshot values"
+        },
+        {
+          "scenario": "On Arbitrum, all TITN transfers are restricted regardless of whether sender is a bridged token holder",
+          "expected_behavior": "Only bridged token holders should be restricted, or restriction should be clearly documented",
+          "actual_behavior": "block.chainid == 42161 causes ALL transfers to be restricted on Arbitrum. Even tokens minted natively via constructor on Arbitrum deployment would be restricted",
+          "risk_level": "medium",
+          "exploitation_potential": "Users who receive TITN on Arbitrum via the MergeTgt contract (not bridging) are still transfer-restricted unless transferAllowedContract is set to MergeTgt"
+        },
+        {
+          "scenario": "deposit() function can be called multiple times by owner",
+          "expected_behavior": "Deposit should only be allowed once for initial TITN funding",
+          "actual_behavior": "No state tracking prevents multiple deposits. Owner can deposit TITN_ARB multiple times, increasing balance beyond expected amount",
+          "risk_level": "low",
+          "exploitation_potential": "Owner can over-fund the contract, changing bonus distribution math in withdrawRemainingTitn. Not harmful to users but inconsistent with the constant naming."
+        }
+      ],
+      "assumption_violations": [
+        "CRITICAL: Contract assumes total TGT deposited will not exceed TGT_TO_EXCHANGE, but this is never enforced. If total TGT supply allows more deposits, the contract becomes insolvent",
+        "Contract assumes owner will not withdraw user-allocated TITN, but withdraw() has no restrictions",
+        "Transfer restriction on Titn assumes isBridgedTokenHolder accurately reflects current bridged status, but flag is permanent and one-directional",
+        "Contract assumes first withdrawRemainingTitn caller will execute when contract has a positive TITN balance >= totalTitnClaimable, but owner can drain beforehand",
+        "to != lzEndpoint check assumes users need to transfer to lzEndpoint, but OFT uses internal _burn which bypasses transfer/transferFrom entirely"
+      ],
+      "game_theory_risks": [
+        "Perverse incentive: users who do NOT claim before 360 days get a proportional bonus from unallocated TITN in withdrawRemainingTitn, discouraging early claims",
+        "If insolvency risk is known, rational actors race to claimTitn early, creating a bank-run scenario where late users get nothing",
+        "Griefing via isBridgedTokenHolder: attacker can cheaply bridge dust to arbitrary addresses on non-Arbitrum chains to permanently restrict their TITN transfers",
+        "MEV opportunity: at exactly 360 days, the claimTitn→withdrawRemainingTitn transition creates potential for block-level manipulation of the initialization snapshot"
+      ],
+      "integration_risks": [
+        "LayerZero endpoint trust: _credit relies on LayerZero authentication; compromise of LZ infrastructure allows arbitrary minting",
+        "ERC677 transferAndCall: relies on TGT token correctly implementing the callback pattern and passing authentic 'from' address",
+        "Single transferAllowedContract: only one contract can be whitelisted at a time. If MergeTgt is set as transferAllowedContract, no DEX can trade TITN, and vice versa",
+        "OFT _debit uses _burn which bypasses transfer restrictions - this is likely intended but means bridge-out is always possible even when transfers are locked",
+        "lzEndpoint stored in both OFT base and Titn private variable - if endpoint implementation is upgraded (address change), the two references could diverge"
+      ],
+      "calculation_errors": [
+        "quoteTitn at timeSinceLaunch = 360 days returns 0 (correct per math), but onTokenTransfer allows deposits at exactly 360 days (boundary inconsistency between > and >= checks)",
+        "withdrawRemainingTitn: unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable can underflow if contract was drained or if over-allocation occurred",
+        "withdrawRemainingTitn: integer division truncation in userProportionalShare means sum of all shares is slightly less than unclaimedTitn, leaving dust TITN permanently locked",
+        "quoteTitn full rate: tgtAmount * 173_700_000e18 / 579_000_000e18 ≈ 0.3 * tgtAmount - calculation is correct but very small TGT amounts may result in 0 due to integer division"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "TGT",
+          "behaviors": [
+            "ERC677_transferAndCall",
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "External token. ERC677 pattern used for deposits. Trusted to provide correct 'from' address in onTokenTransfer callback. No fee-on-transfer assumed.",
+          "approval_model": "unknown",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "TITN",
+          "behaviors": [
+            "OFT_cross_chain",
+            "rebasing:false",
+            "permit:false",
+            "pausable:false",
+            "blacklist:false",
+            "transfer_restricted:conditional",
+            "mint_burn_restricted:false"
+          ],
+          "decimals": 18,
+          "notes": "LayerZero OFT token. Transfer restrictions based on isBridgedTokenHolder flag and chain ID. _mint/_burn bypass transfer restrictions. isBridgedTokenHolder is permanently set on _credit. On Arbitrum (chainId 42161), ALL transfers are restricted. Owner and transferAllowedContract exempted.",
+          "approval_model": "infinite_ok",
+          "transfer_model": "hooks",
+          "accounting_model": "balanceOf",
+          "evidence_refs": [
+            {
+              "file": "Titn.sol",
+              "lines": [
+                60,
+                65,
+                72
+              ],
+              "function": "_validateTransfer"
+            },
+            {
+              "file": "Titn.sol",
+              "lines": [
+                96,
+                103
+              ],
+              "function": "_credit"
+            }
+          ]
+        }
+      ],
+      "invariants": [
+        {
+          "name": "claimable_sum_consistency",
+          "state_vars": [
+            "totalTitnClaimable",
+            "sum(claimableTitnPerUser)"
+          ],
+          "notes": "totalTitnClaimable should equal sum of all claimableTitnPerUser values. Both are incremented/decremented in sync in onTokenTransfer and claimTitn. In withdrawRemainingTitn, totalTitnClaimable -= claimableTitn while user is zeroed, maintaining consistency."
+        },
+        {
+          "name": "solvency_invariant",
+          "state_vars": [
+            "titn.balanceOf(MergeTgt)",
+            "totalTitnClaimable"
+          ],
+          "notes": "VIOLATED if total TGT deposited exceeds TGT_TO_EXCHANGE. No enforcement prevents totalTitnClaimable from exceeding actual TITN balance. Also violated if owner uses withdraw()."
+        },
+        {
+          "name": "single_withdrawal_post_year",
+          "state_vars": [
+            "claimableTitnPerUser[user]"
+          ],
+          "notes": "In withdrawRemainingTitn, claimableTitnPerUser[msg.sender] is set to 0 after claim. User can only call once since subsequent calls fail require(claimableTitn > 0)."
+        },
+        {
+          "name": "temporal_phase_exclusivity",
+          "state_vars": [
+            "block.timestamp",
+            "launchTime"
+          ],
+          "notes": "Before 360 days: claimTitn active, withdrawRemainingTitn blocked. At/after 360 days: claimTitn blocked, withdrawRemainingTitn active. Clean transition at exactly 360 days."
+        },
+        {
+          "name": "bridged_flag_monotonicity",
+          "state_vars": [
+            "isBridgedTokenHolder[addr]"
+          ],
+          "notes": "isBridgedTokenHolder can only transition from false to true, never back. No clearing mechanism exists."
+        }
+      ]
+    }
+  }
+}

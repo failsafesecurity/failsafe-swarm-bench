@@ -1,0 +1,3147 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "C",
+    "process": "threat_deduplication",
+    "deduplicator_model": null,
+    "timestamp": "2026-03-08T03:36:57.814Z",
+    "original_threat_count": 102,
+    "deduplicated_threat_count": 38,
+    "removed_threat_count": 64
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H001",
+      "title": "Bot-Initiated Yield Liquidation Uses Wrong Yield Account, Making Unhealthy Positions Unliquidatable",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In _unstake and _repay, the yield account is resolved via yieldAccounts[msg.sender]. When botAdmin calls these functions to force-liquidate an unhealthy position, the lookup uses yieldAccounts[botAdmin] instead of sd.yieldAccount (the actual user's yield account). Since botAdmin likely has no yield account (address(0)), the require check reverts immediately. Even if botAdmin somehow had a yield account, subsequent operations (deducting yieldShares, requesting withdrawals, claiming) operate on the wrong account, causing underflows or incorrect protocol interactions.",
+      "investigation_rationale": "This is a direct code defect where the wrong address is used for account lookup. The _unstake function resolves vars.yieldAccout = IYieldAccount(yieldAccounts[msg.sender]) at line ~235, then uses it for share accounting at lines ~267-270. When msg.sender is botAdmin (checked at line ~254), this resolves to the bot's account, not the NFT owner's. The same pattern repeats in _repay (~313) and in all protocolRequestWithdrawal/protocolClaimWithdraw implementations which use yieldAccounts[msg.sender].",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_unstake",
+        "_repay",
+        "protocolRequestWithdrawal",
+        "protocolClaimWithdraw"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol",
+        "YieldEthStakingLido.sol",
+        "YieldEthStakingEtherfi.sol",
+        "YieldSavingsDai.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_unstake"
+        },
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_repay"
+        },
+        {
+          "file": "YieldEthStakingLido.sol",
+          "function": "protocolRequestWithdrawal"
+        },
+        {
+          "file": "YieldEthStakingEtherfi.sol",
+          "function": "protocolRequestWithdrawal"
+        },
+        {
+          "file": "YieldSavingsDai.sol",
+          "function": "protocolClaimWithdraw"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "235-270",
+        "pattern": "vars.yieldAccout = IYieldAccount(yieldAccounts[msg.sender]); used when msg.sender == botAdmin; should use sd.yieldAccount"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A user has an active yield stake position",
+        "The position's health factor drops below unstakeHeathFactor",
+        "botAdmin is set and attempts to call unstake"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldStakingBase.sol _unstake and _repay",
+        "vulnerable_pattern": "yieldAccounts[msg.sender] resolves to botAdmin's account instead of NFT owner's",
+        "specific_concern": "accountYieldShares[address(vars.yieldAccout)] -= sd.yieldShare will underflow; protocolRequestWithdrawal withdraws from wrong account",
+        "missing_safeguards": "No fallback to sd.yieldAccount when caller is botAdmin"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can botAdmin ever successfully force-unstake an unhealthy yield position?",
+          "What happens to protocol debt when unhealthy positions cannot be liquidated?",
+          "Can users deliberately create positions they know cannot be liquidated?"
+        ],
+        "validation_requirements": [
+          "Create a yield stake position, let it become unhealthy, attempt bot unstake",
+          "Verify the revert at yieldAccounts[botAdmin] == address(0) check",
+          "Quantify potential bad debt accumulation from unliquidatable positions"
+        ]
+      },
+      "preliminary_attack_scenario": "User stakes NFT and borrows maximum amount. NFT price drops causing HF < threshold. BotAdmin calls unstake but reverts because yieldAccounts[botAdmin] is address(0). The position becomes permanently unliquidatable, accruing bad debt against the lending pool until the position is so underwater the protocol absorbs the loss.",
+      "prerequisites": [
+        "Active yield staking system",
+        "botAdmin configured",
+        "Market conditions causing unhealthy positions"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Unlimited bad debt accumulation - every unhealthy yield position cannot be liquidated by the bot",
+        "affected_users": "All lending pool depositors bear losses from unrecoverable bad debt",
+        "recovery_possibility": "Cannot be fixed without contract upgrade; NFT owner can self-unstake but has no incentive if underwater"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No test for botAdmin-initiated unstake/repay flow",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A - transaction reverts",
+        "capital_requirements": "One NFT + borrow amount sufficient for leverage",
+        "execution_timing": "Multi-block - wait for price decline",
+        "detection_analysis": "Observable on-chain as failed bot transactions and growing yield debt"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H003",
+      "title": "Bot-Initiated Repay DoS: extraAmount Transfer Pulls from NFT Owner Who Can Block Liquidation by Revoking Approval",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In _repay, when claimedYield < nftDebtWithFine, the contract attempts `underlyingAsset.safeTransferFrom(vars.nftOwner, address(this), vars.extraAmount)`. When botAdmin initiates repay for a liquidation, this pulls funds from the NFT owner's wallet. If the NFT owner has not approved the contract or revokes approval, the transfer reverts, blocking the entire liquidation flow. This is independent of TECH-H001 (which would also block bot repay for a different reason).",
+      "investigation_rationale": "The _repay function always pulls extra funds from nftOwner regardless of who calls it. For normal user-initiated repay this is fine, but for bot-initiated liquidation this creates a dependency on the user's approval that the user can weaponize.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_repay"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_repay"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "329-331",
+        "pattern": "underlyingAsset.safeTransferFrom(vars.nftOwner, ...) in bot-callable path without owner's cooperation"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User has an unhealthy yield position in UNSTAKE state",
+        "Claimed yield < debt + fine (extraAmount > 0)",
+        "User revokes WETH approval for the YieldStaking contract"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldStakingBase.sol lines 329-331",
+        "vulnerable_pattern": "safeTransferFrom(vars.nftOwner, ...) when caller may be botAdmin",
+        "specific_concern": "NFT owner can unilaterally block liquidation by not approving or revoking approval",
+        "missing_safeguards": "No alternative path when owner doesn't cooperate"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "If the yield claimed doesn't cover debt, is there any way to complete liquidation without owner cooperation?",
+          "Can the protocol absorb the shortfall from elsewhere (e.g., unstake fine)?",
+          "What is the expected frequency of extraAmount > 0 scenarios?"
+        ],
+        "validation_requirements": [
+          "Simulate underwater position where claimedYield < debt",
+          "Attempt bot repay with owner having revoked approval",
+          "Verify transaction reverts"
+        ]
+      },
+      "preliminary_attack_scenario": "User stakes NFT and borrows maximum. Market drops, position becomes unhealthy. Bot unstakes the position (setting UNSTAKE state with fine). Before bot can repay, user revokes WETH approval. When bot calls repay and yield doesn't cover debt+fine, safeTransferFrom reverts. Position cannot be settled, debt continues accruing.",
+      "prerequisites": [
+        "Unhealthy yield position where yield < debt",
+        "User must have initially approved then revoke"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Lending pool absorbs bad debt from positions that can never be repaid through the bot path",
+        "affected_users": "All lending pool depositors",
+        "recovery_possibility": "NFT owner can voluntarily repay, but has no incentive if underwater"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for bot repay with uncooperative NFT owner",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "One NFT + borrow amount",
+        "execution_timing": "Multi-block",
+        "detection_analysis": "Observable as failed bot repay transactions"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "Unstake Fines Permanently Locked in YieldStaking Contracts with No Extraction Mechanism",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When botAdmin triggers an unstake with a fine, `totalUnstakeFine += unstakeFine` is incremented but never decremented in _repay. The fine amount (in WETH/DAI) is collected from the user or yield during repay and stays in the YieldStaking contract as the underlying ERC20 token. There is no function to withdraw or sweep ERC20 tokens from the YieldStaking contracts. The emergencyEtherTransfer functions only handle native ETH, not WETH/ERC20.",
+      "investigation_rationale": "In _repay, the unstakeFine is factored into nftDebtWithFine calculation but the fine portion is never transferred to any treasury or admin. After repay, delete stakeDatas[nft][tokenId] removes the record, and the ERC20 fine sits in the contract forever. totalUnstakeFine only increases, never decreases.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_unstake",
+        "_repay"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol",
+        "YieldEthStakingLido.sol",
+        "YieldEthStakingEtherfi.sol",
+        "YieldSavingsDai.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_unstake"
+        },
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_repay"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "263-264",
+        "pattern": "totalUnstakeFine += unstakeFine; never decremented; no sweep function for ERC20"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "botAdmin triggers unstake with non-zero unstakeFine",
+        "User repays the position including the fine"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldStakingBase.sol lines 263-264, 325-333",
+        "vulnerable_pattern": "Fine collected during repay stays in contract; no extraction function exists",
+        "specific_concern": "WETH/DAI accumulates in contract permanently; emergencyEtherTransfer only handles native ETH",
+        "missing_safeguards": "No ERC20 sweep function, no fine transfer to treasury"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can the pool admin rescue these funds through any existing mechanism?",
+          "Could YieldRegistry.rescue be used to extract ERC20 from the YieldStaking contract?",
+          "What is the expected volume of fines over protocol lifetime?"
+        ],
+        "validation_requirements": [
+          "Trigger a full stake->unstake(with fine)->repay cycle",
+          "Verify WETH balance of YieldStaking contract increases by fine amount",
+          "Verify no function can extract it"
+        ]
+      },
+      "preliminary_attack_scenario": "Not an attack per se, but a permanent loss: every time a yield position is force-unstaked with a fine, the fine amount in WETH/DAI becomes permanently locked. Over the protocol's lifetime, this accumulates into a significant sum that cannot be recovered.",
+      "prerequisites": [
+        "Bot-initiated unstakes with fines",
+        "Successful repay"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Cumulative loss of all collected unstake fines, growing over protocol lifetime",
+        "affected_users": "Protocol treasury / governance",
+        "recovery_possibility": "Requires contract upgrade to add sweep function"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test verifying fine extraction after repay",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Cumulative over protocol lifetime",
+        "detection_analysis": "Observable by checking ERC20 balance of YieldStaking contracts vs expected"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H005",
+      "title": "Missing Chainlink Price Staleness Time Check Allows Borrowing Against Stale Overvalued Collateral",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "PriceOracle.getAssetPriceFromChainlink validates `updatedAt != 0` and `answeredInRound >= roundId` but does not enforce a maximum age for the price data (e.g., `block.timestamp - updatedAt < MAX_STALENESS`). If a Chainlink feed's heartbeat stops or has significant delays, the protocol continues using the last known price indefinitely. An attacker observing a price drop in external markets (while the oracle is stale) can borrow maximum amounts against overvalued collateral.",
+      "investigation_rationale": "The Chainlink staleness validation is incomplete compared to industry best practices. The project documentation specifically mentions Oracle price manipulation as a risk area. While L2 sequencer uptime feeds add another layer, the base oracle contract itself lacks time-based freshness checks.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getAssetPriceFromChainlink"
+      ],
+      "affected_contracts": [
+        "PriceOracle.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PriceOracle.sol",
+          "function": "getAssetPriceFromChainlink"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PriceOracle.sol",
+        "lines": "81-89",
+        "pattern": "Missing (block.timestamp - updatedAt < MAX_STALENESS) check after latestRoundData"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Chainlink feed experiences a heartbeat delay or failure",
+        "Real market price diverges significantly from stale oracle price",
+        "Attacker has collateral assets to deposit"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PriceOracle.sol lines 81-89",
+        "vulnerable_pattern": "Only checks updatedAt != 0 and answeredInRound >= roundId, no max age",
+        "specific_concern": "Stale prices could persist for hours/days during oracle outages",
+        "missing_safeguards": "No block.timestamp - updatedAt threshold"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the historical maximum delay for Chainlink feeds used by this protocol?",
+          "How much collateral value inflation is possible during a realistic oracle delay?",
+          "Are there circuit-breaker mechanisms at the protocol level?"
+        ],
+        "validation_requirements": [
+          "Deploy with a mock Chainlink aggregator that returns old updatedAt",
+          "Verify borrow succeeds with stale price",
+          "Calculate potential loss during realistic delay scenarios"
+        ]
+      },
+      "preliminary_attack_scenario": "ETH Chainlink feed experiences a 2-hour delay during a 15% market crash. Attacker deposits ETH collateral valued at the stale high price, borrows maximum stablecoins, then waits for oracle to update. When the price corrects, the position is instantly underwater with 15% bad debt that liquidators may not fully recover.",
+      "prerequisites": [
+        "Chainlink oracle delay/outage",
+        "Significant market price movement during outage"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Bad debt proportional to price movement during oracle outage multiplied by TVL",
+        "affected_users": "All depositors of borrowed assets",
+        "recovery_possibility": "Liquidation may recover some but positions could be deeply underwater"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for stale oracle price exploitation",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "Significant collateral deposit",
+        "execution_timing": "Depends on oracle outage duration",
+        "detection_analysis": "Detectable by monitoring Chainlink feed updatedAt timestamps"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H006",
+      "title": "PoolManager dispatch() Can Delegatecall to address(0) If Module Is Uninstalled Without Removing Proxy Trust",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In PoolManager.dispatch(), if a trusted proxy's moduleImpl is address(0) (multi-proxy module), the function falls back to moduleLookup[moduleId]. If the module has been uninstalled (moduleLookup[moduleId] set to address(0)) but the proxy remains in trustedSenders, dispatch will delegatecall to address(0). A delegatecall to address(0) succeeds silently with no execution, returning empty data. This could cause callers expecting return data or state changes to silently receive incorrect results.",
+      "investigation_rationale": "The dispatch function lacks a require(moduleImpl != address(0)) check after resolution. A delegatecall to address(0) returns success with 0 return data, which could be misinterpreted by callers.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Module uninstalled without cleaning up trustedSenders for its proxy"
+      ],
+      "config_evidence": "No deployment evidence of module uninstallation procedure; Installer module logic not in scope to verify cleanup",
+      "affected_functions": [
+        "dispatch"
+      ],
+      "affected_contracts": [
+        "PoolManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PoolManager.sol",
+          "function": "dispatch"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PoolManager.sol",
+        "lines": "43-57",
+        "pattern": "No check that moduleImpl != address(0) before delegatecall; address(0) delegatecall returns success"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A module is uninstalled (moduleLookup[moduleId] = 0)",
+        "The module's proxy address remains in trustedSenders",
+        "A user calls the stale proxy"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PoolManager.sol lines 50-55",
+        "vulnerable_pattern": "if (moduleImpl == address(0)) moduleImpl = moduleLookup[moduleId]; then delegatecall(moduleImpl) without null check",
+        "specific_concern": "delegatecall to address(0) succeeds silently; user operations appear to succeed but no state changes occur",
+        "missing_safeguards": "No require(moduleImpl != address(0)) after fallback lookup"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the Installer module clean up trustedSenders when uninstalling?",
+          "What is the behavior of delegatecall(address(0)) with the assembly block?",
+          "Could silent success cause token loss (e.g., deposit succeeds but no accounting update)?"
+        ],
+        "validation_requirements": [
+          "Verify Installer's uninstall procedure (not in scope, need to check)",
+          "Test delegatecall to address(0) in the dispatch assembly",
+          "Simulate a deposit call through a stale proxy"
+        ]
+      },
+      "preliminary_attack_scenario": "After a module upgrade where the old module is removed, if the proxy's trustedSenders entry isn't cleaned up, users calling the old proxy would have their transactions silently succeed with no effect. For a deposit, the user's tokens are transferred to PoolManager but no supply accounting is updated, causing permanent token loss.",
+      "prerequisites": [
+        "Module uninstalled without proxy cleanup",
+        "Users still interact with stale proxy"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete loss of deposited assets for affected transactions",
+        "affected_users": "Any user interacting with the stale proxy",
+        "recovery_possibility": "Tokens stuck in PoolManager; recoverable only via admin emergency functions"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for module uninstall cleanup and stale proxy behavior",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Observable as transactions that succeed but produce no events or state changes"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "SavingsDai getAccountTotalUnstakedYield Underflow Blocks All New Stakes When sDai Value Drops",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "YieldSavingsDai.getAccountTotalUnstakedYield subtracts accountYieldInWithdraws from getAccountYieldBalance (sDai balance). If the sDai balance drops below the recorded withdrawal amount (due to an external sDai value decrease), the subtraction underflows in Solidity 0.8+, reverting the call. This function is called during _stake via _convertToYieldSharesWithTotalYield(vars.totalYieldBeforeDeposit), which calls getAccountTotalUnstakedYield. Any revert here blocks ALL new stakes to any NFT using the same yield account.",
+      "investigation_rationale": "The SavingsDai override records sd.withdrawAmount during unstake based on current sDai share value. If sDai's exchange rate changes (MakerDAO DSR adjustment), the actual balance could diverge from recorded withdrawal amounts. The require(balance >= inWithdraw) is implicit via unchecked subtraction.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getAccountTotalUnstakedYield",
+        "_stake"
+      ],
+      "affected_contracts": [
+        "YieldSavingsDai.sol",
+        "YieldStakingBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldSavingsDai.sol",
+          "function": "getAccountTotalUnstakedYield"
+        },
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_stake"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldSavingsDai.sol",
+        "lines": "80-86",
+        "pattern": "return balance - inWithdraw; underflows if sDai value dropped since unstake"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User has an active stake AND a pending unstake on the same yield account",
+        "sDai exchange rate or balance decreases after unstake (e.g., MakerDAO DSR reduction)",
+        "accountYieldInWithdraws > current sDai balance"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldSavingsDai.sol lines 80-86",
+        "vulnerable_pattern": "balance - inWithdraw with no underflow protection",
+        "specific_concern": "Blocks new stakes; existing unstake positions also affected if they call this path",
+        "missing_safeguards": "No min(balance, inWithdraw) or safe subtraction"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How volatile is the sDai exchange rate in practice?",
+          "Can the user resolve the situation by completing the pending repay first?",
+          "Does this affect repay operations as well or only new stakes?"
+        ],
+        "validation_requirements": [
+          "Simulate sDai value decrease between unstake and next stake attempt",
+          "Verify revert in getAccountTotalUnstakedYield",
+          "Test whether repay still works (it doesn't call getAccountTotalUnstakedYield)"
+        ]
+      },
+      "preliminary_attack_scenario": "User stakes NFT A, later unstakes it (withdrawAmount recorded). Before repaying, MakerDAO reduces DSR causing sDai balance to drop slightly. User tries to stake NFT B but getAccountTotalUnstakedYield reverts due to underflow. The yield account is DoS'd for all new stakes until the pending repay completes.",
+      "prerequisites": [
+        "Pending unstake on yield account",
+        "sDai value decrease"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Temporary DoS on new stake operations for affected yield accounts",
+        "affected_users": "Users with pending unstakes during sDai value changes",
+        "recovery_possibility": "Completing pending repay resolves the issue"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for sDai value decrease between unstake and new stake",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Depends on external sDai rate changes",
+        "detection_analysis": "Observable as reverted stake transactions"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H008",
+      "title": "Debt Dust Accumulation Via Rounding to Zero in Health Factor Calculation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In GenericLogic._getUserERC20DebtInBaseCurrency, the calculation `(assetPrice * userTotalDebt) / (10 ** assetData.underlyingDecimals)` performs integer division that can truncate small debt amounts to zero. For assets with high decimals (18) and relatively low unit prices, an attacker could open many tiny borrow positions across different groups where each rounds to 0 in the health factor calculation, accumulating real debt that is invisible to the health factor check.",
+      "investigation_rationale": "The division by 10^18 for 18-decimal tokens means the numerator (assetPrice * debt) must exceed 10^18 for the result to be non-zero. For tokens with low base-currency price and small positions, this truncates. The attacker can repeat this across multiple groups and assets to accumulate invisible debt.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_getUserERC20DebtInBaseCurrency",
+        "calculateUserAccountData"
+      ],
+      "affected_contracts": [
+        "GenericLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "GenericLogic.sol",
+          "function": "_getUserERC20DebtInBaseCurrency"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "GenericLogic.sol",
+        "lines": "200-207",
+        "pattern": "userTotalDebt = assetPrice * userTotalDebt; return userTotalDebt / (10 ** assetData.underlyingDecimals); truncates small debts"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Asset has 18 decimals",
+        "Asset price in base currency is low enough that small debts round to 0",
+        "Multiple borrow groups available for the same asset"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "GenericLogic.sol lines 200-207",
+        "vulnerable_pattern": "Integer division truncating small debt amounts to 0 in base currency",
+        "specific_concern": "Health factor shows infinity while actual debt exists; user can borrow without collateral impact",
+        "missing_safeguards": "No minimum debt amount per borrow operation that prevents rounding to zero"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "For deployed assets (WETH, USDT, DAI), what is the minimum borrow to avoid truncation?",
+          "How many zero-truncated borrows would an attacker need to accumulate meaningful debt?",
+          "Does the minimum borrow check in validation prevent this (amounts > 0 is checked but is that sufficient)?"
+        ],
+        "validation_requirements": [
+          "Calculate exact threshold for debt truncation per asset",
+          "Attempt multiple micro-borrows and verify health factor remains max",
+          "Estimate gas cost vs profit potential"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker opens many tiny borrow positions across groups, each small enough that debt rounds to 0 in base currency. Health factor stays at type(uint256).max. Attacker withdraws all collateral while retaining unpayable micro-debts across all groups.",
+      "prerequisites": [
+        "Multiple borrow groups available",
+        "Low-price or high-decimal assets"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Limited per position but scales with number of groups and iterations; likely minor",
+        "affected_users": "Protocol absorbs dust bad debt",
+        "recovery_possibility": "Unrecoverable dust debt; individually small but cumulative"
+      },
+      "investigation_complexity": "high",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for micro-borrow debt truncation in health factor",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Gas cost per micro-borrow vs dust profit",
+        "capital_requirements": "Minimal collateral + gas",
+        "execution_timing": "Multiple transactions needed",
+        "detection_analysis": "Detectable by comparing actual scaled debt vs health-factor-visible debt"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "Yield Staking Debt Share Desynchronization via Direct yieldRepayERC20 Bypass",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The Yield module's yieldRepayERC20 is callable by any whitelisted yield manager address. If someone calls poolYield.yieldRepayERC20 directly (not through YieldStakingBase._repay), it reduces the actual pool debt (getTotalDebt) without reducing totalDebtShare in the YieldStaking contract. This desynchronizes the share-to-asset ratio, causing convertToDebtAssets to return less than actual debt per share. Remaining stakers' debt shares now represent less actual debt, and the lending pool cannot recover the full borrowed amount.",
+      "investigation_rationale": "YieldStakingBase.convertToDebtAssets uses ShareUtils with totalDebtShare and getTotalDebt(poolId). If getTotalDebt decreases without totalDebtShare decreasing proportionally, the per-share value drops. The Yield module sets isExternalCaller=true for direct calls, using the caller's address as staker. If the YieldStaking contract address is the staker in the pool, anyone with access to repay on its behalf could desync.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "yieldRepayERC20",
+        "convertToDebtAssets",
+        "_repay"
+      ],
+      "affected_contracts": [
+        "Yield.sol",
+        "YieldStakingBase.sol",
+        "YieldLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Yield.sol",
+          "function": "yieldRepayERC20"
+        },
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "convertToDebtAssets"
+        },
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_repay"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "430-432",
+        "pattern": "convertToDebtAssets depends on getTotalDebt which can be reduced externally without updating totalDebtShare"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "The YieldStaking contract's pool debt can be partially repaid by an external caller",
+        "Caller has the underlying tokens and calls yieldRepayERC20 with the YieldStaking contract's identity",
+        "The Yield module accepts repayment from external callers for the same staker address"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldStakingBase.sol convertToDebtAssets and Yield.sol yieldRepayERC20",
+        "vulnerable_pattern": "External repayment reduces pool debt without updating internal share accounting",
+        "specific_concern": "All stakers' debt-per-share decreases, causing underpayment on repay",
+        "missing_safeguards": "No mechanism to detect or prevent external debt modifications"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can anyone call yieldRepayERC20 for the YieldStaking contract's address?",
+          "Does the Yield module's auth mechanism prevent this?",
+          "What is the actual msgSender resolution when calling through the Proxy?"
+        ],
+        "validation_requirements": [
+          "Attempt to call yieldRepayERC20 from an external address for the YieldStaking staker",
+          "Verify whether the pool debt decreases without totalDebtShare change",
+          "Calculate the impact on remaining stakers' debt obligations"
+        ]
+      },
+      "preliminary_attack_scenario": "If an attacker can partially repay the YieldStaking contract's pool debt externally, it deflates the debt-per-share ratio. When other stakers repay through the normal flow, they repay less actual debt than expected (since convertToDebtAssets returns a deflated amount). The lending pool ends up with unrecoverable debt.",
+      "prerequisites": [
+        "Ability to call yieldRepayERC20 impersonating the YieldStaking contract",
+        "Underlying tokens for partial repayment"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Lending pool receives less repayment than owed; bad debt proportional to manipulated amount",
+        "affected_users": "Lending pool depositors",
+        "recovery_possibility": "Permanent loss unless protocol detects and corrects"
+      },
+      "investigation_complexity": "high",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for external debt repayment desynchronizing share accounting",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "Tokens for partial repayment",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Detectable by comparing totalDebtShare * debtPerShare vs actual pool debt"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "ERC721 Cross Supply Decrease Missing Owner Verification Allows Accounting Corruption",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "VaultLogic.erc721DecreaseCrossSupply checks tokenData.supplyMode == SUPPLY_MODE_CROSS but does NOT verify tokenData.owner == user parameter. If a caller (via module code) passes a different user address than the actual token owner, the userScaledCrossSupply of the wrong user gets decremented while the actual owner's count stays inflated. This could lead to the owner retaining phantom collateral counting.",
+      "investigation_rationale": "The erc721TransferCrossSupply function does verify ownership per token, but erc721DecreaseCrossSupply (used in withdrawals) only checks supplyMode. If the higher-level code passes the wrong user parameter, accounting is silently corrupted. The withdrawal validation does check tokenData.owner == onBehalf, so exploitation depends on whether there's a code path that bypasses this.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "erc721DecreaseCrossSupply"
+      ],
+      "affected_contracts": [
+        "VaultLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "VaultLogic.sol",
+          "function": "erc721DecreaseCrossSupply"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "VaultLogic.sol",
+        "lines": "340-350",
+        "pattern": "No require(tokenData.owner == user) check; only checks supplyMode"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A module code path passes incorrect user to erc721DecreaseCrossSupply",
+        "The higher-level validation is missing or bypassable for the specific code path"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "VaultLogic.sol lines 340-350",
+        "vulnerable_pattern": "erc721DecreaseCrossSupply lacks owner verification; relies entirely on caller correctness",
+        "specific_concern": "If any module passes wrong user, accounting becomes inconsistent",
+        "missing_safeguards": "No require(tokenData.owner == user) in the decrease function itself"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Do all callers of erc721DecreaseCrossSupply correctly pass the token owner?",
+          "Is there any code path (liquidation, flash loan return, etc.) where the user parameter could diverge?",
+          "What downstream effects would mismatched userScaledCrossSupply have?"
+        ],
+        "validation_requirements": [
+          "Audit all call sites of erc721DecreaseCrossSupply",
+          "Verify each passes the correct user address",
+          "Test with intentionally wrong user to observe corruption"
+        ]
+      },
+      "preliminary_attack_scenario": "If a liquidation or transfer code path incorrectly passes the wrong user to erc721DecreaseCrossSupply, the original owner retains phantom collateral count while their tokens are removed. This inflates their collateral value in health factor calculations, allowing them to maintain borrows against non-existent collateral.",
+      "prerequisites": [
+        "A module code path that passes wrong user address",
+        "Token in cross supply mode"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Phantom collateral allows undercollateralized borrowing; bad debt for protocol",
+        "affected_users": "All lending pool participants",
+        "recovery_possibility": "Requires identifying and correcting mismatched accounting"
+      },
+      "investigation_complexity": "high",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test verifying owner parameter consistency across all erc721DecreaseCrossSupply callers",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "NFT collateral",
+        "execution_timing": "Single transaction if exploitable code path exists",
+        "detection_analysis": "Detectable by comparing sum of user supplies vs total supply per asset"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H011",
+      "title": "Yield Staking createYieldAccount Callable by Anyone for Any User Without Authorization",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "YieldStakingBase.createYieldAccount(address user) is a public function with no access control - anyone can create a yield account for any user address. Since yieldAccounts[user] can only be set once (the function reverts if already set), this means an attacker can front-run a user's createYieldAccount call on chains with public mempools, or simply grief by creating accounts for addresses that haven't requested them. The created account is legitimate (managed by the correct yield manager), so there's no direct fund loss, but it consumes gas from the attacker and could interfere with deployment patterns.",
+      "investigation_rationale": "The function has no msg.sender == user check. On the target chains (some without public mempool), the griefing vector is limited. However, the lack of access control is a code defect regardless.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "createYieldAccount"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "createYieldAccount"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "118-124",
+        "pattern": "No msg.sender == user check; anyone can create account for any address"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Target user hasn't created a yield account yet"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldStakingBase.sol lines 118-124",
+        "vulnerable_pattern": "Public function creates yield account for arbitrary address without authorization",
+        "specific_concern": "No msg.sender validation; anyone can call for any user",
+        "missing_safeguards": "Missing require(msg.sender == user) or similar"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does creating a yield account for a user have any negative consequences for them?",
+          "Could a maliciously timed account creation affect the user's subsequent interactions?",
+          "Are there any approval setup differences if account is created by non-owner?"
+        ],
+        "validation_requirements": [
+          "Call createYieldAccount for a user from a different address",
+          "Verify the user can still use all staking functions normally",
+          "Check if approvals are set correctly"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker calls createYieldAccount for a target user before the user does. The account is created normally and the user can still use it. Impact is primarily gas griefing on chains with public mempools (not applicable to target L2 chains).",
+      "prerequisites": [
+        "Target user has no yield account yet"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Minimal - no fund loss; griefing only",
+        "affected_users": "Users who haven't created accounts",
+        "recovery_possibility": "Created account is functional; no recovery needed"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "low",
+      "test_coverage_gap": "No test for unauthorized yield account creation",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "Gas only",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Observable on-chain"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H012",
+      "title": "Yield cap bypass: yield borrow uses borrowIndex instead of supplyIndex, enabling over-borrowing from pool",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In YieldLogic.executeYieldBorrowERC20(), the 'totalSupply' used to enforce yieldCap/yieldManagerCap is computed using groupData.borrowIndex (yield group's borrow index) instead of assetData.supplyIndex (supply index). Since borrowIndex generally grows faster than supplyIndex, the cap denominator becomes inflated over time, allowing a whitelisted yield staker to borrow more than the intended fraction of actual supplied assets, potentially draining liquidity and harming lenders/borrowers.",
+      "investigation_rationale": "This is a concrete accounting/indexing defect on a critical limiter (yield caps). If confirmed, it directly violates yield risk limits and can cause insolvency/illiquidity events even without oracle or MEV assumptions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeYieldBorrowERC20(InputTypes.ExecuteYieldBorrowERC20Params)"
+      ],
+      "affected_contracts": [
+        "YieldLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldLogic.sol",
+          "function": "executeYieldBorrowERC20(InputTypes.ExecuteYieldBorrowERC20Params)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldLogic.sol",
+        "lines": "39-76",
+        "pattern": "vars.totalSupply = VaultLogic.erc20GetTotalCrossSupply(assetData, groupData.borrowIndex); // should use assetData.supplyIndex for total supply"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Pool has yield enabled and asset has yield enabled with non-zero assetData.yieldCap and staker ymData.yieldCap",
+        "Attacker controls a whitelisted yield staker address (or compromises one) that can call Yield.yieldBorrowERC20()",
+        "Time passes / interest accrues such that yield-group borrowIndex diverges upward relative to supplyIndex"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldLogic.sol lines ~50-60",
+        "vulnerable_pattern": "cap computed from wrong index (borrowIndex instead of supplyIndex)",
+        "specific_concern": "caps become progressively looser as borrowIndex compounds, permitting larger borrows than policy intends",
+        "missing_safeguards": "No secondary cap enforced using supplyIndex/actual deposits; relies solely on inflated totalSupply metric"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Should yield cap be based on total supplied assets (supplyIndex) rather than totalBorrowIndex?",
+          "How large can borrowIndex/supplyIndex divergence get under realistic IRM + feeFactor settings?",
+          "Can a staker borrow up to availableLiquidity and starve normal users while staying under inflated caps?"
+        ],
+        "validation_requirements": [
+          "Unit test showing cap check passes with borrowIndex>>supplyIndex while intended cap (supplyIndex) would fail",
+          "Simulate multi-period accrual with feeFactor>0 and utilization>0 to quantify divergence",
+          "Confirm no other module enforces a tighter yield borrow cap"
+        ]
+      },
+      "preliminary_attack_scenario": "A whitelisted yield staker waits until borrowIndex materially exceeds supplyIndex, then repeatedly calls yieldBorrowERC20() to draw liquidity up to (inflated) cap limits, causing pool illiquidity and potentially bad debt if the staker cannot repay.",
+      "prerequisites": [
+        "Whitelisted yield manager address (or compromised key) with configured ymData.yieldCap",
+        "Sufficient pool liquidity exists to withdraw"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Borrowing beyond intended caps can drain liquidity and increase insolvency risk; may lead to lender losses during stress",
+        "affected_users": "All suppliers and borrowers of the affected ERC20 asset",
+        "recovery_possibility": "Operational recovery possible (pause/disable yield), but funds may already be withdrawn"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "Likely missing invariant test that yield caps are computed using supplyIndex (not borrowIndex)",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "none",
+        "capital_requirements": "Depends on pool size; attack uses ordinary yieldBorrow calls",
+        "execution_timing": "Multi-block (benefits from time/interest accrual)",
+        "detection_analysis": "Monitor ratio borrowIndex/supplyIndex and yield borrows approaching availableLiquidity"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H013",
+      "title": "Unbounded loop DoS on core operations via adversarially large groupList/assetList iteration",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Multiple non-view paths iterate over dynamic EnumerableSet lists (assetData.groupList.values(), poolData.assetList.values()). If these sets grow large (or approach configured maxima) operations that must update interest or compute borrows may exceed gas limits and become uncallable. This can DoS borrowing/repaying/liquidation/fee collection paths that depend on iterating all groups for an asset.",
+      "investigation_rationale": "Even with MAX_NUMBER_OF_ASSET/GROUP caps, practical gas limits on L2/L1 can make some transactions fail. This is especially concerning for safety-critical paths like interest update and fee accrual that happen inside many state-changing flows.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Admins configure pools with many assets and/or many groups per asset near protocol maximums",
+        "Core user operations call functions that iterate across all groups/assets for accounting/validation"
+      ],
+      "config_evidence": "Code contains loops over EnumerableSet values; no deployment evidence that caps are kept small beyond Constants.* limits (not shown in provided snippet).",
+      "affected_functions": [
+        "updateInterestIndexs(DataTypes.PoolData,DataTypes.AssetData)",
+        "erc20GetTotalCrossBorrowInAsset(DataTypes.AssetData)",
+        "erc20GetTotalIsolateBorrowInAsset(DataTypes.AssetData)",
+        "erc20GetUserScaledCrossBorrowInAsset(DataTypes.PoolData,DataTypes.AssetData,address)",
+        "erc20GetUserCrossBorrowInAsset(DataTypes.PoolData,DataTypes.AssetData,address)",
+        "executeRemovePoolGroup(address,uint32,uint8)",
+        "executeCollectFeeToTreasury(address,uint32,address[])"
+      ],
+      "affected_contracts": [
+        "InterestLogic.sol",
+        "VaultLogic.sol",
+        "ConfigureLogic.sol",
+        "PoolLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InterestLogic.sol",
+          "function": "updateInterestIndexs(DataTypes.PoolData storage, DataTypes.AssetData storage)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InterestLogic.sol",
+        "lines": "79-110",
+        "pattern": "for loop over assetData.groupList.values() updating every group each time updateInterestIndexs is called"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "assetData.groupList contains many entries",
+        "A state-changing function on the asset calls updateInterestIndexs() (common pattern)",
+        "Block gas limit is insufficient for worst-case iteration + external IRM calls/events"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "InterestLogic.sol updateInterestIndexs(); VaultLogic erc20GetTotalCrossBorrowInAsset(); ConfigureLogic.executeRemovePoolGroup()",
+        "vulnerable_pattern": "linear iteration over dynamic sets in state-changing contexts",
+        "specific_concern": "gas blowups can freeze risk-critical actions (repay, liquidation, configuration cleanups)",
+        "missing_safeguards": "No pagination / bounded per-tx processing / per-group incremental update mechanism"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What are actual Constants.MAX_NUMBER_OF_GROUP / MAX_NUMBER_OF_ASSET values?",
+          "Are updateInterestIndexs() and debt calculations invoked inside liquidation/withdraw paths (not shown here)?",
+          "Can an attacker indirectly force worst-case loops (e.g., by choosing assets with many groups)?"
+        ],
+        "validation_requirements": [
+          "Gas profiling with max group count and typical IRM implementations",
+          "Identify all state-changing call paths that transitively invoke these loops",
+          "Check whether any safety operations become impossible at configured maxima"
+        ]
+      },
+      "preliminary_attack_scenario": "If a pool is configured with many groups per asset, ordinary user actions that require interest update may revert due to out-of-gas, effectively freezing the market for that asset and preventing repayments/liquidations.",
+      "prerequisites": [
+        "Large configuration of groups/assets (admin action or long-lived pool evolution)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Market freeze can prevent liquidations/repays leading to bad debt accumulation; can also block withdrawals",
+        "affected_users": "All users interacting with affected assets/pools",
+        "recovery_possibility": "Requires admin reconfiguration (remove groups/assets), which itself may be gas-heavy"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "Likely missing max-size gas tests and 'still-liquidatable at max config' tests",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Yes—worst-case max group iteration including external IRM calls",
+        "capital_requirements": "none",
+        "execution_timing": "multi-block (configuration growth), but DoS manifests immediately",
+        "detection_analysis": "Track gas used per operation as group count increases"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "External Callers Can Directly Borrow From Yield Pool Without YieldStaking Collateral",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The Yield.yieldBorrowERC20 function is publicly callable by any address through the Yield module proxy. The only authorization is that the caller's address must have yieldCap > 0 in the asset's yieldManagerLookup. If the pool admin has set yieldCap for an address (e.g., a YieldStaking contract), AND that address has its own externally accessible entry points, OR if yieldCap is misconfigured for a non-manager address, that address can borrow directly from the yield pool without posting any collateral via the YieldStaking flow.",
+      "investigation_rationale": "The yield borrow mechanism relies on the YieldStaking contract as the enforcement layer for collateral. If someone can call yieldBorrowERC20 directly (bypassing YieldStaking), they get uncollateralized loans. The pool admin must carefully manage yieldCap assignments.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "yieldCap is set for an address that can also directly call yieldBorrowERC20 without going through proper collateral flow"
+      ],
+      "config_evidence": "InitConfigYield.s.sol sets yieldCap for YieldStaking addresses via configurator.setManagerYieldCap; Yield.sol yieldBorrowERC20 has no additional collateral check beyond cap",
+      "affected_functions": [
+        "yieldBorrowERC20",
+        "executeYieldBorrowERC20"
+      ],
+      "affected_contracts": [
+        "Yield.sol",
+        "YieldLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Yield.sol",
+          "function": "yieldBorrowERC20"
+        },
+        {
+          "file": "YieldLogic.sol",
+          "function": "executeYieldBorrowERC20"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldLogic.sol",
+        "lines": "19-54",
+        "pattern": "No collateral verification in yield borrow - only checks yield caps, not whether caller has posted NFT collateral"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Caller has yieldCap > 0 set by admin for their address",
+        "Caller can call yieldBorrowERC20 through Yield proxy directly",
+        "Sufficient pool liquidity available"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "validateYieldBorrowERC20 only checks caps, not collateral backing",
+        "manipulation_vector": "If yieldCap is set for any address that isn't a properly-secured yield manager, that address can drain liquidity",
+        "profit_hypothesis": "Borrow up to yieldCap% of total supply without any collateral"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can the YieldStaking contract address itself be used to borrow directly via the proxy?",
+          "Are there any other addresses with yieldCap that could be exploited?",
+          "What prevents arbitrary callers from having yieldCap set?"
+        ],
+        "validation_requirements": [
+          "Verify that only admin can set yieldCap",
+          "Check if YieldStaking address calling through Yield proxy bypasses its own collateral checks",
+          "Test direct yieldBorrowERC20 call from a whitelisted address"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (uncollateralized borrow)",
+        "estimated_execution_cost": "Gas for borrow transaction",
+        "potential_profit_range": "Up to yieldCap% of total supply",
+        "estimated_profit_margin": "Near infinite if successful (no capital required)",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Available pool liquidity",
+        "optimal_timing": "When pool has maximum liquidity",
+        "market_impact_assessment": "Direct loss of lending pool liquidity"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All pool depositors",
+        "estimated_impact_per_user": "Up to yieldCap% of their deposits",
+        "total_value_at_risk": "yieldCap% of total pool supply (deployed at 20%)"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "yieldCap=2000 (20%), whitelisted addresses from deployment",
+        "calculation_validation": "Attempt direct yieldBorrowERC20 from whitelisted address",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Interest Rate Index uint128 Overflow Permanently Bricks Asset Operations",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Supply and borrow indices are stored as uint128 and updated via SafeCast.toUint128(). Starting from 1e27 (RAY), the maximum growth factor before overflow is ~3.4e11x. While this seems large, a misconfigured interest rate model returning extremely high rates, or a prolonged period without any interaction on a high-rate asset, could cause the index to overflow. Once this happens, all operations on the asset (deposit, withdraw, borrow, repay) permanently revert.",
+      "investigation_rationale": "The overflow is irreversible - there is no admin recovery mechanism. The asset becomes permanently bricked, locking all user funds. Even legitimate rate models could produce dangerously high indices over long time horizons without user interaction to reset the timestamp.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Interest rate model returns extremely high rates, or asset goes without interaction for extended period"
+      ],
+      "config_evidence": "InterestLogic.sol uses .toUint128() for both supplyIndex and borrowIndex; deployed rate models have base rates up to 10% with slope up to 100%",
+      "affected_functions": [
+        "_updateSupplyIndex",
+        "_updateBorrowIndex",
+        "updateInterestIndexs"
+      ],
+      "affected_contracts": [
+        "InterestLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InterestLogic.sol",
+          "function": "_updateSupplyIndex"
+        },
+        {
+          "file": "InterestLogic.sol",
+          "function": "_updateBorrowIndex"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InterestLogic.sol",
+        "lines": "163-166, 176-181",
+        "pattern": "assetData.supplyIndex = nextSupplyIndex.toUint128() and groupData.borrowIndex = nextBorrowIndex.toUint128() — SafeCast reverts on overflow with no recovery"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Interest rate model returns very high rates (>100% APY compounded)",
+        "No interaction with the asset for an extended period",
+        "borrowIndex * compoundedInterest exceeds type(uint128).max"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "toUint128() will revert when index exceeds ~3.4e38; starting from 1e27, this allows ~3.4e11x growth",
+        "manipulation_vector": "Set up conditions where no one interacts with asset while high rates compound; or admin sets malicious rate model",
+        "profit_hypothesis": "No direct profit; permanent DoS locks all user funds in the asset"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "At maximum deployed rate (100% slope), how long until overflow?",
+          "Can the rate model be manipulated to return rates that cause faster overflow?",
+          "What are the time bounds for different rate scenarios?"
+        ],
+        "validation_requirements": [
+          "Calculate maximum time-to-overflow for deployed rate model parameters",
+          "Test what happens when toUint128 reverts in updateInterestIndexs",
+          "Verify no recovery mechanism exists"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - DoS attack",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A - funds locked permanently",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Depends on rate model; potentially years at normal rates, much less with extreme rates"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "When asset has high utilization (high rates) and no activity",
+        "market_impact_assessment": "All deposited and borrowed funds for the asset permanently frozen"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All depositors and borrowers of the affected asset",
+        "estimated_impact_per_user": "100% of their deposited/borrowed amount in that asset",
+        "total_value_at_risk": "Total supply + total borrow for the asset"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Max rate = baseRate(10%) + slope(100%) at 100% utilization = 110% APY compound",
+        "calculation_validation": "At 110% APY: 1.1^n * 1e27 > 3.4e38 → n > log(3.4e11)/log(1.1) ≈ 279 years (safe at normal rates)",
+        "execution_complexity": "high",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H016",
+      "title": "Isolate Auction Griefing via Reverting Fallbacks",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial_of_Service",
+      "hypothesis_description": "Attackers can win isolate NFT auctions at their initial bid price by bidding from a smart contract that reverts on receiving ERC20 refunds.",
+      "investigation_rationale": "In VaultLogic.erc20TransferOutBidAmount, the protocol refunds the previous bidder using safeTransfer. If the previous bidder is a smart contract that reverts upon receiving tokens, the safeTransfer will revert, preventing any subsequent bids from succeeding.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Debt asset is an ERC20 token with transfer hooks (e.g., ERC777) or blocklists (e.g., USDC)"
+      ],
+      "config_evidence": "InitConfigPool.s.sol configures USDT as an asset, which has a blocklist.",
+      "affected_functions": [
+        "erc20TransferOutBidAmount"
+      ],
+      "affected_contracts": [
+        "VaultLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "VaultLogic.sol",
+          "function": "erc20TransferOutBidAmount"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "VaultLogic.sol",
+        "lines": "382-383",
+        "pattern": "IERC20Upgradeable(asset).safeTransfer(to, amount);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Isolate loan is in AUCTION state",
+        "Attacker places the first bid",
+        "Attacker's address causes safeTransfer to revert (e.g., via blocklist or token hooks)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Push-based refund mechanism instead of pull-based.",
+        "manipulation_vector": "Attacker forces the refund transfer to revert, locking the auction state and preventing higher bids.",
+        "profit_hypothesis": "Attacker wins the liquidated NFT at the minimum bid price, extracting maximum value from the liquidation."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does the protocol support any ERC20 tokens with transfer hooks or blocklists?",
+          "Can an attacker easily get themselves blocklisted after bidding?"
+        ],
+        "validation_requirements": [
+          "Simulate a bid from a reverting contract (if token allows hooks) or a blocklisted address",
+          "Attempt to place a higher bid and verify it reverts"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimum bid amount",
+        "estimated_execution_cost": "Standard bid gas costs",
+        "potential_profit_range": "Difference between NFT market value and minimum bid",
+        "estimated_profit_margin": "10-50% depending on NFT value",
+        "attack_duration": "Auction duration (e.g., 1 days)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Immediately after auction starts",
+        "market_impact_assessment": "Borrower loses NFT at worst possible price, protocol may accrue bad debt if bid doesn't cover loan"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "NFT Borrower and Protocol",
+        "estimated_impact_per_user": "Loss of NFT equity",
+        "total_value_at_risk": "Value of auctioned NFTs"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Supported ERC20 token semantics",
+        "calculation_validation": "Refund logic",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H020",
+      "title": "RepayETH Function Allows BotAdmin to Force User WETH Spending",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "The repayETH logic flaw allows the botAdmin to extract WETH from the NFT owner's wallet while keeping the ETH they sent.",
+      "investigation_rationale": "In YieldEthStakingEtherfi.repayETH, the function wraps incoming ETH to WETH and transfers it to msg.sender. It then calls super.repay. If botAdmin calls this function, the bot receives the WETH. However, super.repay will pull any extraAmount shortfall directly from the nftOwner's wallet via safeTransferFrom. This allows the botAdmin to force the NFT owner to pay the shortfall from their own WETH balance, while the botAdmin gets their ETH back as WETH.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "repayETH"
+      ],
+      "affected_contracts": [
+        "YieldEthStakingEtherfi.sol",
+        "YieldEthStakingLido.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldEthStakingEtherfi.sol",
+          "function": "repayETH"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldEthStakingEtherfi.sol",
+        "lines": "55-56",
+        "pattern": "IWETH(address(underlyingAsset)).transfer(msg.sender, msg.value);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Yield position is unhealthy and requires liquidation",
+        "Claimed yield is less than debt + fine (extraAmount > 0)",
+        "NFT owner has sufficient WETH balance and approval"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "WETH is transferred to msg.sender, but shortfall is pulled from nftOwner",
+        "manipulation_vector": "botAdmin calls repayETH with ETH, receives WETH, and forces the contract to pull the shortfall from the user.",
+        "profit_hypothesis": "botAdmin doesn't directly profit (they just swap ETH for WETH), but they force the user to pay the shortfall out of pocket, which might not be the intended liquidation mechanics."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is it intended for the botAdmin to be able to force WETH spending from the user?",
+          "Why does repayETH transfer WETH to msg.sender instead of keeping it for the repayment?"
+        ],
+        "validation_requirements": [
+          "Test botAdmin calling repayETH with msg.value > 0",
+          "Verify botAdmin receives WETH and user's WETH balance decreases"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "ETH to send with transaction",
+        "estimated_execution_cost": "Standard gas costs",
+        "potential_profit_range": "None directly, griefing the user",
+        "estimated_profit_margin": "0%",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During liquidation",
+        "market_impact_assessment": "User experiences unexpected WETH deduction"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "NFT Owner",
+        "estimated_impact_per_user": "Loss of WETH equal to shortfall",
+        "total_value_at_risk": "User's approved WETH balance"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "repayETH logic flow",
+        "calculation_validation": "WETH transfer destinations",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "OPS-H015",
+      "title": "CollectFeeToTreasury may mis-account fees by zeroing accruedFee before interest update (fee-loss / accounting skew)",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Fee collection reads accruedFee, sets accruedFee to 0, then updates interest indices which can accrue additional fees for the same asset and groups. This sequencing may cause newly accrued fees during updateInterestIndexs to remain in storage (good) but the collected amount is computed using the pre-update accruedFee with post-update normalizedIncome. If accruedFee is defined as scaled by the then-current supplyIndex, mixing pre-update accruedFee with post-update normalizedIncome could over/under-collect depending on timing and index movement, producing treasury accounting distortion and potentially affecting cap checks relying on accruedFee.",
+      "investigation_rationale": "This is not the classic 'external call before state update' bug; it is a sequencing/accounting correctness issue. Because fee minting affects totalScaledCrossSupply and supply cap checks include accruedFee, any skew can have operational effects (treasury claims too much/too little; supply cap mis-enforced). Needs Phase D math validation with realistic index transitions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeCollectFeeToTreasury()",
+        "updateInterestIndexs()",
+        "_accrueFeeToTreasury()"
+      ],
+      "affected_contracts": [
+        "PoolLogic.sol",
+        "InterestLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PoolLogic.sol",
+          "function": "executeCollectFeeToTreasury()"
+        },
+        {
+          "file": "InterestLogic.sol",
+          "function": "updateInterestIndexs"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PoolLogic.sol",
+        "lines": "33-78",
+        "pattern": "accruedFee=assetData.accruedFee; assetData.accruedFee=0; InterestLogic.updateInterestIndexs(...); normalizedIncome=...; amountToCollect=accruedFee.rayMul(normalizedIncome)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "assetData.accruedFee > 0",
+        "InterestLogic.updateInterestIndexs in the same call causes supplyIndex and/or borrowIndex to change (time has passed, debt exists, feeFactor > 0)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Uses pre-update scaled fee with post-update index multiplier; potential unit mismatch",
+        "admin_dependency": "Triggered by pool admin (normal ops)",
+        "exploitation_window": "Whenever fees are collected after long time gaps or volatile rates"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is accruedFee intended to be stored in scaled units at time of accrual, and is collection using correct index snapshot?",
+          "Does updateInterestIndexs accrue additional fees after accruedFee is zeroed and does that cause drift?",
+          "Could an attacker influence timing of fee collection to change treasury mint amounts (without mempool assumptions)?"
+        ],
+        "validation_requirements": [
+          "Formal unit analysis of accruedFee and normalizedIncome at each point",
+          "Simulate collection across multiple blocks with changing rates and verify collected value equals intended fee share",
+          "Check interactions with supplyCap validation that adds accruedFee into totalSupplyWithFee"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Let fees accrue over time with significant index movement",
+        "phase_2": "Call/trigger fee collection (admin operation) and compare treasury minted amount to expected",
+        "phase_3": "Assess downstream: supply caps, treasury withdraw/claims, solvency invariants"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None (but admin action required to collect)",
+        "operational_disruption": "Accounting drift in treasury balances; potential cap mis-enforcement",
+        "recovery_difficulty": "Medium (may require accounting correction/migration)",
+        "affected_operations": "Fee revenue, supply caps, treasury accounting"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Advanced (needs numeric analysis)",
+        "operational_timing": "Long gaps between interest updates increase sensitivity"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Treasury minted supply jumps inconsistent with borrower interest paid",
+        "operational_anomalies": "Supply cap rejections/acceptances around fee collection events",
+        "behavioral_patterns": "Large time gaps between fee collections",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "ECON2-H004",
+      "title": "Unstake Fine is Economically Negligible Due to uint16 Type and Direct Addition",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Security Features",
+      "hypothesis_description": "The `maxUnstakeFine` is defined as a `uint16`, limiting its maximum value to 65,535. In `_repay`, this fine is added directly to the debt (`vars.nftDebt + sd.unstakeFine`), which is denominated in WETH (18 decimals). A maximum fine of 65,535 wei is worth a fraction of a cent, completely breaking the economic penalty for liquidation.",
+      "investigation_rationale": "Without a meaningful liquidation penalty, users have free optionality. They can take maximum leverage and simply let the bot liquidate them if the market drops, socializing their losses without penalty.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Underlying asset has 18 decimals (e.g., WETH, DAI)"
+      ],
+      "config_evidence": "InitConfigYield.s.sol line 84: yieldEthStakingLido.setNftUnstakeParams(address(addrWPUNK), 100, 1.05e18); sets fine to 100 wei.",
+      "affected_functions": [
+        "setNftUnstakeParams",
+        "_repay"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "_repay"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "262",
+        "pattern": "vars.nftDebtWithFine = vars.nftDebt + sd.unstakeFine; (where unstakeFine is bounded by uint16 max 65535)"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Underlying asset has standard decimals (18)",
+        "Admin configures maxUnstakeFine within uint16 limits"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Adding a uint16 value directly to an 18-decimal wad value",
+        "manipulation_vector": "Users face no economic penalty for being liquidated",
+        "profit_hypothesis": "Users can treat the protocol as a risk-free options contract: keep the yield if it goes up, abandon the position to the bot if it goes down, paying only ~65,535 wei as a penalty."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Was the fine intended to be a percentage (e.g., in basis points)?",
+          "How does the lack of penalty affect borrower behavior?"
+        ],
+        "validation_requirements": [
+          "Verify the exact wei amount added to the debt during a simulated bot liquidation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Capital to open a yield position",
+        "estimated_execution_cost": "Standard gas costs",
+        "potential_profit_range": "Value of the avoided liquidation penalty (e.g., 5-10% of position size)",
+        "estimated_profit_margin": "High ROI on the avoided risk",
+        "attack_duration": "Long-term"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During high volatility in yield token prices",
+        "market_impact_assessment": "Encourages reckless borrowing behavior"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol revenue (lost fines) and lending pool (increased bad debt risk)",
+        "estimated_impact_per_user": "Loss of intended protocol fee revenue",
+        "total_value_at_risk": "All intended liquidation fines"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check deployment scripts for intended fine values",
+        "calculation_validation": "Confirm the addition is direct and not scaled by 1e14 or similar",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H008",
+      "title": "Yield Group Without Rate Model Bricks All Asset Operations via updateInterestIndexs Revert",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When yield is enabled for an asset via executeSetAssetYieldEnable, a new group is added to the asset's groupList but its rateModel is left as address(0). The separate call to setAssetYieldRate must follow to set it. However, updateInterestRates iterates ALL groups in the asset's groupList and calls IInterestRateModel(loopGroupData.rateModel).calculateGroupBorrowRate(). Calling address(0) with an interface function returns 0 bytes, failing Solidity's ABI return-data size check, reverting the entire transaction. Since updateInterestRates is called in virtually every state-changing operation (deposits, withdrawals, borrows, repays), the asset becomes completely bricked for ALL users—not just yield operations.",
+      "investigation_rationale": "This is a code defect: the yield group initialization omits the rateModel, but updateInterestRates doesn't skip groups with zero rateModel. Any multi-tx admin sequence or failed setAssetYieldRate call permanently freezes the asset.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "InitConfigYield.s.sol shows setAssetYieldEnable and setAssetYieldRate as separate calls with no atomic guarantee. If setAssetYieldRate fails or is omitted, the asset is permanently frozen.",
+      "affected_functions": [
+        "updateInterestRates",
+        "updateInterestIndexs",
+        "executeSetAssetYieldEnable"
+      ],
+      "affected_contracts": [
+        "InterestLogic.sol",
+        "ConfigureLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InterestLogic.sol",
+          "function": "updateInterestIndexs"
+        },
+        {
+          "file": "ConfigureLogic.sol",
+          "function": "executeSetAssetYieldEnable()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InterestLogic.sol",
+        "lines": "123-149",
+        "pattern": "updateInterestRates iterates assetGroupIds and calls IInterestRateModel(loopGroupData.rateModel).calculateGroupBorrowRate() without checking rateModel != address(0)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Pool admin calls setAssetYieldEnable(poolId, asset, true)",
+        "setAssetYieldRate is NOT called before the next user interaction with that asset",
+        "Any user triggers a state-changing operation (deposit, withdraw, borrow, repay) on the asset"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "IInterestRateModel(loopGroupData.rateModel).calculateGroupBorrowRate() where rateModel == address(0)",
+        "manipulation_vector": "Admin enable-yield sequence creates a window where all operations revert",
+        "profit_hypothesis": "Attacker can intentionally trigger this to DoS an asset's entire market, or exploit the frozen state to avoid liquidation"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can a race condition between admin transactions be exploited?",
+          "What is the economic impact of freezing a high-TVL asset?",
+          "Can an attacker avoid liquidation by monitoring admin transactions?"
+        ],
+        "validation_requirements": [
+          "Verify EVM behavior of call to address(0) with expected return data",
+          "Test that any operation (deposit, borrow) reverts when yield group has no rate model",
+          "Confirm no graceful fallback exists in updateInterestRates"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 ETH (observation only for opportunistic attack)",
+        "estimated_execution_cost": "~0.001 ETH gas if actively exploiting frozen liquidation",
+        "potential_profit_range": "Up to entire asset TVL at risk from frozen liquidations",
+        "estimated_profit_margin": "Varies; frozen state prevents all operations including liquidations",
+        "attack_duration": "Until admin sets rate model or disables yield"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None for the attack itself",
+        "optimal_timing": "During admin multi-tx configuration or if setAssetYieldRate reverts",
+        "market_impact_assessment": "All users of the affected asset are frozen"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All suppliers, borrowers, and liquidators for the affected asset",
+        "estimated_impact_per_user": "100% of operations blocked",
+        "total_value_at_risk": "Entire TVL of the affected asset"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "ConfigureLogic.executeSetAssetYieldEnable adds group without rateModel",
+        "calculation_validation": "Verify Solidity behavior for external call to address(0) with ABI decoding",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H009",
+      "title": "_accrueFeeToTreasury toUint128 Truncation Can Permanently DoS High-Activity Asset",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In InterestLogic._accrueFeeToTreasury, the fee increment is cast to uint128 via SafeCast.toUint128() before being added to the uint256 accruedFee field. If vars.amountToMint.rayDiv(assetData.supplyIndex) exceeds type(uint128).max (~3.4e38), the SafeCast reverts. Since _accrueFeeToTreasury is called within updateInterestIndexs on every state-changing operation, this would permanently brick the asset. With sufficiently large totalScaledBorrow and/or prolonged periods between index updates, the scaled fee amount could exceed uint128.",
+      "investigation_rationale": "This is a demonstrable code defect: accruedFee is uint256 but the increment is unnecessarily restricted to uint128. The SafeCast revert propagates up through updateInterestIndexs, blocking all operations.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_accrueFeeToTreasury",
+        "updateInterestIndexs"
+      ],
+      "affected_contracts": [
+        "InterestLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InterestLogic.sol",
+          "function": "_accrueFeeToTreasury"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InterestLogic.sol",
+        "lines": "189-192",
+        "pattern": "assetData.accruedFee += vars.amountToMint.rayDiv(assetData.supplyIndex).toUint128() — accruedFee is uint256 but increment is cast to uint128"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Asset has large total borrow (totalScaledCrossBorrow + totalScaledIsolateBorrow)",
+        "feeFactor > 0",
+        "Sufficient time passes between index updates (or high borrow rate) for accrued amount to exceed uint128 after rayDiv"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "vars.amountToMint.rayDiv(assetData.supplyIndex).toUint128() where amountToMint = totalDebtAccrued * feeFactor / 10000",
+        "manipulation_vector": "With ~3.4e38 as uint128 max and supplyIndex starting at 1e27, the raw fee amount must exceed ~3.4e65 to overflow. Very large pools or prolonged inactive periods with high rates could reach this.",
+        "profit_hypothesis": "Attacker creates conditions where the asset DoS prevents their own liquidation, extracting borrowed funds"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What total borrow and rate combination reaches the uint128 limit?",
+          "Is this reachable with realistic pool sizes and time periods?",
+          "Can an attacker engineer these conditions intentionally?"
+        ],
+        "validation_requirements": [
+          "Calculate maximum fee accrual for realistic pool sizes",
+          "Test with extreme parameters: max rate, max time delta, max borrow",
+          "Verify the toUint128 call is indeed unnecessary"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Very large capital to inflate borrow pool (requires validation)",
+        "estimated_execution_cost": "Gas costs of positioning (requires validation)",
+        "potential_profit_range": "Entire asset TVL if DoS enables liquidation avoidance",
+        "estimated_profit_margin": "High if achievable, but preconditions may be extreme",
+        "attack_duration": "Permanent until code fix"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Very high total borrows needed",
+        "optimal_timing": "After prolonged period with no updateInterestIndexs calls",
+        "market_impact_assessment": "Complete asset freeze if triggered"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users of the affected asset",
+        "estimated_impact_per_user": "100% of operations blocked",
+        "total_value_at_risk": "Entire TVL of the asset"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Calculate threshold: amountToMint / supplyIndex > 2^128",
+        "calculation_validation": "With realistic rates, max exp is ~31M seconds; compute fee amount",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H011",
+      "title": "YieldStakingBase Health Factor Calculation Reverts on Zero Debt Edge Case",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "YieldStakingBase.calculateHealthFactor calls wadDiv(totalNftValue + totalYieldValue, totalDebtValue). If totalDebtValue is 0, wadDiv reverts (division by zero in assembly). While this shouldn't occur during normal _stake (debt is just created), it can occur if: (1) during getTotalDebt view call, the pool reports 0 debt due to rounding in convertToDebtAssets, or (2) a second _stake on the same NFT where previous debt was nearly fully repaid externally (breaking the debt share to asset conversion). The revert in calculateHealthFactor would block the _stake operation entirely.",
+      "investigation_rationale": "GenericLogic.calculateHealthFactorFromBalances correctly handles zero debt by returning type(uint256).max, but YieldStakingBase.calculateHealthFactor uses wadDiv directly without this safeguard. This asymmetry is a code defect.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "calculateHealthFactor"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "calculateHealthFactor"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldStakingBase.sol",
+        "lines": "441-449",
+        "pattern": "(totalNftValue + totalYieldValue).wadDiv(totalDebtValue) without zero-debt check; contrast with GenericLogic.calculateHealthFactorFromBalances which returns max on zero debt"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "totalDebtValue from convertToDebtAssets returns 0",
+        "This requires totalDebtShare > 0 but getTotalDebt approaches 0, or rounding causes 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "wadDiv(a, 0) in assembly reverts unconditionally",
+        "manipulation_vector": "If debt share accounting becomes desynced (totalDebtShare > 0 but pool debt ≈ 0), all stake operations revert",
+        "profit_hypothesis": "Griefing attack or accidental state that blocks yield staking"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can convertToDebtAssets realistically return 0 when debtShare > 0?",
+          "Can an attacker desync the debt tracking?",
+          "What are the conditions for totalDebt to round to 0?"
+        ],
+        "validation_requirements": [
+          "Test calculateHealthFactor with zero debt scenario",
+          "Verify ShareUtils.convertToAssets behavior with edge case inputs",
+          "Check if external partial repay can cause this state"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal if exploitable through rounding",
+        "estimated_execution_cost": "~0.01 ETH in gas",
+        "potential_profit_range": "DoS on yield staking, indirect profit via liquidation avoidance",
+        "estimated_profit_margin": "N/A (DoS vector)",
+        "attack_duration": "Until state is corrected"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When totalDebt is very small relative to totalDebtShare",
+        "market_impact_assessment": "Blocks new yield staking operations"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users attempting to stake via yield",
+        "estimated_impact_per_user": "Unable to create new positions",
+        "total_value_at_risk": "Opportunity cost of blocked yield positions"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "convertToDebtAssets edge cases with +1 virtual offset",
+        "calculation_validation": "Test with totalDebtShare=1, getTotalDebt()=0",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H012",
+      "title": "stETH/eETH 1-2 Wei Rounding Loss in protocolDeposit Causes Systematic Yield Undercounting",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Lido's stETH.submit() and EtherFi's liquidityPool.deposit() return share amounts that may differ by 1-2 wei from the deposited ETH due to internal share-to-balance conversion rounding. In protocolDeposit, the returned yieldAmount is used to compute yieldShares. Over many stake operations, the cumulative rounding loss means the total yield shares slightly overstate the account's actual stETH/eETH balance. When the final staker unstakes, convertToYieldAssets may compute a withdrawAmount that exceeds the actual balance, causing protocolRequestWithdrawal to revert.",
+      "investigation_rationale": "Lido's known 1 wei rounding issue is well-documented. The yield share accounting doesn't account for this systematic rounding, creating a growing discrepancy between tracked and actual balances.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "stETH/eETH has known 1-2 wei rounding on deposit/transfer"
+      ],
+      "config_evidence": "DeployYieldStaking.s.sol deploys YieldEthStakingLido with stETH and YieldEthStakingEtherfi with eETH",
+      "affected_functions": [
+        "protocolDeposit"
+      ],
+      "affected_contracts": [
+        "YieldEthStakingLido.sol",
+        "YieldEthStakingEtherfi.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldEthStakingLido.sol",
+          "function": "protocolDeposit"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldEthStakingLido.sol",
+        "lines": "60-72",
+        "pattern": "yieldAmount from stETH.submit() used directly for share calculation; no adjustment for stETH rounding"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Multiple stake operations on the same yield account",
+        "stETH/eETH exhibits 1-2 wei rounding per operation",
+        "Last staker attempts to withdraw full computed amount"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "yieldAmount = stETH.submit(amount) where yieldAmount may be amount-1 or amount-2 due to share rounding",
+        "manipulation_vector": "Cumulative rounding: N operations create up to 2*N wei discrepancy",
+        "profit_hypothesis": "Last staker's withdrawal reverts, locking their yield position"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many operations before the discrepancy becomes functionally significant?",
+          "Can an attacker intentionally amplify the rounding error?",
+          "Does the +1 virtual offset in ShareUtils mitigate this?"
+        ],
+        "validation_requirements": [
+          "Test with real stETH to measure actual rounding per operation",
+          "Simulate 1000 stake/unstake cycles and measure cumulative error",
+          "Verify if protocolRequestWithdrawal reverts when balance < withdrawAmount"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal per operation (1-2 wei loss each)",
+        "estimated_execution_cost": "Gas for many small operations",
+        "potential_profit_range": "Griefing: last staker loses access to yield",
+        "estimated_profit_margin": "Negative for attacker (griefing only)",
+        "attack_duration": "Cumulative over many operations"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None specific",
+        "optimal_timing": "After many operations on same yield account",
+        "market_impact_assessment": "Minimal per-operation but cumulative"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Last staker on a yield account with many operations",
+        "estimated_impact_per_user": "1-2 wei per operation (griefing potential for lockup)",
+        "total_value_at_risk": "Small in absolute terms, but can cause functional lockup"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "stETH sharesPerETH ratio and rounding behavior",
+        "calculation_validation": "Measure actual stETH balance vs tracked amount after N deposits",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H015",
+      "title": "YieldSavingsDai protocolDeposit Sends DAI to YieldAccount Before Deposit, Enabling Griefing",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In YieldSavingsDai.protocolDeposit, DAI is transferred from the YieldStaking contract to the YieldAccount before calling sdai.deposit(amount, yieldAccount). If someone directly sends DAI to the YieldAccount before the deposit, the account's DAI balance would be higher than expected. When sdai.deposit is called, it deposits exactly 'amount' from the account (via the pre-existing DAI approval). The extra DAI stays unaccounted in the yield account. More critically, the getAccountTotalUnstakedYield subtracts accountYieldInWithdraws from the sDAI balance, but if external DAI donation inflates the subsequent sDAI deposit, the share accounting becomes misaligned.",
+      "investigation_rationale": "The yield share conversion relies on accurate sDAI balance tracking. Any external token donations to the YieldAccount can skew the balance-to-share mapping.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "DAI is used as underlying asset for YieldSavingsDai"
+      ],
+      "config_evidence": "DeployYieldStaking.s.sol deploys YieldSavingsDai with DAI/sDAI addresses",
+      "affected_functions": [
+        "protocolDeposit"
+      ],
+      "affected_contracts": [
+        "YieldSavingsDai.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldSavingsDai.sol",
+          "function": "protocolDeposit"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldSavingsDai.sol",
+        "lines": "66-77",
+        "pattern": "dai.safeTransfer(address(yieldAccount), amount) followed by yieldAccount.execute sdai.deposit — DAI balance of account is trusted"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker can send DAI directly to a victim's YieldAccount address",
+        "YieldAccount address is known (deterministic clone)",
+        "Subsequent stake/unstake operations use balance-based accounting"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "sDAI balance includes shares from donated DAI; yield share conversion skewed",
+        "manipulation_vector": "Direct DAI transfer to YieldAccount inflates sDAI balance without corresponding shares",
+        "profit_hypothesis": "Donated DAI becomes unclaimable and skews share price for the account"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does extra DAI in YieldAccount actually affect sDAI deposit amount?",
+          "How does share price distortion affect other stakers on same account?",
+          "Is the donated DAI recoverable via rescue()?"
+        ],
+        "validation_requirements": [
+          "Trace DAI flow from transfer to sdai.deposit",
+          "Verify sdai.deposit only uses 'amount' parameter, not balance",
+          "Test share conversion after donation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "DAI donation amount (lost by attacker)",
+        "estimated_execution_cost": "Gas for DAI transfer",
+        "potential_profit_range": "Griefing: donated funds potentially locked",
+        "estimated_profit_margin": "Negative for attacker (economic griefing)",
+        "attack_duration": "One-time per donation"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "DAI for donation",
+        "optimal_timing": "Before victim's stake operation",
+        "market_impact_assessment": "Per-account impact, not systemic"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "User whose YieldAccount receives donated tokens",
+        "estimated_impact_per_user": "Share accounting skew, potentially minor",
+        "total_value_at_risk": "Donated amount plus potential accounting distortion"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "sDAI.deposit behavior: does it pull exactly amount from msg.sender?",
+        "calculation_validation": "Test with extra DAI balance before deposit",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H016",
+      "title": "Yield NFT Price Manipulation via Oracle for Leveraged Borrowing Beyond Actual Collateral Value",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "YieldStakingBase.getNftPriceInUnderlyingAsset computes nftPriceInBase/underlyingAssetPriceInBase to determine NFT value in underlying terms. With leverageFactor=50000 (500%), the max borrow is 5x the NFT price. If the NFT oracle reports a temporarily inflated price (NFT oracles typically have weaker freshness guarantees than Chainlink), a user can borrow up to 5x the inflated value. When the oracle corrects, the position is deeply underwater and the lending pool absorbs the loss. The BendNFTOracle has no staleness check at all—only require(nftPriceInNftBase > 0).",
+      "investigation_rationale": "The 5x leverage amplifies any oracle inaccuracy. NFT floor prices are inherently volatile and oracle updates may lag. Combined with the lack of staleness checks on the NFT oracle, this creates significant risk.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "InitConfigYield.s.sol sets leverageFactor=50000 (500%) for WPUNK/BAYC on Lido; InitConfigPool.s.sol sets NFT oracle via setBendNFTOracle",
+      "affected_functions": [
+        "getNftPriceInUnderlyingAsset"
+      ],
+      "affected_contracts": [
+        "YieldStakingBase.sol",
+        "PriceOracle.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldStakingBase.sol",
+          "function": "getNftPriceInUnderlyingAsset"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PriceOracle.sol",
+        "lines": "92-102",
+        "pattern": "getAssetPriceFromBendNFTOracle only checks nftPriceInNftBase > 0; no staleness or freshness validation for NFT oracle"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "NFT oracle reports temporarily inflated price",
+        "User has NFT deposited in isolate mode",
+        "Yield staking is active for the NFT collection",
+        "leverageFactor allows 5x borrowing"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "maxBorrowAmount = nftPrice * 500% where nftPrice comes from oracle without freshness check",
+        "manipulation_vector": "NFT oracle lag or manipulation inflates borrowable amount by 5x the price error",
+        "profit_hypothesis": "If oracle overstates NFT by 20%, user borrows 5x * 20% = 100% extra, then defaults"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is BendNFTOracle's typical update frequency?",
+          "How volatile are NFT floor prices intraday?",
+          "What is maximum realistic oracle deviation for NFTs?"
+        ],
+        "validation_requirements": [
+          "Analyze historical BendNFTOracle update frequency vs price movements",
+          "Calculate maximum extractable value given typical oracle lag",
+          "Test end-to-end: stake with inflated price, position becomes underwater"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "1 NFT (e.g., BAYC ~30 ETH floor)",
+        "estimated_execution_cost": "Gas for stake operation (~0.01 ETH)",
+        "potential_profit_range": "Up to 5x * oracle_deviation * NFT_price per NFT",
+        "estimated_profit_margin": "If oracle deviates 20%: ~30 ETH profit from 30 ETH NFT",
+        "attack_duration": "Single transaction for the exploit; loss materializes when oracle corrects"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Sufficient pool liquidity for leveraged borrow",
+        "optimal_timing": "During high NFT market volatility or oracle delays",
+        "market_impact_assessment": "Bad debt absorbed by lending pool depositors"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Pool depositors bearing bad debt",
+        "estimated_impact_per_user": "Proportional to pool share",
+        "total_value_at_risk": "leverageFactor * oracle_deviation * NFT_price per exploited position"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "leverageFactor=50000, typical NFT prices, oracle update intervals",
+        "calculation_validation": "Calculate max extractable given realistic oracle lag",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H017",
+      "title": "MathUtils.calculateCompoundedInterest Unchecked Overflow in thirdTerm Multiplication",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In MathUtils.calculateCompoundedInterest, the thirdTerm calculation multiplies exp * expMinusOne * expMinusTwo * basePowerThree. While basePowerTwo and basePowerThree use unchecked division (correct for performance), the multiplication `exp * expMinusOne * expMinusTwo * basePowerThree` is checked but could overflow uint256 with extreme rate models and very long update gaps. If the rate model returns pathologically high rates (malicious or misconfigured), and the asset hasn't been interacted with for a long time, this computation could revert, permanently freezing the asset.",
+      "investigation_rationale": "While standard rates don't trigger this, a malicious/misconfigured rate model combined with long dormancy could. The interest calculation is in the critical path of all operations.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Rate model is correctly configured and bounded"
+      ],
+      "config_evidence": "InitConfigPool.s.sol deploys DefaultInterestRateModel with reasonable parameters, but rateModel can be changed by admin to arbitrary contract",
+      "affected_functions": [
+        "calculateCompoundedInterest"
+      ],
+      "affected_contracts": [
+        "MathUtils.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MathUtils.sol",
+          "function": "calculateCompoundedInterest"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MathUtils.sol",
+        "lines": "70-82",
+        "pattern": "uint256 thirdTerm = exp * expMinusOne * expMinusTwo * basePowerThree — checked multiplication with potentially large operands"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Rate model returns very high rate (e.g., > 1e30 ray)",
+        "Asset has not been interacted with for a long period (large exp)",
+        "No bounded rate validation in the protocol"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "exp^3 * basePowerThree where basePowerThree = rate^3 / (SECONDS_PER_YEAR^3 * RAY^2)",
+        "manipulation_vector": "Malicious rate model returns uint256.max or very large rate",
+        "profit_hypothesis": "Asset permanently frozen, attacker avoids liquidation"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What rate value causes overflow for 1 day, 1 week, 1 year exp?",
+          "Can admin set a malicious rate model that triggers this?",
+          "Is there any rate bound enforced on rate model return values?"
+        ],
+        "validation_requirements": [
+          "Calculate overflow threshold for various exp values",
+          "Test with max possible rate and typical exp",
+          "Verify no rate bounds exist in the protocol"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (requires admin collusion or misconfiguration)",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Asset DoS value",
+        "estimated_profit_margin": "N/A (DoS vector)",
+        "attack_duration": "Permanent until rate model changed"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "After rate model change + period of inactivity",
+        "market_impact_assessment": "Complete asset operation freeze"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users of the affected asset",
+        "estimated_impact_per_user": "100% of operations blocked",
+        "total_value_at_risk": "Entire asset TVL"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Rate boundary analysis: max rate that doesn't overflow for 1 year exp",
+        "calculation_validation": "uint256 overflow threshold for thirdTerm",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "OPS2-H004",
+      "title": "Healthy Isolate Loans Can Be Forced Into Auction",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "ValidateLogic.validateIsolateAuctionLoan does not verify that the loan's health factor is below the liquidation threshold before allowing an auction to start. This could allow attackers to force healthy loans into auction.",
+      "investigation_rationale": "Auctions are punitive measures for undercollateralized loans. If the health factor is not checked when transitioning a loan from ACTIVE to AUCTION, attackers can grief users by forcing their healthy positions into auction, potentially extracting bid fines or acquiring NFTs at a discount.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "validateIsolateAuctionLoan"
+      ],
+      "affected_contracts": [
+        "ValidateLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ValidateLogic.sol",
+          "function": "validateIsolateAuctionLoan"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ValidateLogic.sol",
+        "lines": "469-482",
+        "pattern": "Missing health factor check in validateIsolateAuctionLoan"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "An active isolate loan exists",
+        "The executeIsolateAuction function (not fully provided but relies on ValidateLogic) does not independently check the health factor"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "State transition to a punitive phase without verifying the punitive condition",
+        "admin_dependency": "None",
+        "exploitation_window": "Any time a user has an active isolate loan"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does executeIsolateAuction check the health factor independently?",
+          "Can a user lose their NFT or pay a fine if their healthy loan is auctioned?"
+        ],
+        "validation_requirements": [
+          "Review IsolateLiquidation.sol (Phase D) to confirm if HF is checked",
+          "Attempt to call isolateAuction on a loan with HF > 1"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify a healthy isolate loan with valuable NFT collateral",
+        "phase_2": "Call executeIsolateAuction on the loan",
+        "phase_3": "The loan enters the AUCTION state despite being healthy",
+        "phase_4": "Attacker waits for auction duration and liquidates the NFT, or forces the owner to redeem and pay a bid fine",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Users lose trust in the protocol as healthy positions are liquidated",
+        "recovery_difficulty": "Requires contract upgrade to add HF check",
+        "affected_operations": "Isolate margin lending"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Basic contract interaction",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Auctions starting for loans with HF > 1",
+        "operational_anomalies": "High volume of unexpected auctions",
+        "behavioral_patterns": "Specific addresses initiating auctions on healthy loans",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational-2",
+      "original_specialist": "operational-2"
+    },
+    {
+      "hypothesis_id": "OPS2-H014",
+      "title": "YieldAccount.initialize permits yieldManager=address(0), creating irrecoverable accounts and trapped funds scenarios",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "YieldAccount.initialize does not validate that _registry and _manager are non-zero. If a YieldAccount is initialized with yieldManager = address(0), no one can call onlyManager functions to move funds or approve protocols. If assets are later sent to such an account (mistake or integration bug), they become effectively stuck unless the registry rescues them (onlyRegistry), but registry address could also be mis-set.",
+      "investigation_rationale": "This is a hardening defect in an initialization path for clones. Even if registry currently initializes correctly, future upgrades/migrations or edge-case tooling could mis-initialize and create dead accounts that complicate operations.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A bug/misconfiguration in YieldRegistry.createYieldAccount or future implementation sets _manager to address(0) or wrong value",
+        "Users or systems may transfer assets to YieldAccount addresses outside normal flows"
+      ],
+      "config_evidence": "Current YieldRegistry.createYieldAccount passes _manager provided by caller; it checks existYieldManager(_manager) but does not explicitly forbid address(0). If yieldManagers set ever contains address(0) (possible), initialize could set manager=0.",
+      "affected_functions": [
+        "initialize(address,address)"
+      ],
+      "affected_contracts": [
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldAccount.sol",
+          "function": "initialize(address _registry, address _manager)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldAccount.sol",
+        "lines": "29-37",
+        "pattern": "function initialize(address _registry, address _manager) public initializer { yieldRegistry=_registry; yieldManager=_manager; } // no nonzero checks"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "YieldRegistry's yieldManagers set contains address(0) OR registry implementation allows passing 0 manager",
+        "A YieldAccount clone is created and initialized with manager=0",
+        "Funds are transferred into that account"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Initializer lacks non-zero validation, allowing creation of unusable accounts if upstream validation fails",
+        "admin_dependency": "Depends on registry configuration (yieldManagers content) or bugs in registry/manager tooling",
+        "exploitation_window": "During manager onboarding/whitelisting or upgrades/migrations"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is address(0) prevented from being added as a yield manager in YieldRegistry.addYieldManager?",
+          "Are there any scripts or admin tools that might accidentally add address(0)?",
+          "What is the recovery procedure if a YieldAccount is mis-initialized (registry rescue vs redeploy)?"
+        ],
+        "validation_requirements": [
+          "Check YieldRegistry.addYieldManager for non-zero validation (currently absent)",
+          "Attempt to addYieldManager(address(0)) then createYieldAccount(0) and observe resulting account behavior"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Cause (via misconfig or exploit of admin process) address(0) to be whitelisted as yield manager",
+        "phase_2": "Call createYieldAccount(address(0)) to deploy unusable YieldAccount clones",
+        "phase_3": "Induce/trigger transfers into these accounts (e.g., mistaken routing or automated scripts) to trap funds",
+        "phase_4": "Force operational rescue actions and degrade trust",
+        "coordination_requirements": "Requires configuration error or privileged misstep"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Not necessary if misconfiguration occurs; but can be accelerated by malicious insider",
+        "operational_disruption": "Stuck assets, support incidents, need for registry rescue, potential accounting complications",
+        "recovery_difficulty": "Medium (requires admin intervention and correct registry address)",
+        "affected_operations": "Yield account lifecycle and asset safety"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "N/A",
+        "coordination_complexity": "Medium",
+        "technical_skills": "Low to moderate",
+        "operational_timing": "During deployments, upgrades, manager onboarding"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "YieldAccount clones where yieldManager == 0 (requires reading storage)",
+        "operational_anomalies": "Accounts receiving assets but never interacting",
+        "behavioral_patterns": "Repeated creation of accounts with same broken configuration",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "operational-2",
+      "original_specialist": "operational-2"
+    },
+    {
+      "hypothesis_id": "TECH-H015",
+      "title": "YieldAccount arbitrary call surface can be abused if manager contract is compromised or misconfigured (fund drain from per-user accounts)",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "YieldAccount exposes execute/executeWithValue/safeTransfer/safeApprove restricted only by yieldManager. If yieldManager (a strategy contract) is upgraded to malicious code, compromised, or has an unprotected external entry point that can invoke these methods, an attacker can drain all assets held by user YieldAccount clones by calling transfers/approvals/arbitrary external calls.",
+      "investigation_rationale": "The per-user YieldAccount is a hot wallet with broad powers delegated to the manager. While this is intended, it becomes a critical escalation target. Confirm whether any manager-facing method can be reached by untrusted callers to trigger YieldAccount.execute paths beyond intended staking actions.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Yield manager contracts are upgradeable (TransparentUpgradeableProxy) and admin may upgrade to a buggy/malicious implementation, or the manager contains an exploitable external call path",
+        "YieldAccounts hold valuable assets (stETH/eETH/sDAI) long-term"
+      ],
+      "config_evidence": "DeployYieldStaking.s.sol deploys strategies behind TransparentUpgradeableProxy; YieldAccount only checks msg.sender == yieldManager, so manager integrity is critical but external exposure depends on manager code correctness.",
+      "affected_functions": [
+        "execute(address,bytes)",
+        "executeWithValue(address,bytes,uint256)",
+        "safeTransfer(address,address,uint256)",
+        "safeApprove(address,address,uint256)"
+      ],
+      "affected_contracts": [
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldAccount.sol",
+          "function": "execute(address target, bytes calldata data)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldAccount.sol",
+        "lines": "44-76",
+        "pattern": "onlyManager gates arbitrary external call: result = target.functionCall(data); and functionCallWithValue"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker obtains ability to make the manager contract call YieldAccount (via manager compromise/bug/upgrade abuse)",
+        "YieldAccounts hold transferable assets or approvals can be set to attacker-controlled spenders"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldAccount.sol execute/executeWithValue/safeTransfer/safeApprove",
+        "vulnerable_pattern": "custodial account with arbitrary call capability controlled by manager",
+        "specific_concern": "single compromised manager can drain many user accounts",
+        "missing_safeguards": "No allowlist of targets/selectors; no per-user authorization; no time delays"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Are there any public/external functions in YieldStakingBase-derived managers that allow arbitrary target/data forwarding?",
+          "Can reentrancy or callback behavior cause unintended manager->YieldAccount calls?",
+          "Is ProxyAdmin / upgrade authority properly secured operationally (out of scope, but impacts realism)?"
+        ],
+        "validation_requirements": [
+          "Review manager contracts for any generic execution hooks beyond protocolDeposit/protocolClaimWithdraw",
+          "Threat model upgrade/admin controls and verify no unintended external entrypoints exist",
+          "Simulate a buggy upgrade that calls YieldAccount.safeTransfer to attacker"
+        ]
+      },
+      "preliminary_attack_scenario": "With a compromised/buggy yield manager, attacker triggers YieldAccount.safeTransfer of stETH/eETH/sDAI from many users’ YieldAccounts to attacker, or sets approvals to drain later.",
+      "prerequisites": [
+        "Manager compromise/upgrade path (off-chain/admin) OR a concrete exploit in manager enabling arbitrary calls"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Total loss of all assets held in YieldAccounts for that manager",
+        "affected_users": "All users who created YieldAccounts under the compromised manager",
+        "recovery_possibility": "Low on-chain recovery; requires off-chain coordination and potential protocol intervention"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing negative tests ensuring managers cannot trigger arbitrary YieldAccount calls via untrusted inputs",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "none",
+        "capital_requirements": "none",
+        "execution_timing": "single transaction drain possible",
+        "detection_analysis": "Monitor YieldAccount outgoing transfers/approvals not matching expected protocol actions"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H016",
+      "title": "PriceOracle lacks time-based staleness bounds, enabling long-lived stale pricing on Chainlink outages",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "PriceOracle.getAssetPriceFromChainlink() validates updatedAt != 0 and answeredInRound >= roundId but does not enforce a max age. If an aggregator halts updates, the protocol can keep accepting the last price indefinitely, allowing users to borrow against overvalued collateral after real market moves. This is a protocol-critical oracle freshness gap.",
+      "investigation_rationale": "Stale-oracle events happen in production (heartbeat failures, sequencer issues, feed pausing). Without a max-age check, lending invariants become dependent on uninterrupted oracle operation.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "At least one listed ERC20 uses Chainlink pricing via assetChainlinkAggregators",
+        "Chainlink feed can become stale while still returning the last round data"
+      ],
+      "config_evidence": "InitConfigPool.s.sol sets Chainlink aggregators for WETH/USDT/DAI; PriceOracle.getAssetPriceFromChainlink has no 'block.timestamp - updatedAt' check.",
+      "affected_functions": [
+        "getAssetPriceFromChainlink(address)",
+        "getAssetPrice(address)",
+        "getAssetPriceFromBendNFTOracle(address)"
+      ],
+      "affected_contracts": [
+        "PriceOracle.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PriceOracle.sol",
+          "function": "getAssetPriceFromBendNFTOracle(address asset)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PriceOracle.sol",
+        "lines": "84-90",
+        "pattern": "staleness checks omit time threshold: require(updatedAt != 0) and answeredInRound>=roundId only"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Chainlink feed stops updating while keeping last valid round retrievable",
+        "Protocol continues allowing borrow/withdraw/liquidation decisions using this oracle",
+        "Attacker can act after observing stale state on-chain (no mempool needed)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PriceOracle.sol getAssetPriceFromChainlink()",
+        "vulnerable_pattern": "missing max-age staleness bound",
+        "specific_concern": "accepts arbitrarily old prices during outages",
+        "missing_safeguards": "No per-asset heartbeat/maxDelay configuration"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Which protocol operations rely on PriceOracle for collateral/debt valuation (borrow limits, liquidation triggers)?",
+          "Are there any emergency pause hooks triggered by stale prices?",
+          "Is there any external monitoring that pauses markets during oracle issues?"
+        ],
+        "validation_requirements": [
+          "Fork test: freeze Chainlink feed (mock updatedAt far in past) and verify borrows still allowed",
+          "Confirm liquidation/health factor computations use this oracle output directly",
+          "Design check: define acceptable staleness threshold per asset"
+        ]
+      },
+      "preliminary_attack_scenario": "During an oracle outage, attacker borrows against collateral valued at outdated higher price; when oracle resumes, position is underwater leaving bad debt.",
+      "prerequisites": [
+        "Oracle outage / staleness event"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Potentially large bad debt across pools during major market moves",
+        "affected_users": "All lenders in markets priced by affected feeds",
+        "recovery_possibility": "Partial via liquidation if collateral remains; otherwise bad debt"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing stale-price max-age tests",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "none",
+        "capital_requirements": "depends on borrowing caps",
+        "execution_timing": "multi-block (during outage)",
+        "detection_analysis": "Monitor updatedAt age for feeds; block borrowing when exceeds threshold"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H017",
+      "title": "Index overflow / permanent DoS if interest rates misconfigured to extreme values (uint128 cast reverts)",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "InterestLogic stores supplyIndex and borrowIndex as uint128 and updates via SafeCast.toUint128(). If the IRM (rate model) returns extreme rates or if long periods pass with high rates, indices may exceed uint128 max and updates will revert permanently for that asset/group. This bricks any operation that calls updateInterestIndexs().",
+      "investigation_rationale": "This is a known irreversible failure mode; Phase A highlights it. While typically 'admin misconfig' driven, it can be triggered by an exploited/malicious IRM contract or bad governance configuration.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Admin sets an IRM that can return unbounded/high borrow rates or supply rates",
+        "Asset remains active long enough for indices to grow excessively, or time delta is large"
+      ],
+      "config_evidence": "InitConfigPool.s.sol deploys DefaultInterestRateModel instances; ConfigureLogic allows setting rateModel addresses for groups and yield group without on-chain bounds enforcement beyond non-zero address.",
+      "affected_functions": [
+        "initAssetData(DataTypes.AssetData)",
+        "initGroupData(DataTypes.GroupData)",
+        "updateInterestIndexs(DataTypes.PoolData,DataTypes.AssetData)",
+        "_updateSupplyIndex(DataTypes.AssetData)",
+        "_updateBorrowIndex(DataTypes.AssetData,DataTypes.GroupData)",
+        "updateInterestRates(DataTypes.PoolData,DataTypes.AssetData,uint256,uint256)"
+      ],
+      "affected_contracts": [
+        "InterestLogic.sol",
+        "ConfigureLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ConfigureLogic.sol",
+          "function": "executeSetAssetLendingRate(address,uint32,address,uint8,address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InterestLogic.sol",
+        "lines": "186-195",
+        "pattern": "assetData.supplyIndex = nextSupplyIndex.toUint128(); (same for groupData.borrowIndex) => hard revert on overflow"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Group/asset is configured with a rateModel that can output extreme rates",
+        "updateInterestIndexs() is called after sufficient time/rate to overflow uint128",
+        "No emergency migration/alternate path exists to reset index"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "InterestLogic.sol _updateSupplyIndex/_updateBorrowIndex using toUint128",
+        "vulnerable_pattern": "narrow type storage for ever-increasing index",
+        "specific_concern": "once overflow happens, all market operations revert permanently",
+        "missing_safeguards": "No rate bounds checks; no circuit breaker; no admin recovery function"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Are rate models bounded in production deployments? (DefaultInterestRateModel parameters)",
+          "What is the maximum plausible index growth over worst-case time delta (e.g., 365 days) at max rates?",
+          "Can an attacker influence rateModel via any unprotected configuration path (not shown here)?"
+        ],
+        "validation_requirements": [
+          "Formal bound calculation for index growth under max IRM outputs",
+          "Fuzz test with adversarial IRM returning near-max rates to trigger overflow",
+          "Review admin functions for setting rate models and any guardrails"
+        ]
+      },
+      "preliminary_attack_scenario": "With a malicious or misconfigured IRM, indices overflow and all interactions with the asset revert, freezing deposits/withdrawals/repays and locking funds.",
+      "prerequisites": [
+        "Admin misconfiguration or compromised governance setting IRM",
+        "Sustained high-rate period"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Funds trapped / market bricked; potentially catastrophic for affected assets",
+        "affected_users": "All users in affected asset markets",
+        "recovery_possibility": "Low without upgrade/migration; may require contract upgrade or emergency measures"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing index-bound invariants under extreme rate/time scenarios",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "none",
+        "capital_requirements": "none",
+        "execution_timing": "multi-block / long-duration",
+        "detection_analysis": "Monitor index growth and cap rates; alert near uint128 limit"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "ECON-H017",
+      "title": "Yield Account Rescue Allows Admin to Drain User Funds",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation_of_Privilege",
+      "hypothesis_description": "Centralization risk allows a compromised or malicious pool admin to execute arbitrary calls from any user's YieldAccount, draining all staked assets.",
+      "investigation_rationale": "YieldRegistry.rescue allows the POOL_ADMIN to execute arbitrary calls (target.functionCall(data)) from any user's YieldAccount clone. This mechanism bypasses all user ownership checks and can be used to transfer staked assets (stETH, eETH, sDAI) out of every user's account.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "rescue",
+        "addYieldManager"
+      ],
+      "affected_contracts": [
+        "YieldRegistry.sol",
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldRegistry.sol",
+          "function": "addYieldManager"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldRegistry.sol",
+        "lines": "85-86",
+        "pattern": "YieldAccount(payable(yieldAccount)).rescue(target, data);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker compromises the POOL_ADMIN private key or admin acts maliciously"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "target.functionCall(data) executed with YieldAccount context",
+        "manipulation_vector": "Admin constructs calldata to call transfer() on the external yield token (e.g., stETH) from the user's YieldAccount to the admin's address.",
+        "profit_hypothesis": "Admin steals 100% of all users' staked yield assets."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is the POOL_ADMIN a multisig or a single EOA?",
+          "Are there any timelocks on the rescue function?"
+        ],
+        "validation_requirements": [
+          "Verify POOL_ADMIN can call rescue to transfer tokens",
+          "Check deployment scripts for admin configuration"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None",
+        "estimated_execution_cost": "Gas for rescue calls",
+        "potential_profit_range": "Total Value Locked (TVL) in yield strategies",
+        "estimated_profit_margin": "100%",
+        "attack_duration": "Single block per user account"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When TVL is highest",
+        "market_impact_assessment": "Complete loss of user funds in yield strategies"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All yield stakers",
+        "estimated_impact_per_user": "100% of staked assets",
+        "total_value_at_risk": "100% of yield TVL"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Admin roles and timelocks",
+        "calculation_validation": "Arbitrary execution scope",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "YieldRegistry Rescue Function Enables Arbitrary Calls From Any Yield Account Draining User Staked Assets",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "YieldRegistry.rescue(yieldAccount, target, data) allows any POOL_ADMIN to execute arbitrary function calls from any YieldAccount via the registry's onlyRegistry modifier. Since YieldAccounts hold user staked assets (stETH, eETH, sDAI), a compromised or malicious pool admin can use rescue to transfer all staked assets out of every user's yield account. The function has no restrictions on target or data, and no timelock or multi-sig requirement at the contract level.",
+      "investigation_rationale": "While POOL_ADMIN is a trusted role, the rescue function provides god-mode access to all user staked assets. The deployment scripts show POOL_ADMIN is initially set to the deployer address with no timelock.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "POOL_ADMIN key is secured; no timelock wraps the ACL role"
+      ],
+      "config_evidence": "DeployPoolFull.s.sol: aclManager.addPoolAdmin(deployer) grants deployer direct admin access",
+      "affected_functions": [
+        "rescue"
+      ],
+      "affected_contracts": [
+        "YieldRegistry.sol",
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldRegistry.sol",
+          "function": "rescue"
+        },
+        {
+          "file": "YieldAccount.sol",
+          "function": "rescue"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldRegistry.sol",
+        "lines": "rescue function",
+        "pattern": "onlyPoolAdmin guard; YieldAccount(payable(yieldAccount)).rescue(target, data) executes arbitrary call from yield account"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "POOL_ADMIN private key compromised or malicious admin action",
+        "Yield accounts hold staked assets (stETH, eETH, sDAI)",
+        "No external timelock or multi-sig protects the POOL_ADMIN role"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Arbitrary external call capability from user-controlled asset storage",
+        "admin_dependency": "Complete admin discretion over all user yield positions",
+        "exploitation_window": "Permanent - as long as yield accounts hold assets"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the POOL_ADMIN role behind a timelock or multi-sig?",
+          "Can rescue be called on yield accounts that are actively staked?",
+          "Total value at risk across all yield accounts?"
+        ],
+        "validation_requirements": [
+          "Verify POOL_ADMIN key management setup",
+          "Test rescue extracting stETH from an active yield position",
+          "Assess whether rescue bypasses any accounting checks"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise POOL_ADMIN key (off-chain attack)",
+        "phase_2": "Call rescue for each yield account: rescue(account, stETH, transfer(attacker, balance))",
+        "phase_3": "All user staked assets (stETH, eETH, sDAI) drained from yield accounts",
+        "phase_4": "Users cannot repay debts (no yield to claim), creating cascading bad debt",
+        "coordination_requirements": "Single compromised admin key"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Complete drain of all user yield positions",
+        "operational_disruption": "All yield staking strategies become insolvent",
+        "recovery_difficulty": "Funds unrecoverable if transferred to external address",
+        "affected_operations": "All yield staking across Lido, EtherFi, and sDAI"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None - requires POOL_ADMIN key",
+        "coordination_complexity": "Low once key is compromised",
+        "technical_skills": "Basic - standard ERC20 transfer calls via rescue",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Rescue calls from YieldRegistry to yield accounts",
+        "operational_anomalies": "Yield account balances dropping without corresponding unstake/repay",
+        "behavioral_patterns": "Multiple rescue calls in succession",
+        "detection_difficulty": "easy"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H017",
+      "title": "Interest index uint128 overflow can permanently brick asset operations under extreme rate model outputs",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "SupplyIndex and BorrowIndex are stored as uint128 and updated via SafeCast.toUint128(). If indices exceed uint128 max, updates revert, potentially bricking all interactions that call updateInterestIndexs for that asset (deposits, withdrawals, borrows, repays). While extreme, this can happen if an interest rate model is misconfigured or returns unboundedly high rates for long periods.",
+      "investigation_rationale": "Phase A invariant INV-MONO-001 flagged irreversible DoS from overflow. This is operationally important: rate model upgrades/config mistakes can create a hard failure state that is difficult to recover from without migrations.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Admin configures/updates a rate model that can output extremely high borrowRate/supplyRate, or utilization/rate spikes can drive outputs high",
+        "Asset experiences long periods without interactions so exp grows large, or rate itself is high enough over shorter time"
+      ],
+      "config_evidence": "Rate models are externally set via configuration (e.g., ConfigureLogic.executeAddAssetGroup / executeSetAssetLendingRate / executeSetAssetYieldRate). No explicit bounds enforcement on returned rates is shown in-scope.",
+      "affected_functions": [
+        "_updateSupplyIndex()",
+        "_updateBorrowIndex()",
+        "updateInterestIndexs()"
+      ],
+      "affected_contracts": [
+        "InterestLogic.sol",
+        "ConfigureLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InterestLogic.sol",
+          "function": "updateInterestIndexs"
+        },
+        {
+          "file": "ConfigureLogic.sol",
+          "function": "executeSetAssetLendingRate"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InterestLogic.sol",
+        "lines": "210-244",
+        "pattern": "assetData.supplyIndex = nextSupplyIndex.toUint128(); groupData.borrowIndex = nextBorrowIndex.toUint128();"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Rate model returns rates high enough that calculateLinearInterest/calculateCompoundedInterest causes next index > type(uint128).max",
+        "Any user/admin action triggers updateInterestIndexs for that asset afterward"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No guardrails ensuring rate model outputs keep indices within uint128 bounds",
+        "admin_dependency": "Yes (rate model configuration), or exploit if IRM itself compromised",
+        "exploitation_window": "After misconfiguration; irreversible once reached"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What are the maximum possible rates produced by each deployed IRM under worst-case utilization?",
+          "What is the longest plausible time delta between updates on the target chain(s)?",
+          "Are there emergency procedures to freeze/disable an asset before overflow occurs?"
+        ],
+        "validation_requirements": [
+          "Compute index growth bounds and time-to-overflow under worst-case rates",
+          "Fuzz/simulate with extreme rate values to confirm revert behavior and blast radius",
+          "Review operational playbooks for IRM changes and monitoring thresholds"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Induce or wait for IRM misconfiguration/extreme rate regime",
+        "phase_2": "Allow time for index growth beyond uint128",
+        "phase_3": "Trigger any operation that calls updateInterestIndexs to brick the asset path"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Not required if misconfiguration is accidental; attacker can benefit by targeting chaos",
+        "operational_disruption": "Permanent DoS for asset operations; user funds potentially stuck until migration",
+        "recovery_difficulty": "High",
+        "affected_operations": "All interactions touching the bricked asset"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium (depends on admin misconfig/time)",
+        "technical_skills": "Intermediate",
+        "operational_timing": "Long-running, depends on rate/time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Rapidly increasing borrowIndex/supplyIndex approaching uint128 limit",
+        "operational_anomalies": "Interest update reverts for a specific asset",
+        "behavioral_patterns": "IRM changes followed by abnormal index growth",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "TECH2-H009",
+      "title": "Arbitrary Execution via YieldRegistry Rescue Allows Admin to Drain User Funds",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The `YieldRegistry.rescue` function allows the `POOL_ADMIN` to execute arbitrary calls (`target.functionCall(data)`) from any `YieldAccount`. A compromised or malicious admin can use this to transfer all staked assets (stETH, eETH, sDAI) out of every user's yield account.",
+      "investigation_rationale": "While admins are trusted, providing them with a mechanism to arbitrarily execute code from user accounts violates the principle of least privilege and creates a massive single point of failure.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "rescue"
+      ],
+      "affected_contracts": [
+        "YieldRegistry.sol",
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldRegistry.sol",
+          "function": "rescue"
+        },
+        {
+          "file": "YieldAccount.sol",
+          "function": "rescue"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldRegistry.sol",
+        "lines": "78",
+        "pattern": "YieldAccount(payable(yieldAccount)).rescue(target, data);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Admin private key is compromised or admin acts maliciously"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "YieldRegistry.sol line 78",
+        "vulnerable_pattern": "Admin-controlled arbitrary execution",
+        "specific_concern": "Admin can call any function on any contract from the context of the user's YieldAccount",
+        "missing_safeguards": "Rescue functions should be restricted to specific tokens or have a timelock"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Is there a timelock on the POOL_ADMIN role?",
+          "Can the rescue function be restricted to only non-strategy tokens?"
+        ],
+        "validation_requirements": [
+          "Simulate an admin calling rescue to transfer stETH from a user's YieldAccount",
+          "Verify the transfer succeeds"
+        ]
+      },
+      "preliminary_attack_scenario": "An attacker compromises the `POOL_ADMIN` private key. They iterate through all `YieldAccount` contracts and call `rescue` to execute `transfer` on the stETH contract, draining all user funds to their own wallet.",
+      "prerequisites": [
+        "Admin key compromise"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Total loss of all user staked assets",
+        "affected_users": "All yield stakers",
+        "recovery_possibility": "None"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "low",
+      "test_coverage_gap": "Missing tests for admin abuse of rescue function",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Any time",
+        "detection_analysis": "Monitoring admin transactions"
+      },
+      "original_category": "technical-2",
+      "original_specialist": "technical-2"
+    },
+    {
+      "hypothesis_id": "TECH2-H009",
+      "title": "PoolManager.dispatch may delegatecall to address(0) leading to silent no-op and inconsistent user expectations",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "PoolManager.dispatch resolves moduleImpl either from trustedSenders[msg.sender].moduleImpl or moduleLookup[moduleId]. If both are address(0) for a trusted proxy (e.g., after admin uninstalls a module but leaves proxy trusted), delegatecall to address(0) will succeed and return empty data, potentially causing user transactions to appear successful while doing nothing (or breaking ABI decoding expectations).",
+      "investigation_rationale": "This is a real invariant identified in Phase A (INV-ACC-003). While it depends on admin misconfiguration (not an unprivileged exploit), it can create confusing and potentially harmful behavior for integrated systems and users.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A proxy remains in trustedSenders with a non-zero moduleId while its implementation is removed/set to zero",
+        "Some callers do not validate expected state changes and rely on call success",
+        "Module uninstall/upgrade flows exist (Installer module) and can produce this state"
+      ],
+      "config_evidence": "Installer module is referenced in deployment scripts (DeployPoolFull.s.sol installs modules), but uninstall behavior and trustedSenders cleanup are not shown in the provided code.",
+      "affected_functions": [
+        "dispatch()"
+      ],
+      "affected_contracts": [
+        "PoolManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PoolManager.sol",
+          "function": "dispatch()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "src/PoolManager.sol",
+        "lines": "63-100",
+        "pattern": "if (moduleImpl == address(0)) moduleImpl = moduleLookup[moduleId]; // no require(moduleImpl!=0) before delegatecall"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACC-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "trustedSenders[proxy].moduleId != 0",
+        "trustedSenders[proxy].moduleImpl == 0 and moduleLookup[moduleId] == 0",
+        "User calls the proxy expecting module execution"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PoolManager.sol lines 63-100",
+        "vulnerable_pattern": "delegatecall target not validated for non-zero address",
+        "specific_concern": "silent success/no-op could mislead external systems and users",
+        "missing_safeguards": "No explicit non-zero implementation assertion"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the Installer/uninstall path ever set moduleLookup[moduleId]=0 without removing trustedSenders entries?",
+          "Do proxies for single-proxy modules store moduleImpl in trustedSenders, reducing risk?",
+          "What is EVM behavior of delegatecall to address(0) in current compiler/chain context (success with empty returndata)?"
+        ],
+        "validation_requirements": [
+          "Review Installer module upgrade/uninstall logic",
+          "Add a regression test for dispatch to missing module implementation",
+          "Confirm behavior with a fork test"
+        ]
+      },
+      "preliminary_attack_scenario": "After an upgrade/uninstall mistake, users continue calling a module proxy. Calls succeed but do nothing, potentially causing users to believe deposits/withdrawals occurred when they did not, and breaking integrator workflows.",
+      "prerequisites": [
+        "Admin misconfiguration or buggy installer/uninstaller"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Indirect; could lead to user mistakes and disrupted operations rather than direct theft",
+        "affected_users": "Users and integrators interacting with affected module proxies",
+        "recovery_possibility": "Fix configuration by reinstalling module / removing proxy trust; add require(moduleImpl!=0)"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No tests for module uninstall/missing implementation dispatch behavior",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "no",
+        "capital_requirements": "none",
+        "execution_timing": "single transaction",
+        "detection_analysis": "Monitor moduleLookup changes vs trustedSenders and proxy usage"
+      },
+      "original_category": "technical-2",
+      "original_specialist": "technical-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H007",
+      "title": "Admin Can Drain All User Yield Assets via rescue Function",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "`YieldRegistry.rescue` allows the `POOL_ADMIN` to execute arbitrary calls from any `YieldAccount` via `YieldAccount.rescue`. Since the `YieldAccount` holds the user's actual yield-bearing assets (e.g., stETH, eETH, sDAI), a compromised or malicious admin can use this function to transfer all staked assets from every user to themselves.",
+      "investigation_rationale": "While protected by an admin modifier, this represents a complete centralization risk and rug-pull vector. The `rescue` function is overly permissive by allowing arbitrary `functionCall` execution rather than restricted token sweeping.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "rescue"
+      ],
+      "affected_contracts": [
+        "YieldRegistry.sol",
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldRegistry.sol",
+          "function": "rescue"
+        },
+        {
+          "file": "YieldAccount.sol",
+          "function": "rescue"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldAccount.sol",
+        "lines": "52",
+        "pattern": "target.functionCall(data);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "POOL_ADMIN private key is compromised, or the admin acts maliciously"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Arbitrary execution from a contract holding user funds",
+        "manipulation_vector": "Admin crafts calldata to call `transfer` on the yield tokens (stETH, etc.)",
+        "profit_hypothesis": "Admin steals 100% of the yield assets deposited by all users across the protocol."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there a timelock on the POOL_ADMIN role?",
+          "Are there any off-chain monitoring systems that would catch this?"
+        ],
+        "validation_requirements": [
+          "Verify that the POOL_ADMIN can craft a payload to transfer stETH out of a YieldAccount"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (requires key compromise)",
+        "estimated_execution_cost": "Gas cost for the rescue calls",
+        "potential_profit_range": "100% of Total Value Locked in Yield Staking",
+        "estimated_profit_margin": "Infinite",
+        "attack_duration": "Single block per account"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When TVL is at its peak",
+        "market_impact_assessment": "Complete destruction of protocol trust and loss of all user funds"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All yield staking users",
+        "estimated_impact_per_user": "100% loss of staked assets",
+        "total_value_at_risk": "Entire TVL of the yield staking modules"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Review the multi-sig or timelock setup for the POOL_ADMIN role in deployment scripts",
+        "calculation_validation": "N/A",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "OPS2-H008",
+      "title": "Admin Can Drain All Yield Accounts via Rescue Function",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "YieldRegistry.rescue allows the POOL_ADMIN to execute arbitrary calls from any YieldAccount via target.functionCall(data). A compromised or malicious admin can use this to transfer all staked assets out of every user's yield account.",
+      "investigation_rationale": "While rescue functions are common for recovering stuck funds, allowing arbitrary execution from user-owned accounts holding active collateral represents a massive centralization risk. A single compromised admin key can result in the total loss of all staked assets.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "POOL_ADMIN role is held by an EOA or a multisig that can be compromised"
+      ],
+      "config_evidence": "DeployPoolFull.s.sol assigns POOL_ADMIN to deployer EOA: aclManager.addPoolAdmin(deployer);",
+      "affected_functions": [
+        "rescue"
+      ],
+      "affected_contracts": [
+        "YieldRegistry.sol",
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldRegistry.sol",
+          "function": "rescue"
+        },
+        {
+          "file": "YieldAccount.sol",
+          "function": "rescue"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldAccount.sol",
+        "lines": "55",
+        "pattern": "target.functionCall(data);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker gains access to the POOL_ADMIN private key or compromises the admin multisig"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Arbitrary execution capability granted to an admin on user-owned contracts",
+        "admin_dependency": "Requires POOL_ADMIN privileges",
+        "exploitation_window": "Always open if admin key is compromised"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the POOL_ADMIN a timelocked multisig or an EOA?",
+          "Are there any off-chain monitoring systems to detect unauthorized rescue calls?"
+        ],
+        "validation_requirements": [
+          "Review deployment scripts to confirm POOL_ADMIN setup",
+          "Simulate an admin draining a yield account using the rescue function"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Attacker compromises the POOL_ADMIN key via phishing, social engineering, or technical exploit",
+        "phase_2": "Attacker calls YieldRegistry.rescue for every active YieldAccount",
+        "phase_3": "The data payload executes a transfer of stETH, eETH, or sDAI to the attacker's address",
+        "phase_4": "All yield accounts are drained, leaving the protocol with massive uncollateralized debt",
+        "coordination_requirements": "Requires off-chain compromise of admin infrastructure"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Full protocol compromise",
+        "operational_disruption": "Total loss of user staked assets, protocol insolvency",
+        "recovery_difficulty": "Impossible to recover stolen funds without a chain fork or external bailout",
+        "affected_operations": "All yield staking operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "High (requires off-chain key compromise)",
+        "technical_skills": "Advanced social engineering or operational security exploitation",
+        "operational_timing": "Any time after key compromise"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Calls to YieldRegistry.rescue",
+        "operational_anomalies": "Sudden transfer of assets out of YieldAccounts not initiated by users",
+        "behavioral_patterns": "Admin address executing unusual batch operations",
+        "detection_difficulty": "low (easy to detect, hard to prevent once initiated)"
+      },
+      "original_category": "operational-2",
+      "original_specialist": "operational-2"
+    },
+    {
+      "hypothesis_id": "OPS2-H015",
+      "title": "Adding address(0) as a yield manager is possible, enabling creation of broken YieldAccounts and weakening authorization assumptions",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "YieldRegistry.addYieldManager lacks a non-zero address check. If pool admin mistakenly (or maliciously) adds address(0) as a yield manager, then createYieldAccount(address(0)) would pass existYieldManager and produce YieldAccounts with yieldManager=0. This breaks the manager-only access model and creates accounts that cannot be controlled via onlyManager, increasing reliance on registry rescue and complicating incident response.",
+      "investigation_rationale": "This is a missing input validation on a high-privilege configuration method, with clear downstream negative effects on account safety and operability.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A pool admin action adds address(0) as a yield manager (mistake or malicious insider)",
+        "Users/automation may create accounts or transfer funds relying on correct manager assignment"
+      ],
+      "config_evidence": "YieldRegistry.sol addYieldManager(address _manager) does not require _manager != address(0).",
+      "affected_functions": [
+        "addYieldManager(address)",
+        "createYieldAccount(address)"
+      ],
+      "affected_contracts": [
+        "YieldRegistry.sol",
+        "YieldAccount.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "YieldRegistry.sol",
+          "function": "addYieldManager(address _manager)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "YieldRegistry.sol",
+        "lines": "65-75",
+        "pattern": "function addYieldManager(address _manager) public onlyPoolAdmin { bool isAddOk = yieldManagers.add(_manager); ... } // no zero-address check"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Caller has POOL_ADMIN privileges for YieldRegistry",
+        "Admin mistakenly/maliciously adds address(0) to yieldManagers",
+        "Subsequent createYieldAccount(0) calls occur"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Authorization set is intended to represent real manager contracts; allowing 0 undermines that model",
+        "admin_dependency": "Requires privileged misconfiguration",
+        "exploitation_window": "Until removed (and existing broken accounts remain)"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are there guardrails in deployment scripts to prevent adding address(0) as manager?",
+          "Do runbooks include validation checks for manager sets?",
+          "How many systems assume yieldManager is always non-zero?"
+        ],
+        "validation_requirements": [
+          "Test addYieldManager(0) then createYieldAccount(0)",
+          "Assess ability to recover assets via registry rescue if many broken accounts exist"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Exploit privileged misconfiguration to whitelist address(0) as yield manager",
+        "phase_2": "Create broken YieldAccounts and/or entice transfers to them",
+        "phase_3": "Force reliance on registry rescue for recovery, increasing admin operational burden and risk",
+        "phase_4": "Potentially combine with other incidents to overwhelm response capacity",
+        "coordination_requirements": "High (privileged action required)"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Partial (misconfiguration of privileged set)",
+        "operational_disruption": "Creation of unusable accounts, trapped funds incidents, monitoring noise",
+        "recovery_difficulty": "Medium",
+        "affected_operations": "Yield account management and incident response"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "N/A",
+        "coordination_complexity": "High",
+        "technical_skills": "Low",
+        "operational_timing": "During admin ops or upgrades"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "yieldManagers contains 0x0; CreateYieldAccount with manager=0",
+        "operational_anomalies": "Spike in registry rescues",
+        "behavioral_patterns": "Accounts with yieldManager==0 receiving assets",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational-2",
+      "original_specialist": "operational-2"
+    }
+  ]
+}

@@ -1,0 +1,994 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "Bridge.sol",
+      "IBridge.sol",
+      "SignalService.sol",
+      "ISignalService.sol",
+      "LibSignals.sol",
+      "ERC20Vault.sol",
+      "ERC1155Vault.sol",
+      "ERC721Vault.sol",
+      "BaseNFTVault.sol",
+      "BaseVault.sol",
+      "BridgedERC20.sol",
+      "BridgedERC721.sol",
+      "BridgedERC1155.sol",
+      "BridgedERC20Base.sol",
+      "LibBridgedToken.sol",
+      "IBridgedERC20.sol",
+      "USDCAdapter.sol",
+      "EssentialContract.sol",
+      "IAddressManager.sol",
+      "LibAddress.sol",
+      "LibTrieProof.sol",
+      "RLPReader.sol",
+      "RLPWriter.sol",
+      "MerkleTrie.sol",
+      "SecureMerkleTrie.sol",
+      "Bytes.sol",
+      "ExcessivelySafeCall.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-05T05:34:04.556Z",
+    "duration_ms": 462603
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS-H001",
+      "title": "Relayer Gas Griefing to Steal Message Processing Fees",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "A malicious relayer can call processMessage with barely enough gas for the bridge overhead but insufficient gas for the actual message execution. The EVM's 63/64 rule means the inner call receives less gas than _message.gasLimit. The call fails, the message is marked RETRIABLE, but the relayer still receives _message.fee. The user's message is stuck in RETRIABLE, requiring the destOwner to retry without any fee compensation.",
+      "investigation_rationale": "processMessage does not verify gasleft() >= _message.gasLimit before forwarding to _invokeMessageCall. ExcessivelySafeCall silently uses whatever gas is available, making under-gas attacks undetectable by the bridge logic.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "processMessage",
+        "_invokeMessageCall"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "_invokeMessageCall"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "217-230",
+        "pattern": "gasLimit = _message.gasLimit used without verifying gasleft() >= gasLimit; ExcessivelySafeCall forwards min(gasLimit, 63/64*gasleft)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Message has non-zero fee (incentive for relayer)",
+        "msg.sender != _message.destOwner (uses _message.gasLimit not gasleft())",
+        "On L2: invocationDelay == 0 so anyone can immediately process",
+        "On L1: attacker is preferredExecutor or waits extra delay"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Relayer submits processMessage with total gas = bridge_overhead + small_buffer, far below _message.gasLimit",
+        "admin_dependency": "None - fully exploitable by any on-chain actor",
+        "exploitation_window": "Available for every message with fee > 0 processed by a non-destOwner"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the minimum gas overhead for processMessage before _invokeMessageCall?",
+          "How much profit can a relayer extract per griefed message?",
+          "Is there monitoring for RETRIABLE messages that should have succeeded?"
+        ],
+        "validation_requirements": [
+          "Calculate exact gas overhead for processMessage (proof verification, storage reads/writes)",
+          "Test with gasLimit set to bridge_overhead + 100 to confirm inner call fails",
+          "Verify fee is paid even when message becomes RETRIABLE"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Monitor for sent bridge messages with profitable fees",
+        "phase_2": "Submit processMessage with just enough gas for bridge overhead (~200k gas) but far less than _message.gasLimit",
+        "phase_3": "Inner call fails due to insufficient gas, message marked RETRIABLE",
+        "phase_4": "Collect _message.fee as msg.sender while user's execution didn't happen",
+        "coordination_requirements": "None - single transaction, any address"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Users lose their processing fees and messages stuck in RETRIABLE state",
+        "recovery_difficulty": "destOwner must call retryMessage (no fee) or processMessage with adequate gas",
+        "affected_operations": "All bridge message processing with non-zero fees"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "None - single atomic transaction",
+        "technical_skills": "Basic - calculate minimum gas for bridge overhead",
+        "operational_timing": "Any time a message with fee is ready to process"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Messages transitioning to RETRIABLE despite adequate message gasLimit",
+        "operational_anomalies": "Relayer addresses consistently processing messages that become RETRIABLE",
+        "behavioral_patterns": "Same relayer profiting from fees on many RETRIABLE messages",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H002",
+      "title": "changeBridgedToken Deletes Wrong Mapping Key - Stale bridgedToCanonical Entry",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In ERC20Vault.changeBridgedToken, `delete bridgedToCanonical[_btokenNew]` is a no-op because the validation above already confirmed _btokenNew has no existing mapping. The intended `delete bridgedToCanonical[btokenOld_]` is never executed. After token migration, the old bridged token retains its canonical mapping in storage, breaking the bijection between bridgedToCanonical and canonicalToBridged. Multiple stale entries accumulate across successive migrations.",
+      "investigation_rationale": "This is a confirmed code bug where line 179 deletes the wrong key. The stale mapping is currently guarded by the btokenBlacklist check in sendToken, but the storage inconsistency creates risk for future upgrades or off-chain indexers.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "changeBridgedToken"
+      ],
+      "affected_contracts": [
+        "ERC20Vault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Vault.sol",
+          "function": "changeBridgedToken"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Vault.sol",
+        "lines": "179",
+        "pattern": "delete bridgedToCanonical[_btokenNew] is no-op; should be delete bridgedToCanonical[btokenOld_]"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner calls changeBridgedToken with a valid old token existing",
+        "btokenOld_ != address(0) (there is an existing bridged token to replace)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "After changeBridgedToken: bridgedToCanonical[btokenOld_].addr != address(0) despite btokenOld_ being replaced",
+        "admin_dependency": "Triggered automatically by any owner-initiated token migration",
+        "exploitation_window": "Every token migration leaves stale mapping data permanently"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are there any code paths that check bridgedToCanonical without also checking btokenBlacklist?",
+          "Could a future upgrade introduce a path that treats the stale mapping as valid?",
+          "Do off-chain indexers rely on bridgedToCanonical for token resolution?"
+        ],
+        "validation_requirements": [
+          "Verify bridgedToCanonical[btokenOld_] persists after changeBridgedToken call",
+          "Confirm the deletion on line 179 is indeed a no-op",
+          "Test successive migrations to confirm stale entries accumulate"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Observe that after any token migration, bridgedToCanonical has stale entry",
+        "phase_2": "In current code, blacklist prevents exploitation via sendToken",
+        "phase_3": "If contract is upgraded and new logic queries bridgedToCanonical without blacklist check, stale entry becomes exploitable",
+        "phase_4": "Old token would be treated as valid bridged token, potentially allowing double-counting",
+        "coordination_requirements": "Requires contract upgrade to introduce exploitable code path (latent vulnerability)"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Storage inconsistency in vault mapping state",
+        "operational_disruption": "Off-chain indexers may show incorrect token relationships",
+        "recovery_difficulty": "Requires contract upgrade to clean stale entries",
+        "affected_operations": "ERC20 token migration correctness"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "None - bug triggers automatically",
+        "technical_skills": "None - inherent code defect",
+        "operational_timing": "Occurs on every changeBridgedToken call with existing old token"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "bridgedToCanonical entries for blacklisted tokens",
+        "operational_anomalies": "Multiple bridgedToCanonical entries mapping to same canonical token",
+        "behavioral_patterns": "N/A - inherent storage bug",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H003",
+      "title": "Permanent Message DoS via Reverting refundTo Address",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If _message.refundTo is set to a contract that cannot receive ETH (reverts on receive/fallback), processMessage always reverts at the refundTo.sendEther() call. The message is permanently stuck in NEW status. Since it never reaches FAILED on the destination chain, recallMessage on the source chain cannot be triggered. The message's value and fee, plus any tokens locked in the source vault, are permanently frozen.",
+      "investigation_rationale": "LibAddress.sendEther uses ExcessivelySafeCall which returns success=false if the target reverts, then LibAddress reverts with ETH_TRANSFER_FAILED. This reverts the entire processMessage. Even when refundAmount is 0, sendEther(0) still makes a call to refundTo which can revert.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "processMessage",
+        "recallMessage"
+      ],
+      "affected_contracts": [
+        "Bridge.sol",
+        "ERC20Vault.sol",
+        "ERC721Vault.sol",
+        "ERC1155Vault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "recallMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "237-243",
+        "pattern": "refundTo.sendEther(refundAmount) reverts if refundTo is a contract that rejects ETH; same issue at srcOwner.sendEther in recallMessage line 174"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "refundTo address is a contract that reverts on ETH receive (or srcOwner for recall path)",
+        "Message is in NEW status on destination chain",
+        "No alternative processing path exists to bypass the sendEther call"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "processMessage always reverts for specific messages despite valid proofs",
+        "admin_dependency": "None - can affect any user who sets refundTo to a non-receiving contract",
+        "exploitation_window": "Permanent - no timeout or admin rescue mechanism for stuck messages"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can destOwner process the message (as msg.sender == refundTo path)?",
+          "If message.value == 0 and refundAmount == 0, does sendEther(0) still revert?",
+          "Is there any admin function to force-complete stuck messages?"
+        ],
+        "validation_requirements": [
+          "Deploy reverting contract as refundTo, send bridge message, confirm processMessage permanently fails",
+          "Verify sendEther(address, 0) still makes a call that can revert",
+          "Confirm no rescue path exists for permanently stuck messages"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "User sets refundTo to a proxy wallet that later upgrades to reject ETH",
+        "phase_2": "Bridge message becomes unprocessable on destination chain",
+        "phase_3": "Source chain tokens/ETH permanently locked since recall requires FAILED status",
+        "phase_4": "No admin intervention possible - no force-complete function exists",
+        "coordination_requirements": "None for self-griefing; proxy upgrade for weaponized version"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Permanent loss of bridged assets for affected messages",
+        "recovery_difficulty": "Requires protocol upgrade to add rescue mechanism",
+        "affected_operations": "Any bridge message with reverting refundTo/srcOwner"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Low - single message with reverting refundTo",
+        "technical_skills": "Low - deploy a contract without receive/fallback",
+        "operational_timing": "refundTo must be reverting when processMessage is called"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Messages stuck in NEW status with repeated failed processMessage attempts",
+        "operational_anomalies": "ETH_TRANSFER_FAILED reverts during processMessage",
+        "behavioral_patterns": "refundTo addresses that are contracts without receive functions",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H004",
+      "title": "SignalService Cannot Be Paused - No Emergency Brake for Proof Verification",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "SignalService._authorizePause always reverts with SS_UNSUPPORTED, making the contract permanently unpausable. If a vulnerability is found in Merkle proof verification (LibTrieProof, MerkleTrie, or the multi-hop logic), there is no way to halt proof processing. While the Bridge can be paused, SignalService.proveSignalReceived remains callable by anyone, and any cached chain data from proof verification persists.",
+      "investigation_rationale": "The inherited pause() and unpause() functions from EssentialContract are publicly callable but always revert for SignalService. This is intentional but creates a gap in emergency response capability.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_authorizePause",
+        "proveSignalReceived",
+        "syncChainData"
+      ],
+      "affected_contracts": [
+        "SignalService.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SignalService.sol",
+          "function": "_authorizePause"
+        },
+        {
+          "file": "SignalService.sol",
+          "function": "proveSignalReceived"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SignalService.sol",
+        "lines": "206-208",
+        "pattern": "function _authorizePause(address) internal pure override { revert SS_UNSUPPORTED(); }"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A vulnerability exists in proof verification logic",
+        "Bridge pausing alone is insufficient because SignalService operations continue independently"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "SignalService.pause() always reverts - dead code path",
+        "admin_dependency": "Even owner cannot pause SignalService",
+        "exploitation_window": "Permanent - no pause capability by design"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can pausing the Bridge alone prevent all exploitation of a SignalService vulnerability?",
+          "Can proveSignalReceived be called directly to cache malicious data even while Bridge is paused?",
+          "Is there an alternative emergency mechanism (e.g., deauthorizing all addresses)?"
+        ],
+        "validation_requirements": [
+          "Confirm SignalService.pause() always reverts",
+          "Test if proveSignalReceived with caching options can write to storage when called directly",
+          "Verify if owner can deauthorize all syncChainData callers as alternative emergency brake"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify vulnerability in MerkleTrie/LibTrieProof proof verification",
+        "phase_2": "Exploit vulnerability to forge proofs while Bridge is paused but SignalService is active",
+        "phase_3": "Call proveSignalReceived directly with CACHE_STATE_ROOT to write malicious roots",
+        "phase_4": "When Bridge is unpaused, process messages using cached malicious roots",
+        "coordination_requirements": "Requires finding a Merkle proof verification bug"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Loss of emergency response capability for cross-chain verification",
+        "operational_disruption": "Cannot halt proof verification during active exploit",
+        "recovery_difficulty": "Requires contract upgrade to add pause capability",
+        "affected_operations": "All cross-chain signal verification"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "High - requires first finding a proof verification vulnerability",
+        "technical_skills": "Advanced - Merkle proof manipulation",
+        "operational_timing": "During an active vulnerability window"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Unexpected chain data syncs during Bridge pause periods",
+        "operational_anomalies": "proveSignalReceived calls with unusual caching options",
+        "behavioral_patterns": "Direct calls to proveSignalReceived outside normal bridge flow",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "Fee-On-Transfer Token Drain on Destination Chain ERC20Vault",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "ERC20Vault._handleMessage correctly measures balanceChange via before/after balanceOf on the source chain for fee-on-transfer tokens. However, _transferTokens on the destination chain calls IERC20(token_).safeTransfer(_to, _amount) with the full recorded amount. If the canonical token on the destination chain is a fee-on-transfer token, the vault transfers _amount from its balance but the recipient receives less. Over many bridge cycles, the vault's reserves are drained faster than bridged tokens are returned, eventually making the vault insolvent.",
+      "investigation_rationale": "Source-side accounting is correct (balance delta), but destination-side does not re-measure the actual transfer amount, creating an asymmetry that accumulates over repeated operations.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Fee-on-transfer ERC20 token is used as a canonical token on the destination chain"
+      ],
+      "config_evidence": "ERC20Vault.sol:_transferTokens line uses safeTransfer without post-transfer balance check; _handleMessage on source uses balance delta",
+      "affected_functions": [
+        "_transferTokens",
+        "_handleMessage",
+        "onMessageInvocation"
+      ],
+      "affected_contracts": [
+        "ERC20Vault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Vault.sol",
+          "function": "_transferTokens"
+        },
+        {
+          "file": "ERC20Vault.sol",
+          "function": "_handleMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Vault.sol",
+        "lines": "270-273",
+        "pattern": "IERC20(token_).safeTransfer(_to, _amount) transfers full _amount without measuring actual received amount on destination"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Canonical token on destination chain has transfer fees",
+        "Token is bridged back to origin chain where it is canonical",
+        "Multiple round-trip bridge operations occur"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Destination vault's canonical token balance decreases faster than expected with each bridge operation",
+        "admin_dependency": "None - occurs naturally with fee-on-transfer tokens",
+        "exploitation_window": "Accumulates over time with each bridge operation"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Which canonical tokens in the vault have transfer fees?",
+          "How quickly does the drain accumulate relative to bridging volume?",
+          "Is there monitoring for vault balance vs bridged token total supply?"
+        ],
+        "validation_requirements": [
+          "Deploy fee-on-transfer token, perform round-trip bridging, measure vault balance divergence",
+          "Calculate break-even point where vault becomes insolvent",
+          "Verify safeTransfer does not account for fee"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify fee-on-transfer canonical token held by vault",
+        "phase_2": "Repeatedly bridge tokens to destination and back",
+        "phase_3": "Each round trip reduces vault's actual token balance by transfer fee amount",
+        "phase_4": "Eventually vault cannot fulfill withdrawal requests, last users lose funds",
+        "coordination_requirements": "Multiple bridge operations required; can be accelerated with flash loans"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Vault insolvency for fee-on-transfer tokens",
+        "recovery_difficulty": "Requires injecting tokens to make vault whole",
+        "affected_operations": "Token bridging for affected canonical tokens"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Low - repeated bridge operations",
+        "technical_skills": "Low",
+        "operational_timing": "Gradual accumulation over many operations"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Vault balance diverging from expected amount based on bridged supply",
+        "operational_anomalies": "Users unable to withdraw full amounts from vault",
+        "behavioral_patterns": "Repeated bridge round-trips for specific tokens",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H006",
+      "title": "Unchecked Overflow in invocationDelay + invocationExtraDelay Could Bypass Timing Security",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In processMessage, `unchecked { invocationDelay += invocationExtraDelay; }` wraps around on overflow. While current hardcoded values in getInvocationDelays are safe, getInvocationDelays is marked `virtual`, allowing derived contracts to return large values. If a derived Bridge contract returns values summing above type(uint256).max, the delay wraps to a small value, allowing non-preferred executors to process messages almost immediately, bypassing the timing security window.",
+      "investigation_rationale": "The unchecked arithmetic on security-critical delay values is dangerous when the function providing those values is overridable. A malicious or buggy override could exploit the overflow.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A derived Bridge contract overrides getInvocationDelays with values that overflow when summed"
+      ],
+      "config_evidence": "Bridge.sol getInvocationDelays is virtual; current hardcoded values are safe but overridability creates risk",
+      "affected_functions": [
+        "processMessage",
+        "getInvocationDelays"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "getInvocationDelays"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "210-213",
+        "pattern": "unchecked { invocationDelay += invocationExtraDelay; } on security-critical timing values"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Bridge is deployed as derived contract with overridden getInvocationDelays",
+        "Sum of invocationDelay + invocationExtraDelay exceeds type(uint256).max",
+        "Non-preferred executor attempts to process message"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Non-preferred executors processing messages without expected extra delay",
+        "admin_dependency": "Requires deployment of derived contract with buggy override",
+        "exploitation_window": "After proof but during intended delay period"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are there any deployed derived Bridge contracts overriding getInvocationDelays?",
+          "Could a governance proposal introduce a bad override?",
+          "Is there input validation on the returned delay values?"
+        ],
+        "validation_requirements": [
+          "Create derived Bridge with large delay values that overflow",
+          "Confirm wrapped delay allows immediate execution",
+          "Verify current production Bridge does not override getInvocationDelays"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Propose upgrade to Bridge with overridden getInvocationDelays returning near-max values",
+        "phase_2": "After upgrade, non-preferred executors' delay wraps to near-zero",
+        "phase_3": "Process messages immediately without the intended security delay",
+        "phase_4": "Execute malicious messages before watchdog can react",
+        "coordination_requirements": "Requires governance control or malicious upgrade"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Timing security bypassed for non-preferred executors",
+        "operational_disruption": "Watchdog response window eliminated",
+        "recovery_difficulty": "Requires contract upgrade to add checked arithmetic",
+        "affected_operations": "All L1 bridge message processing"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Enough for governance proposal if applicable",
+        "coordination_complexity": "High - requires contract upgrade",
+        "technical_skills": "Advanced - understanding of unchecked arithmetic",
+        "operational_timing": "After malicious upgrade is deployed"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Bridge upgrade proposals modifying getInvocationDelays",
+        "operational_anomalies": "Messages processed faster than expected on L1",
+        "behavioral_patterns": "Non-preferred executors processing immediately after proof",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "Suspend-then-Unsuspend Enables Processing Fabricated Bridge Messages Without Proof",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The bridge_watchdog (or owner) can call suspendMessages(hashes, true) then suspendMessages(hashes, false) for ANY arbitrary msgHash. Unsuspending sets proofReceipt[msgHash].receivedAt = block.timestamp. In processMessage, isMessageProven = (receivedAt != 0) which is now true, so _proveSignalReceived is completely skipped. Since messageStatus defaults to NEW (0) for all unused hashes, a crafted message matching the hash can be processed without any Merkle proof. Unlike recallMessage which additionally checks isSignalSent, processMessage has no such secondary verification.",
+      "investigation_rationale": "The asymmetry between processMessage (no isSignalSent check) and recallMessage (has isSignalSent check) means processMessage is uniquely vulnerable to the suspend/unsuspend bypass. A compromised watchdog could enable arbitrary message execution on the destination chain.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "suspendMessages",
+        "processMessage"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "suspendMessages"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "82-92,195-213",
+        "pattern": "suspendMessages sets proofReceipt[msgHash].receivedAt = block.timestamp on unsuspend; processMessage skips proof if receivedAt != 0; no isSignalSent check in processMessage unlike recallMessage"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "bridge_watchdog key is compromised (or owner key)",
+        "Attacker can compute hashMessage for a crafted message",
+        "Destination chain is the one where processMessage is called",
+        "On L1: must wait invocationDelay (1h) + invocationExtraDelay (384s) after unsuspend"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "suspendMessages called for hashes that were never proven, followed by unsuspend, then processMessage",
+        "admin_dependency": "Requires bridge_watchdog or owner key compromise",
+        "exploitation_window": "After unsuspend + invocationDelay on L1; immediate on L2 (zero delay)"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the bridge_watchdog address a multisig with adequate threshold?",
+          "Are suspendMessages calls monitored for hashes that lack corresponding sent messages?",
+          "Can the suspend/unsuspend be made proof-aware (require prior proof before unsuspend restores processability)?"
+        ],
+        "validation_requirements": [
+          "Craft arbitrary message, compute hash, suspend+unsuspend, confirm processMessage succeeds without proof",
+          "Verify that recallMessage is protected by isSignalSent check but processMessage is not",
+          "Quantify maximum extractable value via fabricated messages"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise bridge_watchdog key",
+        "phase_2": "Craft message targeting ERC20Vault.onMessageInvocation with arbitrary canonical token drain data",
+        "phase_3": "Compute msgHash, call suspendMessages([msgHash], true) then suspendMessages([msgHash], false)",
+        "phase_4": "Wait invocationDelay, call processMessage with crafted message - proof is skipped",
+        "coordination_requirements": "bridge_watchdog key compromise required"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Complete bridge drain possible - any message can be fabricated",
+        "operational_disruption": "All vault tokens and bridge ETH can be stolen",
+        "recovery_difficulty": "Requires emergency response, potential hard fork consideration",
+        "affected_operations": "Entire bridge and vault ecosystem"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Medium - need watchdog key + craft valid message encoding",
+        "technical_skills": "Advanced - message construction matching vault ABI",
+        "operational_timing": "On L2: immediate; On L1: 1h+ after unsuspend"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "suspendMessages calls followed by unsuspend for non-proven hashes",
+        "operational_anomalies": "processMessage succeeding without prior proof receipt from legitimate sources",
+        "behavioral_patterns": "Watchdog address calling suspend/unsuspend in rapid succession",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H008",
+      "title": "Banning Vault Address Causes Permanent Token Loss for In-Flight Messages",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If the bridge_watchdog bans a vault address (e.g., erc20_vault on destination chain), all in-flight messages targeting that vault are processed with status DONE immediately, with _message.value refunded but no actual token transfer executed. The message data (containing token transfer instructions) is silently discarded. Since the status is DONE (not FAILED), recallMessage on the source chain cannot be triggered. The tokens locked/burned on the source chain are permanently lost.",
+      "investigation_rationale": "processMessage handles banned target addresses by setting refundAmount = _message.value and status = DONE without invoking the message. The token payload in _message.data is never executed, and DONE status prevents recall.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "processMessage",
+        "banAddress"
+      ],
+      "affected_contracts": [
+        "Bridge.sol",
+        "ERC20Vault.sol",
+        "ERC721Vault.sol",
+        "ERC1155Vault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "banAddress"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "219-226",
+        "pattern": "addressBanned[_message.to] causes refundAmount = _message.value and status = DONE; token data in message.data ignored; DONE prevents recall"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Watchdog or owner bans a vault address",
+        "In-flight messages exist targeting that vault",
+        "Messages are processed after ban takes effect"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Vault address banned → in-flight messages processed as DONE without token delivery → tokens permanently locked on source",
+        "admin_dependency": "Requires bridge_watchdog or owner to ban the vault address",
+        "exploitation_window": "While vault address is banned and in-flight messages are being processed"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are there operational procedures to delay banning vault addresses?",
+          "Could a two-step ban with time delay allow in-flight messages to be processed first?",
+          "Is there a mechanism to recover tokens from permanently DONE messages?"
+        ],
+        "validation_requirements": [
+          "Ban vault address, process in-flight message, confirm tokens are lost",
+          "Verify DONE status prevents recallMessage",
+          "Confirm no admin function to reset DONE messages"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromised watchdog identifies vault address on destination chain",
+        "phase_2": "Bans vault address while high-value messages are in-flight",
+        "phase_3": "Relayers process messages → DONE without token delivery",
+        "phase_4": "Source chain tokens permanently locked (ERC20/721/1155 in vault, burned bridged tokens unrecoverable)",
+        "coordination_requirements": "bridge_watchdog key compromise + timing with in-flight messages"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Targeted token theft via admin action",
+        "operational_disruption": "All in-flight messages to banned address lose their token payloads",
+        "recovery_difficulty": "No recovery mechanism - requires protocol upgrade",
+        "affected_operations": "All token vault operations for banned vault"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Medium - must time ban with in-flight messages",
+        "technical_skills": "Low - simple admin function call",
+        "operational_timing": "During active bridging with high-value in-flight messages"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Ban events for vault addresses; DONE messages with no corresponding vault events",
+        "operational_anomalies": "Messages marked DONE without TokenReceived events",
+        "behavioral_patterns": "Vault addresses being banned and quickly unbanned",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "Bridge Watchdog Can Indefinitely Freeze Funds With No Escape Mechanism",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The bridge_watchdog can call suspendMessages for any message hashes, setting receivedAt = type(uint64).max. Suspended messages cannot be processed because block.timestamp < invocationDelay + type(uint64).max is always true. There is no timeout mechanism, no escape hatch, and no way for affected users to recover their funds. The watchdog can indefinitely freeze any number of messages without any governance override.",
+      "investigation_rationale": "The suspension mechanism has no time limit and no governance or owner override to force-unsuspend. Once suspended, only the watchdog (or owner) can unsuspend, creating a single point of failure for fund recovery.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "suspendMessages",
+        "processMessage",
+        "recallMessage"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "suspendMessages"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "82-92",
+        "pattern": "proofReceipt[msgHash].receivedAt = type(uint64).max; no timeout or governance override for unsuspension"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "bridge_watchdog or owner key is compromised or acts maliciously",
+        "Messages are suspended and never unsuspended",
+        "No alternative governance mechanism can force unsuspend"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Messages suspended with no subsequent unsuspend; funds frozen indefinitely",
+        "admin_dependency": "Requires watchdog or owner to suspend and refuse to unsuspend",
+        "exploitation_window": "Permanent - no timeout on suspension"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is there a governance process to replace the bridge_watchdog address?",
+          "Can the owner override a malicious watchdog's suspensions?",
+          "Should a maximum suspension duration be implemented?"
+        ],
+        "validation_requirements": [
+          "Confirm owner can also call suspendMessages to unsuspend",
+          "Verify no alternative unsuspend path exists",
+          "Test if AddressManager change to bridge_watchdog affects existing suspensions"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise bridge_watchdog key or act as malicious watchdog",
+        "phase_2": "Suspend all high-value in-flight message hashes",
+        "phase_3": "Refuse to unsuspend, holding funds hostage",
+        "phase_4": "Demand ransom or cause protocol-wide disruption",
+        "coordination_requirements": "bridge_watchdog key control"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Indefinite fund freezing capability",
+        "operational_disruption": "Targeted or mass fund freezing with no automatic recovery",
+        "recovery_difficulty": "Requires owner intervention via onlyFromOwnerOrNamed modifier; if owner is timelock, requires governance vote",
+        "affected_operations": "All bridge messages can be targeted"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0 (for watchdog); governance proposal needed if owner is timelock",
+        "coordination_complexity": "Low - single transaction per message batch",
+        "technical_skills": "Low - simple function call",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Large batches of suspended messages without subsequent unsuspend",
+        "operational_anomalies": "Suspension events for valid, proven messages",
+        "behavioral_patterns": "Watchdog suspending without corresponding threat indicators",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "Bridge Message Selector Bypass for Contracts with Short Data Payloads",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "_invokeMessageCall checks if data.length >= 4 AND selector != onMessageInvocation AND target.isContract() → sets success_ = false. However, if data.length < 4 (1-3 bytes), the check is bypassed entirely and ExcessivelySafeCall is made to any contract target with arbitrary short data. This invokes the contract's fallback function with attacker-controlled short data. While impact is limited by what fallback functions do, it allows arbitrary fallback invocation on any non-banned contract through the bridge with ETH value.",
+      "investigation_rationale": "The selector filter intends to restrict bridge calls to only onMessageInvocation, but the length check creates a bypass for short payloads that trigger fallback functions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_invokeMessageCall"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "_invokeMessageCall"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "310-322",
+        "pattern": "if (_message.data.length >= 4 ...) check allows data.length 1-3 to bypass selector restriction; excessivelySafeCall proceeds with short data to contract"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Message data is 1-3 bytes long",
+        "Target is a contract address",
+        "Target is not banned, not address(0), not bridge, not signal service",
+        "Message has valid proof (or proof bypass via suspend/unsuspend)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Bridge messages with 1-3 byte data invoking contract fallback functions",
+        "admin_dependency": "None - any user can craft such a message via sendMessage",
+        "exploitation_window": "Any time - requires sending message with short data from source chain"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are there any contracts addressable through the bridge whose fallback functions have security-relevant behavior?",
+          "Can ETH value combined with short data trigger unexpected behavior in protocol contracts?",
+          "Is there a legitimate use case for 1-3 byte data messages?"
+        ],
+        "validation_requirements": [
+          "Send bridge message with 3-byte data to contract, confirm fallback is invoked",
+          "Survey protocol contracts for fallback function behavior",
+          "Verify if empty data (length 0) is also allowed (yes, it is - for ETH transfers)"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify target contract with exploitable fallback function",
+        "phase_2": "Craft bridge message with 1-3 byte data and ETH value targeting that contract",
+        "phase_3": "Send message from source chain, process on destination",
+        "phase_4": "Fallback function invoked with ETH value and short data",
+        "coordination_requirements": "None - standard bridge message flow"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Depends on target contract's fallback behavior",
+        "operational_disruption": "Limited - most fallback functions are benign or simply receive ETH",
+        "recovery_difficulty": "Low - unlikely to cause permanent damage",
+        "affected_operations": "Contracts with non-trivial fallback functions"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Low - single bridge message",
+        "technical_skills": "Low - craft message with short data",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Bridge messages with data length 1-3 bytes to contract targets",
+        "operational_anomalies": "Unexpected fallback invocations on protocol contracts",
+        "behavioral_patterns": "Messages specifically crafted to bypass selector check",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H011",
+      "title": "Missing bridge_watchdog and bridge_pauser Registration in Deployment Creates Operational Gap",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The deployment scripts (DeployOnL1.s.sol) do not register 'bridge_watchdog' or 'bridge_pauser' named addresses in the AddressManager. Since Bridge uses onlyFromOwnerOrNamed('bridge_watchdog') and _authorizePause checks onlyFromOwnerOrNamed('bridge_pauser'), these resolve to address(0) when not registered. The modifiers allow owner OR the named address, so only the owner (timelock) can perform these actions. This means watchdog and pause operations require governance proposals through the timelock, adding significant latency (7 days per the timelock deployment) to emergency responses.",
+      "investigation_rationale": "The deployment script registers signal_service, bridge, vaults, and bridged token implementations but never registers bridge_watchdog or bridge_pauser. The 7-day timelock on owner actions creates a dangerous gap in emergency response capability.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "bridge_watchdog and bridge_pauser are not registered post-deployment via separate transactions"
+      ],
+      "config_evidence": "DeployOnL1.s.sol deploySharedContracts function registers signal_service, bridge, erc20_vault, erc721_vault, erc1155_vault, bridged_erc20, bridged_erc721, bridged_erc1155 but never registers bridge_watchdog or bridge_pauser",
+      "affected_functions": [
+        "suspendMessages",
+        "banAddress",
+        "pause",
+        "unpause"
+      ],
+      "affected_contracts": [
+        "Bridge.sol",
+        "EssentialContract.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "suspendMessages"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "_authorizePause"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "DeployOnL1.s.sol",
+        "lines": "deploySharedContracts function",
+        "pattern": "No register() calls for 'bridge_watchdog' or 'bridge_pauser' in deployment script; owner set to timelock with 7-day delay"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "bridge_watchdog and bridge_pauser not registered in AddressManager after deployment",
+        "Owner is timelock with 7-day delay",
+        "Emergency situation requires rapid pause or message suspension"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Emergency bridge operations require 7-day timelock governance process",
+        "admin_dependency": "Only timelock (owner) can perform watchdog/pause functions without named address registration",
+        "exploitation_window": "7-day window where emergency response is delayed"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are bridge_watchdog and bridge_pauser registered in a separate post-deployment step?",
+          "What is the actual timelock delay configured in production?",
+          "Is there a security council fast-path for emergency timelock operations?"
+        ],
+        "validation_requirements": [
+          "Query AddressManager for bridge_watchdog and bridge_pauser registrations",
+          "Verify timelock delay for owner operations",
+          "Check if security council has direct proposer+executor roles on timelock"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify that watchdog/pauser addresses are not registered",
+        "phase_2": "Exploit a bridge vulnerability knowing emergency response takes 7 days via timelock",
+        "phase_3": "Execute attack within the 7-day response window",
+        "phase_4": "Drain bridge assets before suspension can take effect",
+        "coordination_requirements": "Requires finding an exploitable vulnerability first"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Delayed emergency response by governance timelock duration",
+        "operational_disruption": "Inability to quickly pause bridge or suspend suspicious messages",
+        "recovery_difficulty": "Low - register watchdog/pauser addresses via governance",
+        "affected_operations": "All bridge emergency response procedures"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0 (the gap exists without attacker action)",
+        "coordination_complexity": "Low - operational gap exists by default",
+        "technical_skills": "Low",
+        "operational_timing": "Any time before watchdog/pauser are registered"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "AddressManager queries for bridge_watchdog and bridge_pauser returning address(0)",
+        "operational_anomalies": "Owner (timelock) being the only address that can pause/suspend",
+        "behavioral_patterns": "N/A - configuration gap, not behavioral",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

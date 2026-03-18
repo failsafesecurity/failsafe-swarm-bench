@@ -1,0 +1,902 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "EdgeChallengeManager.sol",
+      "EdgeChallengeManagerLib.sol",
+      "ChallengeEdgeLib.sol",
+      "MerkleTreeLib.sol",
+      "UintUtilsLib.sol",
+      "ArrayUtilsLib.sol",
+      "ChallengeErrors.sol",
+      "Enums.sol",
+      "IAssertionChain.sol",
+      "RollupCore.sol",
+      "RollupUserLogic.sol",
+      "RollupLib.sol",
+      "Assertion.sol",
+      "AssertionState.sol",
+      "IRollupCore.sol",
+      "IRollupLogic.sol",
+      "Config.sol",
+      "ISequencerInbox.sol",
+      "DelayBufferTypes.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T22:04:05.706Z",
+    "duration_ms": 671821
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS-H001",
+      "title": "Validator Whitelist Permanently Removable During Extended Pause via removeWhitelistAfterValidatorAfk",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The function removeWhitelistAfterValidatorAfk() has no whenNotPaused modifier. If the rollup admin pauses the contract for a legitimate operational reason (e.g., security incident, upgrade coordination) lasting longer than VALIDATOR_AFK_BLOCKS (201600 blocks, ~28 days at 12s), any address can call this function to permanently and irreversibly disable the validator whitelist. Once unpaused, all validator-gated functions become permissionless, allowing any entity to stake, create assertions, and participate in the rollup without authorization.",
+      "investigation_rationale": "This is a direct code defect: the pausable guard is missing on a critical state-changing function. During extended maintenance windows, an attacker could exploit this to remove the whitelist before the admin intends.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "removeWhitelistAfterValidatorAfk",
+        "_validatorIsAfk"
+      ],
+      "affected_contracts": [
+        "RollupUserLogic.sol",
+        "RollupCore.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "removeWhitelistAfterValidatorAfk()"
+        },
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "_validatorIsAfk()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RollupUserLogic.sol",
+        "lines": "73-77",
+        "pattern": "removeWhitelistAfterValidatorAfk() is external with no whenNotPaused modifier; block.number keeps incrementing during pause, making _validatorIsAfk() return true"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-014",
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "validatorWhitelistDisabled == false",
+        "Contract is paused by admin",
+        "Pause duration exceeds VALIDATOR_AFK_BLOCKS (201600 blocks)",
+        "No new assertions confirmed during the pause"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "removeWhitelistAfterValidatorAfk lacks whenNotPaused while all other state-mutating validator functions include it",
+        "admin_dependency": "Admin pause for extended maintenance could trigger unintended whitelist removal",
+        "exploitation_window": "Any time the contract is paused for >28 days and no assertions are confirmed"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can the admin re-enable the whitelist after it's been disabled?",
+          "Is there a mechanism to extend the AFK threshold during planned maintenance?",
+          "What is the longest historical pause duration for any Arbitrum rollup?"
+        ],
+        "validation_requirements": [
+          "Confirm no admin function exists to re-enable the whitelist once disabled",
+          "Test calling removeWhitelistAfterValidatorAfk while contract is paused",
+          "Verify block.number advancement during paused state"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Wait for rollup to be paused for operational reasons (security incident, upgrade)",
+        "phase_2": "Monitor block.number until VALIDATOR_AFK_BLOCKS pass since last assertion activity",
+        "phase_3": "Call removeWhitelistAfterValidatorAfk() - succeeds even during pause",
+        "phase_4": "Once contract is unpaused, any address can now act as validator",
+        "coordination_requirements": "None - single transaction by any address"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Permanent irreversible removal of validator whitelist",
+        "operational_disruption": "Non-whitelisted entities can create assertions and participate in challenges",
+        "recovery_difficulty": "No on-chain recovery mechanism exists to re-enable the whitelist",
+        "affected_operations": "All validator-gated functions: stakeOnNewAssertion, confirmAssertion, returnOldDeposit, reduceDeposit, addToDeposit, createLayerZeroEdge"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None - single permissionless transaction",
+        "technical_skills": "Basic - one external function call",
+        "operational_timing": "Must wait for 201600 blocks of pause duration"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Monitor pause events and block count since last confirmed assertion",
+        "operational_anomalies": "removeWhitelistAfterValidatorAfk called during paused state",
+        "behavioral_patterns": "Repeated checking of _validatorIsAfk() status",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H002",
+      "title": "Rollup Token Accounting Desynchronization: amountStaked Not Reduced on Escrow Transfer",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When stakeOnNewAssertion creates a non-first-child assertion, requiredStake tokens are transferred from the rollup contract to loserStakeEscrow. However, the creating staker's amountStaked is NOT reduced. This creates a persistent accounting desynchronization where sum(amountStaked for all stakers) + totalWithdrawableFunds > contract token balance. While the losing staker is typically stuck and cannot withdraw, if they can become inactive via a third party extending their losing branch, the phantom balance becomes actionable and the contract may have insufficient tokens to service all legitimate withdrawals.",
+      "investigation_rationale": "The code explicitly acknowledges 'if the losing staker have staked more than requiredStake, the excess stake will be stuck' but doesn't adjust accounting. This creates an invariant violation of INV-ECON-001 where contract liabilities exceed assets.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "stakeOnNewAssertion",
+        "returnOldDeposit",
+        "withdrawStaker",
+        "withdrawStakerFunds"
+      ],
+      "affected_contracts": [
+        "RollupUserLogic.sol",
+        "RollupCore.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "stakeOnNewAssertion(AssertionInputs,bytes32)"
+        },
+        {
+          "file": "RollupCore.sol",
+          "function": "withdrawStaker(address)"
+        },
+        {
+          "file": "RollupCore.sol",
+          "function": "increaseWithdrawableFunds(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RollupUserLogic.sol",
+        "lines": "157-163",
+        "pattern": "safeTransfer(loserStakeEscrow, requiredStake) executes without reducing _stakerMap[msg.sender].amountStaked; withdrawStaker later credits full amountStaked to withdrawable"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A fork exists (two children of the same assertion)",
+        "The losing staker has amountStaked >= requiredStake",
+        "The losing staker becomes inactive (their assertion gets a child)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Token transfer to escrow with no corresponding reduction in staker accounting",
+        "admin_dependency": "No admin intervention required - occurs in normal dispute flow",
+        "exploitation_window": "Permanent - occurs on every assertion fork where the loser becomes inactive"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Under what conditions can a losing staker become inactive and trigger the accounting mismatch?",
+          "Can a losing staker use a sybil account to create a child on their losing assertion to become inactive?",
+          "What is the cumulative impact on contract solvency across multiple disputes?"
+        ],
+        "validation_requirements": [
+          "Simulate full dispute lifecycle: fork, escrow transfer, losing staker inactive, withdrawal attempt",
+          "Verify contract balance vs sum of amountStaked + totalWithdrawableFunds after dispute",
+          "Test whether losing staker's returnOldDeposit reverts due to insufficient balance"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Malicious validator creates a second child assertion (non-first-child) - requiredStake sent to escrow",
+        "phase_2": "Using a sybil address, create a child on the losing assertion to make the original staker inactive",
+        "phase_3": "Original losing staker calls returnOldDeposit - full amountStaked credited to withdrawable",
+        "phase_4": "Sybil account's deposit subsidizes the original staker's withdrawal",
+        "coordination_requirements": "Two accounts controlled by attacker, each with requiredStake"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None directly",
+        "operational_disruption": "Inflated totalWithdrawableFunds creates phantom liabilities; late withdrawers may face reverts",
+        "recovery_difficulty": "No on-chain mechanism to correct accounting discrepancy",
+        "affected_operations": "withdrawStakerFunds, returnOldDeposit for all stakers"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - requires two staker accounts",
+        "technical_skills": "Basic validator operations",
+        "operational_timing": "After any dispute fork"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Contract token balance < sum(amountStaked) + totalWithdrawableFunds",
+        "operational_anomalies": "returnOldDeposit calls from stakers on losing branches",
+        "behavioral_patterns": "Sybil account creating children on losing branches",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H003",
+      "title": "EdgeChallengeManager Lacks Emergency Pause Mechanism Allowing Continued Exploit During Rollup Pause",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "EdgeChallengeManager does not inherit Pausable and has no pause/emergency stop mechanism. While RollupUserLogic can be paused to prevent assertion confirmation, the challenge manager continues to accept edge creation, bisection, timer updates, and edge confirmation. During a security incident requiring a pause, an attacker can continue to manipulate the challenge state (creating edges, accumulating timer, confirming edges), such that when the rollup is unpaused, the attacker has a confirmed winning edge ready to force confirmation of a malicious assertion.",
+      "investigation_rationale": "The architectural gap between RollupUserLogic (pausable) and EdgeChallengeManager (not pausable) creates an asymmetric response window where attackers can advance challenges while defenders cannot confirm assertions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "createLayerZeroEdge",
+        "bisectEdge",
+        "confirmEdgeByTime",
+        "confirmEdgeByOneStepProof",
+        "updateTimerCacheByChildren",
+        "updateTimerCacheByClaim"
+      ],
+      "affected_contracts": [
+        "EdgeChallengeManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "EdgeChallengeManager.sol",
+          "function": "createLayerZeroEdge(CreateEdgeArgs)"
+        },
+        {
+          "file": "EdgeChallengeManager.sol",
+          "function": "confirmEdgeByTime(bytes32,AssertionStateData)"
+        },
+        {
+          "file": "EdgeChallengeManager.sol",
+          "function": "confirmEdgeByOneStepProof(bytes32,OneStepData,ConfigData,bytes32[],bytes32[])"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "EdgeChallengeManager.sol",
+        "lines": "1-10",
+        "pattern": "Contract inherits only Initializable, not PausableUpgradeable; no pause() or unpause() functions; no whenNotPaused modifiers on any function"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "RollupUserLogic is paused due to security incident",
+        "Active challenges exist in EdgeChallengeManager",
+        "Attacker has created edges prior to pause"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "All EdgeChallengeManager state-mutating functions remain callable during rollup pause",
+        "admin_dependency": "Admin cannot halt challenge activity even during critical security incidents",
+        "exploitation_window": "Entire duration of any rollup pause"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can the admin replace the challenge manager address to orphan active challenges?",
+          "Is there a proxy admin that could upgrade the EdgeChallengeManager to add pause?",
+          "What is the impact of a confirmed malicious edge during pause?"
+        ],
+        "validation_requirements": [
+          "Confirm no indirect pause mechanism exists via assertionChain interface",
+          "Test full challenge lifecycle during rollup pause",
+          "Verify that edge confirmation during pause enables assertion confirmation upon unpause"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Create and advance challenge edges before or during rollup pause",
+        "phase_2": "Continue bisection and timer accumulation while rollup is paused",
+        "phase_3": "Confirm malicious edge via time or one-step proof during pause",
+        "phase_4": "When rollup is unpaused, use confirmed edge to immediately confirm malicious assertion",
+        "coordination_requirements": "Active challenge with valid edge structure"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Admin cannot halt challenge manipulation during security incidents",
+        "operational_disruption": "Attacker advances challenge state while honest validators are blocked from confirming assertions",
+        "recovery_difficulty": "May require proxy upgrade of EdgeChallengeManager to add pause functionality",
+        "affected_operations": "All challenge operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Edge stake amounts",
+        "coordination_complexity": "Medium - requires pre-existing challenge",
+        "technical_skills": "Advanced challenge protocol understanding",
+        "operational_timing": "During rollup pause"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Edge confirmations occurring while rollup is paused",
+        "operational_anomalies": "Challenge activity spikes during pause events",
+        "behavioral_patterns": "Edge creation and confirmation concentrated during paused periods",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H004",
+      "title": "EdgeChallengeManager Configuration Immutability Prevents Emergency Parameter Updates",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "After initialization, EdgeChallengeManager has NO setter functions for any configuration parameter: assertionChain, challengePeriodBlocks, oneStepProofEntry, stakeToken, excessStakeReceiver, stakeAmounts, layer zero heights, or NUM_BIGSTEP_LEVEL. If a bug is discovered in the oneStepProofEntry, or staking parameters need emergency adjustment, or the excessStakeReceiver address is compromised, the only remedy is deploying a new EdgeChallengeManager entirely. Existing challenges in the old manager would be orphaned, and assertions referencing the old challenge manager via configHash would remain permanently unresolvable through the new manager.",
+      "investigation_rationale": "The complete absence of admin setters in a complex protocol component is a significant operational risk. The configHash binding in assertions means old assertions cannot use a new challenge manager.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "initialize"
+      ],
+      "affected_contracts": [
+        "EdgeChallengeManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "EdgeChallengeManager.sol",
+          "function": "initialize(...)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "EdgeChallengeManager.sol",
+        "lines": "160-224",
+        "pattern": "initialize() sets all configuration; no other setter functions exist in the contract; no admin role or owner pattern for parameter updates"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "A bug is discovered in oneStepProofEntry or other configured dependency",
+        "OR excessStakeReceiver address needs changing",
+        "OR stakeAmounts need adjustment"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Zero admin functions for parameter updates post-initialization",
+        "admin_dependency": "Full redeployment required for any parameter change",
+        "exploitation_window": "Permanent - any discovered bug in dependencies cannot be hotfixed"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is there a proxy admin that can upgrade the implementation to add setters?",
+          "What happens to in-flight challenges when a new challenge manager is deployed?",
+          "Can assertions with old configHash ever be resolved through a new challenge manager?"
+        ],
+        "validation_requirements": [
+          "Verify no proxy upgrade path exists that preserves challenge state",
+          "Assess impact of orphaned challenges on rollup liveness",
+          "Test whether old assertions can ever be confirmed if challenge manager changes"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Discover or exploit a bug in oneStepProofEntry",
+        "phase_2": "Invalid SmallStep edges can be confirmed via the buggy prover",
+        "phase_3": "Admin cannot fix the oneStepProofEntry reference without full redeployment",
+        "phase_4": "Exploit window persists until new challenge manager is deployed and all affected assertions expire",
+        "coordination_requirements": "Depends on the specific bug discovered"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Admin cannot perform emergency parameter updates",
+        "operational_disruption": "In-flight challenges orphaned on redeployment; assertions may become unresolvable",
+        "recovery_difficulty": "Requires full redeployment plus potential rollup state migration",
+        "affected_operations": "All challenge and assertion confirmation operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Depends on the specific vulnerability being exploited",
+        "technical_skills": "Advanced understanding of challenge protocol and oneStepProofEntry",
+        "operational_timing": "After discovery of a dependency bug"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Invalid edge confirmations via buggy oneStepProofEntry",
+        "operational_anomalies": "Unexpected one-step proof results",
+        "behavioral_patterns": "Repeated confirmEdgeByOneStepProof calls with unusual proof data",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "VALIDATOR_AFK_BLOCKS Hardcoded for 12-Second Block Time Enables Premature Whitelist Removal on Faster Chains",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The constant VALIDATOR_AFK_BLOCKS = 201600 is hardcoded assuming a 12-second Ethereum L1 block time (yielding ~28 days). When deployed on chains with faster block times (e.g., 2-second blocks on some L2s), this period becomes ~4.67 days instead of the intended 28 days. This dramatically reduces the time window before any address can call removeWhitelistAfterValidatorAfk() to permanently disable the validator whitelist, even during brief periods of validator inactivity that would normally be expected.",
+      "investigation_rationale": "The contract is designed for deployment on multiple chains (Ethereum and Arbitrum per documentation). On Arbitrum's faster block production, the AFK threshold would be reached much sooner than intended.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Contract deployed on a chain with block time significantly different from 12 seconds"
+      ],
+      "config_evidence": "hardhat.config.ts shows deployment targets include Arbitrum chains (arb1, nova, arbGoerliRollup); RollupCore.sol uses _hostChainIsArbitrum flag",
+      "affected_functions": [
+        "_validatorIsAfk",
+        "removeWhitelistAfterValidatorAfk"
+      ],
+      "affected_contracts": [
+        "RollupUserLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "removeWhitelistAfterValidatorAfk()"
+        },
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "_validatorIsAfk()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RollupUserLogic.sol",
+        "lines": "44-46",
+        "pattern": "VALIDATOR_AFK_BLOCKS = 201600 with comment 'assuming a 12 seconds block time'; no chain-aware block time adjustment"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Contract deployed on a chain with block time < 12 seconds",
+        "validatorWhitelistDisabled == false",
+        "Brief period of validator inactivity (shorter than intended 28 days)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Hardcoded block count constant used across chains with different block times",
+        "admin_dependency": "No admin ability to adjust VALIDATOR_AFK_BLOCKS post-deployment",
+        "exploitation_window": "Any period of validator inactivity exceeding the reduced effective duration"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the actual block time on the target deployment chain?",
+          "What is the effective AFK duration in calendar time on each target chain?",
+          "Are there periods of expected inactivity (upgrades, holidays) that could approach the reduced threshold?"
+        ],
+        "validation_requirements": [
+          "Calculate effective AFK duration for each target chain",
+          "Compare against expected validator downtime scenarios",
+          "Verify whether Arbitrum L2 block times would make this exploitable"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify a deployment on a chain with fast block times",
+        "phase_2": "Wait for a period of validator inactivity (shorter than intended 28 days)",
+        "phase_3": "Call removeWhitelistAfterValidatorAfk() when effective threshold is reached",
+        "phase_4": "Participate as non-whitelisted validator in the now-open rollup",
+        "coordination_requirements": "None - single permissionless call"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Permanent whitelist removal before intended security threshold",
+        "operational_disruption": "Non-authorized entities can participate in validation",
+        "recovery_difficulty": "No mechanism to re-enable whitelist",
+        "affected_operations": "All validator-gated functions"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic - single function call",
+        "operational_timing": "After reduced AFK threshold on fast-block chains"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "removeWhitelistAfterValidatorAfk events on non-Ethereum chains",
+        "operational_anomalies": "Whitelist removal occurring much sooner than 28 days of inactivity",
+        "behavioral_patterns": "Monitoring of _validatorIsAfk() return value on fast-block chains",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H006",
+      "title": "Losing Staker Excess Stake Permanently Locked with No Recovery Path",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When a validator creates a non-first-child assertion via stakeOnNewAssertion, requiredStake is transferred to loserStakeEscrow, but the staker's amountStaked is not reduced. If the staker deposited more than requiredStake (via addToDeposit or initial deposit), the excess (amountStaked - requiredStake) becomes permanently locked in the contract with no recovery mechanism. The staker cannot call returnOldDeposit (assertion has no child) or reduceDeposit (stake is active). There is no admin function to recover these stuck funds.",
+      "investigation_rationale": "Code comment explicitly acknowledges: 'if the losing staker have staked more than requiredStake, the excess stake will be stuck'. This is a known but unresolved code defect that locks user funds permanently.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "stakeOnNewAssertion",
+        "returnOldDeposit",
+        "reduceDeposit"
+      ],
+      "affected_contracts": [
+        "RollupUserLogic.sol",
+        "RollupCore.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "stakeOnNewAssertion(AssertionInputs,bytes32)"
+        },
+        {
+          "file": "RollupCore.sol",
+          "function": "requireInactiveStaker(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RollupUserLogic.sol",
+        "lines": "157-163",
+        "pattern": "Comment on line 161-162: 'NOTE: if the losing staker have staked more than requiredStake, the excess stake will be stuck'; no amountStaked reduction after safeTransfer to loserStakeEscrow"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Validator has amountStaked > requiredStake",
+        "Validator creates a non-first-child assertion (fork scenario)",
+        "The validator's assertion is ultimately on the losing branch"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Token transfer to escrow without corresponding balance reduction; no admin recovery function",
+        "admin_dependency": "No admin function exists to recover stuck tokens",
+        "exploitation_window": "Permanent - every dispute fork with over-staked validators"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What percentage of validators stake more than requiredStake?",
+          "What is the total value at risk of being permanently locked?",
+          "Could a reduceDeposit call be made before stakeOnNewAssertion to avoid excess?"
+        ],
+        "validation_requirements": [
+          "Quantify the stuck funds scenario with realistic staking amounts",
+          "Verify no path exists for the losing staker to ever recover excess",
+          "Test whether the staker can reduceDeposit before creating the fork assertion"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Not an attack per se, but occurs in normal dispute flow",
+        "phase_2": "Validator with excess stake creates non-first-child assertion",
+        "phase_3": "requiredStake sent to escrow, excess remains locked",
+        "phase_4": "If validator's assertion loses, their excess tokens are permanently inaccessible",
+        "coordination_requirements": "None - natural consequence of the staking design"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Validators lose excess funds beyond requiredStake on losing forks",
+        "recovery_difficulty": "No recovery mechanism exists; tokens are permanently locked",
+        "affected_operations": "Staker withdrawal operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Stake amount > requiredStake",
+        "coordination_complexity": "None - occurs naturally",
+        "technical_skills": "None - standard validator operation",
+        "operational_timing": "Any assertion fork"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Stakers with amountStaked significantly above requiredStake on losing branches",
+        "operational_anomalies": "Growing locked token balance in rollup contract",
+        "behavioral_patterns": "Validators adding excess deposit before forks",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "confirmEdgeByOneStepProof machineStep Overflow with High numBigStepLevel Configuration",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In confirmEdgeByOneStepProof, the machineStep calculation iterates through BigStep levels, multiplying stepSize by bigStepHeight at each level: stepSize *= bigStepHeight. With numBigStepLevel > ~9 and bigStepHeight >= 2^26 (a power of 2), the intermediate value overflows uint256 (Solidity 0.8 checked arithmetic), causing the function to always revert. This permanently prevents one-step proof confirmation, making the challenge protocol unable to resolve disputes. The contract allows numBigStepLevel up to 253, but overflow occurs at much lower values.",
+      "investigation_rationale": "The multiplication stepSize *= bigStepHeight grows exponentially with the number of levels. For common bigStepHeight values (powers of 2 like 2^23 or 2^26), overflow occurs at modest level counts. The contract's max check (_numBigStepLevel > 253) is far too permissive.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "numBigStepLevel is set high enough that stepSize * bigStepHeight^(numBigStepLevel-1) overflows uint256"
+      ],
+      "config_evidence": "EdgeChallengeManager.sol initialize(): _numBigStepLevel validated only as > 0 and <= 253; common.ts validates numBigStepLevel > 0 but no overflow check; foundry.toml confirms solc 0.8.17 with checked arithmetic",
+      "affected_functions": [
+        "confirmEdgeByOneStepProof"
+      ],
+      "affected_contracts": [
+        "EdgeChallengeManagerLib.sol",
+        "EdgeChallengeManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "function": "confirmEdgeByOneStepProof"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "EdgeChallengeManagerLib.sol",
+        "lines": "464-478",
+        "pattern": "stepSize *= bigStepHeight in loop iterating through BigStep levels; exponential growth with no overflow guard"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "numBigStepLevel configured high enough to cause overflow (depends on bigStepHeight)",
+        "For bigStepHeight = 2^26: numBigStepLevel >= 10 causes overflow",
+        "For bigStepHeight = 2^23: numBigStepLevel >= 12 causes overflow",
+        "Challenge reaches SmallStep one-step proof stage"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Exponential multiplication without overflow protection in critical challenge resolution path",
+        "admin_dependency": "Parameter set at initialization; cannot be corrected without redeployment",
+        "exploitation_window": "Permanent if deployed with overflow-causing parameters"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What are the typical/planned numBigStepLevel and bigStepHeight values for production deployments?",
+          "Is there a mathematical bound check in the deployment tooling?",
+          "Would overflow permanently break dispute resolution?"
+        ],
+        "validation_requirements": [
+          "Calculate exact overflow threshold for each combination of bigStepHeight and numBigStepLevel",
+          "Verify that production configurations stay below the overflow threshold",
+          "Test confirmEdgeByOneStepProof with boundary configurations"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify deployment with numBigStepLevel high enough to cause overflow",
+        "phase_2": "Create dispute that requires one-step proof resolution",
+        "phase_3": "confirmEdgeByOneStepProof always reverts due to overflow, challenge cannot resolve",
+        "phase_4": "No valid assertion can be confirmed through challenge, potentially stalling rollup",
+        "coordination_requirements": "Must be staker to create dispute"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Complete inability to resolve challenges via one-step proofs; rollup dispute resolution permanently broken",
+        "recovery_difficulty": "Requires redeployment of EdgeChallengeManager with corrected parameters",
+        "affected_operations": "confirmEdgeByOneStepProof and all dispute resolution"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Edge stake amounts",
+        "coordination_complexity": "Low - create a standard dispute",
+        "technical_skills": "Understanding of challenge protocol parameters",
+        "operational_timing": "Anytime after deployment with vulnerable parameters"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "All confirmEdgeByOneStepProof calls reverting",
+        "operational_anomalies": "Disputes unable to reach one-step proof resolution",
+        "behavioral_patterns": "Stalled challenges at SmallStep level",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H008",
+      "title": "fastConfirmNewAssertion Repeated Calls Drain Rollup Contract Token Balance",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "fastConfirmNewAssertion can create assertions without requiring a staker deposit (no receiveTokens call). When the created assertion is not the first child, requiredStake is transferred from the rollup contract to loserStakeEscrow. A compromised anyTrustFastConfirmer could call this function repeatedly on the same predecessor, creating multiple non-first-child assertions, each draining requiredStake from the contract balance. This would exhaust the contract's tokens, preventing legitimate staker withdrawals. The code comments explicitly acknowledge this trust assumption.",
+      "investigation_rationale": "The function creates assertions and transfers stake without corresponding deposits. The code comments note: 'We trust the anyTrustFastConfirmer to not call this function multiple times on the same prev'. This is a documented trust assumption with catastrophic failure mode.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "fastConfirmNewAssertion",
+        "fastConfirmAssertion"
+      ],
+      "affected_contracts": [
+        "RollupUserLogic.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "fastConfirmNewAssertion(AssertionInputs,bytes32)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RollupUserLogic.sol",
+        "lines": "193-221",
+        "pattern": "createNewAssertion called without staker deposit; safeTransfer(loserStakeEscrow, requiredStake) on non-first-child with no deposit to cover it; comment acknowledges trust assumption"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "msg.sender == anyTrustFastConfirmer",
+        "anyTrustFastConfirmer address is compromised or malicious",
+        "Contract has token balance > 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Assertion creation path that transfers tokens out without corresponding deposit in",
+        "admin_dependency": "Requires compromised anyTrustFastConfirmer (trusted role)",
+        "exploitation_window": "Any time the rollup is not paused and anyTrustFastConfirmer is compromised"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What security controls protect the anyTrustFastConfirmer key/contract?",
+          "Can the admin replace anyTrustFastConfirmer immediately upon detecting compromise?",
+          "What is the maximum drainable amount?"
+        ],
+        "validation_requirements": [
+          "Verify that repeated fastConfirmNewAssertion calls drain balance",
+          "Quantify maximum drain rate per block",
+          "Test admin's ability to pause and replace fast confirmer"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise anyTrustFastConfirmer key or contract",
+        "phase_2": "Call fastConfirmNewAssertion repeatedly with same prev, each creating non-first-child",
+        "phase_3": "Each call transfers requiredStake to loserStakeEscrow from contract balance",
+        "phase_4": "Contract balance depleted, legitimate stakers unable to withdraw",
+        "coordination_requirements": "Compromise of anyTrustFastConfirmer"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Full rollup state manipulation via fast confirmation bypass",
+        "operational_disruption": "Token drain prevents all staker withdrawals; rollup insolvency",
+        "recovery_difficulty": "Requires admin intervention to pause and replace fast confirmer; drained funds may be unrecoverable",
+        "affected_operations": "All withdrawal and staking operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None (no deposit required)",
+        "coordination_complexity": "Low once fast confirmer is compromised",
+        "technical_skills": "Basic - repeated function calls",
+        "operational_timing": "When rollup is not paused"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Multiple fastConfirmNewAssertion calls with same prevAssertion",
+        "operational_anomalies": "Rapid decline in contract token balance",
+        "behavioral_patterns": "fastConfirmNewAssertion called more than once per predecessor",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "getPrevAssertionHash Traversal Failure if Intermediate firstRivals is UNRIVALED",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "getPrevAssertionHash traverses edge levels using store.firstRivals[edge.originId] to find the Block-level origin. The same traversal pattern is used in confirmEdgeByOneStepProof for machineStep calculation. If at any intermediate level firstRivals returns the UNRIVALED magic hash instead of a valid edge ID, the subsequent get() call reverts with EdgeNotExists. While the protocol's creation logic should prevent this (non-block layer zero edges require hasLengthOneRival on their claim), an edge case may exist where intermediate level rivals are resolved or where the traversal encounters an unexpected state, permanently blocking one-step proof resolution for the affected challenge.",
+      "investigation_rationale": "The traversal relies on firstRivals always containing valid edge IDs for intermediate levels. The code uses getNoCheck in some places and get() in others. A state where firstRivals[originId] == UNRIVALED at an intermediate level would be fatal for challenge resolution.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getPrevAssertionHash",
+        "confirmEdgeByOneStepProof"
+      ],
+      "affected_contracts": [
+        "EdgeChallengeManagerLib.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "function": "getPrevAssertionHash"
+        },
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "function": "confirmEdgeByOneStepProof"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "EdgeChallengeManagerLib.sol",
+        "lines": "229-237",
+        "pattern": "while loop: lowerLevelId = store.firstRivals[edge.originId]; edge = get(store, lowerLevelId); -- if firstRivals returns UNRIVALED hash, get() reverts"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-016",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multi-level challenge structure exists (numBigStepLevel > 0)",
+        "An intermediate level's firstRivals entry equals UNRIVALED",
+        "This requires a state where a claiming edge's originId maps to UNRIVALED in firstRivals"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Traversal uses firstRivals as edge ID without checking for UNRIVALED sentinel value",
+        "admin_dependency": "No admin ability to fix corrupted firstRivals state",
+        "exploitation_window": "If the state condition is achievable, it permanently blocks OSP for that challenge"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can the edge creation logic ever produce a state where intermediate firstRivals is UNRIVALED?",
+          "Is the hasLengthOneRival check on claim edge creation sufficient to prevent this?",
+          "Could a confirmed rival edge leave firstRivals in an inconsistent state?"
+        ],
+        "validation_requirements": [
+          "Formal verification that layer zero edge creation guarantees firstRivals != UNRIVALED for all intermediate levels",
+          "Test getPrevAssertionHash with edge structures at all possible levels",
+          "Verify confirmEdgeByOneStepProof traversal with various level configurations"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify if a sequence of edge operations can leave intermediate firstRivals as UNRIVALED",
+        "phase_2": "If possible, create such a state via strategic edge creation patterns",
+        "phase_3": "Any confirmEdgeByOneStepProof call traversing through this level reverts",
+        "phase_4": "The affected challenge cannot be resolved via OSP, potentially blocking assertion confirmation",
+        "coordination_requirements": "Requires deep understanding of edge creation ordering"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Specific challenges unable to resolve via one-step proof",
+        "recovery_difficulty": "No on-chain fix; would require challenge manager redeployment",
+        "affected_operations": "confirmEdgeByOneStepProof for affected challenges"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Edge stake amounts",
+        "coordination_complexity": "High - requires specific edge creation sequence",
+        "technical_skills": "Advanced challenge protocol understanding",
+        "operational_timing": "During active challenge"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "confirmEdgeByOneStepProof calls consistently reverting",
+        "operational_anomalies": "Challenges stalling at SmallStep level with valid length-1 edges",
+        "behavioral_patterns": "Strategic edge creation patterns at specific levels",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "Assertion Confirmation Bypasses challengeManager Liveness Check via Stale configHash",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "In confirmAssertion, the challengeManager address is obtained from prevConfig.challengeManager, which is validated against the prev assertion's configHash set at assertion creation time. If the EdgeChallengeManager is behind a proxy and the admin upgrades its implementation to a malicious or buggy version, the configHash validation still passes because it validates the ADDRESS (proxy), not the implementation. An upgraded challenge manager could return fabricated edge data, causing confirmAssertion to accept an invalid winning edge. The assertion chain immutably references the challenge manager proxy address, creating a persistent attack surface through implementation upgrades.",
+      "investigation_rationale": "The configHash binds to the challenge manager proxy address, not its implementation. Proxy upgrades change behavior without invalidating any configHash. This creates a subtle attack surface through the admin upgrade path.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "EdgeChallengeManager is deployed behind a proxy (implied by Initializable pattern)",
+        "Admin/upgrader can modify the proxy implementation"
+      ],
+      "config_evidence": "EdgeChallengeManager.sol constructor calls _disableInitializers() indicating proxy deployment pattern; deployment.ts deploys challengeManager as template; upgrade/deploy4844.ts deploys 'ChallengeManager' without initialization suggesting proxy pattern",
+      "affected_functions": [
+        "confirmAssertion"
+      ],
+      "affected_contracts": [
+        "RollupUserLogic.sol",
+        "EdgeChallengeManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RollupUserLogic.sol",
+          "function": "confirmAssertion(bytes32,bytes32,AssertionState,bytes32,ConfigData,bytes32)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RollupUserLogic.sol",
+        "lines": "106-112",
+        "pattern": "IEdgeChallengeManager(prevConfig.challengeManager).getEdge(winningEdgeId) - challengeManager address from configHash is the proxy address; proxy implementation can be upgraded without invalidating configHash"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-009",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "EdgeChallengeManager deployed behind upgradeable proxy",
+        "Admin/upgrader compromised or malicious",
+        "Active assertions referencing the challenge manager proxy in their configHash"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "configHash validates proxy address not implementation; proxy upgrade changes getEdge() behavior",
+        "admin_dependency": "Requires admin/upgrader to modify proxy implementation",
+        "exploitation_window": "After any proxy upgrade of EdgeChallengeManager"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is EdgeChallengeManager deployed behind a proxy in production?",
+          "Who controls the proxy upgrade rights?",
+          "Is there a timelock on proxy upgrades?"
+        ],
+        "validation_requirements": [
+          "Verify deployment pattern for EdgeChallengeManager",
+          "Check proxy admin controls and timelock configuration",
+          "Test assertion confirmation after challenge manager proxy upgrade"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise proxy admin of EdgeChallengeManager",
+        "phase_2": "Upgrade implementation to return fabricated edge data (confirmed status, matching claimId)",
+        "phase_3": "Call confirmAssertion with a malicious assertionHash and the fabricated winningEdgeId",
+        "phase_4": "Invalid assertion confirmed, outbox updated with malicious state root",
+        "coordination_requirements": "Proxy admin compromise"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Malicious assertion confirmation via fabricated challenge results",
+        "operational_disruption": "Invalid L2 state finalized on L1; bridge integrity compromised",
+        "recovery_difficulty": "Would require emergency pause and potential rollback",
+        "affected_operations": "confirmAssertion and all dependent bridge operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None - requires proxy admin key",
+        "coordination_complexity": "Low once proxy admin is compromised",
+        "technical_skills": "Advanced - must craft valid-looking edge data",
+        "operational_timing": "After proxy admin compromise"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Proxy implementation upgrade events on EdgeChallengeManager",
+        "operational_anomalies": "Assertion confirmations referencing unexpected edge data",
+        "behavioral_patterns": "Proxy upgrades followed by rapid assertion confirmations",
+        "detection_difficulty": "medium"
+      }
+    }
+  ]
+}

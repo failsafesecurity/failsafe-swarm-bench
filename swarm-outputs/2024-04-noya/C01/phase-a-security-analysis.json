@@ -1,0 +1,315 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T04:52:17.372Z",
+    "duration_ms": 225756
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User Input (Deposits & Withdrawals)",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "AccountingManager.deposit",
+          "AccountingManager.withdraw"
+        ],
+        "failure_modes": [
+          "Users attempting to withdraw more than their balance",
+          "Users exceeding deposit limits"
+        ],
+        "attack_vectors": [
+          "Queue manipulation",
+          "First-depositor inflation attack (mitigated by queue but still a risk if TVL is manipulated)"
+        ]
+      },
+      {
+        "boundary": "Keeper/Manager Operations",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "AccountingManager.calculateDepositShares",
+          "AccountingManager.executeDeposit",
+          "AccountingManager.calculateWithdrawShares",
+          "AccountingManager.executeWithdraw",
+          "BaseConnector.swapHoldings",
+          "BaseConnector.addLiquidity"
+        ],
+        "failure_modes": [
+          "Keeper executes calculations during a manipulated TVL state",
+          "Keeper performs unfavorable swaps with high slippage"
+        ],
+        "attack_vectors": [
+          "MEV sandwich attacks on queue calculation transactions",
+          "Compromised keeper draining funds via malicious swaps"
+        ]
+      },
+      {
+        "boundary": "Oracle and TVL Data",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "TVLHelper.getTVL",
+          "NoyaValueOracle.getValue"
+        ],
+        "failure_modes": [
+          "Spot price manipulation via flash loans",
+          "Stale oracle data",
+          "Reverting oracle causing DoS"
+        ],
+        "attack_vectors": [
+          "Flash loan manipulation of AMM spot reserves to inflate/deflate TVL",
+          "Exploiting logic errors in TVL calculation (e.g., adding debt instead of subtracting)"
+        ]
+      },
+      {
+        "boundary": "Admin/Emergency Controls",
+        "trust_level": "trusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "AccountingManager.rescue",
+          "AccountingManager.emergencyStop",
+          "Registry.addTrustedPosition"
+        ],
+        "failure_modes": [
+          "Admin key compromise leading to total loss of funds",
+          "Malicious trusted positions added without timelock"
+        ],
+        "attack_vectors": [
+          "Centralization risk exploitation",
+          "Privilege escalation via compromised maintainer keys"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Deposit Requested",
+        "to_state": "Shares Calculated",
+        "trigger": "AccountingManager.calculateDepositShares",
+        "conditions": [
+          "Deposit record time must be <= oldest update time of positions"
+        ],
+        "invariants": [
+          "Shares minted must be proportional to TVL at calculation time"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Withdraw Requested",
+        "to_state": "Withdraw Calculated",
+        "trigger": "AccountingManager.calculateWithdrawShares",
+        "conditions": [
+          "No active withdraw group currently started"
+        ],
+        "invariants": [
+          "Assets allocated must be proportional to TVL at calculation time"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Profit Recorded",
+        "to_state": "Performance Fee Collected",
+        "trigger": "AccountingManager.collectPerformanceFees",
+        "conditions": [
+          "12 to 48 hours must have passed since profit was recorded",
+          "TVL must not have dropped below recorded profit level"
+        ],
+        "invariants": [
+          "Performance fee shares are only minted if profit is sustained for 12 hours"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Logic Error / Incorrect TVL Calculation",
+        "locations": [
+          "MorphoBlueConnector.sol:_getPositionTVL"
+        ],
+        "severity": "critical",
+        "evidence": "The function adds `borrowAmount` to `supplyAmount` and `collateral` instead of treating it as debt. This artificially inflates the vault's TVL by 2x the borrowed amount.",
+        "exploitation_method": "An attacker or manager borrows heavily on MorphoBlue. The vault's TVL spikes artificially. The attacker then queues a withdrawal and the manager calculates shares based on the inflated TVL, allowing the attacker to drain the vault's base tokens.",
+        "affected_assets": [
+          "All vault assets"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (DoS)",
+        "locations": [
+          "TVLHelper.sol:getTVL"
+        ],
+        "severity": "high",
+        "evidence": "The function iterates over all holding positions and calls `getPositionTVL`. If a single connector reverts (e.g., due to a paused external protocol or an oracle failure), the entire `getTVL` function reverts.",
+        "exploitation_method": "An attacker or a failing external protocol causes one position's TVL calculation to revert. This bricks `calculateDepositShares`, `calculateWithdrawShares`, and `recordProfitForFee`, completely halting the vault's core operations.",
+        "affected_assets": [
+          "Vault operations (deposits/withdrawals)"
+        ]
+      },
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Access Control / Privilege Escalation",
+        "locations": [
+          "NoyaGovernanceBase.sol:onlyManager"
+        ],
+        "severity": "critical",
+        "evidence": "The `onlyManager` modifier allows `registry.flashLoan()` to bypass access controls. If the flash loan address is a generic provider (e.g., Balancer Vault) that allows arbitrary callbacks, anyone can execute `onlyManager` functions.",
+        "exploitation_method": "An attacker initiates a flash loan, and in the callback (where `msg.sender` is the flash loan provider), they call `calculateWithdrawShares` or `executeWithdraw` to manipulate the queue or drain funds.",
+        "affected_assets": [
+          "All vault assets"
+        ]
+      },
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Missing Validation / Bypassed Security Control",
+        "locations": [
+          "Watchers.sol:verifyRemoveLiquidity",
+          "BaseConnector.sol:sendTokensToTrustedAddress"
+        ],
+        "severity": "medium",
+        "evidence": "The `Watchers.verifyRemoveLiquidity` function is completely empty. `BaseConnector` relies on this function to verify the amount of tokens the accounting manager is allowed to withdraw.",
+        "exploitation_method": "A compromised manager can withdraw arbitrary amounts of tokens from connectors to the accounting manager, bypassing the intended Watcher security mechanism.",
+        "affected_assets": [
+          "Connector funds"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Oracle Manipulation / MEV Sandwich Attack",
+        "locations": [
+          "UNIv3Connector.sol:_getPositionTVL",
+          "AerodromeConnector.sol:_getPositionTVL",
+          "BalancerConnector.sol:_getPositionTVL",
+          "MaverickConnector.sol:_getPositionTVL",
+          "CurveConnector.sol:_getPositionTVL"
+        ],
+        "severity": "critical",
+        "evidence": "Multiple connectors calculate TVL using spot balances (`getReserves`, `_tokenBalances`) or spot prices (`slot0`). These are highly susceptible to single-block flash loan manipulation.",
+        "exploitation_method": "An attacker queues a withdrawal. When the manager sends the `calculateWithdrawShares` transaction, the attacker front-runs it with a flash loan to imbalance the AMM pool, drastically inflating the vault's TVL. The manager calculates the attacker's withdrawal using the inflated TVL, granting them excessive base tokens. The attacker back-runs to restore the pool.",
+        "affected_assets": [
+          "All vault assets"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "AccountingManager.sol",
+          "function": "setFeeReceivers(address,address,address)",
+          "guards": [
+            "onlyMaintainer"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Maintainer role is typically timelocked via Registry"
+        },
+        {
+          "contract": "AccountingManager.sol",
+          "function": "setFees(uint256,uint256,uint256)",
+          "guards": [
+            "onlyMaintainer"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "AccountingManager.sol",
+          "function": "rescue(address,uint256)",
+          "guards": [
+            "onlyEmergency",
+            "nonReentrant"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can drain all funds from the AccountingManager"
+        },
+        {
+          "contract": "Registry.sol",
+          "function": "addTrustedPosition(uint256,uint256,address,bool,bool,bytes,bytes)",
+          "guards": [
+            "onlyVaultMaintainerWithoutTimeLock",
+            "vaultExists",
+            "nonReentrant"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Bypasses timelock to add trusted positions"
+        },
+        {
+          "contract": "Registry.sol",
+          "function": "changeVaultAddresses(uint256,address,address,address,address,address,address)",
+          "guards": [
+            "onlyVaultGoverner",
+            "vaultExists"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Chainlink",
+          "freshness_min_sec": 7200,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "ChainlinkOracleConnector.sol",
+              "lines": "85-103",
+              "function": "getValueFromChainlinkFeed"
+            }
+          ],
+          "compositional_usage": [
+            "Inverse pricing support"
+          ]
+        },
+        {
+          "source": "LP-TWAP",
+          "freshness_min_sec": 1800,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "UniswapValueOracle.sol",
+              "lines": "54-72",
+              "function": "getValue"
+            }
+          ],
+          "compositional_usage": [
+            "Uniswap V3 observe"
+          ]
+        },
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "NoyaValueOracle.sol",
+              "lines": "63-80",
+              "function": "_getValue"
+            }
+          ],
+          "compositional_usage": [
+            "Multi-hop routing",
+            "Fallback to default base currency oracles"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,734 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator_2",
+    "llm_model": null,
+    "llm_provider": "gemini",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "AutomataDcapV3Attestation.sol",
+      "PEMCertChainLib.sol",
+      "V3Parser.sol",
+      "V3Struct.sol",
+      "IPEMCertChainLib.sol",
+      "TCBInfoStruct.sol",
+      "EnclaveIdStruct.sol",
+      "IAttestation.sol",
+      "ISigVerifyLib.sol",
+      "BytesUtils.sol",
+      "RsaVerify.sol",
+      "SHA1.sol",
+      "SigVerifyLib.sol",
+      "Asn1Decode.sol",
+      "X509DateUtils.sol",
+      "TaikoL2.sol",
+      "TaikoL2EIP1559Configurable.sol",
+      "CrossChainOwned.sol",
+      "Lib1559Math.sol",
+      "TimelockTokenPool.sol",
+      "MerkleClaimable.sol",
+      "ERC20Airdrop.sol",
+      "ERC20Airdrop2.sol",
+      "ERC721Airdrop.sol",
+      "EssentialContract.sol",
+      "IAddressManager.sol",
+      "LibAddress.sol",
+      "LibMath.sol",
+      "ISignalService.sol",
+      "LibSignals.sol",
+      "IBridge.sol",
+      "ExcessivelySafeCall.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-05T05:28:18.124Z",
+    "duration_ms": 273353
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON2-H001",
+      "title": "Triangular Double-Counting of L1 Block Issuance Drains EIP-1559 Gas Excess",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The EIP-1559 base fee calculation incorrectly accumulates L1 block issuance due to delayed updates of `lastSyncedBlock`. Because `lastSyncedBlock` is only updated every `BLOCK_SYNC_THRESHOLD` blocks, `numL1Blocks` grows linearly (1, 2, 3...) for each L2 block anchored within the threshold window. This causes the gas issuance subtraction to be applied triangularly (e.g., 1+2+3+4+5+6 = 21 times the target instead of 6), rapidly draining `gasExcess` to 1 and permanently breaking the dynamic base fee mechanism.",
+      "investigation_rationale": "This is a fundamental mathematical flaw in the core economic mechanism of the L2. It will cause the base fee to plummet to the minimum value (1 wei) during normal operation, allowing attackers to spam the network for free.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "anchor",
+        "_calc1559BaseFee"
+      ],
+      "affected_contracts": [
+        "TaikoL2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "TaikoL2.sol",
+          "function": "anchor"
+        },
+        {
+          "file": "TaikoL2.sol",
+          "function": "_calc1559BaseFee"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "TaikoL2.sol",
+        "lines": "270-285",
+        "pattern": "numL1Blocks = _l1BlockId - lastSyncedBlock; issuance = numL1Blocks * gasTarget; excess -= issuance; but lastSyncedBlock is not updated every block"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "BLOCK_SYNC_THRESHOLD > 0 (default is 5)",
+        "gasExcess > 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "issuance = (_l1BlockId - lastSyncedBlock) * target",
+        "manipulation_vector": "lastSyncedBlock remains stale for multiple blocks, causing the same elapsed L1 blocks to be subtracted multiple times from the running excess",
+        "profit_hypothesis": "Base fee drops to 1 wei, allowing infinite cheap block space consumption"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How fast does gasExcess reach 1 under normal block production?",
+          "Can the owner rescue the base fee using setConfigAndExcess before the network is spammed?"
+        ],
+        "validation_requirements": [
+          "Simulate 10 consecutive anchor calls and track gasExcess state",
+          "Calculate the exact divergence between intended issuance and actual subtracted issuance"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (happens automatically)",
+        "estimated_execution_cost": "Normal L2 transaction fees (which approach 0)",
+        "potential_profit_range": "Infinite cheap block space for MEV/spam",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Continuous after threshold is reached"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Any time after initialization",
+        "market_impact_assessment": "Complete collapse of L2 fee market"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Taiko Protocol (loss of sequencer revenue)",
+        "estimated_impact_per_user": "Network congestion and degraded UX",
+        "total_value_at_risk": "All future L2 transaction fee revenue"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "BLOCK_SYNC_THRESHOLD = 5",
+        "calculation_validation": "Triangular sequence sum vs linear sum",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H002",
+      "title": "Cross-Chain Signature Replay Allows Theft of Vested Tokens",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "The `withdraw(address _to, bytes memory _sig)` function in `TimelockTokenPool` verifies an ECDSA signature over a hash that only includes the `_to` address. It completely lacks a domain separator (chain ID, contract address) and a nonce. An attacker can capture a valid withdrawal signature from one chain (e.g., L2) and replay it on another chain (e.g., L1) or against future grants, forcing the victim's tokens to be sent to the `_to` address. If `_to` is a smart contract the victim controls on L2 but not L1, the L1 tokens are permanently lost or stolen.",
+      "investigation_rationale": "Signature replay without domain separators is a classic and highly exploitable vulnerability (SWC-121). Given Taiko's multi-chain architecture, the probability of the same recipient having grants on multiple chains is high.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "withdraw(address,bytes)"
+      ],
+      "affected_contracts": [
+        "TimelockTokenPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "TimelockTokenPool.sol",
+          "function": "withdraw"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "TimelockTokenPool.sol",
+        "lines": "120-130",
+        "pattern": "bytes32 hash = keccak256(abi.encodePacked(\"Withdraw unlocked Taiko token to: \", _to));"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-015",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Victim signs a withdrawal message",
+        "Victim has vested tokens on multiple chains or receives a future grant"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "ECDSA.recover without chainid/address(this)/nonce",
+        "manipulation_vector": "Signature replay across chains or time",
+        "profit_hypothesis": "Attacker forces tokens to an address they can compromise, or griefs the user by sending tokens to an inaccessible L1 contract"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are TimelockTokenPools deployed on multiple chains for the same users?",
+          "Can the attacker front-run the legitimate withdrawal on the target chain?"
+        ],
+        "validation_requirements": [
+          "Verify cross-chain deployment addresses and recipient overlaps",
+          "Test signature replay in a multi-chain foundry setup"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas costs only",
+        "estimated_execution_cost": "~0.01 ETH per replay",
+        "potential_profit_range": "Up to 100% of the victim's vested tokens on the target chain",
+        "estimated_profit_margin": "Infinite ROI",
+        "attack_duration": "Single block execution"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Immediately after the victim signs the message on the source chain",
+        "market_impact_assessment": "Direct theft/loss of user funds"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Grant recipients (team, investors)",
+        "estimated_impact_per_user": "Total loss of cross-chain grant allocation",
+        "total_value_at_risk": "Entire TVL of secondary chain token pools"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Signature payload structure",
+        "calculation_validation": "N/A",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H003",
+      "title": "Precision Loss in Vesting Cost Calculation Allows Fractional Token Theft",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In `TimelockTokenPool`, the cost required to withdraw tokens is calculated as `costToWithdraw = (amountUnlocked / 1e18) * costPerToken - costPaid`. Because the division by `1e18` occurs before multiplication, the fractional part of `amountUnlocked` (up to `0.999... * 1e18` wei) is truncated. A user can withdraw their entire `amountUnlocked` (including the fractional part) but will only pay for the integer part. At the end of the vesting period, the user permanently avoids paying `costPerToken` for the fractional remainder of their total grant.",
+      "investigation_rationale": "This is a direct economic exploit allowing users to extract value from the protocol without paying the required cost. If `costPerToken` is high (e.g., priced in USDC), the stolen value per user is significant.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getMyGrantSummary",
+        "withdraw"
+      ],
+      "affected_contracts": [
+        "TimelockTokenPool.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "TimelockTokenPool.sol",
+          "function": "getMyGrantSummary"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "TimelockTokenPool.sol",
+        "lines": "140-150",
+        "pattern": "uint128 _amountUnlocked = amountUnlocked / 1e18; costToWithdraw = _amountUnlocked * r.grant.costPerToken - r.costPaid;"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Grant amount has a fractional component (not perfectly divisible by 1e18)",
+        "costPerToken > 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Division before multiplication in cost calculation",
+        "manipulation_vector": "User withdraws the full fractional grant at the end of the vesting period",
+        "profit_hypothesis": "User extracts up to (1e18 - 1) wei of tokens for free, saving up to ~1 * costPerToken"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the expected costPerToken in production?",
+          "Are grant amounts strictly enforced to be multiples of 1e18?"
+        ],
+        "validation_requirements": [
+          "Calculate exact value extractable based on production costToken decimals",
+          "Test withdrawal of 10.99e18 tokens to confirm only 10 * costPerToken is charged"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Normal cost payment for the integer portion",
+        "estimated_execution_cost": "Standard gas fees",
+        "potential_profit_range": "Up to 1 * costPerToken per grant recipient",
+        "estimated_profit_margin": "100% ROI on the fractional portion",
+        "attack_duration": "Single transaction at the end of vesting"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When amountUnlocked reaches its maximum fractional value",
+        "market_impact_assessment": "Protocol insolvency for the costToken pool relative to expectations"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Taiko Protocol Treasury",
+        "estimated_impact_per_user": "Loss of ~1 * costPerToken per user",
+        "total_value_at_risk": "Number of recipients * costPerToken"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "costPerToken value and costToken decimals",
+        "calculation_validation": "Verify truncation behavior in Solidity 0.8.24",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H004",
+      "title": "Gas Griefing via ES256Verifier Panic Halts Proving",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The `verifyES256Signature` function uses `assert(success)` after a `staticcall` to the external `ES256VERIFIER` (P256 precompile). If the precompile fails (e.g., due to an invalid public key not on the curve), `success` is false. The `assert(false)` triggers a Panic (opcode 0xFE), which consumes 100% of the transaction's allocated gas. An attacker can submit a malformed SGX quote that causes this panic, forcing the prover who attempts to verify the block to lose their entire gas limit.",
+      "investigation_rationale": "Provers must submit proofs on L1, which costs significant gas. If an attacker can inject a transaction into the L2 block that causes the L1 proof verification to panic, they can economically drain the provers, halting the network.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "verifyES256Signature"
+      ],
+      "affected_contracts": [
+        "SigVerifyLib.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SigVerifyLib.sol",
+          "function": "verifyES256Signature"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SigVerifyLib.sol",
+        "lines": "120-130",
+        "pattern": "(bool success, bytes memory ret) = ES256VERIFIER.staticcall(args); assert(success);"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-012",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker can submit an L2 transaction containing a malformed SGX quote",
+        "Prover attempts to verify the block on L1"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "assert(success) instead of require(success)",
+        "manipulation_vector": "Invalid P256 public key causes precompile to revert",
+        "profit_hypothesis": "Attacker spends minimal L2 gas to cost the prover maximum L1 gas (e.g., 30M gas)"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does the L2 node simulate and reject malformed quotes before inclusion?",
+          "What is the maximum gas limit a prover uses for L1 verification?"
+        ],
+        "validation_requirements": [
+          "Test P256 precompile behavior with invalid curve points",
+          "Verify that assert(false) consumes all gas in the current EVM version"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal L2 transaction fee",
+        "estimated_execution_cost": "< $0.01 on L2",
+        "potential_profit_range": "No direct profit, but inflicts massive losses on competitors/provers",
+        "estimated_profit_margin": "N/A (Griefing)",
+        "attack_duration": "Continuous"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When L1 gas prices are high",
+        "market_impact_assessment": "Provers stop submitting proofs due to economic losses, halting L2 finality"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Taiko Provers",
+        "estimated_impact_per_user": "Loss of up to 30M L1 gas per failed proof (~0.1 to 0.5 ETH)",
+        "total_value_at_risk": "Prover operational capital"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "P256 precompile failure modes",
+        "calculation_validation": "Gas consumption of Panic opcode",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H005",
+      "title": "Incorrect ASN.1 Date Tag Validation Rejects Valid SGX Certificates",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The `decodeCert` function in `PEMCertChainLib` contains a logic error in its date tag validation: `(notBeforeTag != 0x17 && notBeforeTag == 0x18)`. This condition evaluates to true (rejecting the certificate) ONLY if the tag is `0x18` (GeneralizedTime). It incorrectly accepts `0x17` (UTCTime) AND any other invalid tag (e.g., `0x19`). If Intel issues PCK certificates using GeneralizedTime (which is standard for dates after 2049, or depending on CA config), the contract will reject them, causing a complete DoS of the attestation system.",
+      "investigation_rationale": "Cryptographic parsing bugs that reject valid inputs lead to systemic DoS. If the attestation system rejects valid Intel quotes, blocks cannot be proven, halting the rollup and potentially slashing honest provers.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "decodeCert"
+      ],
+      "affected_contracts": [
+        "PEMCertChainLib.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PEMCertChainLib.sol",
+          "function": "decodeCert"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PEMCertChainLib.sol",
+        "lines": "100-110",
+        "pattern": "if ((notBeforeTag != 0x17 && notBeforeTag == 0x18) || ...)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Intel SGX PCK certificates use GeneralizedTime (0x18) for the notBefore field"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Logical AND of mutually exclusive conditions (x != A && x == B simplifies to x == B)",
+        "manipulation_vector": "Natural issuance of 0x18 tags by Intel CA",
+        "profit_hypothesis": "Network halt allows attackers to exploit time-sensitive DeFi positions on L2"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does Intel currently issue any PCK certs with GeneralizedTime?",
+          "What happens to prover bonds if no valid proof can be submitted?"
+        ],
+        "validation_requirements": [
+          "Review Intel SGX PCK Certificate profile specifications",
+          "Test decodeCert with a mock 0x18 certificate"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (Systemic failure)",
+        "estimated_execution_cost": "None",
+        "potential_profit_range": "Indirect profit from network halt",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent until contract upgrade"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When Intel rotates CAs or updates cert profiles",
+        "market_impact_assessment": "Complete halt of L2 finality"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All L2 users and provers",
+        "estimated_impact_per_user": "Inability to withdraw funds to L1",
+        "total_value_at_risk": "Entire L2 TVL"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "ASN.1 tag values in production Intel certs",
+        "calculation_validation": "Boolean logic truth table",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H006",
+      "title": "Strict Sequential txId Enforcement Causes Cross-Chain Head-of-Line Blocking",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In `CrossChainOwned`, `onMessageInvocation` enforces strict sequential execution via `if (txId != nextTxId) revert`. If the inner `address(this).call(txdata)` reverts, the entire transaction reverts, and `nextTxId` is not incremented. The bridge message remains FAILED/RETRIABLE. If the transaction cannot be made to succeed (e.g., it attempts to set a config that is no longer valid due to external state changes), `nextTxId` is permanently stuck. All subsequent cross-chain admin commands will fail because their `txId` will be greater than the stuck `nextTxId`.",
+      "investigation_rationale": "Admin channels must be robust. Bricking the cross-chain ownership channel prevents the DAO/Admin from upgrading contracts, pausing the system during an exploit, or rescuing funds.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onMessageInvocation"
+      ],
+      "affected_contracts": [
+        "CrossChainOwned.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "CrossChainOwned.sol",
+          "function": "onMessageInvocation"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "CrossChainOwned.sol",
+        "lines": "40-50",
+        "pattern": "if (!success) revert XCO_TX_REVERTED(); emit TransactionExecuted(nextTxId++, bytes4(txdata));"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Admin sends a cross-chain transaction that reverts on the destination chain",
+        "The revert condition is permanent (e.g., invalid parameter, state conflict)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "nextTxId increment is bypassed on revert, blocking sequence",
+        "manipulation_vector": "Attacker forces the admin transaction to revert (e.g., by front-running state changes)",
+        "profit_hypothesis": "Attacker bricks the admin channel, preventing the protocol from pausing or upgrading during a subsequent exploit"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can the bridge recall a failed message and skip the txId?",
+          "Is there any fallback mechanism to increment nextTxId?"
+        ],
+        "validation_requirements": [
+          "Trace the IBridge.recallMessage flow to see if it allows skipping txIds on the destination chain (it doesn't, recall is on source)",
+          "Simulate a permanently failing admin transaction"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Depends on the front-running vector",
+        "estimated_execution_cost": "Standard gas fees",
+        "potential_profit_range": "Enables other exploits by disabling admin response",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Right before launching a major protocol exploit",
+        "market_impact_assessment": "Loss of protocol governance control"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol Admin/DAO",
+        "estimated_impact_per_user": "Loss of security response capabilities",
+        "total_value_at_risk": "Entire protocol TVL (indirectly)"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Bridge message lifecycle",
+        "calculation_validation": "N/A",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H007",
+      "title": "Forced Airdrop Claim via Unvalidated Delegation Signature",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "In `ERC20Airdrop.claimAndDelegate`, the `delegationData` parameter is passed directly to `IVotes(token).delegateBySig`. The contract does not verify that the recovered signer of the delegation signature matches the `user` receiving the airdrop. An attacker can call this function for any eligible user, providing a valid delegation signature signed by the *attacker*. This forces the user to receive the airdrop tokens immediately, while delegating the attacker's (likely zero) votes.",
+      "investigation_rationale": "While not a direct theft of funds, forcing a user to claim an airdrop can disrupt their financial planning, trigger unwanted taxable events, or grief them if they intended to delegate to a specific entity at a specific time.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claimAndDelegate"
+      ],
+      "affected_contracts": [
+        "ERC20Airdrop.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Airdrop.sol",
+          "function": "claimAndDelegate"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Airdrop.sol",
+        "lines": "60-70",
+        "pattern": "IVotes(token).delegateBySig(delegatee, nonce, expiry, v, r, s); // without checking signer == user"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "User is eligible for the airdrop but has not claimed yet",
+        "Attacker generates a valid EIP-712 delegation signature for their own address"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Missing signer validation against the 'user' parameter",
+        "manipulation_vector": "Attacker submits transaction on behalf of victim",
+        "profit_hypothesis": "Griefing attack; no direct profit unless attacker is shorting the token and wants to force circulating supply increases"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can this be used to manipulate governance by forcing claims right before a snapshot?",
+          "Does the token contract allow delegating 0 balance?"
+        ],
+        "validation_requirements": [
+          "Test claimAndDelegate with mismatched user and signer addresses"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas costs only",
+        "estimated_execution_cost": "~0.005 ETH per forced claim",
+        "potential_profit_range": "None directly",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Single block"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Right before end of tax year or governance snapshot",
+        "market_impact_assessment": "User dissatisfaction and potential governance skew"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Airdrop recipients",
+        "estimated_impact_per_user": "Unwanted tax liabilities",
+        "total_value_at_risk": "N/A"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "EIP-712 signature recovery",
+        "calculation_validation": "N/A",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H008",
+      "title": "Extending claimEnd Causes Underflow and Locks Airdrop Withdrawals",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In `ERC20Airdrop2`, the `timeBasedAllowance` is calculated relative to `claimEnd`. If the admin uses `setConfig` to extend `claimEnd` to a later date, the calculated `timeBasedAllowance` for all users will instantly decrease. If a user has already withdrawn tokens such that `withdrawnAmount[user] > new_timeBasedAllowance`, the calculation `withdrawableAmount = timeBasedAllowance - withdrawnAmount[user]` will revert due to arithmetic underflow. This completely breaks `getBalance` and `withdraw` for those users.",
+      "investigation_rationale": "Admin actions that retroactively break state assumptions lead to locked funds. Extending an airdrop claim period is a common operational action, making this a highly realistic scenario.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getBalance",
+        "withdraw"
+      ],
+      "affected_contracts": [
+        "ERC20Airdrop2.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Airdrop2.sol",
+          "function": "getBalance"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Airdrop2.sol",
+        "lines": "90-100",
+        "pattern": "withdrawableAmount = timeBasedAllowance - withdrawnAmount[user]; // underflows if timeBasedAllowance decreases"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User has claimed and withdrawn some tokens",
+        "Admin calls setConfig to increase claimEnd"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "timeBasedAllowance decreases when claimEnd increases",
+        "manipulation_vector": "Admin configuration change causes unintended underflow",
+        "profit_hypothesis": "Funds are temporarily or permanently locked, causing DoS"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How long are funds locked if claimEnd is extended by 30 days?",
+          "Does this break frontend integrations that rely on getBalance not reverting?"
+        ],
+        "validation_requirements": [
+          "Simulate a user withdrawing 50% of allocation, then admin extending claimEnd by 1 month",
+          "Verify underflow in getBalance"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None",
+        "estimated_execution_cost": "None",
+        "potential_profit_range": "None",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Until timeBasedAllowance catches up to withdrawnAmount"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When admin extends claim period",
+        "market_impact_assessment": "User panic due to locked funds and reverting UI"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Early airdrop claimers",
+        "estimated_impact_per_user": "Temporary loss of access to remaining funds",
+        "total_value_at_risk": "Remaining unvested airdrop allocations"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "claimEnd and withdrawalWindow interaction",
+        "calculation_validation": "Underflow conditions",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON2-H009",
+      "title": "Fragile ASN.1 Parsing Causes Array Out-of-Bounds DoS in TCB Verification",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In `PEMCertChainLib._findTcb`, the code iterates exactly 17 times to parse 16 `CPUSVN` values and 1 `PCESVN` value. It writes `CPUSVN` values to a fixed-size array `cpusvns` of length 16. If the `PCESVN_OID` is encountered at any position other than the very last element (index 16), the loop will eventually attempt to write a `CPUSVN` value to `cpusvns[16]`, which is out of bounds and will revert. This makes the parser extremely fragile to the ordering of extensions in the Intel SGX certificate.",
+      "investigation_rationale": "Smart contracts parsing complex external data formats (like X.509/ASN.1) are prone to edge cases. If Intel changes the extension ordering, or if a valid cert naturally has a different order, the entire attestation system will permanently revert.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_findTcb"
+      ],
+      "affected_contracts": [
+        "PEMCertChainLib.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PEMCertChainLib.sol",
+          "function": "_findTcb"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PEMCertChainLib.sol",
+        "lines": "250-270",
+        "pattern": "cpusvns[i] = cpusvn; // where i can reach 16, but array size is 16"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Intel SGX PCK certificate contains the PCESVN extension before the final CPUSVN extension"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Writing to array index 'i' in a loop that runs 'array.length + 1' times",
+        "manipulation_vector": "External dependency (Intel CA) formatting changes",
+        "profit_hypothesis": "Systemic DoS of the proving network"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does the ASN.1 DER specification guarantee the order of these specific extensions?",
+          "Can an attacker request a valid quote from Intel with a specific extension order?"
+        ],
+        "validation_requirements": [
+          "Test _findTcb with a mock DER byte array where PCESVN is the first element",
+          "Verify array out-of-bounds revert"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None",
+        "estimated_execution_cost": "None",
+        "potential_profit_range": "None",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent until contract upgrade"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When Intel updates certificate generation logic",
+        "market_impact_assessment": "Halt of L2 block proving"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Taiko Protocol",
+        "estimated_impact_per_user": "Inability to finalize L2 blocks",
+        "total_value_at_risk": "L2 TVL"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Intel SGX PCK Certificate Profile",
+        "calculation_validation": "Array bounds checking in Solidity 0.8.24",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

@@ -1,0 +1,436 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T00:05:09.721Z",
+    "duration_ms": 280016
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-UserOp-Validation",
+        "source": "Bundler submits UserOperation to EntryPoint",
+        "path": [
+          "EntryPoint calls CoinbaseSmartWallet.validateUserOp()",
+          "Nonce key extracted from userOp.nonce >> 64",
+          "Selector check on userOp.callData[0:4] for executeWithoutChainIdValidation",
+          "Hash recomputed without chain ID if cross-chain op, else use entrypoint-supplied userOpHash",
+          "_validateSignature() called with the hash and userOp.signature",
+          "SignatureWrapper decoded from signature",
+          "Owner bytes loaded by ownerIndex",
+          "Dispatches to ECDSA or WebAuthn verification path based on owner bytes length"
+        ],
+        "transformations": [
+          "userOpHash recomputed without chainId for replayable ops: keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))",
+          "For Ethereum owners: SignatureCheckerLib.isValidSignatureNow",
+          "For passkey owners: WebAuthn.verify with challenge = abi.encode(message)"
+        ],
+        "sinks": [
+          "Return 0 (valid) or 1 (invalid) to EntryPoint"
+        ],
+        "trust_changes": "Bundler-submitted data transitions to trusted after signature verification; ownerIndex is trusted implicitly (attacker can choose any index, but signature must match)",
+        "validation_points": [
+          "r,s range check in FCL.ecdsa_verify",
+          "Public key on-curve check in FCL.ecAff_isOnCurve",
+          "Signature malleability check (s <= n/2) in WebAuthn.verify",
+          "WebAuthn type and challenge field verification",
+          "Nonce key validation against REPLAYABLE_NONCE_KEY"
+        ],
+        "exposure_risks": [
+          "ownerIndex is user-controlled; wrong index causes revert at signature check, not a security risk but may waste gas"
+        ],
+        "manipulation_risks": [
+          "Cross-chain replay: userOpHash is recomputed without chain ID for whitelisted selectors, enabling intentional replay across chains",
+          "Attacker controlling typeIndex/challengeIndex in WebAuthn could attempt string position manipulation, but keccak256 match and full-JSON hashing prevent bypass"
+        ]
+      },
+      {
+        "flow_id": "DF-02-ERC1271-Validation",
+        "source": "External contract calls isValidSignature(hash, signature)",
+        "path": [
+          "ERC1271.isValidSignature called with raw hash",
+          "replaySafeHash() wraps hash with EIP-712 domain separator (chainId + address(this))",
+          "_validateSignature() called with replay-safe hash",
+          "Same owner-based dispatch as UserOp validation"
+        ],
+        "transformations": [
+          "hash -> keccak256(\\x19\\x01 || domainSeparator || keccak256(abi.encode(typeHash, hash)))",
+          "Domain separator includes block.chainid and address(this)"
+        ],
+        "sinks": [
+          "Returns 0x1626ba7e (valid) or 0xffffffff (invalid)"
+        ],
+        "trust_changes": "External callers receive boolean validity; anti-replay layer prevents cross-account/cross-chain signature reuse",
+        "validation_points": [
+          "EIP-712 domain separator binds to specific chain and contract address",
+          "Same signature verification as UserOp path"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If a dApp does not use replaySafeHash to construct the message, signatures may fail or the anti-replay protection is bypassed conceptually"
+        ]
+      },
+      {
+        "flow_id": "DF-03-MagicSpend-Paymaster-Flow",
+        "source": "UserOperation with paymasterAndData pointing to MagicSpend",
+        "path": [
+          "EntryPoint calls validatePaymasterUserOp(userOp, userOpHash, maxCost)",
+          "WithdrawRequest decoded from userOp.paymasterAndData[20:]",
+          "Amount checked >= maxCost",
+          "Asset checked == address(0) (ETH only)",
+          "_validateRequest: nonce uniqueness check, nonce marked used, event emitted",
+          "Signature validated via isValidWithdrawSignature (owner's signature on getHash())",
+          "Balance check: address(this).balance >= withdrawAmount",
+          "_withdrawableETH[sender] += withdrawAmount - maxCost",
+          "Context encoded: (maxCost, sender)",
+          "--- UserOp executes ---",
+          "postOp called: withdrawable = _withdrawableETH[account] + (maxGasCost - actualGasCost)",
+          "_withdrawableETH[account] deleted",
+          "withdrawable sent to account via forceSafeTransferETH"
+        ],
+        "transformations": [
+          "withdrawAmount split into gas portion (maxCost) and user portion (withdrawAmount - maxCost)",
+          "Gas refund computed as maxGasCost - actualGasCost in postOp",
+          "Hash computed via EIP-191 v0x45: toEthSignedMessageHash(abi.encode(this, account, chainid, asset, amount, nonce, expiry))"
+        ],
+        "sinks": [
+          "ETH transferred to user account in postOp",
+          "_withdrawableETH mapping",
+          "Nonce consumed in _nonceUsed mapping"
+        ],
+        "trust_changes": "Signature by MagicSpend owner authorizes the withdrawal; EntryPoint is trusted to call postOp with correct gas cost data",
+        "validation_points": [
+          "Nonce uniqueness in _validateRequest",
+          "Signature validation against contract owner",
+          "Balance sufficiency check",
+          "Amount >= maxCost check",
+          "Expiry encoded in validationData for EntryPoint to enforce"
+        ],
+        "exposure_risks": [
+          "Nonce state is permanently consumed even if validation returns sigFailed=1"
+        ],
+        "manipulation_risks": [
+          "Balance check race: multiple UserOps in the same bundle each pass balance check independently during validation phase, but combined withdrawals may exceed actual balance",
+          "Nonce is consumed in _validateRequest before signature check in validatePaymasterUserOp - invalid signature still burns the nonce"
+        ]
+      },
+      {
+        "flow_id": "DF-04-Owner-Management",
+        "source": "Owner calls addOwnerAddress/addOwnerPublicKey/removeOwnerAtIndex",
+        "path": [
+          "onlyOwner modifier: _checkOwner() verifies isOwnerAddress(msg.sender) or msg.sender == address(this)",
+          "For add: _addOwner encodes bytes, checks AlreadyOwner, stores in ownerAtIndex[nextOwnerIndex++] and isOwner[bytes]",
+          "For remove: loads ownerAtIndex[index], checks non-empty, deletes isOwner[bytes] and ownerAtIndex[index]"
+        ],
+        "transformations": [
+          "address -> abi.encode(address) = 32 bytes",
+          "public key (x,y) -> abi.encode(x,y) = 64 bytes"
+        ],
+        "sinks": [
+          "MultiOwnableStorage: ownerAtIndex mapping, isOwner mapping, nextOwnerIndex counter"
+        ],
+        "trust_changes": "Only existing owners can modify the owner set; self-call (address(this)) also authorized",
+        "validation_points": [
+          "AlreadyOwner check prevents duplicate registration",
+          "NoOwnerAtIndex check on removal",
+          "Length validation (32 or 64 bytes) in _initializeOwners",
+          "Address range validation (uint160) for 32-byte owners"
+        ],
+        "exposure_risks": [
+          "Removed owner index leaves a gap that is never reused - nextOwnerIndex only increments"
+        ],
+        "manipulation_risks": [
+          "Cross-chain replay: owner management functions are whitelisted for chain-agnostic execution, so adding/removing owners replays across all chains",
+          "No minimum owner count: all owners can be removed, permanently locking the wallet"
+        ]
+      },
+      {
+        "flow_id": "DF-05-WebAuthn-Signature-Verification",
+        "source": "User provides WebAuthnAuth struct via signature",
+        "path": [
+          "s malleability check: s <= P256_N_DIV_2",
+          "Type verification: clientDataJSON.slice(typeIndex, typeIndex+21) must match expected type hash",
+          "Challenge verification: clientDataJSON.slice(challengeIndex, challengeIndex+len) must match base64url-encoded challenge",
+          "UP flag check at authenticatorData[32]",
+          "Optional UV flag check at authenticatorData[32]",
+          "clientDataJSONHash = sha256(clientDataJSON)",
+          "messageHash = sha256(authenticatorData || clientDataJSONHash)",
+          "Try RIP-7212 precompile at 0x100",
+          "Fallback to FCL.ecdsa_verify"
+        ],
+        "transformations": [
+          "challenge -> base64url encoding -> embedded in expected challenge string",
+          "authenticatorData + sha256(clientDataJSON) -> sha256 -> messageHash for ECDSA verification"
+        ],
+        "sinks": [
+          "Boolean verification result returned to caller"
+        ],
+        "trust_changes": "User-supplied typeIndex and challengeIndex are validated by content comparison, not by position; authenticatorData comes from hardware authenticator and is validated via signature",
+        "validation_points": [
+          "s <= n/2 malleability guard",
+          "Type string match",
+          "Challenge string match",
+          "User Present flag",
+          "ECDSA signature verification on message hash"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "typeIndex and challengeIndex are user-controlled; attacker could point them to positions within other JSON fields that happen to contain matching substrings, but since the full clientDataJSON is hashed and signed this cannot forge a signature",
+          "RIP-7212 precompile fallback: if 0x100 has unrelated code deployed on certain chains, staticcall could return unexpected data; ret.length > 0 check partially mitigates"
+        ]
+      },
+      {
+        "flow_id": "DF-06-Factory-Deployment",
+        "source": "User calls CoinbaseSmartWalletFactory.createAccount(owners, nonce)",
+        "path": [
+          "Revert if owners is empty",
+          "Salt computed: keccak256(abi.encode(owners, nonce))",
+          "LibClone.createDeterministicERC1967(msg.value, implementation, salt)",
+          "If not already deployed: account.initialize(owners)"
+        ],
+        "transformations": [
+          "owners + nonce -> keccak256 -> salt for CREATE2",
+          "ERC1967 proxy deployed with implementation slot set"
+        ],
+        "sinks": [
+          "New proxy contract deployed on-chain",
+          "Proxy's MultiOwnableStorage initialized"
+        ],
+        "trust_changes": "First deployer sets the owners; subsequent calls to same salt return existing address without re-initialization",
+        "validation_points": [
+          "owners.length > 0 enforced",
+          "initialize() reverts if already initialized (nextOwnerIndex != 0)"
+        ],
+        "exposure_risks": [
+          "Anyone can deploy the account for any set of owners; first deployer pays gas but cannot influence ownership"
+        ],
+        "manipulation_risks": [
+          "If msg.value is sent during createAccount for an already-deployed account, the ETH is sent to the existing proxy via createDeterministicERC1967 - this is by design"
+        ]
+      },
+      {
+        "flow_id": "DF-07-MagicSpend-Direct-Withdraw",
+        "source": "User calls MagicSpend.withdraw(withdrawRequest)",
+        "path": [
+          "_validateRequest: nonce check and mark used",
+          "Signature validation via isValidWithdrawSignature",
+          "Expiry check: block.timestamp > withdrawRequest.expiry",
+          "_withdraw: transfer asset to msg.sender"
+        ],
+        "transformations": [
+          "WithdrawRequest fields -> getHash() -> EIP-191 signed message hash",
+          "Owner signature verified against hash"
+        ],
+        "sinks": [
+          "ETH or ERC20 transferred to msg.sender"
+        ],
+        "trust_changes": "MagicSpend owner's signature authorizes the withdrawal for a specific account",
+        "validation_points": [
+          "Nonce uniqueness",
+          "Signature validity",
+          "Expiry check (block.timestamp <= expiry)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Nonce is consumed before signature check - if signature is invalid, nonce is still burned (DoS if attacker has the withdraw request data but not a valid signature, they can front-run and burn the nonce for the legitimate user)"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Smart wallet controlled by multiple owners (EOA addresses or passkey public keys)",
+        "Only EntryPoint can call validateUserOp; only EntryPoint or owners can execute transactions",
+        "Cross-chain replayable operations limited to owner management and upgrade functions",
+        "MagicSpend withdrawals require owner signature with nonce, expiry, and chain-binding",
+        "UUPS upgrade only allowed by wallet owners",
+        "ERC-1271 signatures protected against cross-account replay via EIP-712 domain separator"
+      ],
+      "economic_incentives": [
+        "MagicSpend sponsors gas by providing ETH via paymaster; excess refunded to user in postOp",
+        "Bundlers are incentivized to include UserOps with valid signatures and sufficient gas",
+        "MagicSpend owner can withdraw any funds from the contract"
+      ],
+      "governance_mechanisms": [
+        "Multi-owner model: any single owner can add/remove other owners, execute transactions, or upgrade the implementation",
+        "No multisig or threshold requirement - any single owner has full control",
+        "Cross-chain owner sync via executeWithoutChainIdValidation"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "initialize() called with empty owners array",
+          "expected_behavior": "Should revert or set a meaningful state preventing re-initialization",
+          "actual_behavior": "No-op: nextOwnerIndex stays 0, allowing another call to initialize() with different owners, potentially by an attacker",
+          "risk_level": "medium",
+          "exploitation_potential": "If a proxy is deployed without using the factory (which enforces owners.length > 0), an attacker can front-run the legitimate initialize() call to take ownership. Factory-deployed wallets are not affected."
+        },
+        {
+          "scenario": "All owners removed via removeOwnerAtIndex",
+          "expected_behavior": "Some minimum owner count should be maintained",
+          "actual_behavior": "All owners can be removed, permanently bricking the wallet with no way to recover access or funds",
+          "risk_level": "medium",
+          "exploitation_potential": "A compromised owner could remove all owners (including themselves) as a grief attack. The last owner removed cannot be re-added since no owner exists to authorize the operation."
+        },
+        {
+          "scenario": "MagicSpend nonce consumed before signature validation in _validateRequest",
+          "expected_behavior": "Nonce should only be consumed for valid requests",
+          "actual_behavior": "In withdraw(), _validateRequest consumes the nonce BEFORE isValidWithdrawSignature check. An attacker who obtains the withdraw request data (but not a valid signature) can front-run with the same nonce, burning it.",
+          "risk_level": "medium",
+          "exploitation_potential": "Front-running attack: attacker observes a pending withdraw() call in mempool, extracts the WithdrawRequest, and calls withdraw() first. The nonce is burned even though the signature check fails for the attacker. The legitimate user's subsequent call fails with InvalidNonce."
+        },
+        {
+          "scenario": "MagicSpend validatePaymasterUserOp nonce burned on failed signature",
+          "expected_behavior": "Nonce only consumed for valid withdrawals",
+          "actual_behavior": "_validateRequest is called before signature validation; nonce is permanently consumed even when sigFailed=true is returned to EntryPoint. The EntryPoint would reject the UserOp, but the nonce is already spent.",
+          "risk_level": "high",
+          "exploitation_potential": "An attacker can craft a UserOp referencing a victim's withdraw request (known from e.g., off-chain API). Even with an invalid signature, the nonce is consumed. The victim's legitimate withdrawal request becomes unusable, requiring a new signed request from the MagicSpend owner."
+        },
+        {
+          "scenario": "Multiple MagicSpend-sponsored UserOps in same bundle pass balance check individually",
+          "expected_behavior": "Balance check should account for all pending withdrawals",
+          "actual_behavior": "Each validatePaymasterUserOp checks address(this).balance independently. If the contract has 10 ETH and two UserOps each request 7 ETH, both pass validation. During postOp execution, the second transfer may fail.",
+          "risk_level": "low",
+          "exploitation_potential": "Bundler or malicious actor could craft a bundle where multiple UserOps drain MagicSpend balance. The assert in postOp would be triggered if postOp is called with postOpReverted mode, consuming all remaining gas."
+        },
+        {
+          "scenario": "RIP-7212 precompile address 0x100 has deployed code on an unexpected chain",
+          "expected_behavior": "Precompile returns valid P-256 signature verification result",
+          "actual_behavior": "If an arbitrary contract exists at 0x100 on some chain, staticcall succeeds and returns data that may decode to uint256(1), causing false positive signature verification",
+          "risk_level": "medium",
+          "exploitation_potential": "On chains where 0x100 has arbitrary contract code, the staticcall might return data that passes the length > 0 check and decodes to 1, accepting forged signatures. FCL fallback would not execute."
+        },
+        {
+          "scenario": "Cross-chain replay of upgradeToAndCall",
+          "expected_behavior": "Upgrade should be intentional per-chain",
+          "actual_behavior": "upgradeToAndCall is in canSkipChainIdValidation whitelist. A signed upgrade UserOp can be replayed on every chain where the wallet exists at the same address",
+          "risk_level": "medium",
+          "exploitation_potential": "If the target implementation address doesn't exist or contains different code on another chain, the replay could brick wallets or introduce malicious implementations on other chains"
+        },
+        {
+          "scenario": "FCL ecAff_IsZero only checks y == 0",
+          "expected_behavior": "Should check both x == 0 and y == 0 for identity point",
+          "actual_behavior": "Only checks y == 0. A point on the curve with y = 0 (if one exists for P-256) would be treated as the identity. For P-256 with cofactor 1, such a point would have order 2, which is impossible since the group order is prime.",
+          "risk_level": "low",
+          "exploitation_potential": "For P-256 specifically, no point with y=0 exists on the curve because the group order is prime and > 2. So this is not exploitable for P-256 but would be a bug for other curves."
+        },
+        {
+          "scenario": "WebAuthn verify with requireUV set to false",
+          "expected_behavior": "User verification provides stronger assurance of user intent",
+          "actual_behavior": "CoinbaseSmartWallet._validateSignature calls WebAuthn.verify with requireUV: false, meaning user verification is never required",
+          "risk_level": "low",
+          "exploitation_potential": "An authenticator that does not perform user verification (e.g., no biometric/PIN check) can still produce valid signatures. This reduces the security guarantee from the authenticator."
+        },
+        {
+          "scenario": "MagicSpend withdraw() allows withdrawal at exactly expiry timestamp",
+          "expected_behavior": "Consistent behavior: either include or exclude the boundary",
+          "actual_behavior": "Uses block.timestamp > expiry (allows at exact expiry). But validatePaymasterUserOp packs expiry into validationData where EntryPoint uses validUntil semantics (block.timestamp < validUntil). Inconsistent boundary handling.",
+          "risk_level": "low",
+          "exploitation_potential": "Marginal timing inconsistency between direct withdraw and paymaster paths at the exact expiry second. Not practically exploitable."
+        },
+        {
+          "scenario": "Owner index reuse after removal",
+          "expected_behavior": "Removed index could be reused to conserve index space",
+          "actual_behavior": "nextOwnerIndex only increments; removed indices are permanently abandoned. Indices grow monotonically. SignatureWrapper.ownerIndex for a removed owner would return empty bytes, causing revert in _validateSignature.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploitation, but over a very long wallet lifetime with many owner changes, ownerIndex grows unboundedly."
+        }
+      ],
+      "assumption_violations": [
+        "MagicSpend assumes EntryPoint validates expiry from validationData - correct for ERC-4337 but relies on EntryPoint behavior",
+        "WebAuthn assumes authenticatorData is at least 33 bytes; shorter data causes out-of-bounds revert, not graceful failure",
+        "FCL assumes curve has prime order (cofactor 1) - true for P-256 but library comment warns against other curves",
+        "Factory assumes initialize() can only be called once due to nextOwnerIndex check - violated if called with empty owners array",
+        "MagicSpend postOp assumes actualGasCost <= maxGasCost, relying on EntryPoint invariant",
+        "WebAuthn relies on RIP-7212 precompile at 0x100 being either absent or correctly implemented; arbitrary code at that address breaks the verification"
+      ],
+      "game_theory_risks": [
+        "Nonce-burning grief attack on MagicSpend: attacker can burn a victim's withdrawal nonce by front-running with the same WithdrawRequest, requiring the MagicSpend owner to issue a new signed request",
+        "Single-owner takeover: any owner can unilaterally add themselves as sole owner and remove all others; no multisig protection",
+        "Cross-chain replay weapon: an attacker who compromises one chain's owner keys can replay owner changes and upgrades to all chains simultaneously",
+        "Bundler can refuse to include withdrawGasExcess() calls, temporarily locking user's excess ETH in MagicSpend"
+      ],
+      "integration_risks": [
+        "EntryPoint v0.6 specific: hardcoded EntryPoint address (0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789) means incompatibility with EntryPoint v0.7 or any future version",
+        "RIP-7212 precompile availability varies by chain; on chains without it, every WebAuthn verification falls back to FCL with higher gas cost",
+        "Solady SafeTransferLib.forceSafeTransferETH behavior may differ across EVM-compatible chains with different precompile or opcode support",
+        "MagicSpend relies on address(this).balance which can be manipulated via SELFDESTRUCT (deprecated but still functional pre-Cancun) or coinbase rewards"
+      ],
+      "calculation_errors": [
+        "No arithmetic overflow errors found in MagicSpend: Solidity 0.8.23 provides native overflow protection for non-assembly code",
+        "FCL assembly arithmetic uses mulmod/addmod which inherently handle modular arithmetic correctly for P-256 parameters",
+        "FCL ecZZ_mulmuladd_S_asm: at loop termination, the index wraps from 0 to 2^256-1 in assembly, but loop condition gt(minus_1, index) correctly exits since minus_1 == 2^256-1"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "ETH",
+          "behaviors": [
+            "native_asset",
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Primary asset for MagicSpend. Transferred via SafeTransferLib.safeTransferETH and forceSafeTransferETH. No ERC20 token accounting."
+        },
+        {
+          "address_or_symbol": "ERC20_generic",
+          "behaviors": [
+            "fee_on_transfer:possible",
+            "rebasing:possible"
+          ],
+          "decimals": -1,
+          "notes": "MagicSpend._withdraw supports generic ERC20 via SafeTransferLib.safeTransfer for ownerWithdraw and withdraw. MagicSpend.withdraw allows non-ETH assets but validatePaymasterUserOp rejects them (UnsupportedPaymasterAsset). Fee-on-transfer tokens would cause accounting discrepancies if amount received differs from amount specified."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "nonce_uniqueness",
+          "state_vars": [
+            "_nonceUsed[nonce][account]"
+          ],
+          "description": "Each (nonce, account) pair in MagicSpend can only be used once. Once _nonceUsed is set to true, it can never be reset."
+        },
+        {
+          "name": "owner_consistency",
+          "state_vars": [
+            "isOwner[bytes]",
+            "ownerAtIndex[index]"
+          ],
+          "description": "For every index where ownerAtIndex[index] is non-empty, isOwner[ownerAtIndex[index]] must be true. Violated temporarily if the same owner bytes could be at multiple indices (prevented by AlreadyOwner check)."
+        },
+        {
+          "name": "nextOwnerIndex_monotonic",
+          "state_vars": [
+            "nextOwnerIndex"
+          ],
+          "description": "nextOwnerIndex only increases. Removing an owner does not decrement it."
+        },
+        {
+          "name": "withdrawableETH_conservation",
+          "state_vars": [
+            "_withdrawableETH[account]",
+            "contract ETH balance"
+          ],
+          "description": "The sum of all _withdrawableETH values should not exceed the contract's ETH balance minus funds reserved for gas. This invariant is checked at validation time (balance >= withdrawAmount) but multiple concurrent validations could violate it."
+        },
+        {
+          "name": "implementation_not_initializable",
+          "state_vars": [
+            "nextOwnerIndex on implementation"
+          ],
+          "description": "The implementation contract's constructor sets address(0) as owner, making nextOwnerIndex = 1, preventing re-initialization on the implementation itself."
+        },
+        {
+          "name": "signature_malleability_prevention",
+          "state_vars": [],
+          "description": "WebAuthn enforces s <= n/2 for secp256r1 signatures. ECDSA (secp256k1) malleability is handled by SignatureCheckerLib from Solady."
+        }
+      ]
+    }
+  }
+}

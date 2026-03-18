@@ -1,0 +1,365 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T00:08:48.331Z",
+    "duration_ms": 266365
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "External caller (any address)",
+        "path": [
+          "AccessControlHooks.onQueueWithdrawal()",
+          "_tryValidateAccess()",
+          "_tryValidateAccessInner()",
+          "_handleHooksData()",
+          "_tryValidateCredential() or _tryGetCredential()"
+        ],
+        "transformations": [
+          "hooksData parsed as provider address + credential bytes",
+          "credential timestamp truncated to uint32"
+        ],
+        "sinks": [
+          "_lenderStatus[lender] storage",
+          "External provider.validateCredential() call"
+        ],
+        "trust_changes": "AccessControlHooks.onQueueWithdrawal has NO isHooked check, unlike FixedTermLoanHooks. Any address can call this function as msg.sender, triggering credential validation and storage writes.",
+        "validation_points": [
+          "No msg.sender validation in onQueueWithdrawal"
+        ],
+        "exposure_risks": [
+          "Lender credential state can be modified by unauthenticated callers"
+        ],
+        "manipulation_risks": [
+          "Attacker can call onQueueWithdrawal from any address, triggering _tryValidateAccess which writes to _lenderStatus storage",
+          "Attacker can force expiration of a lender's credential by calling when credential is expired, causing unsetCredential to be written to storage",
+          "Attacker can trigger stateful validateCredential calls on providers via crafted hooksData without the lender's consent"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "Borrower (deployer) via hooksData calldata",
+        "path": [
+          "FixedTermLoanHooks._onCreateMarket()",
+          "assembly calldataload(hooksData.offset) for fixedTermEndTime",
+          "assembly calldataload(add(hooksData.offset, 0x20)) for minimumDeposit",
+          "Stored in _hookedMarkets[marketAddress]"
+        ],
+        "transformations": [
+          "fixedTermEndTime: 256-bit calldataload assigned to uint32 variable in assembly",
+          "minimumDeposit: 256-bit calldataload passed through SafeCastLib.toUint128()"
+        ],
+        "sinks": [
+          "_hookedMarkets[marketAddress].fixedTermEndTime (uint32)",
+          "_hookedMarkets[marketAddress].minimumDeposit (uint128)"
+        ],
+        "trust_changes": "Borrower-supplied calldata parsed via inline assembly without Solidity type-safety guarantees",
+        "validation_points": [
+          "fixedTermEndTime range check against block.timestamp and MaximumLoanTerm",
+          "minimumDeposit bounded by toUint128() SafeCast"
+        ],
+        "exposure_risks": [
+          "fixedTermEndTime uses full 256-bit value in validation but is stored as uint32 - truncation mismatch possible for future timestamps beyond uint32 max"
+        ],
+        "manipulation_risks": [
+          "Currently safe due to block.timestamp fitting in uint32, but will break after year 2106 when block.timestamp exceeds uint32.max"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Role provider external contract",
+        "path": [
+          "IRoleProvider.getCredential(address) or IRoleProvider.validateCredential(address,bytes)",
+          "Return value read via assembly (mload(0) masked to uint32)",
+          "credentialTimestamp used in calculateExpiry",
+          "status.setCredential() updates LenderStatus in memory",
+          "_lenderStatus[account] written to storage"
+        ],
+        "transformations": [
+          "Provider return value masked to uint32 via and(mload(0), 0xffffffff)",
+          "Expiry calculated as satAdd(credentialTimestamp, timeToLive, type(uint32).max)"
+        ],
+        "sinks": [
+          "_lenderStatus mapping in storage"
+        ],
+        "trust_changes": "External untrusted contract return data is used to set credential timestamps. Provider address is validated against _roleProviders mapping.",
+        "validation_points": [
+          "Provider must be in _roleProviders",
+          "credentialTimestamp != 0",
+          "credentialTimestamp <= block.timestamp",
+          "calculateExpiry >= block.timestamp"
+        ],
+        "exposure_risks": [
+          "Malicious provider could return manipulated timestamps to extend or shorten credential validity"
+        ],
+        "manipulation_risks": [
+          "Provider returning credentialTimestamp = block.timestamp always results in maximum credential validity for that provider's TTL"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "Market contract (msg.sender) calling onDeposit",
+        "path": [
+          "onDeposit receives scaledAmount and MarketState",
+          "normalizedAmount = scaledAmount.rayMul(state.scaleFactor)",
+          "Compare against market.minimumDeposit",
+          "_tryValidateAccessInner for credential check",
+          "_writeLenderStatus updates storage and isKnownLenderOnMarket"
+        ],
+        "transformations": [
+          "scaledAmount multiplied by scaleFactor via rayMul",
+          "Result compared to minimumDeposit (uint128)"
+        ],
+        "sinks": [
+          "_lenderStatus[lender]",
+          "isKnownLenderOnMarket[lender][msg.sender]"
+        ],
+        "trust_changes": "Market-provided scaleFactor and scaledAmount are trusted for minimum deposit calculation",
+        "validation_points": [
+          "isHooked check",
+          "isBlockedFromDeposits check",
+          "minimumDeposit check",
+          "credential validation"
+        ],
+        "exposure_risks": [
+          "If market provides manipulated scaleFactor, minimum deposit check could be bypassed"
+        ],
+        "manipulation_risks": [
+          "Minimum deposit is checked against normalized amount, which depends on market-supplied scaleFactor"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Borrower calling onSetAnnualInterestAndReserveRatioBips",
+        "path": [
+          "MarketConstraintHooks.onSetAnnualInterestAndReserveRatioBips()",
+          "Read temporaryExcessReserveRatio[market]",
+          "Check canExpire / canCancel conditions",
+          "_calculateTemporaryReserveRatioBips()",
+          "Write to temporaryExcessReserveRatio[market]",
+          "Return (newAnnualInterestBips, newReserveRatioBips)"
+        ],
+        "transformations": [
+          "relativeDiff = 10000 * (originalAPR - newAPR) / originalAPR",
+          "temporaryReserveRatio = max(2 * relativeDiff, originalReserveRatio) bounded by 10000"
+        ],
+        "sinks": [
+          "temporaryExcessReserveRatio[market] storage",
+          "Return values used by market to set state"
+        ],
+        "trust_changes": "Market contract is trusted as msg.sender. Borrower indirectly controls parameters through market.",
+        "validation_points": [
+          "annualInterestBips range check",
+          "canExpire requires expiry passed AND rate not decreased",
+          "canCancel requires rate >= original"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Borrower can step-down APR repeatedly: reduce 25%, wait 2 weeks, let expire, reduce another 25% from new baseline, avoiding high temporary reserve ratios"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Lender or anyone calling grantRole / grantRoles",
+        "path": [
+          "grantRole(address account, uint32 roleGrantedTimestamp)",
+          "Lookup _roleProviders[msg.sender]",
+          "_grantRole checks existing credential",
+          "_setCredentialAndEmitAccessGranted writes to storage"
+        ],
+        "transformations": [
+          "newExpiry = callingProvider.calculateExpiry(roleGrantedTimestamp)"
+        ],
+        "sinks": [
+          "_lenderStatus[account]"
+        ],
+        "trust_changes": "Only approved role providers can call. Provider can grant to any account.",
+        "validation_points": [
+          "msg.sender must be in _roleProviders",
+          "newExpiry >= block.timestamp",
+          "credential replacement rules enforced"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "A provider with type(uint32).max TTL can grant credentials with any timestamp (even 0) since satAdd returns type(uint32).max"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Only the borrower can deploy markets, manage role providers, block/unblock lenders, and modify market parameters",
+        "Lenders must have valid credentials from approved role providers to deposit (when deposit requires access)",
+        "Known lenders (who have deposited or received tokens with access) retain withdrawal access even after credential expiry",
+        "Fixed term end time can only be decreased, never increased by the borrower",
+        "APR reductions trigger temporary increased reserve ratio for 2-week protection period",
+        "Credential replacement requires either same provider, unsupported provider, or later expiry"
+      ],
+      "economic_incentives": [
+        "Borrowers are incentivized to reduce APR to lower interest costs, restrained by temporary reserve ratio increase",
+        "Lenders are protected by fixed term restrictions preventing early withdrawal queue",
+        "Minimum deposit amounts prevent dust attacks and ensure meaningful participation",
+        "Two-week cooling period on APR reductions protects lenders from sudden rate drops"
+      ],
+      "governance_mechanisms": [
+        "Borrower has unilateral control over role providers, market parameters, and lender blocking",
+        "Role providers are external contracts trusted to validate lender credentials",
+        "Pull providers can be queried for credential refresh; push providers can only be called by lenders"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "AccessControlHooks.onQueueWithdrawal called by non-market address",
+          "expected_behavior": "Should revert with NotHookedMarket since caller is not a registered market",
+          "actual_behavior": "No isHooked check exists. Function proceeds to _tryValidateAccess, potentially modifying _lenderStatus storage and making external calls to providers via hooksData",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker calls onQueueWithdrawal(victim, ..., maliciousHooksData) to: (1) clear victim's expired credentials from storage, (2) trigger stateful validateCredential calls on providers causing unintended side effects, (3) potentially grief lenders by manipulating their credential state"
+        },
+        {
+          "scenario": "Borrower calls setFixedTermEndTime with newFixedTermEndTime = 0",
+          "expected_behavior": "Debatable - should there be a minimum remaining term?",
+          "actual_behavior": "Term is set to 0, immediately allowing all lenders to queue withdrawals since 0 > block.timestamp is false",
+          "risk_level": "medium",
+          "exploitation_potential": "Borrower can eliminate fixed term protection at will, potentially front-running lender deposits that expected a minimum term guarantee. Lenders have no on-chain assurance of minimum term beyond trusting the borrower."
+        },
+        {
+          "scenario": "Borrower reduces APR by exactly 25% repeatedly with 2-week waits",
+          "expected_behavior": "Temporary reserve ratio should protect lenders from drastic rate reductions",
+          "actual_behavior": "Each 25% reduction from the NEW baseline avoids elevated reserve ratio since relativeDiff <= 2500 returns originalReserveRatioBips. After expiry, the new lower rate becomes the baseline for the next reduction.",
+          "risk_level": "medium",
+          "exploitation_potential": "Borrower can reduce APR from 10000 → 7500 → 5625 → 4219 → 3164 over 8 weeks (4 reductions) without ever triggering elevated reserve ratios above original, effectively dropping APR ~68% while maintaining minimum reserves"
+        },
+        {
+          "scenario": "Provider added by borrower as non-pull provider, then borrower tries to use it as pull provider in _handleHooksData",
+          "expected_behavior": "Credential should not be pulled from non-pull provider",
+          "actual_behavior": "In _handleHooksData with hooksData.length == 20, the check `provider.isPullProvider()` correctly prevents pulling. But if hooksData.length > 20, _tryValidateCredential is called which uses `call` (not staticcall), allowing stateful validation regardless of pull/push status. This is by design but inconsistent.",
+          "risk_level": "low",
+          "exploitation_potential": "Non-pull providers can still be invoked via validateCredential path with > 20 bytes of hooksData"
+        },
+        {
+          "scenario": "All pull providers removed while lender has canRefresh = true",
+          "expected_behavior": "Credential refresh should gracefully fail",
+          "actual_behavior": "_tryValidateAccessInner checks if lastProvider is not null. If provider was removed, _roleProviders[lastProvider] returns 0 (null), so refresh is skipped. _loopTryGetCredential with empty _pullProviders returns false. Credential is unset. Correct behavior.",
+          "risk_level": "low",
+          "exploitation_potential": "None - graceful degradation"
+        },
+        {
+          "scenario": "onSetAnnualInterestAndReserveRatioBips called when intermediateState.annualInterestBips is 0",
+          "expected_behavior": "Should handle zero APR correctly",
+          "actual_behavior": "If tmp.expiry > 0 and annualInterestBips >= 0 (always true for uint16), canExpire might be true if expiry passed. If no tmp exists, the code checks annualInterestBips < originalAnnualInterestBips (0), which is false for uint16 since minimum is 0. No temporary ratio created. Correct.",
+          "risk_level": "low",
+          "exploitation_potential": "None"
+        },
+        {
+          "scenario": "HooksConfig.onBorrow assembly uses RepayHook_Base_Size instead of BorrowHook_Base_Size",
+          "expected_behavior": "Should use BorrowHook_Base_Size constant",
+          "actual_behavior": "Uses RepayHook_Base_Size (0x0224) which happens to equal BorrowHook_Base_Size (0x0224). No functional impact.",
+          "risk_level": "low",
+          "exploitation_potential": "None currently - cosmetic bug. If constants diverge in future, could cause incorrect calldata sizing."
+        },
+        {
+          "scenario": "Lender with isBlockedFromDeposits=true receives market tokens via transfer on a market where transferRequiresAccess=false",
+          "expected_behavior": "Blocked lender should not receive tokens",
+          "actual_behavior": "onTransfer checks isBlockedFromDeposits and reverts if true, even when transferRequiresAccess is false. The block check is applied before the access requirement check. Correct.",
+          "risk_level": "low",
+          "exploitation_potential": "None - correctly blocked"
+        },
+        {
+          "scenario": "FixedTermLoanHooks._onCreateMarket with hooksData between 32 and 64 bytes",
+          "expected_behavior": "Should either read minimumDeposit or not, clearly",
+          "actual_behavior": "minimumDeposit is only read if hooksData.length == 64 exactly. For lengths 33-63, only fixedTermEndTime is read. This is correct but could lead to user error if they provide partial data.",
+          "risk_level": "low",
+          "exploitation_potential": "None - clear length requirements"
+        },
+        {
+          "scenario": "Multiple markets sharing same FixedTermLoanHooks/AccessControlHooks instance with different access requirements",
+          "expected_behavior": "_lenderStatus is global across all markets, isKnownLenderOnMarket is per-market",
+          "actual_behavior": "Credential stored in _lenderStatus is shared. A credential granted for market A also works for market B if both use the same hooks. isKnownLenderOnMarket correctly tracks per-market status.",
+          "risk_level": "medium",
+          "exploitation_potential": "Lender approved for one market automatically has credential for all markets using same hooks instance, even if the borrower intended different access policies per market"
+        }
+      ],
+      "assumption_violations": [
+        "AccessControlHooks.onQueueWithdrawal assumes msg.sender is always a hooked market - no validation performed",
+        "fixedTermEndTime validation assumes block.timestamp fits in uint32 (valid until 2106)",
+        "Credential system assumes role providers are non-malicious and return meaningful timestamps",
+        "_tryGetCredential assembly uses scratch space (0x00-0x3f) which is safe but could conflict with Solidity compiler's free memory usage patterns in edge cases",
+        "Temporary reserve ratio mechanism assumes borrower cannot front-run lender withdrawals after reducing APR to 0"
+      ],
+      "game_theory_risks": [
+        "Borrower can gradually reduce APR by 25% every 2 weeks without elevated reserve ratio penalty, eventually reaching near-zero rates",
+        "Borrower can set fixedTermEndTime to 0 to allow immediate withdrawals, potentially after depositing was encouraged at higher rates",
+        "Role provider can be malicious and grant/revoke credentials strategically to benefit the borrower",
+        "Borrower controls both role providers and blocking, giving full power to gatekeep deposits and restrict specific lenders"
+      ],
+      "integration_risks": [
+        "External role providers may have bugs or be malicious - all provider calls use try-catch semantics (assembly call returning false on failure)",
+        "validateCredential on providers is stateful (CALL not STATICCALL), meaning provider state can change during hooks execution",
+        "Market contracts trust hook return values for reserve ratio and interest rate - incorrect hook implementation affects all depositors",
+        "If a role provider's isPullProvider() changes behavior after being registered, the hooks contract will use stale pull/push classification"
+      ],
+      "calculation_errors": [
+        "HooksConfig.onBorrow uses RepayHook_Base_Size (0x0224) instead of BorrowHook_Base_Size (0x0224) - values are equal so no actual error, but a maintenance hazard"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "MarketToken",
+          "behaviors": [
+            "rebasing:true",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Rebasing market tokens where scaleFactor inflates balances. scaledAmount * scaleFactor = normalizedAmount. Used in deposit amount validation via rayMul."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "known_lender_immutability",
+          "state_vars": [
+            "isKnownLenderOnMarket[lender][market]"
+          ],
+          "description": "Once set to true, isKnownLenderOnMarket can never be set back to false. Known lenders always retain withdrawal access."
+        },
+        {
+          "name": "fixed_term_monotonic_decrease",
+          "state_vars": [
+            "_hookedMarkets[market].fixedTermEndTime"
+          ],
+          "description": "fixedTermEndTime can only be decreased or kept the same, never increased after market creation."
+        },
+        {
+          "name": "credential_single_owner",
+          "state_vars": [
+            "_lenderStatus[account].lastProvider",
+            "_lenderStatus[account].lastApprovalTimestamp"
+          ],
+          "description": "Each lender has at most one active credential at a time, from a single provider."
+        },
+        {
+          "name": "temporary_reserve_original_invariant",
+          "state_vars": [
+            "temporaryExcessReserveRatio[market].originalAnnualInterestBips",
+            "temporaryExcessReserveRatio[market].originalReserveRatioBips"
+          ],
+          "description": "Original values are set once when temporary ratio is created and remain unchanged until deleted. New reductions reference these originals, not intermediate values."
+        },
+        {
+          "name": "pull_provider_index_consistency",
+          "state_vars": [
+            "_pullProviders[]",
+            "_roleProviders[addr].pullProviderIndex"
+          ],
+          "description": "pullProviderIndex in _roleProviders must match the actual index in _pullProviders array. Maintained by _removePullProvider swap-and-pop pattern."
+        }
+      ]
+    }
+  }
+}

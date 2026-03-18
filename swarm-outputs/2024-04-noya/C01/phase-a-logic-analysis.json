@@ -1,0 +1,487 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T04:55:32.679Z",
+    "duration_ms": 421059
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User deposit (base token)",
+        "path": [
+          "User calls deposit(receiver, amount, referrer)",
+          "baseToken.safeTransferFrom to AccountingManager",
+          "DepositRequest created in depositQueue",
+          "Manager calls calculateDepositShares() using TVL-based previewDeposit",
+          "Manager calls executeDeposit() minting shares + forwarding to connector"
+        ],
+        "transformations": [
+          "amount -> shares via ERC4626 previewDeposit",
+          "base token -> connector liquidity position"
+        ],
+        "sinks": [
+          "User receives vault shares",
+          "Base tokens forwarded to connector via addLiquidity"
+        ],
+        "trust_changes": "Untrusted user input becomes queued request; manager controls calculation and execution timing",
+        "validation_points": [
+          "amount > 0 check",
+          "depositLimitPerTransaction check",
+          "TVL < depositLimitTotalAmount check",
+          "depositWaitingTime delay",
+          "oldestUpdateTime freshness gate"
+        ],
+        "exposure_risks": [
+          "TVL check runs AFTER transferFrom, so deposited tokens inflate TVL() making check stricter than intended"
+        ],
+        "manipulation_risks": [
+          "Share price manipulation between deposit and calculateDepositShares via TVL oracle manipulation",
+          "Manager timing of calculateDepositShares can be gamed to assign advantageous share prices"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "User withdrawal request (shares)",
+        "path": [
+          "User calls withdraw(share, receiver)",
+          "WithdrawRequest enqueued; withdrawRequestsByAddress locks shares",
+          "Manager calls calculateWithdrawShares() using previewRedeem",
+          "Manager calls startCurrentWithdrawGroup()",
+          "Manager calls retrieveTokensForWithdraw() from connectors",
+          "Manager calls fulfillCurrentWithdrawGroup()",
+          "Manager calls executeWithdraw() burning shares + transferring base token"
+        ],
+        "transformations": [
+          "shares -> base token amount via previewRedeem",
+          "pro-rata adjustment via totalABAmount/totalCBAmountFullfilled ratio"
+        ],
+        "sinks": [
+          "User receives base tokens minus withdrawal fee",
+          "Fee receiver gets withdrawal fee"
+        ],
+        "trust_changes": "Queued request calculated by manager; fulfillment gated by asset availability",
+        "validation_points": [
+          "Balance check including locked shares",
+          "withdrawWaitingTime delay",
+          "Group fulfillment state checks"
+        ],
+        "exposure_risks": [
+          "resetMiddle can cause totalCBAmount double-counting",
+          "fulfillCurrentWithdrawGroup event emits 0 for totalCBAmount due to ordering bug"
+        ],
+        "manipulation_risks": [
+          "resetMiddle followed by re-calculation inflates totalCBAmount leading to excess token retrieval or incorrect pro-rata distribution"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "TVL calculation across connectors",
+        "path": [
+          "AccountingManager.TVL() calls TVLHelper.getTVL()",
+          "TVLHelper iterates holdingPositions from Registry",
+          "Each position calls connector.getPositionTVL()",
+          "Connectors use valueOracle for price conversion",
+          "Result aggregated as totalTVL - totalDebt + base token balance - pending deposits"
+        ],
+        "transformations": [
+          "Connector-specific TVL -> base token value via oracle",
+          "Debt positions subtracted from total"
+        ],
+        "sinks": [
+          "Used in share price calculation (totalAssets), fee calculations, deposit limits"
+        ],
+        "trust_changes": "External oracle prices trusted for valuation; connector implementations trusted for position TVL",
+        "validation_points": [
+          "Oracle staleness checks in Chainlink connector",
+          "TWAP period in Uniswap oracle"
+        ],
+        "exposure_risks": [
+          "MorphoBlueConnector ADDS borrow amount instead of subtracting, inflating TVL",
+          "UNIv3Connector uses aggregate pool position key, potentially overstating TVL",
+          "AerodromeConnector ignores staked LP balance in TVL"
+        ],
+        "manipulation_risks": [
+          "Oracle manipulation affects share price for all deposits/withdrawals",
+          "TVL inflation via Morpho borrow positions directly inflates share value"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "Keeper multi-sig transaction execution",
+        "path": [
+          "Off-chain: Keepers decrypt IPFS strategy",
+          "Keepers.execute() called with signatures",
+          "EIP-712 signature verification",
+          "Nonce increment",
+          "Low-level call to destination"
+        ],
+        "transformations": [
+          "Calldata bytes encoded into EIP-712 hash (non-standard: bytes not pre-hashed)"
+        ],
+        "sinks": [
+          "Arbitrary function call on destination contract"
+        ],
+        "trust_changes": "Multiple owner signatures required (threshold >= 2); executor must be msg.sender",
+        "validation_points": [
+          "Signature threshold check",
+          "Nonce replay prevention",
+          "Deadline expiry",
+          "Ascending signer address ordering"
+        ],
+        "exposure_risks": [
+          "EIP-712 non-compliance: bytes data not pre-hashed per spec, may cause signing tool incompatibility"
+        ],
+        "manipulation_risks": [
+          "gasLimit parameter could be set too low causing silent failures at destination"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Connector token transfers via sendTokensToTrustedAddress",
+        "path": [
+          "Caller invokes BaseConnector.sendTokensToTrustedAddress",
+          "Branch 1: AccountingManager calls -> Watcher verification -> transfer newAmount",
+          "Branch 2: Active connector or flashLoan calls -> direct transfer",
+          "Branch 3: Swap handler route -> route verification -> transfer"
+        ],
+        "transformations": [
+          "For AccountingManager branch: amount may be reduced to newAmount via Watcher"
+        ],
+        "sinks": [
+          "Tokens transferred to msg.sender (accounting manager, connector, or swap route)"
+        ],
+        "trust_changes": "Flash loan contract has same trust level as active connectors",
+        "validation_points": [
+          "Connector active check",
+          "FlashLoan address check",
+          "Route verification",
+          "Watcher verifyRemoveLiquidity (currently NO-OP)"
+        ],
+        "exposure_risks": [
+          "Watchers.verifyRemoveLiquidity is empty - no actual verification of withdrawal amounts",
+          "Flash loan contract can drain tokens from any connector with no additional checks"
+        ],
+        "manipulation_risks": [
+          "Any entity with flashLoan role can extract tokens from connectors without watcher oversight"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Registry holding position management",
+        "path": [
+          "Connector calls registry.updateHoldingPosition()",
+          "Position index lookup via isPositionUsed mapping",
+          "Add: push to holdingPositions array, set isPositionUsed",
+          "Remove: swap-and-pop pattern, update isPositionUsed for swapped element"
+        ],
+        "transformations": [
+          "holdingPositionId = keccak256(msg.sender, positionId, data)"
+        ],
+        "sinks": [
+          "holdingPositions array and isPositionUsed mapping in Registry"
+        ],
+        "trust_changes": "Only enabled connectors can modify positions",
+        "validation_points": [
+          "Connector enabled check",
+          "Position trusted check",
+          "maxNumHoldingPositions limit"
+        ],
+        "exposure_risks": [
+          "Swap-and-pop key recomputation uses calculatorConnector from HoldingPI instead of original msg.sender, causing key mismatch if they differ"
+        ],
+        "manipulation_risks": [
+          "Key mismatch during position removal corrupts isPositionUsed mapping, leaving stale entries and preventing correct lookups"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Deposits and withdrawals are queued and processed in batches by managers",
+        "Share price derived from TVL across all connectors plus idle base tokens",
+        "Waiting periods enforce delay between calculation and execution to allow price verification",
+        "Withdraw requests lock shares to prevent transfer during pending withdrawal",
+        "Fee system: withdrawal fee (instant), management fee (time-based), performance fee (profit-based with lock)"
+      ],
+      "economic_incentives": [
+        "Withdrawal fee incentivizes long-term holding",
+        "Performance fee aligned with vault profit (with 12-48 hour lock window)",
+        "Management fee proportional to AUM minus fee receiver shares",
+        "checkIfTVLHasDroped allows anyone to reset performance fee if profit drops - protects depositors"
+      ],
+      "governance_mechanisms": [
+        "Timelock-protected maintainer role for configuration changes",
+        "Keeper multi-sig for strategy execution (threshold >= 2)",
+        "Watcher role for monitoring and reverting suspicious actions",
+        "Emergency role for pause/unpause and rescue operations",
+        "Governor role for changing vault addresses"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "MorphoBlueConnector._getPositionTVL adds borrow amount instead of subtracting it",
+          "expected_behavior": "TVL = supplyAmount + collateralValue - borrowAmount",
+          "actual_behavior": "TVL = supplyAmount + borrowAmount + collateralValue (borrow ADDED not subtracted)",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker borrows maximum on Morpho to inflate vault TVL by 2x the borrow amount, inflating share price for existing holders or enabling performance fee extraction on phantom profits"
+        },
+        {
+          "scenario": "Registry.onlyVaultMaintainer modifier uses OR instead of AND in condition",
+          "expected_behavior": "Either vault maintainer OR emergency role can call protected functions",
+          "actual_behavior": "Requires BOTH being vault maintainer AND having emergency role simultaneously due to (!=maintainer || !emergency) logic",
+          "risk_level": "high",
+          "exploitation_potential": "addConnector, updateConnectorTrustedTokens, and removeTrustedPosition are effectively broken unless maintainer also holds EMERGENCY_ROLE in the global AccessControl"
+        },
+        {
+          "scenario": "resetMiddle for withdraw queue does not reset currentWithdrawGroup.totalCBAmount",
+          "expected_behavior": "Resetting middle should allow clean re-calculation of withdrawal amounts",
+          "actual_behavior": "calculateWithdrawShares accumulates into totalCBAmount additively; after resetMiddle, re-processing same requests doubles totalCBAmount",
+          "risk_level": "high",
+          "exploitation_potential": "Inflated totalCBAmount causes neededAssetsForWithdraw to be doubled, potentially blocking fulfillment or causing incorrect pro-rata distribution in executeWithdraw"
+        },
+        {
+          "scenario": "UNIv3Connector._getPositionTVL uses pool-level aggregate position instead of specific NFT tokenId",
+          "expected_behavior": "TVL reflects only the liquidity of the specific NFT position owned by the connector",
+          "actual_behavior": "pool.positions(key) returns aggregate liquidity for ALL positions at the same tick range owned by the NonfungiblePositionManager, potentially overstating TVL",
+          "risk_level": "medium",
+          "exploitation_potential": "If other users have positions through the same NFT manager at identical tick ranges, the connector reports inflated TVL affecting share pricing"
+        },
+        {
+          "scenario": "fulfillCurrentWithdrawGroup emits event after zeroing totalCBAmount",
+          "expected_behavior": "Event should log the actual totalCBAmount before zeroing",
+          "actual_behavior": "totalCBAmount is set to 0 before emit, so event always logs 0",
+          "risk_level": "low",
+          "exploitation_potential": "No direct financial impact but breaks off-chain monitoring and auditing capabilities"
+        },
+        {
+          "scenario": "Watchers.verifyRemoveLiquidity is an empty function (no-op)",
+          "expected_behavior": "Watcher should verify that withdrawal amounts from connectors are legitimate",
+          "actual_behavior": "Function body is empty, providing no verification at all",
+          "risk_level": "high",
+          "exploitation_potential": "Malicious manager can extract arbitrary amounts from connectors to AccountingManager without any watcher-level validation"
+        },
+        {
+          "scenario": "collectManagementFees subtracts preformanceFeeSharesWaitingForDistribution from totalSupply",
+          "expected_behavior": "currentFeeShares should not exceed totalSupply to avoid underflow",
+          "actual_behavior": "preformanceFeeSharesWaitingForDistribution is not yet minted but is subtracted from totalSupply; if large enough, causes underflow revert",
+          "risk_level": "medium",
+          "exploitation_potential": "A large pending performance fee can block management fee collection entirely, as totalShares - currentFeeShares would revert"
+        },
+        {
+          "scenario": "UniswapValueOracle silently truncates amount to uint128",
+          "expected_behavior": "Revert or handle amounts > uint128.max correctly",
+          "actual_behavior": "uint128(amount) silently truncates, returning incorrect (much smaller) value",
+          "risk_level": "medium",
+          "exploitation_potential": "If a position has extremely large token amounts, the oracle returns a truncated value, understating TVL"
+        },
+        {
+          "scenario": "AerodromeConnector._getPositionTVL ignores staked LP in gauge",
+          "expected_behavior": "TVL should include both unstaked and staked LP token balances",
+          "actual_behavior": "Only counts IERC20(pool).balanceOf(address(this)), missing gauge-staked liquidity",
+          "risk_level": "medium",
+          "exploitation_potential": "After staking LP in gauge, TVL drops to 0 for that position, understating vault TVL and share price"
+        },
+        {
+          "scenario": "TVL() check in deposit() runs after token transfer but before totalAWFDeposit update",
+          "expected_behavior": "TVL should not include pending deposit amounts",
+          "actual_behavior": "Transferred tokens inflate balanceOf but totalAWFDeposit not yet updated, making TVL appear higher and potentially rejecting valid deposits",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit but legitimate deposits may be rejected when vault is near capacity"
+        },
+        {
+          "scenario": "Registry position removal swap-and-pop uses wrong key for isPositionUsed update",
+          "expected_behavior": "Key for swapped element should use same computation as original insertion (msg.sender)",
+          "actual_behavior": "Uses calculatorConnector from HoldingPI struct, which may differ from the connector that created the position",
+          "risk_level": "high",
+          "exploitation_potential": "Corrupted isPositionUsed mapping causes positions to become unfindable or causes index collisions, breaking position management"
+        },
+        {
+          "scenario": "Keepers EIP-712 encoding does not hash dynamic bytes type",
+          "expected_behavior": "Per EIP-712 spec, dynamic types like bytes should be encoded as keccak256(value)",
+          "actual_behavior": "Raw bytes data is passed to abi.encode without pre-hashing",
+          "risk_level": "low",
+          "exploitation_potential": "Non-standard encoding may cause incompatibility with EIP-712 compliant signing tools; no direct security impact since signatures still work internally"
+        },
+        {
+          "scenario": "Flash loan contract included in onlyManager modifier trust boundary",
+          "expected_behavior": "Flash loan should have restricted permissions, not full manager access",
+          "actual_behavior": "registry.flashLoan() address can call any onlyManager function on AccountingManager and any connector",
+          "risk_level": "medium",
+          "exploitation_potential": "Compromised or malicious flash loan contract can execute arbitrary manager operations including calculating deposits, executing withdrawals, and triggering fee collection"
+        },
+        {
+          "scenario": "ChainlinkOracleConnector does not normalize output to base token decimals",
+          "expected_behavior": "Output should be in base token decimal precision for consistent TVL calculations",
+          "actual_behavior": "Output precision depends on Chainlink feed decimals and asset decimals, not base token decimals",
+          "risk_level": "medium",
+          "exploitation_potential": "For token pairs with mismatched decimals (e.g., 18-decimal token priced via 8-decimal feed into 6-decimal base), values are off by orders of magnitude"
+        },
+        {
+          "scenario": "executeDeposit reverts when no deposits are ready to process",
+          "expected_behavior": "Gracefully handle case when no deposits meet the waiting time criterion",
+          "actual_behavior": "processedBaseTokenAmount remains 0, connector check branch always reverts with NoyaAccounting_INVALID_CONNECTOR",
+          "risk_level": "low",
+          "exploitation_potential": "No financial impact; wastes gas for manager calls when no deposits are ready"
+        }
+      ],
+      "assumption_violations": [
+        "Registry onlyVaultMaintainer assumes OR logic but implements AND due to boolean operator error",
+        "MorphoBlue TVL assumes borrow is subtracted but code adds it",
+        "UniswapV3 TVL assumes pool.positions(key) returns only this connector's liquidity",
+        "Watchers verify function assumes future implementation will add checks, but currently provides zero protection",
+        "Management fee assumes totalSupply always >= currentFeeShares, but unminted performance fee shares can violate this",
+        "Position registry removal assumes calculatorConnector equals the connector that created the holdingPositionId key"
+      ],
+      "game_theory_risks": [
+        "checkIfTVLHasDroped is public: anyone can reset performance fee shares during temporary oracle/TVL dips, griefing strategy managers",
+        "Manager controls timing of calculateDepositShares and calculateWithdrawShares, can front-run known TVL changes",
+        "Inflating TVL via Morpho borrow positions allows extracting performance fees on non-existent profits",
+        "Withdrawal fee creates asymmetric cost that penalizes rapid repositioning but fee goes to a single receiver"
+      ],
+      "integration_risks": [
+        "Chainlink oracle staleness check (2 hours) may be too aggressive or lenient depending on the asset",
+        "Uniswap TWAP oracle period (1800s) may be insufficient for manipulation resistance on low-liquidity pairs",
+        "Pendle market oracle parameters (twapDuration=10) may be too short for reliable pricing",
+        "Curve calc_withdraw_one_coin may be manipulable via flash loans affecting virtual prices",
+        "Balancer pool TVL calculation assumes weighted pool type, incorrect for stable/composable pools"
+      ],
+      "calculation_errors": [
+        "MorphoBlueConnector._getPositionTVL: supplyAmount + borrowAmount + collateralValue should be supplyAmount - borrowAmount + collateralValue",
+        "BalancerConnector._getPositionTVL: potential overflow in 1e18 * token1bal * lpBalance for large pools",
+        "ChainlinkOracleConnector: missing feed decimals normalization causes result in feed-decimal precision instead of base-token precision",
+        "UniswapValueOracle: uint128 truncation of amount silently loses precision for values > 2^128"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "baseToken",
+          "behaviors": [
+            "permit:false",
+            "rebasing:false"
+          ],
+          "decimals": 6,
+          "notes": "Assumed to be a standard ERC20 like USDC/USDT; fee-on-transfer tokens would break deposit queue accounting since totalAWFDeposit tracks nominal amounts not received amounts"
+        },
+        {
+          "address_or_symbol": "vault_shares",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "notes": "ERC4626 vault shares; transfers restricted by withdrawRequestsByAddress lock; standard ERC4626 deposit/mint/withdraw/redeem all revert"
+        },
+        {
+          "address_or_symbol": "CRV",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Reward token from Curve gauge harvesting"
+        },
+        {
+          "address_or_symbol": "CVX",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Reward token from Convex harvesting"
+        },
+        {
+          "address_or_symbol": "PRISMA",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Reward token from Prisma harvesting"
+        },
+        {
+          "address_or_symbol": "BAL",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Reward token from Balancer/Aura harvesting"
+        },
+        {
+          "address_or_symbol": "AURA",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Reward token from Aura harvesting"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "share_lock_conservation",
+          "state_vars": [
+            "balanceOf(user)",
+            "withdrawRequestsByAddress[user]"
+          ],
+          "rule": "For all users: balanceOf(user) >= withdrawRequestsByAddress[user]; enforced in _update override"
+        },
+        {
+          "name": "deposit_queue_ordering",
+          "state_vars": [
+            "depositQueue.first",
+            "depositQueue.middle",
+            "depositQueue.last"
+          ],
+          "rule": "first <= middle <= last; first = executed, middle = calculated, last = pending"
+        },
+        {
+          "name": "withdraw_queue_ordering",
+          "state_vars": [
+            "withdrawQueue.first",
+            "withdrawQueue.middle",
+            "withdrawQueue.last",
+            "currentWithdrawGroup.lastId"
+          ],
+          "rule": "first <= lastId <= middle <= last; withdrawal group bounds execution window"
+        },
+        {
+          "name": "tvl_base_token_separation",
+          "state_vars": [
+            "baseToken.balanceOf(this)",
+            "depositQueue.totalAWFDeposit"
+          ],
+          "rule": "balanceOf(this) >= totalAWFDeposit at all times; idle TVL = balanceOf - totalAWFDeposit"
+        },
+        {
+          "name": "profit_tracking",
+          "state_vars": [
+            "TVL()",
+            "totalDepositedAmount",
+            "totalWithdrawnAmount"
+          ],
+          "rule": "profit = max(0, TVL + totalWithdrawnAmount - totalDepositedAmount)"
+        },
+        {
+          "name": "holding_position_index_consistency",
+          "state_vars": [
+            "holdingPositions.length",
+            "isPositionUsed mapping"
+          ],
+          "rule": "VIOLATED: swap-and-pop during removal uses calculatorConnector instead of original connector for key recomputation"
+        },
+        {
+          "name": "withdraw_group_totalCBAmount_accuracy",
+          "state_vars": [
+            "currentWithdrawGroup.totalCBAmount",
+            "withdrawQueue items"
+          ],
+          "rule": "VIOLATED: resetMiddle does not reset totalCBAmount, allowing double-counting on re-calculation"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,868 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "FCL.sol",
+      "CoinbaseSmartWallet.sol",
+      "MagicSpend.sol",
+      "MultiOwnable.sol",
+      "WebAuthn.sol",
+      "ERC1271.sol",
+      "CoinbaseSmartWalletFactory.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T00:15:02.048Z",
+    "duration_ms": 521688
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "MagicSpend Paymaster Batch Balance Over-Commitment Leading to Solvency Violation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In validatePaymasterUserOp, the balance check `address(this).balance < withdrawAmount` is performed independently per UserOperation. When a bundler includes multiple UserOps from the same or different senders using MagicSpend as paymaster, each validation independently passes the balance check against the same contract balance (which hasn't changed during validation). The cumulative _withdrawableETH can exceed the contract's actual ETH holdings. During postOp execution, the first postOp drains accumulated _withdrawableETH plus gas refund, leaving insufficient funds for subsequent postOps. The second postOp's forceSafeTransferETH may fail, triggering assert(mode != PostOpMode.postOpReverted) which consumes all remaining gas.",
+      "investigation_rationale": "This is a concrete solvency invariant violation. The balance check is per-operation, not cumulative. EntryPoint v0.6 runs all validatePaymasterUserOp calls sequentially before any execution/postOp. The contract's ETH balance doesn't change between validations since _withdrawableETH credits are purely state changes. This creates a TOCTOU gap between the balance check and actual fund transfers.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "validatePaymasterUserOp",
+        "postOp"
+      ],
+      "affected_contracts": [
+        "MagicSpend.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MagicSpend.sol",
+          "function": "validatePaymasterUserOp"
+        },
+        {
+          "file": "MagicSpend.sol",
+          "function": "postOp"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MagicSpend.sol",
+        "lines": "109-133",
+        "pattern": "address(this).balance check is per-UserOp; _withdrawableETH[userOp.sender] += withdrawAmount - maxCost is additive across ops in same bundle"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "MagicSpend contract holds ETH (e.g., 10 ETH)",
+        "Attacker has 2+ valid WithdrawRequests signed by MagicSpend owner (e.g., each for 7 ETH)",
+        "Bundler includes both UserOps in the same handleOps bundle"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Each `address(this).balance < withdrawAmount` check sees the SAME balance since no ETH is moved during validation",
+        "manipulation_vector": "Submit N UserOps where each individually passes the balance check but sum(withdrawAmount_i) > address(this).balance",
+        "profit_hypothesis": "First postOp receives all accumulated _withdrawableETH; later postOps fail, but attacker already extracted excess value. Total extracted can exceed contract balance."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can a single sender have multiple valid WithdrawRequests in the same bundle?",
+          "How does EntryPoint v0.6 handle postOp failure when assert fires?",
+          "What is the exact sequence of postOp calls and which account gets the excess?"
+        ],
+        "validation_requirements": [
+          "Construct a test with MagicSpend holding N ETH and 2 UserOps each requesting > N/2 ETH",
+          "Verify that both pass validatePaymasterUserOp independently",
+          "Verify that the second postOp reverts due to insufficient balance"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 ETH (uses legitimate signed WithdrawRequests)",
+        "estimated_execution_cost": "Gas cost for bundling 2+ UserOps (~0.01 ETH)",
+        "potential_profit_range": "Up to entire MagicSpend balance minus gas costs",
+        "estimated_profit_margin": "Up to 100% of over-committed amount (requires validation)",
+        "attack_duration": "Single bundle (single block)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "No external liquidity needed",
+        "optimal_timing": "Any time MagicSpend has sufficient balance and attacker has multiple signed requests",
+        "market_impact_assessment": "No market impact - direct fund extraction from paymaster"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "MagicSpend contract (and transitively its owner/depositors)",
+        "estimated_impact_per_user": "Users whose postOp fails lose their gas refund and withdrawal",
+        "total_value_at_risk": "Entire MagicSpend ETH balance"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Contract balance, individual withdraw amounts, maxCost values",
+        "calculation_validation": "Trace full lifecycle: validatePaymasterUserOp for all ops → execution → postOp for all ops",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "Cross-Chain UUPS Upgrade Replay via executeWithoutChainIdValidation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The canSkipChainIdValidation function returns true for UUPSUpgradeable.upgradeToAndCall.selector, allowing upgrade UserOperations to be replayed across all chains where the wallet exists at the same address. An attacker observes a legitimate upgrade on chain A (from on-chain data), then replays the identical UserOperation on chain B. If the implementation address contains different code on chain B (e.g., malicious contract deployed at same address via CREATE2, or no code at all), the wallet is compromised or bricked on chain B.",
+      "investigation_rationale": "The upgrade is whitelisted for chain-agnostic hash computation, meaning the signature is valid on any chain. The implementation address is deterministic but the CODE at that address can differ across chains. An attacker can deploy malicious code at the target implementation address on another chain using CREATE2 before the replay.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "canSkipChainIdValidation",
+        "executeWithoutChainIdValidation",
+        "validateUserOp"
+      ],
+      "affected_contracts": [
+        "CoinbaseSmartWallet.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "CoinbaseSmartWallet.sol",
+          "function": "canSkipChainIdValidation"
+        },
+        {
+          "file": "CoinbaseSmartWallet.sol",
+          "function": "executeWithoutChainIdValidation"
+        },
+        {
+          "file": "CoinbaseSmartWallet.sol",
+          "function": "validateUserOp"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "CoinbaseSmartWallet.sol",
+        "lines": "217-226",
+        "pattern": "canSkipChainIdValidation returns true for UUPSUpgradeable.upgradeToAndCall.selector, enabling cross-chain replay of implementation upgrades"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Wallet deployed at same address on multiple chains",
+        "Owner executes a legitimate upgrade on chain A",
+        "Attacker can deploy different code at the target implementation address on chain B (via CREATE2 or EOA nonce manipulation)",
+        "Attacker can submit the replayed UserOp through a bundler on chain B"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "getUserOpHashWithoutChainId omits chain ID from hash: keccak256(abi.encode(UserOperationLib.hash(userOp), entryPoint()))",
+        "manipulation_vector": "Replay upgrade UserOp on chain where implementation address contains attacker-controlled code",
+        "profit_hypothesis": "Complete wallet takeover on target chain - all assets (ETH, tokens, NFTs) stolen"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How feasible is deploying a malicious contract at the exact implementation address on another chain?",
+          "What is the total value locked in wallets on chains where this replay is possible?",
+          "Can the attacker predict and preemptively deploy before the legitimate upgrade?"
+        ],
+        "validation_requirements": [
+          "Confirm upgrade UserOp can be submitted to a different chain's bundler",
+          "Verify the same UserOp hash is valid without chain ID binding",
+          "Test that a malicious implementation at the target address gains full wallet control"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "~0.01-0.1 ETH for deploying malicious contract and submitting replay tx",
+        "estimated_execution_cost": "Gas for contract deployment + UserOp submission on target chain",
+        "potential_profit_range": "Full wallet balance on target chain",
+        "estimated_profit_margin": "Potentially >10000% ROI depending on wallet balance",
+        "attack_duration": "Two transactions: deploy malicious impl + replay upgrade"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "After a legitimate upgrade on any chain",
+        "market_impact_assessment": "No market impact - direct wallet takeover"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Wallet owner on all other chains",
+        "estimated_impact_per_user": "100% of wallet assets on targeted chain",
+        "total_value_at_risk": "All assets in cross-chain deployed wallets"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Implementation addresses used across chains, CREATE2 salt determinism",
+        "calculation_validation": "Verify that the chain-agnostic UserOpHash produced by getUserOpHashWithoutChainId is identical across chains",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "RIP-7212 Precompile Address Spoofing Enables Forged WebAuthn Signatures",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "WebAuthn.verify attempts to use the RIP-7212 precompile at address(0x100) for secp256r1 signature verification. If a contract deployed at address 0x100 on a target chain returns success with ret.length > 0 and abi.decode(ret, (uint256)) == 1, all WebAuthn signature verifications will return true regardless of actual signature validity. The FCL fallback is skipped when the precompile returns successfully. This allows an attacker to forge any passkey-based signature, taking over all wallets with passkey owners on that chain.",
+      "investigation_rationale": "The code at lines 149-157 of WebAuthn.sol checks `success && ret.length > 0` then decodes the result. On chains where 0x100 is not the RIP-7212 precompile but has other deployed code, the staticcall could return arbitrary data. A contract that always returns abi.encode(uint256(1)) would cause all signature verifications to succeed.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Target chain has a contract deployed at address 0x100 that returns abi.encode(uint256(1)) on any input"
+      ],
+      "config_evidence": "WebAuthn.sol line 47: `address private constant VERIFIER = address(0x100)`. Deployed to multiple chains per docs: Ethereum, Base, Optimism, Arbitrum, Polygon, BNB, Avalanche, Gnosis. RIP-7212 availability varies by chain.",
+      "affected_functions": [
+        "verify"
+      ],
+      "affected_contracts": [
+        "WebAuthn.sol",
+        "CoinbaseSmartWallet.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WebAuthn.sol",
+          "function": "verify"
+        },
+        {
+          "file": "CoinbaseSmartWallet.sol",
+          "function": "_validateSignature"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WebAuthn.sol",
+        "lines": "145-157",
+        "pattern": "staticcall to VERIFIER(0x100); success check and ret.length > 0 check; abi.decode(ret, (uint256)) == 1 acceptance; no chain-specific validation of precompile existence"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Target chain has a contract at address 0x100 that is NOT the RIP-7212 precompile",
+        "That contract returns success with data that decodes to uint256(1)",
+        "Wallet has at least one passkey (WebAuthn) owner"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "bool valid = ret.length > 0; if (success && valid) return abi.decode(ret, (uint256)) == 1; — no validation that 0x100 is actually the precompile",
+        "manipulation_vector": "On a chain with arbitrary code at 0x100, any (r,s) values pass verification",
+        "profit_hypothesis": "Complete wallet takeover for all passkey-based wallets on affected chain"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Which of the target chains have code deployed at address 0x100?",
+          "What does the code at 0x100 return on each chain?",
+          "How many wallets use passkey owners vs EOA owners on each chain?"
+        ],
+        "validation_requirements": [
+          "Check address 0x100 code and behavior on each target chain",
+          "Test WebAuthn.verify with forged signature on a chain with code at 0x100",
+          "Verify that FCL fallback is NOT reached when precompile returns success"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "~0.01 ETH for gas",
+        "estimated_execution_cost": "Single transaction gas cost",
+        "potential_profit_range": "Total value in all passkey-owned wallets on affected chain",
+        "estimated_profit_margin": "Potentially unbounded ROI",
+        "attack_duration": "Single transaction per wallet"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Any time — permanent vulnerability on affected chains",
+        "market_impact_assessment": "No market interaction required"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All wallets using passkey (WebAuthn) owners on affected chain",
+        "estimated_impact_per_user": "100% of wallet assets",
+        "total_value_at_risk": "All passkey-wallet TVL on affected chains"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Code at 0x100 on Ethereum, Base, Optimism, Arbitrum, Polygon, BNB, Avalanche, Gnosis",
+        "calculation_validation": "Verify staticcall return behavior to 0x100 on each chain",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "Uninitialized Proxy Takeover via Empty Owners Array in initialize()",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "CoinbaseSmartWallet.initialize() checks nextOwnerIndex() != 0 as its only re-initialization guard. If initialize is called with an empty owners array, _initializeOwners loops zero times, nextOwnerIndex remains 0, and the wallet remains re-initializable. Any subsequent caller can invoke initialize() with their own owner set. The factory enforces owners.length > 0, but the wallet's initialize() does not. Any proxy deployed outside the factory (manual ERC1967 proxy deployment) is vulnerable.",
+      "investigation_rationale": "The code has a clear gap: initialize() relies on nextOwnerIndex() != 0 as its initialization guard, but calling initialize([]) does not increment nextOwnerIndex. This is a code defect regardless of how the proxy is deployed, though exploitation requires non-factory deployment.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Proxy deployed without using CoinbaseSmartWalletFactory (e.g., manual CREATE2 or third-party deployer)"
+      ],
+      "config_evidence": "CoinbaseSmartWalletFactory.sol lines 44-45 enforce owners.length > 0 with OwnerRequired(), but CoinbaseSmartWallet.sol initialize() at lines 104-109 has no such check.",
+      "affected_functions": [
+        "initialize",
+        "_initializeOwners"
+      ],
+      "affected_contracts": [
+        "CoinbaseSmartWallet.sol",
+        "MultiOwnable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "CoinbaseSmartWallet.sol",
+          "function": "initialize"
+        },
+        {
+          "file": "MultiOwnable.sol",
+          "function": "_initializeOwners"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "CoinbaseSmartWallet.sol",
+        "lines": "104-109",
+        "pattern": "initialize() checks nextOwnerIndex() != 0 but calling with empty array leaves nextOwnerIndex at 0, allowing re-call"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Proxy deployed outside the factory (factory has owners.length > 0 guard)",
+        "initialize() called with empty array or not yet called",
+        "Attacker can submit a transaction to the proxy's initialize() before legitimate owner"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_initializeOwners(owners) loops `owners.length` times; with length 0, nextOwnerIndex is never incremented",
+        "manipulation_vector": "Call initialize([]) or find an uninitialized proxy, then call initialize([attacker_address]) to become sole owner",
+        "profit_hypothesis": "Full wallet takeover — all current and future deposits are controlled by attacker"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are there existing non-factory-deployed proxies in production?",
+          "Do any integrators deploy CoinbaseSmartWallet proxies manually?",
+          "What is the total value in wallets that could be affected?"
+        ],
+        "validation_requirements": [
+          "Deploy a proxy manually, call initialize([]), confirm nextOwnerIndex == 0",
+          "Call initialize([attacker]) on same proxy, confirm attacker becomes owner",
+          "Verify factory-deployed wallets are NOT affected"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "~0.01 ETH for gas",
+        "estimated_execution_cost": "Single transaction gas",
+        "potential_profit_range": "All funds in the targeted wallet",
+        "estimated_profit_margin": "Potentially unlimited ROI",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Immediately after non-factory proxy deployment or finding uninitialized proxy",
+        "market_impact_assessment": "No market interaction"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Owner of the affected proxy wallet",
+        "estimated_impact_per_user": "100% of wallet funds",
+        "total_value_at_risk": "All funds in non-factory-deployed wallets"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check if any non-factory proxies exist on target chains",
+        "calculation_validation": "Confirm that initialize([]) leaves nextOwnerIndex == 0 via unit test",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "MagicSpend postOp Assert Failure Creates Unrecoverable Fund Loss",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "MagicSpend.postOp asserts `mode != PostOpMode.postOpReverted`. If the initial postOp call fails (e.g., forceSafeTransferETH fails due to insufficient contract balance from batch over-commitment in ECON-H001, or extreme gas conditions), the EntryPoint re-invokes postOp with PostOpMode.postOpReverted. The assert statement consumes all remaining gas, and the user's _withdrawableETH was already deleted in the first (reverted) postOp call, but the revert restored it. However, the UserOp's gas cost is still charged. The fundamental issue is that the assert creates an unrecoverable error mode that could lock user funds.",
+      "investigation_rationale": "The assert(mode != PostOpMode.postOpReverted) means that if the first postOp reverts for ANY reason, the second invocation with postOpReverted also fails. In EntryPoint v0.6, this could mean the user's withdrawal is lost because the EntryPoint charges gas but never successfully transfers the withdrawal.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "postOp",
+        "validatePaymasterUserOp"
+      ],
+      "affected_contracts": [
+        "MagicSpend.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MagicSpend.sol",
+          "function": "postOp"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MagicSpend.sol",
+        "lines": "143-161",
+        "pattern": "assert(mode != PostOpMode.postOpReverted) creates hard failure; no graceful recovery path for failed ETH transfers"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "The first postOp call must revert (insufficient balance from over-commitment, or extreme gas conditions)",
+        "EntryPoint calls postOp second time with postOpReverted mode"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "assert(mode != PostOpMode.postOpReverted) consumes ALL remaining gas with no recovery",
+        "manipulation_vector": "Trigger batch over-commitment (ECON-H001) causing forceSafeTransferETH to fail",
+        "profit_hypothesis": "User loses their withdrawal amount; funds remain in MagicSpend but are no longer credited to user"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What happens to the user's _withdrawableETH after the double-revert?",
+          "Does the EntryPoint charge gas from MagicSpend deposit even when both postOp calls fail?",
+          "Can the user recover via withdrawGasExcess after the failed postOp?"
+        ],
+        "validation_requirements": [
+          "Trace EntryPoint v0.6 behavior when paymaster postOp reverts on both calls",
+          "Determine the state of _withdrawableETH after the failed bundle",
+          "Test whether funds are permanently stuck or recoverable"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Requires conditions from ECON-H001 or specific gas manipulation",
+        "estimated_execution_cost": "Gas consumed by both postOp failures",
+        "potential_profit_range": "Loss to victim equals their withdrawal amount",
+        "estimated_profit_margin": "N/A (griefing/DoS attack)",
+        "attack_duration": "Single bundle"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Combined with batch over-commitment attack",
+        "market_impact_assessment": "No market impact"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users whose postOp fails",
+        "estimated_impact_per_user": "Full withdrawal amount locked/lost",
+        "total_value_at_risk": "Per-UserOp withdrawal amounts"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "EntryPoint v0.6 postOp revert handling semantics",
+        "calculation_validation": "Trace state changes when postOp reverts twice",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "MagicSpend _withdrawableETH Accumulation Across Multiple Paymaster UserOps Creates Unbalanced Payout",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When multiple UserOps from the same sender use MagicSpend as paymaster in the same bundle, _withdrawableETH accumulates additively across validations. The first postOp to execute receives the ENTIRE accumulated balance plus its gas refund, while subsequent postOps receive only their gas refund. Combined with the per-operation balance check (ECON-H001), this creates an asymmetric payout that can drain more ETH than the contract can sustain for later operations.",
+      "investigation_rationale": "The additive accumulation `_withdrawableETH[userOp.sender] += withdrawAmount - maxCost` means two UserOps with 10 ETH withdraw each (maxCost 5 ETH each) create _withdrawableETH = 10 ETH. First postOp sends 10 + gasRefund1 ETH and deletes the mapping. Second postOp sends only gasRefund2. The first payout is disproportionately large.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "validatePaymasterUserOp",
+        "postOp"
+      ],
+      "affected_contracts": [
+        "MagicSpend.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MagicSpend.sol",
+          "function": "validatePaymasterUserOp"
+        },
+        {
+          "file": "MagicSpend.sol",
+          "function": "postOp"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MagicSpend.sol",
+        "lines": "128-161",
+        "pattern": "_withdrawableETH[userOp.sender] += withdrawAmount - maxCost (additive); postOp reads full accumulation then deletes"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Same sender has 2+ valid WithdrawRequests with different nonces",
+        "Both included in same handleOps bundle",
+        "MagicSpend balance passes individual checks but not combined"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "First postOp: withdrawable = accumulated_all_ops + gasRefund1; Second postOp: withdrawable = 0 + gasRefund2",
+        "manipulation_vector": "Submit N UserOps to concentrate all withdrawable ETH into first postOp",
+        "profit_hypothesis": "First postOp extracts disproportionate value; subsequent postOps may fail due to insufficient balance"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is the total payout across all postOps correct (withdrawAmount1 + withdrawAmount2 - totalGasCost)?",
+          "Can the concentrated first payout cause the contract to become insolvent for other users?",
+          "What happens when the second postOp attempts to send ETH the contract doesn't have?"
+        ],
+        "validation_requirements": [
+          "Calculate exact payouts for 2-3 UserOps from same sender in one bundle",
+          "Test with contract balance that passes individual checks but fails combined",
+          "Verify whether EntryPoint handles partial postOp failures gracefully"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (uses legitimate signed requests)",
+        "estimated_execution_cost": "Bundle gas cost (~0.02 ETH)",
+        "potential_profit_range": "Excess ETH above the attacker's legitimate entitlement",
+        "estimated_profit_margin": "Depends on over-commitment ratio (requires validation)",
+        "attack_duration": "Single bundle"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When attacker has multiple signed WithdrawRequests",
+        "market_impact_assessment": "None"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Other MagicSpend users/depositors",
+        "estimated_impact_per_user": "Failed postOp means lost gas refund + withdrawal",
+        "total_value_at_risk": "MagicSpend balance exceeding what's committed"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Exact _withdrawableETH values after N validations; contract balance",
+        "calculation_validation": "Arithmetic trace through validate-execute-postOp for N ops",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "All-Owner Removal Creates Permanent Irrecoverable Fund Lock",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "MultiOwnable.removeOwnerAtIndex has no minimum owner count check. An owner can systematically remove all owners including themselves, leaving zero owners. With zero owners, no entity can pass the _checkOwner() check, making addOwnerAddress, addOwnerPublicKey, execute, executeBatch, and _authorizeUpgrade all permanently inaccessible. All funds (ETH, tokens, NFTs) in the wallet become permanently locked with no recovery mechanism. The EntryPoint path also fails since validateUserOp requires a valid signature from a registered owner.",
+      "investigation_rationale": "removeOwnerAtIndex only checks that the owner exists at the given index, then deletes it. There is no check ensuring at least one owner remains. This is a code defect: the function should enforce count(activeOwners) >= 1.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "removeOwnerAtIndex",
+        "_checkOwner"
+      ],
+      "affected_contracts": [
+        "MultiOwnable.sol",
+        "CoinbaseSmartWallet.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MultiOwnable.sol",
+          "function": "removeOwnerAtIndex"
+        },
+        {
+          "file": "MultiOwnable.sol",
+          "function": "_checkOwner"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MultiOwnable.sol",
+        "lines": "93-102",
+        "pattern": "removeOwnerAtIndex deletes owner without checking remaining owner count; no minimum owner enforcement anywhere"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker must be a current wallet owner (compromised key or malicious insider)",
+        "Owner calls removeOwnerAtIndex for every active owner index"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "After removing all owners: isOwnerAddress(anyone) returns false, _checkOwner always reverts",
+        "manipulation_vector": "Compromised owner or social engineering to remove all owners as grief attack",
+        "profit_hypothesis": "No direct profit to attacker (grief attack) — victim loses all wallet funds permanently"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any recovery mechanism once all owners are removed?",
+          "Can the EntryPoint path work without any registered owners?",
+          "Can a UUPS upgrade restore owner access?"
+        ],
+        "validation_requirements": [
+          "Remove all owners in test, confirm all owner-gated functions revert",
+          "Confirm no path exists to re-add owners (initialize reverts if nextOwnerIndex > 0)",
+          "Verify funds are permanently locked"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas for N removeOwnerAtIndex calls",
+        "estimated_execution_cost": "~0.01 ETH in gas",
+        "potential_profit_range": "0 (griefing attack)",
+        "estimated_profit_margin": "N/A — victim loss is permanent lock of all funds",
+        "attack_duration": "N transactions (one per owner removal)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Any time — requires compromised owner",
+        "market_impact_assessment": "None"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All wallet co-owners and users",
+        "estimated_impact_per_user": "100% permanent loss of all wallet assets",
+        "total_value_at_risk": "Entire wallet balance"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Owner count tracking mechanism (none exists)",
+        "calculation_validation": "Confirm no recovery path exists after zero-owner state",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "MagicSpend Nonce Consumed Before Expiry Enforcement in Paymaster Path",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In validatePaymasterUserOp, _validateRequest consumes the nonce immediately during validation. The expiry is only communicated to the EntryPoint via validationData for post-validation enforcement. If a UserOp passes initial bundler simulation (within expiry) but is included in a block after the expiry, the EntryPoint rejects the UserOp. However, the nonce consumption depends on whether the EntryPoint reverts the entire handleOps or only the specific UserOp. In EntryPoint v0.6, if the expiry check fails in _validateAccountAndPaymasterValidationData, the entire handleOps reverts, protecting the nonce. But in edge cases with simulation-execution timing gaps, nonces could be wasted.",
+      "investigation_rationale": "The temporal separation between nonce consumption (validation) and expiry enforcement (EntryPoint post-validation check) creates a potential griefing vector. While handleOps revert protects against permanent nonce loss, the pattern is fragile and could be exploited by a bundler that delays inclusion.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "validatePaymasterUserOp",
+        "_validateRequest"
+      ],
+      "affected_contracts": [
+        "MagicSpend.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MagicSpend.sol",
+          "function": "validatePaymasterUserOp"
+        },
+        {
+          "file": "MagicSpend.sol",
+          "function": "_validateRequest"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MagicSpend.sol",
+        "lines": "107-133",
+        "pattern": "_validateRequest at line 112 consumes nonce; expiry encoded in validationData at line 121 for EntryPoint to enforce later"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "UserOp with near-expiry WithdrawRequest is included in a bundle",
+        "Block timestamp exceeds expiry between simulation and inclusion",
+        "EntryPoint handleOps reverts for the expired op (protecting nonce in v0.6)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_validateRequest (nonce consumed) runs at validation; expiry check runs post-validation in EntryPoint",
+        "manipulation_vector": "In v0.6 the revert protects the nonce, but in alternative EntryPoint implementations or future versions, partial reverts could leave nonce consumed",
+        "profit_hypothesis": "Griefing: user must request new signed withdrawal with different nonce from MagicSpend owner"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does EntryPoint v0.6 fully revert nonce consumption on expiry failure?",
+          "Could a malicious bundler intentionally delay inclusion to trigger expiry?",
+          "What is the cost to the MagicSpend owner of re-signing withdrawal requests?"
+        ],
+        "validation_requirements": [
+          "Trace EntryPoint v0.6 code for expiry failure handling",
+          "Verify nonce state after an expired UserOp in a reverted handleOps",
+          "Test with near-expiry withdrawal requests"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas for submitting expired UserOp",
+        "estimated_execution_cost": "Wasted gas if handleOps reverts",
+        "potential_profit_range": "0 (griefing attack)",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Single failed bundle"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Near WithdrawRequest expiry boundary",
+        "market_impact_assessment": "None"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "User with the expired WithdrawRequest",
+        "estimated_impact_per_user": "Operational delay; must get new signed request",
+        "total_value_at_risk": "No funds at risk; operational griefing only"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "EntryPoint v0.6 revert semantics for expiry failures",
+        "calculation_validation": "Confirm nonce is not permanently consumed on expiry revert",
+        "execution_complexity": "medium",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "WebAuthn requireUV=false Reduces Passkey Security to Single-Factor",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "CoinbaseSmartWallet._validateSignature hardcodes requireUV: false when calling WebAuthn.verify for passkey owners. This means user verification (biometric/PIN) is never required — only user presence (physical tap) is checked. An attacker with physical access to an unlocked device containing the passkey can authorize arbitrary wallet operations (transfers, owner changes, upgrades) with just a tap, without biometric or PIN verification.",
+      "investigation_rationale": "The UV flag is a WebAuthn security property that, when required, ensures the authenticator verified the user's identity (e.g., via FaceID, fingerprint, or PIN). By hardcoding requireUV=false, the wallet accepts signatures from authenticators that only verify presence (e.g., touching a key), not identity. This is a design decision that reduces security below what the hardware authenticator supports.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_validateSignature",
+        "verify"
+      ],
+      "affected_contracts": [
+        "CoinbaseSmartWallet.sol",
+        "WebAuthn.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "CoinbaseSmartWallet.sol",
+          "function": "_validateSignature"
+        },
+        {
+          "file": "WebAuthn.sol",
+          "function": "verify"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "CoinbaseSmartWallet.sol",
+        "lines": "285-287",
+        "pattern": "WebAuthn.verify({challenge: abi.encode(message), requireUV: false, webAuthnAuth: auth, x: x, y: y}) — UV never required"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Wallet has a passkey (WebAuthn) owner",
+        "Attacker has physical access to the device containing the passkey",
+        "Device is unlocked or the authenticator allows presence-only authentication"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "requireUV=false means authenticatorData[32] & AUTH_DATA_FLAGS_UV check is skipped",
+        "manipulation_vector": "Physical access to device allows signing without biometric/PIN",
+        "profit_hypothesis": "Complete wallet takeover via presence-only authentication"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What percentage of passkey authenticators enforce UV even when not required?",
+          "How common is the physical access attack vector for target users?",
+          "Would enabling requireUV break compatibility with certain authenticators?"
+        ],
+        "validation_requirements": [
+          "Test with authenticator that supports but does not require UV",
+          "Confirm signature passes with UV=0 in authenticatorData flags",
+          "Verify this is not an intentional compatibility tradeoff documented by the team"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Physical access to device (no on-chain capital)",
+        "estimated_execution_cost": "Gas for signing and submitting transactions",
+        "potential_profit_range": "Full wallet balance",
+        "estimated_profit_margin": "100% of stolen assets minus gas",
+        "attack_duration": "Seconds (single interaction with device)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When device is accessible without biometric gate",
+        "market_impact_assessment": "None"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Wallet owner whose device is accessed",
+        "estimated_impact_per_user": "100% of wallet assets",
+        "total_value_at_risk": "All passkey-owned wallet balances"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Authenticator behavior when UV not required",
+        "calculation_validation": "Confirm UV flag is not checked when requireUV=false",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "MagicSpend Owner Can Drain Funds Committed to User _withdrawableETH Balances",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "MagicSpend.ownerWithdraw allows the contract owner to withdraw any amount of any asset with no check against _withdrawableETH commitments. Between validatePaymasterUserOp (which credits _withdrawableETH) and postOp (which transfers funds), the owner could call ownerWithdraw to drain the ETH needed for user payouts. This would cause postOp's forceSafeTransferETH to fail, triggering the assert failure in the postOpReverted path.",
+      "investigation_rationale": "The _withdrawableETH mapping represents a commitment to users, but ownerWithdraw has no solvency check. The owner can drain committed funds, breaking the paymaster's ability to fulfill its obligations to users. While this requires admin action, it represents a missing safeguard against accidental or malicious owner behavior.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "ownerWithdraw",
+        "postOp",
+        "validatePaymasterUserOp"
+      ],
+      "affected_contracts": [
+        "MagicSpend.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MagicSpend.sol",
+          "function": "ownerWithdraw"
+        },
+        {
+          "file": "MagicSpend.sol",
+          "function": "postOp"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MagicSpend.sol",
+        "lines": "168-170",
+        "pattern": "ownerWithdraw has no check against _withdrawableETH commitments; can drain funds below committed amounts"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "MagicSpend owner calls ownerWithdraw during or between UserOp processing",
+        "Withdrawal reduces balance below sum of _withdrawableETH commitments",
+        "Subsequent postOp cannot transfer committed funds"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "ownerWithdraw(_withdraw(asset, to, amount)) has zero checks against pending _withdrawableETH",
+        "manipulation_vector": "Owner calls ownerWithdraw to extract ETH committed to users",
+        "profit_hypothesis": "Owner extracts ETH; users lose their withdrawable balance"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can ownerWithdraw be called in the same block as UserOp execution?",
+          "Is there a practical scenario where the owner accidentally breaks solvency?",
+          "Should ownerWithdraw enforce balance > sum(_withdrawableETH)?"
+        ],
+        "validation_requirements": [
+          "Verify ownerWithdraw can reduce balance below committed amounts",
+          "Test postOp behavior when balance is insufficient after ownerWithdraw",
+          "Assess whether the MagicSpend owner is an EOA or multisig in production"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (admin uses existing funds)",
+        "estimated_execution_cost": "Gas for ownerWithdraw call",
+        "potential_profit_range": "Admin extracts committed user funds",
+        "estimated_profit_margin": "100% of extracted amount",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During active UserOp processing with pending _withdrawableETH",
+        "market_impact_assessment": "None"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users with pending _withdrawableETH balances",
+        "estimated_impact_per_user": "Full withdrawable amount lost",
+        "total_value_at_risk": "Sum of all _withdrawableETH commitments"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical _withdrawableETH balances and contract ETH balance",
+        "calculation_validation": "Confirm no solvency guard exists in ownerWithdraw",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

@@ -1,0 +1,890 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "SecondSwap_Marketplace.sol",
+      "SecondSwap_StepVesting.sol",
+      "SecondSwap_MarketplaceSetting.sol",
+      "SecondSwap_VestingManager.sol",
+      "SecondSwap_VestingDeployer.sol",
+      "SecondSwap_Whitelist.sol",
+      "SecondSwap_WhitelistDeployer.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T05:55:22.612Z",
+    "duration_ms": 476916
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "Grantor releaseRate Miscalculation Enables Token Theft from Vesting Contract",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In transferVesting, the grantor's releaseRate is recalculated as totalAmount/numOfSteps instead of (totalAmount-amountClaimed)/(numOfSteps-stepsClaimed). This inflates the per-step claim rate, allowing a seller who has already claimed some steps to over-claim tokens belonging to other beneficiaries in intermediate steps before the final step reverts from underflow.",
+      "investigation_rationale": "A marketplace seller can claim steps, list a small amount (triggering the buggy recalculation), then continue claiming at inflated rates. The overclaimed tokens are drawn from the vesting contract's balance—other beneficiaries' funds.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "transferVesting",
+        "claim",
+        "claimable",
+        "_createVesting"
+      ],
+      "affected_contracts": [
+        "SecondSwap_StepVesting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "transferVesting"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "claim"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "claimable"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "162-163",
+        "pattern": "grantorVesting.releaseRate = grantorVesting.totalAmount / numOfSteps — divides by total steps instead of remaining steps (numOfSteps - grantorVesting.stepsClaimed)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker has a vesting schedule with multiple steps",
+        "Attacker has claimed some steps (stepsClaimed > 0, amountClaimed > 0)",
+        "Other beneficiaries exist in the same vesting contract with unclaimed tokens",
+        "Vesting plan is sellable on marketplace"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "grantorVesting.releaseRate = grantorVesting.totalAmount / numOfSteps (line 163)",
+        "manipulation_vector": "After claiming 5 of 10 steps (500/1000 tokens) and transferring 200: inflatedRate=800/10=80, correctRate=(800-500)/5=60. Over 4 intermediate steps: claims 320 instead of 240, stealing 20 tokens from other beneficiaries.",
+        "profit_hypothesis": "Overclaim = (inflatedRate - correctRate) * (remainingSteps - 1). Scales with stepsClaimed ratio and number of remaining intermediate steps."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the maximum extractable amount given typical vesting parameters?",
+          "Can the attack be repeated across multiple transfer-claim cycles?",
+          "Does the marketplace listing flow (list → claim → eventually unlist/sell) create a clean extraction path?"
+        ],
+        "validation_requirements": [
+          "Construct PoC: seller claims 8/10 steps, lists 50 tokens, claims remaining steps at inflated rate",
+          "Verify amountClaimed exceeds totalAmount after intermediate claims",
+          "Verify final step reverts due to underflow in totalAmount - amountClaimed",
+          "Measure net token drain from other beneficiaries"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Only needs existing vesting allocation (zero additional capital)",
+        "estimated_execution_cost": "~0.01 ETH gas for list + claim transactions",
+        "potential_profit_range": "2-20% of transferred amount stolen per cycle depending on step ratio",
+        "estimated_profit_margin": "Nearly 100% ROI on gas costs",
+        "attack_duration": "Multi-block (requires waiting for vesting steps to elapse)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None - attack uses existing vesting allocation",
+        "optimal_timing": "When most steps are already claimed but several remain",
+        "market_impact_assessment": "Victims discover missing funds only when their safeTransfer reverts due to insufficient contract balance"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All other beneficiaries in the same StepVesting contract",
+        "estimated_impact_per_user": "Loss of claimable tokens proportional to overclaim amount",
+        "total_value_at_risk": "Entire vesting contract balance for other beneficiaries"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "numOfSteps, stepsClaimed ratio, transfer amount",
+        "calculation_validation": "Compare inflated vs correct releaseRate across parameter space",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "VestingManager stepsClaimed Contamination Corrupts Buyer Vesting Schedules",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "VestingManager acts as intermediary holder during marketplace trades. Its _vestings record accumulates a single stepsClaimed from the FIRST seller who lists on a given vesting plan. All subsequent buyers inherit this potentially stale stepsClaimed value regardless of the actual seller's progress, causing buyers to receive incorrect vesting schedules.",
+      "investigation_rationale": "The first seller's stepsClaimed permanently defines the manager's stepsClaimed. If first seller listed at step 0, late-stage buyers (purchasing step-8 tokens) start from step 0, delaying their claims. If first seller listed at step 8, early-stage buyers get accelerated vesting. An attacker can observe the manager's state and strategically purchase underpriced accelerated vestings.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "listVesting",
+        "completePurchase",
+        "transferVesting",
+        "_createVesting"
+      ],
+      "affected_contracts": [
+        "SecondSwap_VestingManager.sol",
+        "SecondSwap_StepVesting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "listVesting"
+        },
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "completePurchase"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "_createVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "189-202",
+        "pattern": "_createVesting for existing beneficiary (VestingManager) only updates totalAmount and releaseRate, never updates stepsClaimed. First seller's stepsClaimed becomes permanent for all manager-intermediated transfers."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multiple sellers list tokens from the same vesting plan at different step progress levels",
+        "VestingManager already holds a vesting allocation (from a prior listing)",
+        "Buyer purchases from a seller whose stepsClaimed differs from the manager's"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_createVesting existing path: totalAmount += _totalAmount; releaseRate recalculated with MANAGER's stepsClaimed, not seller's",
+        "manipulation_vector": "If manager.stepsClaimed=8 (from first seller) and new seller listed at step 2, buyer inherits stepsClaimed=8 and can claim 80% immediately",
+        "profit_hypothesis": "Buyer pays discounted price for step-2 tokens but receives step-8 vesting schedule, gaining immediate access to majority of tokens"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can an attacker manipulate the manager's stepsClaimed by being the first lister?",
+          "What is the economic impact of stepsClaimed mismatch for typical vesting parameters?",
+          "Does the claimable() final-step catch-all prevent total overclaim?"
+        ],
+        "validation_requirements": [
+          "Simulate: Seller A lists at step 8, Seller B lists at step 2, Buyer purchases Seller B's allocation",
+          "Verify buyer inherits stepsClaimed=8 and can immediately claim ~80% of purchased tokens",
+          "Calculate fair value vs realized value for the buyer"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Price of the listing being purchased",
+        "estimated_execution_cost": "~0.01 ETH gas",
+        "potential_profit_range": "Potentially receiving immediate claim on tokens that should vest over remaining period",
+        "estimated_profit_margin": "Depends on stepsClaimed delta - could be substantial if delta is large",
+        "attack_duration": "Single transaction for purchase, then claim immediately"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Sufficient funds to purchase the listing",
+        "optimal_timing": "When manager's stepsClaimed is high and a low-stepsClaimed seller lists at discount",
+        "market_impact_assessment": "Vesting contract may become insolvent for other beneficiaries if combined with H001"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Sellers who listed tokens and buyers who receive wrong vesting schedules",
+        "estimated_impact_per_user": "Buyer either gains or loses significant vesting time depending on direction",
+        "total_value_at_risk": "All marketplace-traded vesting allocations on a given plan"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Manager's stepsClaimed vs seller's stepsClaimed delta",
+        "calculation_validation": "Trace full listing→purchase→claim flow with different stepsClaimed values",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "Referral Fee Calculated But Never Transferred to Referrer",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "In _handleTransfers, referralFeeCost is computed and emitted in the Purchased event, but no actual token transfer to the referral address occurs. The entire buyerFeeTotal + sellerFeeTotal is sent to feeCollector, keeping the referral's share. The referral system is completely non-functional despite events suggesting otherwise.",
+      "investigation_rationale": "This is a clear code bug: the referral amount is calculated, a variable is set, it's emitted in events, but the transfer is missing. FeeCollector receives funds that should go to referrers. Any integrator building referral tracking will have incorrect accounting.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_handleTransfers",
+        "spotPurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_handleTransfers"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "spotPurchase"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "290-305",
+        "pattern": "referralFeeCost computed at line 295-298, but feeCollectorTotal at line 300 = buyerFeeTotal + sellerFeeTotal (does not subtract referralFeeCost). No safeTransfer to _referral address exists."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A purchase is made with a non-zero _referral address",
+        "Listing has no whitelist (listing.whitelist == address(0))",
+        "Buyer fee > 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "referralFeeCost = buyerFeeTotal - (baseAmount * bfee * referralFee) / (BASE * BASE) — computed but never used in transfer",
+        "manipulation_vector": "feeCollector silently receives referral portion. No transfer(referral, referralFeeCost) exists in code.",
+        "profit_hypothesis": "FeeCollector gains 100% of referral rewards across all referred purchases. With referralFee=1000, ~90% of buyer fee should go to referrer but goes to feeCollector instead."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What total referral fees would be misdirected over expected marketplace volume?",
+          "Is the referral formula itself also inverted (90% vs 10%)?",
+          "Are there downstream integrators relying on Purchased event's referralReward field?"
+        ],
+        "validation_requirements": [
+          "Confirm no transfer to _referral exists anywhere in the purchase flow",
+          "Verify feeCollectorTotal does not deduct referralFeeCost",
+          "Test with actual purchase and verify referrer balance unchanged"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — protocol design flaw, not attacker exploit",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "FeeCollector receives all referral fees — potentially significant protocol revenue leakage",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Every referred purchase"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Continuous — affects every referred purchase",
+        "market_impact_assessment": "Referral program is non-functional, undermining user acquisition incentives"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All referrers who promote the marketplace expecting rewards",
+        "estimated_impact_per_user": "100% of expected referral rewards lost",
+        "total_value_at_risk": "All referral fees across marketplace lifetime"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "referralFee=1000, buyerFee=250, typical baseAmount",
+        "calculation_validation": "Trace exact token flows in _handleTransfers with referral set",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "Self-Service Whitelist Bypass Undermines Private Sale Restrictions",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The whitelistAddress() function has no access control — any user can call it to add themselves to any whitelist. Private listing protection is reduced to a first-come-first-served capacity limit rather than seller-curated access control. Any attacker can whitelist themselves and purchase from private listings intended for specific buyers.",
+      "investigation_rationale": "Documentation states 'ensuring only authorized addresses can participate' but the code allows anyone to self-authorize. The lotOwner (seller) has no function to add specific addresses, only to increase capacity. This contradicts the stated design intent.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whitelistAddress",
+        "validateAddress",
+        "spotPurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Whitelist.sol",
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Whitelist.sol",
+          "function": "whitelistAddress"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "spotPurchase"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Whitelist.sol",
+        "lines": "50-56",
+        "pattern": "whitelistAddress() is external with no caller restriction — any address can whitelist itself up to maxWhitelist capacity"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "A private listing exists with available whitelist slots",
+        "Attacker has funds to purchase the listing"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No access check: any msg.sender can set userSettings[msg.sender] = true",
+        "manipulation_vector": "Attacker calls whitelistAddress() on the listing's whitelist contract, then purchases from the private listing",
+        "profit_hypothesis": "Private listings often offer discounted prices to specific buyers. Attacker gains access to these favorable terms."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are private listings typically offered at significant discounts vs public listings?",
+          "Can an attacker front-fill all whitelist slots, blocking intended buyers?",
+          "Is the self-service design intentional or a missing access control?"
+        ],
+        "validation_requirements": [
+          "Confirm non-lotOwner can call whitelistAddress()",
+          "Verify whitelisted address can purchase from private listing",
+          "Test that lotOwner has no mechanism to remove unauthorized whitelist entries"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas for whitelistAddress() + purchase funds",
+        "estimated_execution_cost": "~0.001 ETH gas",
+        "potential_profit_range": "Access to private-sale pricing, potentially significant discount",
+        "estimated_profit_margin": "Depends on private vs public price differential",
+        "attack_duration": "Two transactions"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Sufficient funds to purchase the private listing",
+        "optimal_timing": "Before legitimate whitelist slots fill up",
+        "market_impact_assessment": "Undermines private sale mechanism entirely"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Sellers who created private listings for specific counterparties",
+        "estimated_impact_per_user": "Complete loss of private sale exclusivity",
+        "total_value_at_risk": "All private listing value on the marketplace"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "maxWhitelist typical values, private listing frequency",
+        "calculation_validation": "End-to-end test: deploy whitelist, self-whitelist from attacker, purchase",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "Marketplace Freeze Locks All Listed Tokens With No Recovery Path",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Both listVesting and unlistVesting apply the isFreeze modifier. When the marketplace is frozen, sellers cannot unlist their tokens, and even the admin cannot unlist because unlistVesting also requires !isMarketplaceFreeze. All listed vesting tokens become locked indefinitely during a freeze, with no emergency withdrawal mechanism.",
+      "investigation_rationale": "An emergency freeze is intended to protect users, but paradoxically it locks all listed assets. Admin must unfreeze to allow unlisting, but unfreezing re-enables all marketplace operations including purchases, defeating the emergency purpose.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "unlistVesting",
+        "setMarketplaceStatus"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol",
+        "SecondSwap_MarketplaceSetting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "unlistVesting"
+        },
+        {
+          "file": "SecondSwap_MarketplaceSetting.sol",
+          "function": "setMarketplaceStatus"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "194-195",
+        "pattern": "unlistVesting has isFreeze modifier — same modifier as listVesting and spotPurchase. During freeze, ALL marketplace operations are blocked including fund recovery."
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Active listings exist on the marketplace",
+        "Admin freezes the marketplace"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "modifier isFreeze() applies to unlistVesting, blocking seller recovery during freeze",
+        "manipulation_vector": "Admin freeze → all listed vesting tokens locked → no emergency exit path for sellers",
+        "profit_hypothesis": "Not profit-driven but causes significant locked capital for all sellers with active listings"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the total value typically listed on the marketplace at any given time?",
+          "Can admin selectively unfreeze-unlist-refreeze without exposing window for unwanted purchases?",
+          "Is there a proxy upgrade path to add emergency withdrawal?"
+        ],
+        "validation_requirements": [
+          "Confirm unlistVesting reverts when marketplace is frozen",
+          "Confirm admin cannot bypass the freeze for unlisting operations",
+          "Verify no alternative recovery path exists"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — design flaw",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A — griefing / DoS impact",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Duration of marketplace freeze"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Any freeze event",
+        "market_impact_assessment": "All listed assets locked, potentially causing cascading issues if sellers need those tokens elsewhere"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All sellers with active listings during freeze",
+        "estimated_impact_per_user": "Entire listed allocation locked until unfreeze",
+        "total_value_at_risk": "All active listings on marketplace"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical listing volume and duration",
+        "calculation_validation": "Test freeze + unlist revert behavior",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "Reentrancy in spotPurchase via Callback-Enabled Currency Token",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In spotPurchase, _handleTransfers executes external safeTransferFrom/safeTransfer calls to the currency token BEFORE listing.balance is decremented. If the currency token supports transfer callbacks (ERC-777, hooks), an attacker can reenter spotPurchase during the callback and purchase the same listing multiple times, extracting vesting tokens beyond the listing balance.",
+      "investigation_rationale": "The checks-effects-interactions pattern is violated: external calls precede state updates. The addCoin function has no token validation (decimals check was commented out), so any token including callback-enabled ones could be added as supported currency.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A callback-enabled token (e.g., ERC-777) is added as supported currency via addCoin()"
+      ],
+      "config_evidence": "SecondSwap_Marketplace.sol:addCoin() lines 160-165 — decimals validation is commented out, no callback/hook detection. Any token can be added.",
+      "affected_functions": [
+        "spotPurchase",
+        "_handleTransfers",
+        "addCoin"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "spotPurchase"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_handleTransfers"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "addCoin"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "310-332",
+        "pattern": "spotPurchase calls _handleTransfers (external token transfers at lines 287-305) BEFORE updating listing.balance at line 326. No reentrancy guard present."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A callback-enabled token is added as supported currency",
+        "A listing exists using that currency",
+        "Attacker deploys a contract that reenters spotPurchase during transfer callback"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_handleTransfers external calls at lines 287-305, listing.balance update at line 326",
+        "manipulation_vector": "During safeTransfer to seller (line 300), attacker's callback reenters spotPurchase. listing.balance unchanged from first call, so validation passes again.",
+        "profit_hypothesis": "Each reentrant call extracts _amount of vesting tokens. Attacker drains VestingManager's allocation for the listing's vesting plan."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does SafeERC20's safeTransfer trigger ERC-777 hooks?",
+          "Can the reentrant call's completePurchase succeed if VestingManager has sufficient allocation?",
+          "Would Solidity 0.8 underflow in listing.balance -= _amount on unwind catch the issue?"
+        ],
+        "validation_requirements": [
+          "Deploy ERC-777 token, add as supported currency",
+          "Create listing with ERC-777 currency, attempt reentrant purchase",
+          "Verify listing.balance unchanged during reentrant call"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Purchase price × number of reentrant calls",
+        "estimated_execution_cost": "~0.05 ETH gas for complex reentrant TX",
+        "potential_profit_range": "Entire listing's vesting allocation drained beyond intended balance",
+        "estimated_profit_margin": "Depends on vesting token value vs purchase price",
+        "attack_duration": "Single atomic transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Attacker needs sufficient callback-token balance",
+        "optimal_timing": "Any time after callback-enabled token is added",
+        "market_impact_assessment": "VestingManager drained of vesting allocation for affected plan"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Seller (listing oversold), other marketplace participants on same vesting plan",
+        "estimated_impact_per_user": "Complete loss of listed allocation beyond intended sale",
+        "total_value_at_risk": "VestingManager's entire allocation for the affected vesting plan"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "ERC-777 hook behavior with SafeERC20",
+        "calculation_validation": "Trace state during reentrant calls",
+        "execution_complexity": "high",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "Default Penalty Fee Makes Early Unlisting Impossible With Real USDT",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "penaltyFee is initialized to 10 ether (10 * 10^18) in MarketplaceSetting constructor. On target chains (Ethereum, Base, Arbitrum), real USDT has 6 decimals, so this equals 10^13 USDT (~$10 trillion). No seller can afford this penalty, making early unlisting impossible until admin explicitly calls setPenaltyFee with a corrected value.",
+      "investigation_rationale": "The deployment script (DeploySecondSwap.s.sol) creates MarketplaceSetting with cfg.usdt but never updates penaltyFee. If deployed as-is, sellers who list and want to unlist before minListingDuration are permanently blocked.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "USDT address is real USDT with 6 decimals",
+        "Admin does not call setPenaltyFee after deployment"
+      ],
+      "config_evidence": "SecondSwap_MarketplaceSetting.sol constructor line 98: penaltyFee = 10 ether. DeploySecondSwap.s.sol: no setPenaltyFee call after deployment. Target chains per docs: Ethereum, Base, Arbitrum — all have 6-decimal USDT.",
+      "affected_functions": [
+        "unlistVesting",
+        "setPenaltyFee"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol",
+        "SecondSwap_MarketplaceSetting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_MarketplaceSetting.sol",
+          "function": "constructor"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "unlistVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_MarketplaceSetting.sol",
+        "lines": "98",
+        "pattern": "penaltyFee = 10 ether — 10 * 10^18 units. With 6-decimal USDT, this requires 10^13 USDT ($10 trillion) for early unlisting."
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Deployed with real USDT (6 decimals)",
+        "Admin has not called setPenaltyFee to adjust the default",
+        "Seller tries to unlist before minListingDuration expires"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "penaltyFee = 10 * 10^18 interpreted as 10^13 USDT tokens (6 decimals)",
+        "manipulation_vector": "No user can hold 10 trillion USDT; balanceOf check at unlist always fails",
+        "profit_hypothesis": "Not profit-driven — DoS preventing sellers from recovering listed tokens"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is the admin workflow guaranteed to call setPenaltyFee before marketplace goes live?",
+          "What is the minListingDuration, and how long are sellers locked?",
+          "Can this be combined with marketplace freeze for permanent token lockup?"
+        ],
+        "validation_requirements": [
+          "Deploy with 6-decimal USDT, attempt early unlist, verify revert",
+          "Check deployment scripts for setPenaltyFee calls"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — configuration gap",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A — DoS impact",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Until admin corrects penaltyFee"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Immediately after deployment before admin corrects",
+        "market_impact_assessment": "All early unlisting blocked"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Any seller who lists and needs to unlist before minListingDuration",
+        "estimated_impact_per_user": "Tokens locked until minListingDuration expires",
+        "total_value_at_risk": "All listed tokens during affected period"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "penaltyFee=10 ether, USDT decimals=6, minListingDuration=120s",
+        "calculation_validation": "Verify 10*10^18 / 10^6 = 10^13 USDT required",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "No Upper Bound on discountPct Creates Permanently Unpurchasable Listings",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "listVesting does not validate that discountPct < BASE (10000). A seller (intentionally or accidentally) can set discountPct >= 10000 for FIX or LINEAR discount types. Any purchase attempt will revert due to unsigned integer underflow in _getDiscountedPrice when computing BASE - discountPct. The seller's vesting tokens become locked in the listing, recoverable only by unlisting (potentially paying penalty).",
+      "investigation_rationale": "The validation only checks that discountPct > 0 for non-NO discount types but has no upper bound. This is a missing input validation that can trap seller funds.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "listVesting",
+        "_getDiscountedPrice"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "listVesting"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_getDiscountedPrice"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "172-174",
+        "pattern": "Validation: (_discountType != DiscountType.NO && _discountPct > 0) || (_discountType == DiscountType.NO) — no upper bound check. _getDiscountedPrice at line 261: (BASE - listing.discountPct) underflows when discountPct >= BASE."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Seller creates listing with discountPct >= 10000 and discountType != NO"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "BASE - discountPct where discountPct >= BASE causes underflow revert",
+        "manipulation_vector": "Listing created successfully but all purchases revert. Seller must unlist to recover tokens.",
+        "profit_hypothesis": "Not profit-driven — self-DoS. Could be used as griefing if marketplace relies on listing metrics."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can this be used to grief other users or the protocol?",
+          "Does the unlist penalty create economic damage for accidental mispricing?",
+          "Can discountPct just below BASE create near-zero prices for exploitation?"
+        ],
+        "validation_requirements": [
+          "Create listing with discountPct=10001, verify purchase reverts",
+          "Verify listing creation succeeds without revert",
+          "Test near-boundary values (9999, 10000, 10001)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Vesting allocation to list",
+        "estimated_execution_cost": "~0.01 ETH gas + potential penalty fee to unlist",
+        "potential_profit_range": "No direct profit — DoS/griefing",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Until seller unlists"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "Listing pollution, wasted gas for potential buyers"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Seller who creates the bad listing, buyers who attempt purchase",
+        "estimated_impact_per_user": "Wasted gas for buyers, penalty fee for seller to recover tokens",
+        "total_value_at_risk": "Listed vesting tokens locked until unlist"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "discountPct boundary values, BASE=10000",
+        "calculation_validation": "Trace _getDiscountedPrice with discountPct=10000",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Division by Zero Blocks End-of-Vesting Transfers to New Beneficiaries",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In _createVesting, when a new beneficiary receives a transfer and numOfSteps == _stepsClaimed (all steps elapsed), releaseRate = amount / (numOfSteps - _stepsClaimed) causes division by zero. This prevents transferring vesting tokens to new addresses after the full vesting period, blocking both marketplace purchases and direct transfers at end-of-vesting.",
+      "investigation_rationale": "Marketplace purchases at end-of-vesting (when all steps have elapsed but tokens remain unclaimed) will revert, locking tokens in VestingManager. The buyer pays but the completePurchase call fails.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_createVesting",
+        "transferVesting",
+        "completePurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_StepVesting.sol",
+        "SecondSwap_VestingManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "_createVesting"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "transferVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "191",
+        "pattern": "releaseRate: _totalAmount / (numOfSteps - _stepsClaimed) — when _stepsClaimed == numOfSteps, divides by zero"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "All vesting steps have elapsed (block.timestamp >= endTime)",
+        "Transfer target is a new address (no existing vesting record)",
+        "Grantor has unclaimed tokens"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_totalAmount / (numOfSteps - _stepsClaimed) where both equal numOfSteps → division by zero",
+        "manipulation_vector": "Any marketplace purchase after full vesting period reverts for new buyers. Listed tokens become permanently locked in VestingManager.",
+        "profit_hypothesis": "Not profit-driven — funds locked permanently. Sellers cannot recover listed tokens if unlistVesting also triggers this path."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many listings could be active near end-of-vesting?",
+          "Does unlistVesting also hit this path (transferring back to seller at end of vesting)?",
+          "Can existing beneficiaries (with existing vesting records) still receive transfers?"
+        ],
+        "validation_requirements": [
+          "Set block.timestamp > endTime, attempt transfer to new address",
+          "Verify division by zero revert",
+          "Test with existing beneficiary (should take else branch, no div-by-zero)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — timing-dependent DoS",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A — fund lockup",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent once vesting period ends"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "After vesting endTime",
+        "market_impact_assessment": "All active listings on expired vesting plans become unpurchasable"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Sellers with listings on expired plans, buyers attempting late purchases",
+        "estimated_impact_per_user": "Listed tokens permanently locked",
+        "total_value_at_risk": "All listed tokens on vesting plans near/past expiry"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "numOfSteps, block.timestamp vs endTime",
+        "calculation_validation": "Trace _createVesting with stepsClaimed == numOfSteps",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "Uninitialized Implementation Contracts Exploitable for State Hijacking",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "SecondSwap_Marketplace, SecondSwap_VestingManager, and SecondSwap_VestingDeployer are deployed as Transparent proxies but their implementation contracts lack _disableInitializers() in constructors. An attacker can call initialize() on any implementation directly to set themselves as s2Admin on the implementation contract.",
+      "investigation_rationale": "The Foundry deployment script deploys implementations without disabling initializers. While Transparent proxy architecture means the implementation's state doesn't affect the proxy, the initialized implementation could be used in unexpected ways if referenced directly or in future upgrade paths.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "DeploySecondSwap.s.sol: implementation contracts deployed with `new SecondSwap_Marketplace()` etc. No _disableInitializers() in any constructor. OpenZeppelin best practice: https://docs.openzeppelin.com/upgrades-plugins/1.x/writing-upgradeable#initializing_the_implementation_contract",
+      "affected_functions": [
+        "initialize"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol",
+        "SecondSwap_VestingManager.sol",
+        "SecondSwap_VestingDeployer.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "initialize"
+        },
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "initialize"
+        },
+        {
+          "file": "SecondSwap_VestingDeployer.sol",
+          "function": "initialize"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "140-143",
+        "pattern": "No constructor with _disableInitializers(). initialize() is public with only OZ initializer modifier — callable on implementation."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Implementation contract addresses are known or discoverable on-chain",
+        "initialize() has not been called on implementations"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Implementation contracts are uninitialized post-deployment",
+        "manipulation_vector": "Attacker calls initialize() on implementation, becomes s2Admin of implementation contract",
+        "profit_hypothesis": "With Transparent proxy, direct exploitation is limited. Risk escalates if implementations are ever used directly or in UUPS upgrades."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can the initialized implementation be used to affect proxy state in any way?",
+          "Are there any DELEGATECALL paths from implementation to proxy?",
+          "Could a future upgrade introduce UUPS pattern, increasing risk?"
+        ],
+        "validation_requirements": [
+          "Verify implementation contracts accept initialize() call",
+          "Confirm Transparent proxy isolates implementation state from proxy state",
+          "Check for any selfdestruct or delegatecall in implementation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "~0.001 ETH gas",
+        "estimated_execution_cost": "~0.001 ETH",
+        "potential_profit_range": "Minimal with Transparent proxy; elevated if upgrade pattern changes",
+        "estimated_profit_margin": "Low under current architecture",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Immediately after deployment",
+        "market_impact_assessment": "Limited under Transparent proxy; best practice violation"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol if upgrade pattern changes",
+        "estimated_impact_per_user": "Potential full protocol compromise in future upgrade scenario",
+        "total_value_at_risk": "All protocol assets if implementation is leveraged"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Proxy pattern, implementation isolation",
+        "calculation_validation": "Test initialize() call on implementation address",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

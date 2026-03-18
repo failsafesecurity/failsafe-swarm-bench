@@ -1,0 +1,339 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Token1 Premium Sign Inversion in computeNAV Distorts Portfolio Valuation",
+      "severity": "high",
+      "summary": "In computeNAV, the token1 premium exposure calculation uses longPremium.leftSlot() - shortPremium.leftSlot(), which is the inverse of the token0 convention (shortPremium.rightSlot() - longPremium.rightSlot()). For a vault that is net short and earning token1 premiums, the NAV is understated. For a vault that is net long and owing token1 premiums, the NAV is overstated. This directly affects all deposit/withdrawal fulfillment share pricing via fulfillDeposits and fulfillWithdrawals.",
+      "description": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "line_start": 109,
+          "line_end": 113,
+          "desc": "poolExposure0 = short.rightSlot() - long.rightSlot() but poolExposure1 = long.leftSlot() - short.leftSlot(); asymmetric sign convention"
+        }
+      ],
+      "impact": "CRITICAL. Every deposit and withdrawal fulfillment when the vault has non-zero net token1 premiums will use an incorrect NAV. The magnitude of mispricing is 2x the net token1 premium value. For options vaults that primarily collect premiums, this can be a significant fraction of total NAV. All historical fulfillments are retroactively incorrect with no way to correct them. Existing shareholders are systematically diluted during deposit fulfillments, and withdrawers are systematically underpaid during withdrawal fulfillments (when net short on token1). The reverse occurs when net long.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unsafe uint128 Truncation in Fulfillment State Storage Causes Supply-Accounting Divergence",
+      "severity": "high",
+      "summary": "In fulfillDeposits and fulfillWithdrawals, computed values (sharesReceived, assetsReceived, etc.) are cast to uint128 when stored in epoch state structs, but totalSupply is updated using the full uint256 value. If any computed value exceeds type(uint128).max, the stored epoch state is silently truncated while totalSupply reflects the true value. When users call executeDeposit, they receive shares based on the truncated value, creating permanently orphaned shares in totalSupply.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 313,
+          "line_end": 318,
+          "desc": "sharesReceived: uint128(sharesReceived) - unsafe downcast; totalSupply = _totalSupply + sharesReceived uses full uint256"
+        }
+      ],
+      "impact": "If triggered, the defect creates a permanent divergence between totalSupply and the sum of all distributable shares. This effectively creates phantom shares that dilute the share price (NAV/totalSupply) for all existing shareholders. The orphaned shares can never be claimed or burned, permanently reducing the vault's share price. In fulfillWithdrawals, the same pattern affects assetsReceived vs reservedWithdrawalAssets, potentially locking excess assets permanently.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Double mulDiv Rounding in executeDeposit Systematically Shorts Users on Shares",
+      "severity": "high",
+      "summary": "executeDeposit performs two consecutive mulDiv operations: first computing userAssetsDeposited (queuedAmount * assetsFulfilled / assetsDeposited), then sharesReceived (userAssetsDeposited * sharesReceived / assetsFulfilled). Each rounds down independently, compounding the rounding error. A single-step calculation mulDiv(queuedAmount, sharesReceived, assetsDeposited) would be more precise. The lost dust shares accumulate in totalSupply with no claimant.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 236,
+          "line_end": 245,
+          "desc": "Two consecutive mulDiv calls: userAssetsDeposited = mulDiv(A, B, C) then sharesReceived = mulDiv(userAssetsDeposited, D, B); intermediate rounding compounds"
+        }
+      ],
+      "impact": "LOW to MEDIUM severity. Per-user per-epoch loss is at most 1-2 wei of shares. However, it is systematic (affects every user every partially-fulfilled epoch), cumulative (dust permanently accumulates), and represents a code precision defect. The orphaned shares inflate totalSupply relative to claimable shares, causing a minor but persistent dilution of all shareholders. A malicious manager could choose fulfillment amounts that maximize rounding to amplify the effect.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Withdrawal Epoch Rollover Rounding Creates Per-User/Epoch-Level Accounting Divergence",
+      "severity": "high",
+      "summary": "In executeWithdrawal, sharesToFulfill is computed as (pendingAmount * sharesFulfilled / sharesWithdrawn), rounding down. The per-user sharesRemaining = amount - sharesToFulfill is thus rounded up. Similarly, withdrawnBasis uses the same rounding pattern. The aggregate rollover from fulfillWithdrawals uses exact subtraction at the epoch level, but per-user rollovers can sum to more than the epoch-level rollover. This mirrors the deposit rollover issue (TECH-H003) and causes the last withdrawal ex",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 268,
+          "line_end": 283,
+          "desc": "sharesToFulfill rounds down per user; sharesRemaining rounds up; sum of per-user rollovers exceeds epoch-level rollover from fulfillWithdrawals"
+        }
+      ],
+      "impact": "The divergence is bounded by the number of users experiencing non-exact division per epoch (up to 1 share per user per epoch). For dust-level amounts this is minimal, but it compounds across epochs with partial fulfillment. Over the protocol's lifetime with many users and partial fulfillments, the accumulated divergence means: (1) sum(queuedWithdrawal[*][e].amount) > withdrawalEpochState[e].sharesWithdrawn for rolled-over epochs, violating INV-ECON-005; (2) the last executor per epoch may receive fewer assets or face a revert; (3) reservedWithdrawalAssets can be drained beyond what was allocated. This is a real accounting defect even if the per-epoch impact is small.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unset feeWallet (address(0)) Permanently Blocks All Profitable Withdrawal Executions",
+      "severity": "high",
+      "summary": "feeWallet defaults to address(0) (never set in constructor). If performanceFeeBps > 0 and feeWallet is never set via setFeeWallet(), any executeWithdrawal where the user has profit (assetsToWithdraw > withdrawnBasis) will attempt SafeTransferLib.safeTransfer to address(0). Most ERC-20 tokens revert on transfer to address(0), permanently blocking all profitable withdrawal executions.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 328,
+          "line_end": 331,
+          "desc": "SafeTransferLib.safeTransfer(underlyingToken, feeWallet, performanceFee) where feeWallet can be address(0); no validation in constructor or executeWithdrawal"
+        }
+      ],
+      "impact": "HIGH severity. All profitable withdrawal executions are blocked when feeWallet == address(0) and performanceFeeBps > 0. Users who called requestWithdrawal have their shares burned and cannot access their underlying assets until the owner intervenes. The remediation path exists (owner calls setFeeWallet) but requires off-chain awareness. In the worst case, if the owner key is lost or the owner is unresponsive, profitable withdrawals are permanently blocked.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "NAV Underflow in Fulfillment Functions Bricks Vault When Underwater",
+      "severity": "high",
+      "summary": "Both fulfillDeposits and fulfillWithdrawals compute totalAssets as `computeNAV() + 1 - assetsDeposited - reservedWithdrawalAssets`. If the vault's NAV drops below assetsDeposited + reservedWithdrawalAssets (due to investment losses or market conditions), this subtraction underflows, reverting the transaction. The manager cannot fulfill any deposits or withdrawals, effectively bricking the vault. Users' deposited assets are locked with no withdrawal path since they haven't received shares.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 351,
+          "line_end": 354,
+          "desc": "totalAssets = accountant.computeNAV(...) + 1 - epochState.assetsDeposited - reservedWithdrawalAssets; unchecked subtraction underflows if NAV < deposits + reserved"
+        }
+      ],
+      "impact": "HIGH severity. When triggered: (1) All deposit fulfillment is blocked - depositors cannot receive shares, (2) All withdrawal fulfillment is blocked - withdrawers cannot receive assets, (3) cancelDeposit may also fail if the vault lacks underlying tokens to transfer, (4) Users' deposited assets are locked with no withdrawal path since they don't have shares to request withdrawal on, (5) The vault is effectively bricked until NAV recovers above the threshold or the manager can somehow cancel enough deposits to reduce assetsDeposited below NAV + 1 - reservedWithdrawalAssets.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Zero Fulfillment Amount Creates Permanently Stuck User Funds via Division-by-Zero Epoch",
+      "severity": "high",
+      "summary": "If the manager calls fulfillDeposits(0, ...) or fulfillWithdrawals(0, ...), the epoch state records 0 for assetsFulfilled/sharesFulfilled. The epoch advances, and the aggregate unfulfilled amount rolls over correctly. However, individual users' executeDeposit/executeWithdrawal for that epoch will revert with division by zero (mulDiv denominator = 0). Since the function reverts, the per-user rollover to epoch+1 never occurs. The user's deposit/withdrawal is permanently stuck in the zero-fulfilled",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 257,
+          "line_end": 265,
+          "desc": "executeDeposit: Math.mulDiv(userAssetsDeposited, sharesReceived, assetsFulfilled) where assetsFulfilled=0 causes division by zero; no validation in fulfillDeposits that assetsToFulfill > 0"
+        }
+      ],
+      "impact": "HIGH - All users with deposits or withdrawals queued in a zero-fulfilled epoch permanently lose access to their funds through normal contract mechanisms. For deposits: underlying tokens locked in vault. For withdrawals: shares already burned, assets inaccessible. The aggregate epoch rollover creates a divergence from per-user state that cannot be reconciled. While the manager could partially mitigate via manage() token transfers for deposits, this breaks accounting invariants and cannot restore burned shares for withdrawals.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Token as Underlying Creates Accounting Mismatch and Last-Withdrawer Loss",
+      "severity": "high",
+      "summary": "requestDeposit records the full `assets` parameter into queuedDeposit and depositEpochState.assetsDeposited, but SafeTransferLib.safeTransferFrom transfers fewer tokens to the vault if the underlying is a fee-on-transfer token. The vault's actual balance is less than the recorded deposits, creating a growing shortfall. Early withdrawers receive full entitlements, while later withdrawers face insufficient balance and reverted transfers.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 228,
+          "line_end": 234,
+          "desc": "queuedDeposit += assets; safeTransferFrom(assets) without checking actual received amount; no balance delta validation"
+        }
+      ],
+      "impact": "If the vault is deployed with a fee-on-transfer token: (1) Every deposit creates a shortfall of (assets × fee_rate), (2) The shortfall is irreversible and accumulates, (3) cancelDeposit would also fail for exact-amount returns, (4) Last withdrawers lose up to 100% of their withdrawal entitlement, (5) Total value at risk equals the cumulative transfer fees across all deposits. For a 1% fee-on-transfer token with $10M total deposits, the shortfall would be $100K.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Position Duplication Bypasses Leg Count Validation to Hide Debt",
+      "severity": "high",
+      "summary": "The accountant validates the manager's provided position list by checking if the total number of legs matches the vault's actual leg count. However, it does not check for duplicate tokenIds. A manager can provide an array that duplicates a highly profitable position to replace an underwater position with the same number of legs, artificially inflating NAV.",
+      "description": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "line_start": 141,
+          "line_end": 141,
+          "desc": "if (numLegs != pools[i].pool.numberOfLegs(_vault)) revert IncorrectPositionList();"
+        },
+        {
+          "file": "HypoVault.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: setAccountant(IVaultAccountant)"
+        }
+      ],
+      "impact": "CRITICAL. The manager can inflate NAV by an arbitrary amount bounded by the value difference between the profitable and underwater positions. This directly translates to excess asset extraction during fulfillWithdrawals, as assetsReceived is computed as sharesToFulfill * totalAssets / totalSupply with inflated totalAssets. All vault depositors are affected, with potential total loss of funds. The accountant's entire validation framework (pools hash, TWAP checks, leg count) is undermined by this single missing uniqueness check.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Epoch Rollover Rounding Causes User-Level Share Over-Minting vs Epoch-Level Accounting",
+      "severity": "high",
+      "summary": "When fulfillDeposits partially fulfills an epoch, the aggregate unfulfilled remainder is rolled to the next epoch's assetsDeposited. When individual users call executeDeposit, each user's pro-rata fulfilled amount is rounded down via mulDiv, making individual rollovers slightly larger than the aggregate. The sum of user-level rollovers exceeds the epoch-level assetsDeposited for the next epoch. In the next epoch, users collectively claim more shares than were added to totalSupply, creating unbac",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 259,
+          "line_end": 275,
+          "desc": "executeDeposit computes userAssetsDeposited = mulDiv(queuedAmount, assetsFulfilled, assetsDeposited) then rolls remainder to epoch+1 via queuedDeposit[user][epoch+1] += assetsRemaining without updating depositEpochState[epoch+1].assetsDeposited"
+        }
+      ],
+      "impact": "The invariant sum(queuedDeposit[*][epoch]) == depositEpochState[epoch].assetsDeposited is violated after any partial fulfillment with multiple depositors where rounding occurs. This leads to: (1) Over-minting of shares — sum(balanceOf) can exceed totalSupply minus phantom shares; (2) Erosion of the phantom share inflation protection (1M phantom shares); (3) Incorrect share pricing in subsequent epochs since totalSupply doesn't reflect actual distributed shares; (4) Compounding over many epochs. Economic severity ranges from negligible (18-decimal tokens, few users) to low-medium (6-decimal tokens, many small depositors, many partial fulfillment epochs, NAV decreases).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Vault Free Balances Can Be Erased by Underwater Pool Positions",
+      "severity": "high",
+      "summary": "Free ERC20 balances held by the vault are assigned to the first pool that uses them. If that pool is underwater, the per-pool zero-clamp wipes out the free balance, artificially crashing the NAV.",
+      "description": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "line_start": 166,
+          "line_end": 170,
+          "desc": "poolExposure0 += ... int256(pools[i].token0.balanceOf(_vault)); before the per-pool clamp"
+        }
+      ],
+      "impact": "CRITICAL. The NAV can be substantially understated whenever: (1) the vault holds free tokens that also appear as pool tokens (extremely common), and (2) the first pool using that token has negative position exposure. This leads to: share mispricing during deposit fulfillment (depositors get too many shares), share mispricing during withdrawal fulfillment (withdrawers get too few assets), and potential NAV manipulation if the manager can control pool ordering. The defect also violates INV-STATE-003 by allowing real vault assets to be invisible in NAV.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Performance-fee basis can truncate to uint128 and brick executeWithdrawal or miscompute fees for large withdrawals",
+      "severity": "high",
+      "summary": "In requestWithdrawal(), the per-withdrawal cost basis (withdrawalBasis) is computed as uint256 then added into a uint128 field (PendingWithdrawal.basis) via an unchecked narrowing conversion. If withdrawalBasis (or cumulative basis across requests in an epoch) exceeds 2^128-1, it will truncate, corrupting fee accounting and potentially causing executeWithdrawal() to revert due to underflow when subtracting the prorated withdrawnBasis from the (truncated) pendingWithdrawal.basis.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 138,
+          "line_end": 159,
+          "desc": "queuedWithdrawal[...] = PendingWithdrawal({ amount: pendingWithdrawal.amount + shares, basis: uint128(pendingWithdrawal.basis + withdrawalBasis) }); // uint256->uint128 truncation"
+        }
+      ],
+      "impact": "The code has a confirmed unsafe narrowing cast that silently truncates basis accounting values. If triggered, users would be overcharged on performance fees (basis appears lower → profit appears higher). In theory, partial fulfillment rollovers through executeWithdrawal also carry the same truncation risk, potentially compounding the corruption across epochs. The practical likelihood is very low for standard ERC-20 tokens, but the missing safeguard represents a real code defect per secure coding standards.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permanent Loss of Usable Capital via Withdrawal Rounding Dust",
+      "severity": "high",
+      "summary": "In executeWithdrawal, sharesToFulfill and assetsToWithdraw are calculated using integer division, which rounds down. The fractional dust assets remain in reservedWithdrawalAssets forever and can never be claimed.",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 250,
+          "line_end": 255,
+          "desc": "uint256 assetsToWithdraw = Math.mulDiv(sharesToFulfill, _withdrawalEpochState.assetsReceived, _withdrawalEpochState.sharesFulfilled);"
+        }
+      ],
+      "impact": "The per-epoch dust is bounded by approximately (number_of_users_in_epoch - 1) units in the smallest token denomination. For tokens with 18 decimals, this is negligible per epoch. Over years of operation with hundreds of epochs, the accumulated dust could reach thousands of wei — still insignificant in absolute terms. However, the code IS defective: there is no mechanism to recover this dust, and it permanently inflates reservedWithdrawalAssets relative to actual obligations. The invariant INV-ECON-005 (reservedWithdrawalAssets >= unexecuted fulfilled withdrawals) is violated in the OPPOSITE direction — reservedWithdrawalAssets EXCEEDS actual obligations, reducing effective capital. This is a real code defect even if the economic impact is minimal under normal conditions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Epoch State Overwrite During Potential Reentrancy Through accountant.computeNAV",
+      "severity": "high",
+      "summary": "In fulfillDeposits and fulfillWithdrawals, accountant.computeNAV() is called before the epoch state is finalized and epoch counter incremented. If IVaultAccountant interface does not declare computeNAV as 'view', the compiler uses CALL instead of STATICCALL, allowing a malicious or misconfigured accountant to reenter the vault. During reentrancy, calls like requestDeposit would modify depositEpochState[currentEpoch].assetsDeposited, but the outer fulfillDeposits overwrites this state using the p",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 305,
+          "line_end": 327,
+          "desc": "accountant.computeNAV() external call at line 305-307 before epoch state write at lines 313-327; epochState read at line 302 before external call"
+        }
+      ],
+      "impact": "IF all preconditions were met (non-view interface + malicious accountant), the impact would be as described: deposits made during the reentrancy window would be lost from accounting, with tokens trapped in the vault. However, since the implementation is view and the owner is a trusted role, the practical risk is negligible. The lack of a nonReentrant modifier is a defense-in-depth concern but not an active vulnerability given STATICCALL protection.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Per-Pool NAV Clamping to Zero Inflates NAV by Ignoring Underwater Pool Debt",
+      "severity": "high",
+      "summary": "computeNAV sums NAV across pools using `nav += uint256(Math.max(poolExposure0 + poolExposure1, 0))`. Negative per-pool exposure (debt/loss) is clamped to zero instead of reducing the aggregate NAV. If Pool A has +100 exposure and Pool B has -80 exposure, NAV reports 100 instead of the correct 20. This systematically overstates NAV whenever any pool has negative net exposure.",
+      "description": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "line_start": 182,
+          "line_end": 182,
+          "desc": "nav += uint256(Math.max(poolExposure0 + poolExposure1, 0)) clamps negative pool exposure to zero per-pool instead of aggregating then clamping"
+        }
+      ],
+      "impact": "The NAV overstatement equals the sum of absolute negative pool exposures that are clamped to zero. For deposit fulfillment: depositors receive fewer shares than fair value (dilution). For withdrawal fulfillment: withdrawers receive more assets than fair value (vault drainage). The effect is persistent as long as any pool maintains negative exposure. Over time, this systematic mispricing transfers value from depositors and remaining shareholders to withdrawers. The developer's comment suggests this is intentional per Panoptic's bounded-loss model, but the mixing of shared wallet balances into per-pool exposure before clamping creates distortions not covered by that justification.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Oracle Time-Based Staleness Not Validated Allowing Outdated Prices in NAV",
+      "severity": "high",
+      "summary": "computeNAV validates manager-provided prices against TWAP oracles using a deviation band check, but never verifies the TWAP oracle's last update timestamp. If the underlying Uniswap pool has low activity, the TWAP uses stale observations that may be hours or days old. The manager can provide prices within maxPriceDeviation of the stale TWAP, but far from actual market prices, leading to incorrect NAV calculation.",
+      "description": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "line_start": 100,
+          "line_end": 105,
+          "desc": "Math.abs(managerPrice - PanopticMath.twapFilter(oracle, twapWindow)) > maxPriceDeviation checks deviation but not underlying oracle freshness timestamp"
+        }
+      ],
+      "impact": "The impact is proportional to (actual_price - stale_price) × position_size. For pools with assets denominated in volatile tokens and infrequent oracle pool trading, the divergence could be significant (e.g., 5-20% in high volatility periods). This affects every deposit and withdrawal fulfillment that relies on stale oracle data. Depositors entering during understated NAV receive excess shares at existing shareholders' expense. Withdrawers during overstated NAV receive excess assets. The impact scales with vault TVL and the magnitude of price divergence since the last oracle pool trade.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Manager Price Deviation Band Allows Systematic Value Extraction",
+      "severity": "high",
+      "summary": "The accountant allows the manager to provide custom pool prices as long as they are within `maxPriceDeviation` of the TWAP. A manager can systematically choose prices at the extreme edges of this band to artificially deflate NAV during deposits (diluting users) and inflate NAV during withdrawals (overpaying themselves or colluding users).",
+      "description": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "line_start": 100,
+          "line_end": 105,
+          "desc": "Math.abs(conversionTick - managerPrices[i].token0Price) > pools[i].maxPriceDeviation"
+        },
+        {
+          "file": "HypoVault.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _burnVirtual(address,uint256)"
+        }
+      ],
+      "impact": "The impact depends on (a) the configured maxPriceDeviation value, (b) the size and concentration of liquidity positions, and (c) the vault's TVL. For a 1% deviation band with concentrated positions, the manager could extract approximately 0.5-1% of the affected position value per fulfillment cycle. Over time, this compounds into significant value drain from shareholders. However, the manager already has unlimited power via manage(), making this a secondary concern — it primarily matters if the manager role is intended to be semi-trusted (trusted for operations but not for value extraction) rather than fully trusted.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Batch manage() Lacks Input Array Length Validation Enabling Silent Partial Execution Failure",
+      "severity": "high",
+      "summary": "The batch manage(address[],bytes[],uint256[]) function iterates using targets.length but does not validate that data[] and values[] arrays have the same length. If data.length < targets.length or values.length < targets.length, the call reverts mid-execution with an opaque out-of-bounds error after already executing some calls successfully. Since the entire transaction reverts, this wastes gas and creates operational risk. More critically, if values.length > targets.length, extra value entries a",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 350,
+          "line_end": 358,
+          "desc": "uint256 targetsLength = targets.length; for loop uses targetsLength but never checks data.length == targetsLength || values.length == targetsLength"
+        }
+      ],
+      "impact": "Low-to-medium severity code defect. The silent ignoring of mismatched array elements is a genuine input validation flaw. While gated by onlyManager, the lack of validation makes this function fragile against tooling bugs. The opaque revert case (shorter data/values) is a usability issue. The silent ignore case (shorter targets) could cause operational failures in multi-step vault management sequences. No direct fund theft is possible from this defect alone.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Performance Fee Avoidance via Basis Concentration Through Transfer-Withdrawal Sequencing",
+      "severity": "high",
+      "summary": "When requestWithdrawal is called with small share amounts, the basis computation `withdrawalBasis = (previousBasis * shares) / userBalance` rounds DOWN to zero when `previousBasis * shares < userBalance`. A user can use multicall to repeatedly call requestWithdrawal(1) many times, each time moving 0 basis to the withdrawal queue while retaining all basis on remaining shares. After many iterations, the user's remaining shares have a disproportionately high basis (approaching total original basis)",
+      "description": [
+        {
+          "file": "HypoVault.sol",
+          "line_start": 233,
+          "line_end": 245,
+          "desc": "withdrawalBasis = (previousBasis * shares) / userBalance rounds to 0 when shares=1 and userBalance > previousBasis; repeated calls via multicall accumulate zero-basis withdrawal shares"
+        }
+      ],
+      "impact": "No exploitable impact. The rounding behavior exists but cannot be leveraged for fee avoidance. In profit scenarios, total fees are unchanged. In loss scenarios, the attacker pays more total fees than without the manipulation. The basis conservation invariant (INV-ECON-001) is maintained: total basis across userBasis and queuedWithdrawal.basis remains constant throughout the manipulation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

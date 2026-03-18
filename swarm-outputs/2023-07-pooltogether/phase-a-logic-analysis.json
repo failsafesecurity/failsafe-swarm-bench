@@ -1,0 +1,462 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T17:12:49.804Z",
+    "duration_ms": 566920
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User (depositor)",
+        "path": [
+          "Vault.deposit()",
+          "Vault._deposit()",
+          "IERC20.safeTransferFrom()",
+          "_yieldVault.deposit()",
+          "_twabController.mint()"
+        ],
+        "transformations": [
+          "Assets converted to shares via _convertToShares using exchange rate",
+          "Exchange rate updated after mint via _updateExchangeRate"
+        ],
+        "sinks": [
+          "YieldVault (underlying assets)",
+          "TwabController (share balances)"
+        ],
+        "trust_changes": "User trusts vault with assets; vault trusts yield vault with deposits",
+        "validation_points": [
+          "maxDeposit check",
+          "_isVaultCollateralized check",
+          "Exchange rate calculation"
+        ],
+        "exposure_risks": [
+          "Exchange rate can be observed by frontrunners"
+        ],
+        "manipulation_risks": [
+          "Pre-existing vault balance allows free deposit - if assets sit in vault, next depositor uses them without paying, stealing available yield"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "Liquidator / LiquidationPair",
+        "path": [
+          "Vault.liquidate()",
+          "_prizePool.contributePrizeTokens()",
+          "_mint(account, _amountOut)",
+          "_increaseYieldFeeBalance()"
+        ],
+        "transformations": [
+          "Prize tokens contributed to PrizePool accumulator",
+          "Vault shares minted to liquidation account",
+          "Yield fee tracked in _yieldFeeTotalSupply"
+        ],
+        "sinks": [
+          "PrizePool (prize tokens in accumulators)",
+          "TwabController (new vault shares)",
+          "Vault state (_yieldFeeTotalSupply)"
+        ],
+        "trust_changes": "Vault trusts liquidation pair contract; PrizePool trusts vault for contribution accounting",
+        "validation_points": [
+          "msg.sender == liquidationPair",
+          "tokenIn == prizeToken",
+          "tokenOut == vault share",
+          "_amountOut <= liquidatableYield",
+          "vault collateralized check"
+        ],
+        "exposure_risks": [
+          "Yield fee calculation can revert with division by zero when yieldFeePercentage == FEE_PRECISION"
+        ],
+        "manipulation_risks": [
+          "Vault asset balance comparison with shares (_amountOut >= _vaultAssets) is comparing incompatible units, potentially leaving assets in vault for theft"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Vault (via contributePrizeTokens)",
+        "path": [
+          "PrizePool.contributePrizeTokens()",
+          "DrawAccumulatorLib.add(vaultAccumulator)",
+          "DrawAccumulatorLib.add(totalAccumulator)"
+        ],
+        "transformations": [
+          "Raw contribution amount → exponentially smoothed disbursement via alpha parameter",
+          "Balance delta check against prizeToken.balanceOf"
+        ],
+        "sinks": [
+          "vaultAccumulator[vault] (per-vault smoothed contributions)",
+          "totalAccumulator (global smoothed contributions)"
+        ],
+        "trust_changes": "Anyone can call contributePrizeTokens for any vault, but must have transferred tokens first",
+        "validation_points": [
+          "_deltaBalance >= _amount check"
+        ],
+        "exposure_risks": [
+          "Contribution amounts are publicly visible"
+        ],
+        "manipulation_risks": [
+          "Front-running closeDraw with contributions to manipulate vault portion for prize claims"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "DrawManager (closeDraw)",
+        "path": [
+          "PrizePool.closeDraw()",
+          "_computeNextNumberOfTiers()",
+          "_nextDraw()",
+          "TieredLiquidityDistributor._computeNewDistributions()",
+          "Tier state updates"
+        ],
+        "transformations": [
+          "Contributions for draw → deltaPrizeTokensPerShare (floor division)",
+          "Tier liquidity reclamation from shrunk tiers",
+          "Reserve updated with reclaimed + remainder"
+        ],
+        "sinks": [
+          "_tiers mapping (updated prize sizes)",
+          "prizeTokenPerShare (global)",
+          "_reserve",
+          "numberOfTiers",
+          "lastClosedDrawId"
+        ],
+        "trust_changes": "Only drawManager can close draws",
+        "validation_points": [
+          "winningRandomNumber != 0",
+          "block.timestamp >= _openDrawEndsAt()",
+          "numberOfTiers bounds"
+        ],
+        "exposure_risks": [
+          "uint96 truncation of _contributionsForDraw silently loses contributions exceeding ~79 billion tokens"
+        ],
+        "manipulation_risks": [
+          "Tier expansion can bypass thresholds if canary tier is claimed (largestTierClaimed + 2 >= numTiers regardless of claim counts)"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Claimer / Vault (claimPrize)",
+        "path": [
+          "Vault.claimPrizes()",
+          "Vault._claimPrize()",
+          "hooks.beforeClaimPrize()",
+          "PrizePool.claimPrize()",
+          "_isWinner()",
+          "_consumeLiquidity()",
+          "_transfer()"
+        ],
+        "transformations": [
+          "PRN = keccak256(user, tier, prizeIndex, winningRandomNumber)",
+          "TWAB lookup for user balance and total supply",
+          "Vault portion from accumulator",
+          "Winning zone = userTwab * tierOdds * vaultPortion",
+          "constrainedRandom = PRN % vaultTwabTotalSupply"
+        ],
+        "sinks": [
+          "Winner receives prize tokens",
+          "Fee recipient receives claim fee",
+          "claimerRewards mapping updated",
+          "_tiers[tier] prizeTokenPerShare updated"
+        ],
+        "trust_changes": "Vault trusts claimer (msg.sender check); PrizePool trusts vault (msg.sender as vault); hooks can redirect prize recipient",
+        "validation_points": [
+          "_isWinner check",
+          "claimedPrizes double-claim prevention",
+          "_fee <= prizeSize",
+          "valid tier check"
+        ],
+        "exposure_risks": [
+          "Hook implementations can grief claimers by reverting",
+          "afterClaimPrize hook receives payout amount"
+        ],
+        "manipulation_risks": [
+          "beforeClaimPrize hook can redirect prize to arbitrary address",
+          "Stale vault portion if contributions change between draw close and claim"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "TwabController balance tracking",
+        "path": [
+          "TwabController.mint/burn/transfer()",
+          "_transferBalance()",
+          "_increaseBalances/_decreaseBalances()",
+          "TwabLib.increaseBalances/decreaseBalances()",
+          "Ring buffer observation write"
+        ],
+        "transformations": [
+          "Balance changes recorded as observations in ring buffer",
+          "Cumulative balance extrapolated from previous observation",
+          "Period-based observation indexing"
+        ],
+        "sinks": [
+          "userObservations mapping (per-vault per-user)",
+          "totalSupplyObservations mapping (per-vault)",
+          "delegates mapping"
+        ],
+        "trust_changes": "msg.sender is used as vault address - any contract can act as a vault",
+        "validation_points": [
+          "Balance underflow checks in decreaseBalances",
+          "Cardinality bounds against MAX_CARDINALITY"
+        ],
+        "exposure_risks": [
+          "Historical balances are publicly queryable"
+        ],
+        "manipulation_risks": [
+          "No access control on mint/burn/transfer - any contract can create its own 'vault' namespace, but this is by design"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "Claimer VRGDA fee computation",
+        "path": [
+          "Claimer.claimPrizes()",
+          "_computeFeePerClaim()",
+          "LinearVRGDALib.getVRGDAPrice()",
+          "Vault.claimPrizes()"
+        ],
+        "transformations": [
+          "Fee computed via VRGDA: price = minFee * e^(decayConstant * (elapsed - sold/perTimeUnit))",
+          "Fee averaged across all claims in batch",
+          "Fee truncated to uint96"
+        ],
+        "sinks": [
+          "Vault.claimPrizes with feePerClaim",
+          "PrizePool.claimerRewards mapping"
+        ],
+        "trust_changes": "Claimer trusts prizePool state (claimCount, numberOfTiers) at call time",
+        "validation_points": [
+          "_maxFee cap per claim",
+          "overflow checks in VRGDA",
+          "FeeTooLarge check in PrizePool"
+        ],
+        "exposure_risks": [
+          "Fee computation depends on elapsed time and claimed count, both publicly observable"
+        ],
+        "manipulation_risks": [
+          "Race condition: multiple claimers competing, claimCount changes between fee computation and claim execution, potentially making fee calculation stale"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Prize pool token balance >= tier liquidity + reserve + claimer rewards",
+        "Each winner can claim each prize index only once per draw",
+        "Number of tiers must be between MINIMUM_NUMBER_OF_TIERS (3) and MAXIMUM_NUMBER_OF_TIERS (15)",
+        "Canary tier is always the last tier (numberOfTiers - 1)",
+        "Total shares = (numberOfTiers - 1) * tierShares + canaryShares + reserveShares",
+        "Vault exchange rate caps at last recorded rate to exclude yield from share pricing",
+        "TWAB observations stored in ring buffer with MAX_CARDINALITY = 365"
+      ],
+      "economic_incentives": [
+        "Claimers incentivized by VRGDA fees that increase over time, creating urgency to claim",
+        "Yield fee recipient earns a percentage of liquidated yield",
+        "Vaults compete for prize allocation proportional to their contributions",
+        "Canary tier serves as an indicator for tier expansion/contraction"
+      ],
+      "governance_mechanisms": [
+        "DrawManager role controls draw closure and reserve withdrawal",
+        "Vault owner controls claimer, liquidation pair, yield fee settings",
+        "setDrawManager is one-time settable but front-runnable"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Vault yield fee percentage set to exactly FEE_PRECISION (1e9, i.e., 100%)",
+          "expected_behavior": "Should either be disallowed or handle gracefully",
+          "actual_behavior": "Division by zero in liquidate(): (_amountOut * FEE_PRECISION) / (FEE_PRECISION - _yieldFeePercentage) where denominator is 0",
+          "risk_level": "high",
+          "exploitation_potential": "Owner sets yieldFeePercentage to FEE_PRECISION, permanently breaking liquidation and prize funding. Even if not malicious, a configuration mistake causes permanent DoS."
+        },
+        {
+          "scenario": "Assets sitting in Vault's balance (from direct transfer or liquidation leftover) when a deposit occurs",
+          "expected_behavior": "Depositor should pay for all shares received; vault balance should not subsidize deposits",
+          "actual_behavior": "In _deposit(), if _assets <= vault's asset balance, no transfer from caller occurs. Caller receives shares backed by vault's pre-existing balance, effectively stealing available yield.",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker sends underlying asset to vault, then calls deposit() to receive shares without paying. The stolen amount equals the vault's asset balance. In liquidation flows where _amountOut < _vaultAssets (comparing shares to assets - unit mismatch), assets remain in vault enabling this attack."
+        },
+        {
+          "scenario": "Canary tier prize claimed, bypassing expansion threshold checks",
+          "expected_behavior": "Tier expansion should require both canary claim count AND normal claim count to meet claimExpansionThreshold",
+          "actual_behavior": "In _computeNextNumberOfTiers, _nextNumberOfTiers = largestTierClaimed + 2. If canary (tier numberOfTiers-1) is claimed, _nextNumberOfTiers = numberOfTiers + 1 BEFORE the threshold check. Even if thresholds are not met, _nextNumberOfTiers remains numberOfTiers + 1 since the threshold check only sets (doesn't reduce) _nextNumberOfTiers.",
+          "risk_level": "high",
+          "exploitation_potential": "A single canary claim can trigger tier expansion regardless of whether the threshold conditions are met, leading to premature and unwarranted tier expansion that dilutes prize liquidity across too many tiers."
+        },
+        {
+          "scenario": "Contributions exceed uint96 max in closeDraw",
+          "expected_behavior": "All contributed tokens should be distributed across tiers",
+          "actual_behavior": "uint96(_contributionsForDraw(lastClosedDrawId + 1)) silently truncates values > type(uint96).max (~79.2 billion with 18 decimals), losing the excess contributions",
+          "risk_level": "medium",
+          "exploitation_potential": "In high-value prize pools with large contributions, excess tokens beyond uint96 capacity are lost from distribution, remaining unaccounted in the prize pool balance"
+        },
+        {
+          "scenario": "Vault liquidate() compares _amountOut (shares) >= _vaultAssets (asset amount) for yield vault deposit trigger",
+          "expected_behavior": "Should compare equivalent units (both in asset terms or both in share terms)",
+          "actual_behavior": "When exchange rate != 1:1, the comparison is between different units. If exchange rate > 1 (more assets per share), _amountOut < _vaultAssets even when the economic value is equal, causing assets to remain in vault.",
+          "risk_level": "medium",
+          "exploitation_potential": "Assets accumulate in vault over time when exchange rate drifts from 1:1, enabling the free deposit vulnerability described above"
+        },
+        {
+          "scenario": "Prize claims for early draws attempt TWAB lookups before protocol start",
+          "expected_behavior": "Graceful handling of insufficient TWAB history",
+          "actual_behavior": "_getVaultUserBalanceAndTotalSupplyTwab computes _startTimestamp = _endTimestamp - _drawDuration * drawPeriodSeconds. For high-frequency tiers (grand prize: 365 draws), this underflows uint32 when insufficient draws have occurred, causing revert.",
+          "risk_level": "low",
+          "exploitation_potential": "Not exploitable but prevents legitimate grand prize claims for ~365 draws after launch. By design for TWAB accuracy but undocumented."
+        },
+        {
+          "scenario": "Winner sets beforeClaimPrize hook that always reverts",
+          "expected_behavior": "Only that winner's claim fails; others succeed",
+          "actual_behavior": "Vault.claimPrizes batches all claims. If one hook reverts, the entire batch reverts, preventing all winners in the batch from being claimed.",
+          "risk_level": "medium",
+          "exploitation_potential": "Griefing attack: winner sets reverting hook, forcing claimers to exclude them from batches. Claimers waste gas on failed transactions before discovering the issue."
+        },
+        {
+          "scenario": "PrizePool.setDrawManager called when drawManager is address(0)",
+          "expected_behavior": "Secure initialization of draw manager",
+          "actual_behavior": "Anyone can call setDrawManager to set themselves as draw manager via front-running, gaining control of draw closure and reserve withdrawal",
+          "risk_level": "medium",
+          "exploitation_potential": "Front-run the constructor's DrawManagerSet to become the draw manager and control draw closures and reserve withdrawals. Mitigated by post-deployment verification."
+        },
+        {
+          "scenario": "UD34x4 precision loss accumulates in _consumeLiquidity over many prize claims",
+          "expected_behavior": "Tier prizeTokenPerShare tracks consumption exactly",
+          "actual_behavior": "fromUD60x18toUD34x4 divides by 1e14, losing 14 decimal places of precision. Each consumption operation loses up to 1e14 wei, accumulating over hundreds of claims per draw.",
+          "risk_level": "low",
+          "exploitation_potential": "Over many claims, tracked consumption is less than actual consumption, creating a small phantom liquidity that can never be claimed. Reserve may be over-consumed to compensate."
+        },
+        {
+          "scenario": "_computeNewDistributions uses floor() on deltaPrizeTokensPerShare",
+          "expected_behavior": "Liquidity distributed proportionally with minimal loss",
+          "actual_behavior": "floor() truncates fractional tokens per share. With large totalShares, the remainder (up to totalShares - 1 tokens) is added to reserve, slightly reducing tier allocations each draw.",
+          "risk_level": "low",
+          "exploitation_potential": "Not directly exploitable but causes systematic under-allocation to prize tiers in favor of the reserve over many draws."
+        },
+        {
+          "scenario": "Vault liquidation approves underlying asset to LiquidationPair",
+          "expected_behavior": "LP should only need prize token approval or no approval at all",
+          "actual_behavior": "setLiquidationPair approves type(uint256).max of the underlying asset to the new LP address. A malicious LP can drain the vault's underlying asset balance.",
+          "risk_level": "medium",
+          "exploitation_potential": "If owner is compromised or sets a malicious LP, the LP can call transferFrom to steal all underlying assets held by the vault. Trusted owner assumption mitigates but doesn't eliminate the risk."
+        },
+        {
+          "scenario": "vaultPortion calculation uses endDrawId = _lastClosedDrawId + 1",
+          "expected_behavior": "Vault portion should only reflect contributions up to the closed draw",
+          "actual_behavior": "_computeVaultTierDetails passes _lastClosedDrawId + 1 as endDrawId to _getVaultPortion, including smoothed disbursements from the open draw in the vault portion calculation",
+          "risk_level": "low",
+          "exploitation_potential": "A vault can contribute to the open draw immediately before claiming, slightly inflating its portion for the closed draw's prize calculation. Economic feasibility is limited by contribution cost."
+        }
+      ],
+      "assumption_violations": [
+        "Vault assumes no assets will be directly transferred to it, but anyone can do so via ERC20 transfer, enabling the free deposit exploit",
+        "TieredLiquidityDistributor assumes _nextNumberOfTiers will be capped by threshold checks, but the initial value from largestTierClaimed + 2 can bypass this",
+        "Vault assumes yieldFeePercentage < FEE_PRECISION for liquidation math, but _setYieldFeePercentage allows equality",
+        "PrizePool assumes contributions fit in uint96, but the accumulator operates in uint256",
+        "Vault._deposit assumes vault asset balance is available for depositor use, conflating yield-related balances with deposit flows"
+      ],
+      "game_theory_risks": [
+        "Claimers compete in a first-come basis; earlier claimers get lower VRGDA fees, incentivizing gas auction behavior",
+        "A vault can contribute large amounts to inflate its portion just before prize claims, then withdraw contributions next draw",
+        "Winners with hooks can grief claimers by setting reverting hooks, then claiming directly themselves (if claim function allows self-claiming)",
+        "Tier expansion can be manipulated by ensuring canary prizes are claimed (even a single claim triggers expansion), diluting prizes across more tiers"
+      ],
+      "integration_risks": [
+        "Yield vault (ERC4626) maxWithdraw may not reflect actual withdrawable amount if yield vault has withdrawal fees or delays",
+        "TwabController period alignment assumes consistent block.timestamp progression; timestamp manipulation could affect TWAB calculations",
+        "DrawAccumulatorLib exponential smoothing with extreme alpha values (close to 1) can cause numerical instability in pow() calculations",
+        "External hook contracts (IVaultHooks) have unbounded gas consumption, potentially causing out-of-gas for claimers"
+      ],
+      "calculation_errors": [
+        "Vault.liquidate yield fee: (_amountOut * FEE_PRECISION) / (FEE_PRECISION - _yieldFeePercentage) division by zero when fee = 100%",
+        "Vault.liquidate asset sweep: comparison _amountOut >= _vaultAssets mixes share units with asset units",
+        "_computeNextNumberOfTiers: _nextNumberOfTiers = largestTierClaimed + 2 can exceed _numTiers without meeting threshold conditions",
+        "_getVaultUserBalanceAndTotalSupplyTwab: uint32 timestamp underflow when _drawDuration * drawPeriodSeconds exceeds _endTimestamp"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "prizeToken (POOL)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:assumed_false"
+          ],
+          "decimals": 18,
+          "notes": "Used as prize and contribution token. SafeERC20 used for transfers. contributePrizeTokens relies on balanceOf delta - fee-on-transfer tokens would break accounting."
+        },
+        {
+          "address_or_symbol": "Vault share token",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true"
+          ],
+          "decimals": 18,
+          "notes": "ERC4626 + ERC20Permit. Balances stored in TwabController, not standard ERC20 balanceOf. Minted during deposits and liquidations. uint96 cap from TwabController."
+        },
+        {
+          "address_or_symbol": "Underlying asset (e.g., USDC)",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:assumed_false",
+            "permit:varies"
+          ],
+          "decimals": -1,
+          "notes": "Decimals determined at deployment via ERC4626. Fee-on-transfer tokens would break _deposit logic (transfers less than expected). Approved to both yield vault (max) and liquidation pair (max, unnecessarily)."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "prize_pool_balance_invariant",
+          "state_vars": [
+            "prizeToken.balanceOf(prizePool)",
+            "_accountedBalance()",
+            "_totalWithdrawn",
+            "totalAccumulator.available",
+            "totalAccumulator.disbursed"
+          ]
+        },
+        {
+          "name": "tier_liquidity_conservation",
+          "state_vars": [
+            "prizeTokenPerShare",
+            "_tiers[i].prizeTokenPerShare",
+            "_reserve",
+            "sum(tier_remaining_liquidity)"
+          ]
+        },
+        {
+          "name": "vault_collateralization",
+          "state_vars": [
+            "_currentExchangeRate()",
+            "_assetUnit",
+            "_yieldVault.maxWithdraw(vault)",
+            "_totalSupply()",
+            "_yieldFeeTotalSupply"
+          ]
+        },
+        {
+          "name": "twab_balance_consistency",
+          "state_vars": [
+            "userObservations[vault][user].details.balance",
+            "totalSupplyObservations[vault].details.balance",
+            "sum(user_balances) == totalSupply"
+          ]
+        },
+        {
+          "name": "accumulator_available_disbursed_sum",
+          "state_vars": [
+            "observation.available",
+            "observation.disbursed"
+          ],
+          "notes": "For any new observation: available + disbursed should equal sum of all contributions accounting for smoothing"
+        }
+      ]
+    }
+  }
+}

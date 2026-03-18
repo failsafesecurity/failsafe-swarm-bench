@@ -1,0 +1,52 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "LendingLedger Passes Block Numbers to GaugeController Which Expects Unix Timestamps, Causing All Gauge Weights to Return Zero",
+      "severity": "high",
+      "summary": "There is a fundamental unit mismatch between LendingLedger and GaugeController. LendingLedger's update_market function iterates over blocks and computes epoch values aligned to BLOCK_EPOCH (100,000 blocks). These epoch values (e.g., 100000, 200000, 7700000) are passed as the `_time` argument to GaugeController.gauge_relative_weight_write(). However, GaugeController's _gauge_relative_weight function treats `_time` as a Unix timestamp in seconds, dividing by WEEK (604800 seconds) to find the week-",
+      "description": [
+        {
+          "file": "src/LendingLedger.sol",
+          "line_start": 64,
+          "line_end": 69,
+          "desc": "LendingLedger computes `epoch = (i / BLOCK_EPOCH) * BLOCK_EPOCH` where `i` starts at `market.lastRewardBlock` (a block number). This block-number-aligned epoch value is passed as the `_time` parameter to `gaugeController.gauge_relative_weight_write(_market, epoch)`. However, GaugeController interprets `_time` as a Unix timestamp and computes `t = (_time / WEEK) * WEEK` where `WEEK = 604800 seconds`. Since block numbers (millions) are orders of magnitude smaller than Unix timestamps (billions), the lookup maps to timestamps in 1970 where no vote data exists."
+        }
+      ],
+      "impact": "Complete failure of the reward distribution system. All CANTO rewards configured via setRewards() and sent to the LendingLedger contract are permanently locked. No user can ever claim any CANTO rewards. The secondary rewards (secRewardsPerShare) are unaffected since they don't depend on GaugeController.",
+      "proof_of_concept": "1. Governance configures cantoPerBlock with rewards for upcoming epochs via setRewards()\n2. CANTO is sent to the LendingLedger contract to fund rewards\n3. Lending markets are whitelisted, users deposit through sync_ledger()\n4. When update_market() is called (via sync_ledger or claim), epoch values like 7700000 are passed to gauge_relative_weight_write()\n5. GaugeController looks up weight at t = (7700000 / 604800) * 604800 = 7257600 (a 1970 timestamp)\n6. points_sum[7257600].bias = 0, so gauge_relative_weight returns 0\n7. cantoReward = 0 for every iteration of the loop\n8. accCantoPerShare never increases — all users' claimable CANTO is permanently zero\n9. All CANTO funded to the contract is permanently trapped with no recovery mechanism",
+      "remediation": "LendingLedger should convert block-number epochs to timestamp-based epochs when calling GaugeController. Alternatively, both contracts should agree on the same unit system. One approach: replace the epoch calculation with `uint256 epoch = (block.timestamp / WEEK) * WEEK` and align the reward rate mapping to use timestamp-based epochs."
+    },
+    {
+      "title": "GaugeController changes_sum Double-Decrement After Gauge Removal Corrupts Total Weight Accounting",
+      "severity": "high",
+      "summary": "The GaugeController tracks per-gauge weight slopes and a global sum of all gauge slopes. When a gauge is removed, _remove_gauge_weight() properly cleans up the gauge's contribution to both per-gauge and global state. However, it does NOT clear the per-user vote records (vote_user_slopes mapping).\n\nWhen a user who had voted for the removed gauge later calls vote_for_gauge_weights() — either to vote 0 (reclaim power) or to re-vote on a re-added gauge — the function reads the stale vote_user_slopes",
+      "description": [
+        {
+          "file": "src/GaugeController.sol",
+          "line_start": 285,
+          "line_end": 310,
+          "desc": "When a gauge is removed via remove_gauge(), _remove_gauge_weight() clears changes_weight entries and decrements changes_sum for that gauge's scheduled slope changes. However, vote_user_slopes[user][gauge] is NOT cleared. When the user subsequently re-votes or votes 0 to reclaim power, vote_for_gauge_weights() reads the stale old_slope and attempts to cancel the old slope changes again at lines 285-310. This double-decrements points_sum[next_time].slope (via Math.max subtraction) and may zero out changes_sum entries that belong to other gauges."
+        }
+      ],
+      "impact": "Corruption of the global weight accounting leads to inflated gauge_relative_weight values for remaining gauges. This causes LendingLedger to over-distribute CANTO rewards to markets associated with those gauges, draining the reward pool faster than governance intended. Early claimers benefit from inflated rewards while later claimers may find the pool empty. The severity scales with the proportion of total votes that were on the removed gauge.",
+      "proof_of_concept": "1. User1 creates a VE lock and votes 100% (10000 bps) for gauge1\n2. User2 creates a VE lock and votes 100% for gauge2\n3. Governance legitimately removes gauge1 (e.g., market is deprecated)\n4. _remove_gauge_weight clears gauge1's contributions and decrements changes_sum\n5. User1 calls vote_for_gauge_weights(gauge1, 0) to reclaim their voting power (allowed for removed gauges per line 244)\n6. The stale old_slope from vote_user_slopes causes points_sum[next_time].slope to be double-decremented\n7. Total weight is now artificially low (understated by the removed gauge's slope)\n8. gauge_relative_weight for gauge2 now returns > 1e18 (inflated beyond 100%)\n9. LendingLedger's update_market calculates cantoReward using the inflated weight, over-distributing CANTO rewards\n10. The CANTO reward pool drains faster than intended, potentially causing insolvency for later claimers",
+      "remediation": "When removing a gauge via _remove_gauge_weight(), also clear all users' vote_user_slopes for that gauge (requires tracking voters per gauge, or an alternative accounting approach). Alternatively, modify vote_for_gauge_weights() to detect when old slope changes have already been cleaned up and skip the slope cancellation."
+    },
+    {
+      "title": "GaugeController _remove_gauge_weight Underflow Reverts When Global Slope Diverges From Per-Gauge Slope",
+      "severity": "high",
+      "summary": "The GaugeController uses lazy evaluation for both global weight sums (_get_sum) and per-gauge weights (_get_weight). Both functions iterate week by week, decaying bias and applying scheduled slope changes. Each has a protective branch: when bias drops to zero or below, both bias and slope are zeroed out. This prevents negative values but silently drops any pending slope decrements (changes_sum or changes_weight entries) for that and subsequent weeks.\n\nThe global bias (sum of all gauges) tends to",
+      "description": [
+        {
+          "file": "src/GaugeController.sol",
+          "line_start": 220,
+          "line_end": 220,
+          "desc": "In _remove_gauge_weight(), line 220 performs `points_sum[next_time].slope -= old_slope` where old_slope is the gauge's individual slope at next_time. The global aggregate slope (points_sum) and per-gauge slope (points_weight) are updated lazily via _get_sum() and _get_weight() respectively. These lazy evaluation loops have an `else` branch (lines 83-86 for _get_sum, 109-112 for _get_weight) that zeroes both bias and slope when bias drops below slope*WEEK, silently dropping pending slope changes. This causes the global slope to hit zero before individual gauge slopes do, creating a state where points_sum[next_time].slope < points_weight[gauge][next_time].slope. The subtraction at line 220 then reverts due to Solidity 0.8.x underflow protection."
+        }
+      ],
+      "impact": "Governance cannot remove gauges once the slope divergence occurs. If the GaugeController's _get_sum() or other functions also encounter underflows in their slope calculations (a secondary effect of the state inconsistency), the gauge_relative_weight_write function reverts, bricking all LendingLedger operations (update_market, claim, sync_ledger) across all markets with no recovery path. All CANTO rewards and potentially all user positions in lending markets become permanently frozen.",
+      "proof_of_concept": "1. Multiple users vote for gauge1 and gauge2 with varying lock durations\n2. Significant time passes without checkpoint_gauge being called\n3. During this period, the aggregate bias (points_sum) decays to zero via the natural slope*time decay, hitting the else branch in _get_sum() which zeroes the global slope\n4. Meanwhile, gauge1's individual bias (in _get_weight) has not yet decayed to zero due to its specific vote structure\n5. Governance calls remove_gauge(gauge1)\n6. _remove_gauge_weight calls _get_weight(gauge1) -> returns positive slope\n7. _remove_gauge_weight calls _get_sum() -> returns 0 slope (was zeroed)\n8. Line 220: `points_sum[next_time].slope -= old_slope` -> 0 - positive = UNDERFLOW REVERT\n9. Gauge removal is permanently bricked\n10. If this state also affects _get_sum() during normal vote_for_gauge_weights or gauge_relative_weight_write calls, the entire GaugeController can become non-functional, cascading to brick LendingLedger",
+      "remediation": "Add underflow protection to line 220: `points_sum[next_time].slope = points_sum[next_time].slope >= old_slope ? points_sum[next_time].slope - old_slope : 0;`. Also add similar protection to the slope subtraction in the _get_sum and _get_weight loops (lines 82 and 108). Consider redesigning the lazy evaluation to avoid silent dropping of slope changes when bias reaches zero."
+    }
+  ]
+}

@@ -1,0 +1,561 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T01:09:49.249Z",
+    "duration_ms": 283897
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-swap-pricing",
+        "source": "Trader calling sellBase/sellQuote on MagicLP",
+        "path": [
+          "User sends tokens to MagicLP contract",
+          "sellBase/sellQuote reads balance delta as input",
+          "querySellBase/querySellQuote called with tx.origin",
+          "PMMPricing computes output amount",
+          "FeeRateModel.getFeeRate called with tx.origin and _LP_FEE_RATE_",
+          "Output token transferred to recipient",
+          "MT fee transferred to maintainer",
+          "Reserves and targets updated"
+        ],
+        "transformations": [
+          "Input tokens -> PMM pricing -> gross output",
+          "Gross output - lpFee - mtFee = net output"
+        ],
+        "sinks": [
+          "Recipient address",
+          "Maintainer address",
+          "Internal reserves state"
+        ],
+        "trust_changes": "tx.origin is used instead of msg.sender for fee calculation, bypassing contract-level fee customization",
+        "validation_points": [
+          "NonReentrant modifier",
+          "Balance delta check for input"
+        ],
+        "exposure_risks": [
+          "tx.origin usage allows fee manipulation via phishing"
+        ],
+        "manipulation_risks": [
+          "tx.origin in fee calculation allows attacker to proxy calls through victim EOA for different fee rates",
+          "Front-running the swap by sandwiching with large trades"
+        ]
+      },
+      {
+        "flow_id": "DF-002-liquidation",
+        "source": "Liquidator calling CauldronV4.liquidate",
+        "path": [
+          "updateExchangeRate() fetches oracle price",
+          "accrue() updates interest",
+          "For each user: check _isSolvent with fresh rate",
+          "Calculate borrowAmount from totalBorrow.toElastic(borrowPart)",
+          "Calculate collateralShare from borrowAmount * LIQUIDATION_MULTIPLIER * exchangeRate",
+          "Update user balances",
+          "Accumulate totals",
+          "Compute distribution fee",
+          "Add distribution to allBorrowAmount",
+          "Compute allBorrowShare = toShare(allBorrowAmount) [FIRST TIME]",
+          "Transfer collateral to liquidator/swapper",
+          "Swapper swaps collateral for MIM",
+          "Recompute allBorrowShare = toShare(allBorrowAmount) [SECOND TIME]",
+          "Transfer MIM from liquidator to cauldron"
+        ],
+        "transformations": [
+          "borrowPart -> borrowAmount via Rebase",
+          "borrowAmount -> collateralShare via exchange rate and liquidation multiplier",
+          "borrowAmount -> allBorrowAmount with distribution fee",
+          "allBorrowAmount -> allBorrowShare via BentoBox conversion"
+        ],
+        "sinks": [
+          "User borrow/collateral balances",
+          "totalBorrow",
+          "totalCollateralShare",
+          "feesEarned"
+        ],
+        "trust_changes": "Swapper is freely chosen by caller; swapper can interact with BentoBox during callback",
+        "validation_points": [
+          "Solvency check per user",
+          "allBorrowAmount != 0 check"
+        ],
+        "exposure_risks": [
+          "Swapper callback can observe and manipulate BentoBox state"
+        ],
+        "manipulation_risks": [
+          "allBorrowShare is computed twice - swapper can manipulate BentoBox totals between the two computations, causing the second toShare to differ from first",
+          "Liquidator can choose a malicious swapper that manipulates BentoBox state"
+        ]
+      },
+      {
+        "flow_id": "DF-003-lp-oracle",
+        "source": "MagicLpAggregator.latestAnswer called by Cauldron oracle",
+        "path": [
+          "Fetch base and quote oracle answers",
+          "Normalize oracle answers to 18 decimals",
+          "Take min of normalized answers",
+          "Call _getReserves() for base and quote reserves",
+          "Normalize reserves to 18 decimals",
+          "Compute minAnswer * (baseReserve + quoteReserve) / totalSupply"
+        ],
+        "transformations": [
+          "Oracle answers normalized to WAD",
+          "Reserves normalized to WAD",
+          "LP price = min(basePrice, quotePrice) * totalReserveValue / totalSupply"
+        ],
+        "sinks": [
+          "Return value used by Cauldron for solvency checks"
+        ],
+        "trust_changes": "Oracle answer directly affects collateral valuation and liquidation threshold",
+        "validation_points": [
+          "No validation on oracle staleness",
+          "No validation on reserve values"
+        ],
+        "exposure_risks": [
+          "CRITICAL: _getReserves() does not return values - returns (0, 0) by default, making latestAnswer() return 0"
+        ],
+        "manipulation_risks": [
+          "_getReserves() bug causes oracle to always return 0, making all LP collateral worthless in any Cauldron using this oracle",
+          "Even if _getReserves was fixed: reserves can be manipulated via flash loans to inflate/deflate LP price"
+        ]
+      },
+      {
+        "flow_id": "DF-004-staking-rewards",
+        "source": "Operator calling notifyRewardAmount on LockingMultiRewards",
+        "path": [
+          "_updateRewards updates global rewardPerToken for all tokens",
+          "Tokens transferred from operator to contract",
+          "Remaining rewards from current period added to new amount",
+          "rewardRate = total amount / remaining time to next epoch",
+          "periodFinish set to nextEpoch",
+          "Users accrue rewards proportional to balanceOf(user) / totalSupply"
+        ],
+        "transformations": [
+          "amount + leftover = total reward for period",
+          "total / remainingTime = rewardRate per second",
+          "rewardRate * timeElapsed * 1e18 / totalSupply = rewardPerToken delta",
+          "user balance * rewardPerToken delta / 1e18 = user earned"
+        ],
+        "sinks": [
+          "_rewardData storage",
+          "rewards mapping per user",
+          "Token transfers on claim"
+        ],
+        "trust_changes": "Operator controls reward rate; reward distribution delays 1 epoch for locked rewards",
+        "validation_points": [
+          "amount >= remainingRewardTime",
+          "token must exist",
+          "minRemainingTime check"
+        ],
+        "exposure_risks": [
+          "Reward tokens are locked for 1 epoch before claimable"
+        ],
+        "manipulation_risks": [
+          "Large stake right before reward notification to capture disproportionate share",
+          "Flash stake attack mitigated by epoch delay on reward claims"
+        ]
+      },
+      {
+        "flow_id": "DF-005-bootstrap-claim",
+        "source": "User calling BlastOnboardingBoot.claim",
+        "path": [
+          "Verify ready state and not already claimed",
+          "Compute _claimable shares from (userLocked * totalPoolShares) / totalLocked",
+          "Set claimed[user] = true",
+          "Call staking.stakeFor to stake LP shares for user"
+        ],
+        "transformations": [
+          "userLocked (MIM + USDB) -> proportional pool shares",
+          "Pool shares staked in LockingMultiRewards"
+        ],
+        "sinks": [
+          "claimed mapping",
+          "LockingMultiRewards staking balances"
+        ],
+        "trust_changes": "User deposits converted to LP stakes; no ability to withdraw original tokens after bootstrap",
+        "validation_points": [
+          "ready flag check",
+          "already claimed check",
+          "shares > 0 check"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "MIM and USDB locked amounts are summed directly despite potentially different values (I = 0.998), giving slight advantage to USDB depositors",
+          "totalPoolShares may not equal totalLocked in value terms due to pool pricing"
+        ]
+      },
+      {
+        "flow_id": "DF-006-bentobox-deposit",
+        "source": "User depositing tokens into DegenBox",
+        "path": [
+          "_onBeforeDeposit hook (checks enabledTokens in BlastBox)",
+          "Convert amount to shares or shares to amount via Rebase",
+          "Check minimum share balance",
+          "Update balanceOf, totals",
+          "Transfer tokens from user or wrap ETH"
+        ],
+        "transformations": [
+          "amount -> share via total.toBase(amount, false)",
+          "share -> amount via total.toElastic(share, true)"
+        ],
+        "sinks": [
+          "balanceOf mapping",
+          "totals Rebase",
+          "Token balance of DegenBox"
+        ],
+        "trust_changes": "Deposit trust model: from == msg.sender, from == address(this) for skim, or approved masterContract",
+        "validation_points": [
+          "allowed modifier",
+          "to != address(0)",
+          "MINIMUM_SHARE_BALANCE",
+          "totalSupply > 0 check"
+        ],
+        "exposure_risks": [
+          "Skim mode allows anyone to use contract's excess balance"
+        ],
+        "manipulation_risks": [
+          "First depositor can manipulate share ratio by sending tokens directly then depositing",
+          "Strategy balance included in _tokenBalanceOf can be manipulated by strategy"
+        ]
+      },
+      {
+        "flow_id": "DF-007-cook-pipeline",
+        "source": "User calling CauldronV4.cook with array of actions",
+        "path": [
+          "Iterate through actions array",
+          "Auto-accrue for actions < 10",
+          "Execute each action sequentially",
+          "value1/value2 carry return values between actions",
+          "ACTION_CALL allows arbitrary external calls (except blacklisted)",
+          "Solvency check at end if needed"
+        ],
+        "transformations": [
+          "value1/value2 pipeline for composing operations",
+          "_num function resolves int256 to uint256 using value1/value2 sentinel values"
+        ],
+        "sinks": [
+          "User collateral/borrow state",
+          "BentoBox balances",
+          "External contract calls"
+        ],
+        "trust_changes": "ACTION_CALL delegates to arbitrary non-blacklisted contracts; return data is trusted",
+        "validation_points": [
+          "Blacklist check for ACTION_CALL",
+          "Solvency check at end",
+          "Auto-accrue for actions < 10"
+        ],
+        "exposure_risks": [
+          "ACTION_BENTO_SETAPPROVAL can approve arbitrary masterContracts",
+          "ACTION_CALL can call arbitrary contracts with arbitrary data"
+        ],
+        "manipulation_risks": [
+          "Composable actions can be chained to create complex attack sequences",
+          "Return value from ACTION_CALL is trusted without validation"
+        ]
+      },
+      {
+        "flow_id": "DF-008-flash-loan-magiclp",
+        "source": "Caller invoking MagicLP.flashLoan",
+        "path": [
+          "Transfer base and quote tokens to assetTo",
+          "Callback ICallee.FlashLoanCall",
+          "Check post-callback balances",
+          "Determine if sell-base or sell-quote",
+          "Compute swap output and verify against borrowed amount",
+          "Transfer mtFee",
+          "Update state (RState, targets)",
+          "_sync() updates reserves"
+        ],
+        "transformations": [
+          "Borrowed amounts -> callback -> returned amounts",
+          "Balance delta determines swap direction",
+          "PMM pricing validates the returned amount covers borrowed + fees"
+        ],
+        "sinks": [
+          "assetTo receives borrowed tokens",
+          "Maintainer receives mtFee",
+          "Updated reserves"
+        ],
+        "trust_changes": "assetTo receives callback and can execute arbitrary logic",
+        "validation_points": [
+          "Balance check after callback",
+          "Swap output validation"
+        ],
+        "exposure_risks": [
+          "Callback reentrancy mitigated by nonReentrant"
+        ],
+        "manipulation_risks": [
+          "Flash loan can be used to manipulate pool state for oracle attacks",
+          "Callback could interact with other contracts that depend on pool state"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Users must remain solvent (collateral value >= borrow value * collateralization rate) after borrowing or removing collateral",
+        "Interest accrues continuously based on INTEREST_PER_SECOND on totalBorrow.elastic",
+        "LP shares are proportional to the minimum ratio of base/quote deposits relative to reserves",
+        "PMM pricing follows proactive market maker algorithm with constant I parameter",
+        "Locked staking provides boosted rewards proportional to lockingBoostMultiplerInBips",
+        "Reward claims are delayed by 1 epoch (locked until next epoch boundary)",
+        "BentoBox maintains share/amount ratio with minimum share balance of 1000",
+        "MagicLP dead shares (1001) are minted to address(0) on first deposit to prevent share ratio manipulation"
+      ],
+      "economic_incentives": [
+        "Liquidators receive collateral worth borrowAmount * LIQUIDATION_MULTIPLIER, incentivizing liquidation",
+        "10% of liquidation fee surplus goes to protocol (feesEarned), 90% to liquidator",
+        "LP providers earn trading fees proportional to their share",
+        "Maintainer earns separate mtFee on each swap",
+        "Locking tokens for 13 weeks provides lockingBoostMultiplerInBips / BIPS multiplier on staking rewards",
+        "Borrow opening fee charged as percentage of borrowed amount, accrues to protocol"
+      ],
+      "governance_mechanisms": [
+        "MasterContract owner can change interest rates, borrow limits, liquidation parameters",
+        "Implementation owner controls MagicLP parameters via setParameters",
+        "Factory owner can set implementation and maintainer fee model",
+        "BlastOnboarding owner controls state transitions (Idle->Opened->Closed)",
+        "Operators can notify rewards and process expired locks in LockingMultiRewards"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "MagicLpAggregator._getReserves() returns (0,0) instead of actual reserves",
+          "expected_behavior": "Should return pair's base and quote reserves for LP price calculation",
+          "actual_behavior": "Function declares local variables but has no return statement; unnamed return values default to (0,0)",
+          "risk_level": "high",
+          "exploitation_potential": "Any Cauldron using MagicLpAggregator as oracle will see LP collateral as worthless (price = 0), causing immediate insolvency for all borrowers and blocking new borrows"
+        },
+        {
+          "scenario": "FeeCollectable.setFeeParameters validates wrong variable",
+          "expected_behavior": "Should validate that the NEW _feeBips doesn't exceed BIPS",
+          "actual_behavior": "Validates the OLD feeBips state variable instead of the _feeBips parameter",
+          "risk_level": "high",
+          "exploitation_potential": "Fee operator can set feeBips to any value above BIPS (100%), extracting more than the full amount on fee calculations. First call always passes since initial feeBips is 0."
+        },
+        {
+          "scenario": "MagicLP swap functions use tx.origin for fee rate lookup",
+          "expected_behavior": "Fee rate should be based on the direct caller (msg.sender)",
+          "actual_behavior": "Uses tx.origin which is the EOA initiating the transaction",
+          "risk_level": "medium",
+          "exploitation_potential": "Phishing attack: trick user into calling malicious contract that triggers swap; fee rate applied is for victim's EOA address rather than the contract. May bypass intended fee structures for contracts."
+        },
+        {
+          "scenario": "CauldronV4.liquidate computes allBorrowShare twice with swapper call in between",
+          "expected_behavior": "allBorrowShare should be consistent",
+          "actual_behavior": "First computation used as input to swapper, second computation used for actual transfer; swapper can change BentoBox totals between calls",
+          "risk_level": "medium",
+          "exploitation_potential": "Malicious swapper could manipulate BentoBox MIM totals between the two toShare calls, causing liquidator to pay different amount than expected"
+        },
+        {
+          "scenario": "BlastOnboardingBoot._claimable sums MIM and USDB locked amounts directly",
+          "expected_behavior": "Should account for different token values (I = 0.998 means 1 MIM ≈ 0.998 USDB)",
+          "actual_behavior": "Sums raw amounts: userLocked = balances[user][MIM].locked + balances[user][USDB].locked",
+          "risk_level": "medium",
+          "exploitation_potential": "Users depositing USDB get slightly fewer pool shares than their proportional value contribution since USDB is worth more than MIM. Conversely MIM depositors get slightly more shares than deserved."
+        },
+        {
+          "scenario": "MagicLP.buyShares when totalSupply > 0 but baseReserve == 0 or quoteReserve == 0",
+          "expected_behavior": "Should handle gracefully or revert with clear error",
+          "actual_behavior": "Falls through both if/else-if branches; shares remains 0; _mint(to, 0) reverts with ErrMintAmountNotEnough",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploitation but poor error handling could confuse integrators"
+        },
+        {
+          "scenario": "LockingMultiRewards.processExpiredLocks corrupts lastLockIndex via swap-and-pop",
+          "expected_behavior": "lastLockIndex should always point to the most recently created lock",
+          "actual_behavior": "After swap-and-pop, lastLockIndex may point to an older lock that was swapped into the position, causing _createLock to create new entries instead of appending",
+          "risk_level": "medium",
+          "exploitation_potential": "Users could end up with more lock entries than expected, potentially hitting maxLocks limit prematurely and being unable to lock more tokens"
+        },
+        {
+          "scenario": "CauldronV4.withdrawFees when feeTo is address(0)",
+          "expected_behavior": "Should revert or handle gracefully",
+          "actual_behavior": "Reads masterContract.feeTo() which could return address(0); BentoBox transfer to address(0) would revert",
+          "risk_level": "low",
+          "exploitation_potential": "If feeTo not set on masterContract, withdrawFees reverts, locking fees"
+        },
+        {
+          "scenario": "Router._validateDecimals when baseDecimals > quoteDecimals",
+          "expected_behavior": "Should handle or give clear error",
+          "actual_behavior": "uint8 subtraction (quoteDecimals - baseDecimals) underflows and reverts in Solidity 0.8+",
+          "risk_level": "low",
+          "exploitation_potential": "Cannot create pools through Router where base token has more decimals than quote token, even if difference is small"
+        },
+        {
+          "scenario": "CauldronV4 borrow limit check uses elastic for total but parts for per-address",
+          "expected_behavior": "Consistent limit enforcement",
+          "actual_behavior": "totalBorrow.elastic <= cap.total (includes accrued interest) while userBorrowPart <= cap.borrowPartPerAddress (does not include interest)",
+          "risk_level": "low",
+          "exploitation_potential": "As interest accrues, total limit becomes effectively lower while per-address limits remain constant in part terms. This could prevent new borrows when total interest pushes elastic above cap."
+        },
+        {
+          "scenario": "MagicLP.setParameters silently truncates _LP_FEE_RATE_, _K_, _I_ via unsafe casts",
+          "expected_behavior": "Values should be stored at full precision or validated against cast limits",
+          "actual_behavior": "Cast to uint64/uint64/uint128 respectively before storing in uint256 state variables",
+          "risk_level": "low",
+          "exploitation_potential": "For valid input ranges (after validation checks), values fit within cast types. However, the implicit narrowing is fragile and could cause issues if MAX constants are increased."
+        },
+        {
+          "scenario": "BlastOnboarding proxy storage collision with BlastOnboardingBoot",
+          "expected_behavior": "Proxy and implementation should have aligned storage layouts",
+          "actual_behavior": "BlastOnboarding inherits BlastOnboardingData + Proxy; Boot inherits BlastOnboardingBootDataV1 (extends BlastOnboardingData) with new storage vars (pool, router, etc.)",
+          "risk_level": "medium",
+          "exploitation_potential": "If Proxy adds storage variables, they could collide with BlastOnboardingBootDataV1's new variables (pool, router, factory, etc.). OpenZeppelin's Proxy itself has no storage, but ERC1967 patterns should be verified."
+        }
+      ],
+      "assumption_violations": [
+        "MagicLpAggregator assumes _getReserves returns valid data but it returns (0,0) due to missing return statement",
+        "CauldronV4 assumes BentoBox totals don't change during liquidation swap callback",
+        "BlastOnboardingBoot assumes MIM and USDB have equal value per unit for share distribution",
+        "MagicLP assumes tx.origin is an appropriate identifier for fee rate purposes",
+        "LockingMultiRewards assumes lastLockIndex always correctly points to the chronologically latest lock after processExpiredLocks",
+        "DegenBox assumes rebasing tokens are not used (explicitly documented) but BlastBox configures CLAIMABLE mode which is compatible",
+        "FeeCollectable assumes the validation in setFeeParameters checks the new value, but it checks the old value"
+      ],
+      "game_theory_risks": [
+        "Liquidators can choose swappers that manipulate BentoBox state to their advantage during liquidation callback",
+        "Staking rewards can be gamed by large stakers timing their locks around reward notification epochs",
+        "PMM pricing with constant I can be exploited by arbitrageurs when market price deviates from I",
+        "Flash loan in MagicLP allows atomic manipulation of reserves for oracle manipulation if oracles read pool state",
+        "Bootstrap share allocation favors MIM depositors over USDB depositors due to direct amount summation despite I < 1"
+      ],
+      "integration_risks": [
+        "BlastBox configuring tokens as CLAIMABLE assumes DegenBox accounting handles non-rebasing yield correctly; if tokens auto-rebase, share/amount ratio breaks",
+        "MagicLpAggregator oracle returning 0 would cause cascading failures in any Cauldron using LP as collateral",
+        "Blast precompile interactions could fail silently or change behavior on upgrades",
+        "FeeRateModel is an external dependency that could return arbitrary fee rates",
+        "Strategy contracts in DegenBox could report incorrect balances affecting all share calculations"
+      ],
+      "calculation_errors": [
+        "MagicLpAggregator._getReserves() returns (0,0) making latestAnswer() always 0 - division by pair.totalSupply() of (0 + 0) = 0",
+        "FeeCollectable.setFeeParameters checks 'feeBips > BIPS' instead of '_feeBips > BIPS', allowing any fee percentage on first set",
+        "BlastOnboardingBoot._claimable: (userMIM + userUSDB) * totalPoolShares / (totalMIM + totalUSDB) incorrectly treats tokens as same value"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "MIM",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "MagicInternetMoney stablecoin; used as borrow asset in Cauldrons"
+        },
+        {
+          "address_or_symbol": "USDB",
+          "behaviors": [
+            "rebasing:true",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Blast native USDB with rebasing yield; configured as CLAIMABLE in Blast contracts. Must NOT be set to AUTOMATIC in DegenBox/BlastBox"
+        },
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "rebasing:true",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Blast native WETH with rebasing yield; configured as CLAIMABLE. AUTOMATIC mode would break BentoBox accounting"
+        },
+        {
+          "address_or_symbol": "MagicLP",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "notes": "LP token for MIMSwap pools; decimals match base token decimals; 1001 dead shares minted to address(0) on initialization"
+        },
+        {
+          "address_or_symbol": "stakingToken (LockingMultiRewards)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Assumed to be standard ERC20; contract tracks balances via stakingTokenBalance rather than balanceOf"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation_bentobox",
+          "state_vars": [
+            "totals[token].base",
+            "sum(balanceOf[token][*])"
+          ],
+          "description": "Total shares (base) must equal sum of all user balances for each token"
+        },
+        {
+          "name": "cauldron_collateral_conservation",
+          "state_vars": [
+            "totalCollateralShare",
+            "sum(userCollateralShare[*])"
+          ],
+          "description": "Total collateral share must equal sum of all user collateral shares"
+        },
+        {
+          "name": "cauldron_borrow_conservation",
+          "state_vars": [
+            "totalBorrow.base",
+            "sum(userBorrowPart[*])"
+          ],
+          "description": "Total borrow parts must equal sum of all user borrow parts"
+        },
+        {
+          "name": "staking_supply_conservation",
+          "state_vars": [
+            "unlockedSupply",
+            "lockedSupply",
+            "sum(_balances[*].unlocked)",
+            "sum(_balances[*].locked)"
+          ],
+          "description": "unlockedSupply == sum of all unlocked balances; lockedSupply == sum of all locked balances"
+        },
+        {
+          "name": "staking_token_balance",
+          "state_vars": [
+            "stakingTokenBalance",
+            "stakingToken.balanceOf(address(this))"
+          ],
+          "description": "stakingTokenBalance <= actual token balance; difference is recoverable excess"
+        },
+        {
+          "name": "magiclp_reserve_consistency",
+          "state_vars": [
+            "_BASE_RESERVE_",
+            "_QUOTE_RESERVE_",
+            "_BASE_TOKEN_.balanceOf(this)",
+            "_QUOTE_TOKEN_.balanceOf(this)"
+          ],
+          "description": "After _sync(), reserves should equal actual balances. Between operations, actual balance >= reserve (excess can be used as input)"
+        },
+        {
+          "name": "onboarding_balance_consistency",
+          "state_vars": [
+            "totals[token].total",
+            "totals[token].locked + totals[token].unlocked"
+          ],
+          "description": "total should equal locked + unlocked for each token"
+        },
+        {
+          "name": "solvency_invariant",
+          "state_vars": [
+            "userCollateralShare",
+            "userBorrowPart",
+            "exchangeRate",
+            "COLLATERIZATION_RATE"
+          ],
+          "description": "For each user after any state change: either borrowPart == 0 or collateral value * CR >= borrow value * exchangeRate"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,241 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T00:13:02.685Z",
+    "duration_ms": 429677
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "GaugeController.sol",
+        "description": "remove_gauge zeroes gauge_types_[_gauge] BEFORE calling _remove_gauge_weight, which then reads gauge_types_[_gauge] - 1 = -1 as the type. This causes _remove_gauge_weight to operate on type -1 (nonexistent type), whose time_sum is 0, causing _get_sum to return 0. The subsequent 'new_sum = 0 - old_weight_bias' underflows and reverts for any gauge with positive weight, making remove_gauge non-functional. Even if it didn't revert, slope changes would be cleaned from the wrong type, permanently corrupting gauge controller state.",
+        "attack_scenario": "Governance tries to remove a gauge that has active votes. The transaction reverts because gauge_types_ is zeroed before _remove_gauge_weight reads it, causing an underflow in the sum calculation. The gauge cannot be removed, and governance loses the ability to manage the gauge system. If the revert is avoided (zero-weight gauge), slope changes are cleaned from type -1 instead of the correct type, silently corrupting state.",
+        "invariant_logic": "In remove_gauge: gauge_types_[_gauge] must be read by _remove_gauge_weight BEFORE it is set to 0. Equivalently: _remove_gauge_weight(_gauge) must execute while gauge_types_[_gauge] still holds the correct type + 1 value.",
+        "solidity_property": "function invariant_remove_gauge_type_consistency(address _gauge) public view { if (gauge_types_[_gauge] == 0) { /* If gauge type is 0, _remove_gauge_weight should not be called or should have the original type passed as parameter */ } }",
+        "inventory_refs": [
+          {
+            "file": "GaugeController.sol",
+            "function": "remove_gauge"
+          },
+          {
+            "file": "GaugeController.sol",
+            "function": "_remove_gauge_weight"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "GaugeController.sol",
+        "description": "Users who voted for a gauge that is subsequently removed cannot reclaim their voting power. vote_for_gauge_weights allows voting 0 on non-gauges (removed gauges) via the first require, but then gauge_types_[addr] - 1 = -1 fails the 'gauge_type >= 0' check, permanently trapping the user's allocated vote_user_power. The user can never reallocate those basis points to other gauges.",
+        "attack_scenario": "User allocates 5000 bps to gauge X. Governance removes gauge X. User tries to vote 0 on gauge X to reclaim their 5000 bps. The transaction reverts at 'require(gauge_type >= 0)' because gauge_types_[X] is 0, making gauge_type = -1. The user's vote_user_power permanently includes the 5000 bps for the removed gauge, reducing their effective voting capacity to 5000 bps forever.",
+        "invariant_logic": "For all users u and gauges g: if vote_user_slopes[u][g].power > 0 then user u MUST be able to set vote_user_slopes[u][g].power to 0 and recover vote_user_power[u] -= old_power.",
+        "solidity_property": "function invariant_vote_power_reclaimable(address user, address gauge) public view { if (vote_user_slopes[user][gauge].power > 0) { /* User must be able to call vote_for_gauge_weights(gauge, 0) without revert */ assert(true); /* Cannot check executability in view, but the invariant is that the code path must succeed */ } }",
+        "inventory_refs": [
+          {
+            "file": "GaugeController.sol",
+            "function": "vote_for_gauge_weights"
+          },
+          {
+            "file": "GaugeController.sol",
+            "function": "remove_gauge"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "The LockAction enum defines DELEGATE and UNDELEGATE actions, the LockedBalance struct contains delegatee and delegated fields, increaseAmount contains an else-branch for delegated locks, and withdraw requires delegatee == msg.sender. However, no delegate() or undelegate() functions exist. The entire delegation subsystem is dead code, and the protocol cannot support delegation despite being architecturally designed for it.",
+        "attack_scenario": "Users expect to delegate their voting power to other addresses (a core governance feature implied by the code architecture). Since no delegate/undelegate functions are exposed, this functionality silently doesn't exist. Users cannot participate in delegation strategies. The delegatee field is permanently set to self in createLock and can never be changed. The dead code paths in increaseAmount for delegated locks can never execute.",
+        "invariant_logic": "For every LockAction variant in the enum, there MUST exist at least one external/public function that emits events using that action. Currently DELEGATE and UNDELEGATE actions have no corresponding functions.",
+        "solidity_property": "/* Cannot express as on-chain assertion; this is a missing-code invariant: functions delegate(address) and undelegate() must exist and correctly update locked[].delegatee and locked[].delegated */",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "createLock"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "increaseAmount"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "LendingLedger.sol",
+        "description": "In update_market, the epochTime used for gauge_relative_weight_write is computed as the current block's estimated timestamp for ALL historical block iterations, not the timestamp of each historical block. This means all accumulated reward epochs receive the CURRENT gauge weight rather than the weight that was active during each epoch. An attacker can manipulate current gauge weights and then trigger update_market to retroactively apply favorable weights to all un-updated historical epochs.",
+        "attack_scenario": "Market M hasn't had update_market called for 10 epochs. Attacker votes heavily for market M in the gauge controller, giving it 90% relative weight (it previously had 10%). Attacker then calls update_market(M). All 10 historical epochs are calculated with the current 90% weight instead of the historical 10% weight. The attacker (who is a depositor in M) claims 9x more rewards than they should have received for those epochs.",
+        "invariant_logic": "For each block range [i, i+blockDelta) in the update_market loop, the epochTime passed to gauge_relative_weight_write must correspond to the estimated time of block i, not block.number. Specifically: epochTime_for_block_i = referenceBlockTime + ((i - referenceBlockNumber) * averageBlockTime) / 1000",
+        "solidity_property": "/* In update_market: epochTime should use i instead of block.number: uint256 epochTime = referenceBlockTime + ((i - referenceBlockNumber) * averageBlockTime) / 1000; */",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LendingLedger.sol",
+        "description": "MarketInfo.accCantoPerShare and secRewardsPerShare are stored as uint128. The per-block accumulation formula divides by marketSupply. With very small marketSupply (e.g., 1 wei), the accumulation per block can be enormous. For accCantoPerShare: with cantoPerBlock = 1e18 and relativeWeight = 1e18 and marketSupply = 1, a single block adds 1e36, and just ~340 blocks causes uint128 overflow (max ~3.4e38). The uint128() cast in Solidity 0.8+ reverts on overflow, permanently DoSing the market.",
+        "attack_scenario": "Attacker is the first depositor in a newly whitelisted market and deposits only 1 wei of gauge tokens. Governance sets cantoPerBlock for the epoch. After ~340 blocks (~30 minutes), anyone calling update_market, sync_ledger, or claim for this market will revert due to uint128 overflow in accCantoPerShare accumulation. The market is permanently bricked; no user can deposit, withdraw (sync_ledger reverts), or claim.",
+        "invariant_logic": "For all markets m: blockDelta * cantoPerBlock[epoch] * gaugeRelativeWeight / lendingMarketTotalBalance[m] must fit in uint128 for each loop iteration. Equivalently: lendingMarketTotalBalance[m] must be large enough relative to cantoPerBlock to prevent overflow.",
+        "solidity_property": "function invariant_no_accPerShare_overflow(address _market) public view { /* assert that accCantoPerShare accumulation cannot overflow uint128 within reasonable block ranges given current marketSupply and cantoPerBlock */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "The LockAction enum defines a QUIT action (early lock exit, typically with penalty in Curve-derived implementations), but no quitLock() function exists. Combined with the fixed 5-year LOCKTIME that resets on every action, users have no mechanism for early exit from their locks except the governance-controlled unlockOverride (which is all-or-nothing for all users). This can permanently trap user funds for up to 5 years.",
+        "attack_scenario": "A user locks a large amount of CANTO for 5 years. Their financial circumstances change and they urgently need liquidity. There is no early exit mechanism. The user must wait the full 5 years. If they called increaseAmount at any point, their lock was reset to 5 years from that action. The only escape is governance toggling unlockOverride, which affects all users and may have undesirable systemic effects.",
+        "invariant_logic": "For every LockAction variant in the enum, there MUST exist at least one executable code path. QUIT has no corresponding function. Users should have an emergency exit path (even with penalty) independent of governance.",
+        "solidity_property": "/* Missing function: quitLock() should allow early withdrawal with penalty, using LockAction.QUIT */",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "GaugeController.sol",
+        "description": "vote_user_power[user] tracks total basis points allocated across all gauges (max 10000). This value must always be recoverable to 0 so users can reallocate. Due to INV-ACCESS-001, if a gauge is removed, the power allocated to it becomes permanently unrecoverable, making vote_user_power monotonically increasing in a way that harms users rather than protects them. The user's effective voting capacity permanently decreases.",
+        "attack_scenario": "User allocates 2000 bps to gauge A, 3000 bps to gauge B. Governance removes gauge A. User's vote_user_power = 5000. User cannot vote 0 on gauge A (reverts). User can only allocate 5000 more bps total. If gauge B is also removed, user can only allocate 5000 bps. After enough gauge removals, user's entire 10000 bps is locked and they cannot vote at all.",
+        "invariant_logic": "For all users u: sum(vote_user_slopes[u][g].power for all active AND removed gauges g) == vote_user_power[u] AND user must be able to set any individual vote_user_slopes[u][g].power to 0",
+        "solidity_property": "function invariant_power_reclaimable(address user) public view { assert(vote_user_power[user] <= 10000); /* Additionally: for each gauge g where vote_user_slopes[user][g].power > 0, user must be able to call vote_for_gauge_weights(g, 0) */ }",
+        "inventory_refs": [
+          {
+            "file": "GaugeController.sol",
+            "function": "vote_for_gauge_weights"
+          },
+          {
+            "file": "GaugeController.sol",
+            "function": "remove_gauge"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "VotingEscrow.sol",
+        "description": "The _checkpoint function iterates at most 255 weeks to fill the global point history. However, LOCKTIME is 1825 days ≈ 260 weeks. If no checkpoint is called for more than 255 weeks (~4.9 years), the global point history cannot fully catch up, resulting in incorrect totalSupply and voting power calculations. Since locks last 5 years, this gap of 5 weeks could leave slope changes unprocessed.",
+        "attack_scenario": "No transactions interact with VotingEscrow for 260 weeks (unlikely but possible on a low-activity chain). A checkpoint is then called. The loop processes only 255 weeks of slope changes, missing the final 5 weeks. Global bias and slope are incorrect, affecting totalSupply calculations and any governance decisions based on voting power. Historical votes during the missed window are not properly accounted for.",
+        "invariant_logic": "The checkpoint loop iteration count (255) must be >= LOCKTIME / WEEK (260). Currently 255 < 260, leaving a 5-week gap where slope changes may be missed.",
+        "solidity_property": "function invariant_checkpoint_covers_locktime() public pure { assert(255 >= (1825 days / 7 days)); /* This assertion FAILS: 255 < 260 */ }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_checkpoint"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_supplyAt"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiquidityGauge.sol",
+        "description": "LiquidityGauge inherits ERC20Burnable, exposing public burn() and burnFrom() functions. Calling burn() destroys gauge tokens and triggers _afterTokenTransfer which calls sync_ledger(user, -amount), reducing the user's ledger balance. However, the underlying tokens remain locked in the gauge contract forever, as withdrawUnderlying is the only function that returns underlying tokens. This creates an irreversible loss path that the protocol architecture exposes unnecessarily.",
+        "attack_scenario": "User holds 1000 gauge tokens with 1000 underlying deposited. User accidentally calls burn(1000) instead of withdrawUnderlying(1000). Their gauge tokens are destroyed, their ledger balance is reduced, but the 1000 underlying tokens are permanently stuck in the gauge contract. No mechanism exists to recover them. The user loses their principal and their reward tracking.",
+        "invariant_logic": "For all users u: balanceOf(u) gauge tokens should only decrease through withdrawUnderlying (which returns underlying) or transfer. Direct burn should not be possible, OR burn should return underlying tokens.",
+        "solidity_property": "function invariant_underlying_recoverable() public view { /* ERC20Burnable.burn should not be accessible, or should be overridden to return underlying tokens */ assert(IERC20(underlyingToken).balanceOf(address(this)) >= totalSupply()); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidityGauge.sol",
+            "function": "withdrawUnderlying"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "VotingEscrow.sol",
+        "description": "A user can only withdraw their locked CANTO if locked_.delegatee == msg.sender (self-delegated). Since no delegate/undelegate functions exist, this condition is always met. However, the code architecture implies delegation should exist, and if delegation were added, a user who delegated their lock would be unable to withdraw even after lock expiry, creating a fund-trapping dependency on the delegatee.",
+        "invariant_logic": "For all users u: if locked[u].end <= block.timestamp AND locked[u].amount > 0, then u MUST be able to withdraw, regardless of delegation state. The current code blocks withdrawal when delegatee != msg.sender.",
+        "solidity_property": "function invariant_expired_lock_withdrawable(address user) public view { if (locked[user].end <= block.timestamp && locked[user].amount > 0) { /* User must be able to call withdraw() successfully. Currently blocked if delegatee != user. */ } }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-003",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LendingLedger.sol",
+        "description": "LendingLedger receives CANTO via the receive() fallback and distributes it through claims, but there is no accounting to ensure the contract's CANTO balance is sufficient to cover all committed rewards. Governance sets cantoPerBlock independently of actual CANTO deposits. If the contract is underfunded, claim() calls will revert on the CANTO transfer, creating a first-come-first-served race for available funds.",
+        "invariant_logic": "address(this).balance >= sum(pending_rewards(user, market) for all users and all markets). Currently no mechanism enforces or checks this.",
+        "solidity_property": "function invariant_sufficient_balance() public view { /* Total pending rewards across all users and markets must not exceed address(this).balance. No on-chain tracking exists for total pending rewards. */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "claim"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "setRewards"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "In withdraw(), the stored locked balance has newLocked.delegated -= amountToSend, then locked[msg.sender] = newLocked is saved. Afterward, newLocked.delegated is set to 0 for the checkpoint call. The stored state and the checkpoint state diverge: stored locked has delegated = (original_delegated - amount) while checkpoint sees delegated = 0. If delegation were active (others delegated to this user), the stored residual delegated value would be non-zero but the checkpoint would record zero voting power, creating an inconsistency between on-chain state and recorded voting history.",
+        "invariant_logic": "For all users u: the LockedBalance passed to _checkpoint as newLocked must be consistent with the value stored in locked[u]. Currently they diverge when delegation is non-zero.",
+        "solidity_property": "function invariant_checkpoint_state_consistency(address user) public view { /* After withdraw: locked[user].delegated should equal the value used in _checkpoint's newLocked.delegated */ }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_checkpoint"
+          }
+        ]
+      }
+    ]
+  }
+}

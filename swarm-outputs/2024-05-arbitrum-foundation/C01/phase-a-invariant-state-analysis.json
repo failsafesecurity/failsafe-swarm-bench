@@ -1,0 +1,431 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T21:50:53.982Z",
+    "duration_ms": 383596
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "time_resource",
+        "target_contract": "SequencerInbox.sol",
+        "description": "forceInclusion only enforces block-based delay check, missing the time-based delay check. The error ForceIncludeTimeTooSoon is defined but never used, and delaySeconds is stored and used in getTimeBounds but not checked during force inclusion.",
+        "attack_scenario": "On chains with variable block production rates or after protocol changes that decouple block numbers from wall-clock time, an attacker could force-include delayed messages earlier than intended by exploiting the missing timestamp check. If block production speeds up temporarily, the block threshold is reached before the intended time threshold, allowing premature force inclusion that could disrupt sequencer operations.",
+        "invariant_logic": "forceInclusion(msg) => msg.l1BlockAndTime[0] + delayBlocks_ < block.number AND msg.l1BlockAndTime[1] + delaySeconds_ < block.timestamp",
+        "solidity_property": "function invariant_forceInclusionTimeCheck() public view { /* After any forceInclusion call, both block.number > l1Block + delayBlocks AND block.timestamp > l1Time + delaySeconds must hold */ }",
+        "inventory_refs": [
+          {
+            "file": "SequencerInbox.sol",
+            "function": "forceInclusion"
+          },
+          {
+            "file": "Error.sol",
+            "function": "ForceIncludeTimeTooSoon"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "SequencerInbox.sol",
+        "description": "totalDelayedMessagesRead must strictly increase across batch submissions and force inclusions. A decrease would allow replaying old delayed messages or skipping messages, corrupting the inbox accumulator chain.",
+        "attack_scenario": "If totalDelayedMessagesRead could decrease, an attacker could replay previously processed delayed messages, causing double-spending or state corruption on L2. The afterDelayedMessagesRead parameter in batch posting must always be >= totalDelayedMessagesRead.",
+        "invariant_logic": "post(totalDelayedMessagesRead) >= pre(totalDelayedMessagesRead) AND afterDelayedMessagesRead >= totalDelayedMessagesRead AND afterDelayedMessagesRead <= bridge.delayedMessageCount()",
+        "solidity_property": "function invariant_delayedMessagesMonotonic(uint256 oldValue, uint256 newValue) public pure { assert(newValue >= oldValue); }",
+        "inventory_refs": [
+          {
+            "file": "SequencerInbox.sol",
+            "function": "addSequencerL2BatchImpl"
+          },
+          {
+            "file": "SequencerInbox.sol",
+            "function": "forceInclusion"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RollupCore.sol",
+        "description": "Assertion status transitions must follow: NoAssertion -> Pending -> Confirmed. No reverse transitions or state skipping is allowed. The only exception is forceConfirmAssertion which bypasses deadline checks but still requires whenPaused.",
+        "attack_scenario": "If an assertion could transition from Confirmed back to Pending, or from NoAssertion directly to Confirmed without going through Pending, an attacker could manipulate the rollup state, confirm malicious assertions, or re-open resolved disputes.",
+        "invariant_logic": "forall a: (status(a) == Confirmed => old(status(a)) == Pending) AND (status(a) == Pending => old(status(a)) == NoAssertion) AND (status(a) != NoAssertion => status(a) never becomes NoAssertion again)",
+        "solidity_property": "function invariant_assertionLifecycle(bytes32 assertionHash) public view { AssertionNode memory a = getAssertion(assertionHash); assert(a.status != AssertionStatus.NoAssertion || a.createdAtBlock == 0); }",
+        "inventory_refs": [
+          {
+            "file": "RollupCore.sol",
+            "function": "createNewAssertion"
+          },
+          {
+            "file": "RollupCore.sol",
+            "function": "confirmAssertionInternal"
+          },
+          {
+            "file": "Assertion.sol",
+            "function": "createAssertion"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "DelayBuffer.sol",
+        "description": "The delay buffer (bufferBlocks) must always remain within [threshold, max] after any update. calcBuffer saturates at threshold on the low end and max on the high end. Violation would allow the force inclusion delay to become either zero (instant force inclusion) or unbounded.",
+        "attack_scenario": "If bufferBlocks could go below threshold, the force inclusion window could become extremely short (or zero via delayBufferableBlocks), allowing anyone to force-include messages almost immediately, disrupting the sequencer's ability to order transactions. If it exceeds max, the buffer provides false security about delay tolerance.",
+        "invariant_logic": "buffer.threshold <= buffer.bufferBlocks <= buffer.max",
+        "solidity_property": "function invariant_bufferBounds(BufferData storage self) internal view { assert(self.bufferBlocks >= self.threshold && self.bufferBlocks <= self.max); }",
+        "inventory_refs": [
+          {
+            "file": "DelayBuffer.sol",
+            "function": "calcBuffer"
+          },
+          {
+            "file": "DelayBuffer.sol",
+            "function": "update"
+          },
+          {
+            "file": "SequencerInbox.sol",
+            "function": "_setBufferConfig"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SequencerInbox.sol",
+        "description": "When the delay buffer is active, new delayed messages can only be read without a delay proof if the buffer is in a synced state (block.number - prevBlockNumber <= threshold). If the buffer is not synced (indicating potential delays), a delay proof must be provided to update the buffer before reading new messages.",
+        "attack_scenario": "If a batch poster can read new delayed messages while the buffer is depleted/not-synced without providing a delay proof, they could bypass buffer depletion tracking. This allows the sequencer to delay messages beyond the expected threshold without the buffer being depleted, keeping the force inclusion window artificially long and preventing timely force inclusion of user messages.",
+        "invariant_logic": "isDelayBufferable AND afterDelayedMessagesRead > totalDelayedMessagesRead AND !buffer.isSynced() => delayProof must be provided",
+        "solidity_property": "function invariant_delayProofRequired(uint256 afterDelayed) public view { if (isDelayBufferable && afterDelayed > totalDelayedMessagesRead && !buffer.isSynced()) { /* delayProof variant must be used */ assert(false); } }",
+        "inventory_refs": [
+          {
+            "file": "SequencerInbox.sol",
+            "function": "isDelayProofRequired"
+          },
+          {
+            "file": "SequencerInbox.sol",
+            "function": "addSequencerL2BatchFromOrigin"
+          },
+          {
+            "file": "SequencerInbox.sol",
+            "function": "addSequencerL2BatchFromBlobs"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SequencerInbox.sol",
+        "description": "forceInclusion on a delay-bufferable inbox triggers buffer.update() with the delayed message's block number, directly setting prevBlockNumber and prevSequencedBlockNumber. Since forceInclusion is callable by anyone, an external actor can reset the buffer's reference points, affecting subsequent buffer depletion calculations for all batch posters.",
+        "attack_scenario": "An attacker strategically times forceInclusion calls to manipulate buffer state: (1) Force-include old messages to deplete the buffer maximally, shortening the force inclusion window for subsequent messages, making it easier to force-include messages before the sequencer can batch them. (2) After buffer depletion via force inclusion, the sync window resets, allowing the sequencer to read additional delayed messages without proofs during the new sync window, bypassing further depletion.",
+        "invariant_logic": "buffer.update(blockNumber) should only reflect actual sequencing delays, not be manipulable by arbitrary callers timing forceInclusion calls",
+        "solidity_property": "function invariant_bufferUpdateConsistency() public view { /* After forceInclusion, buffer.prevBlockNumber == forceIncluded message block AND buffer.prevSequencedBlockNumber == block.number */ }",
+        "inventory_refs": [
+          {
+            "file": "SequencerInbox.sol",
+            "function": "forceInclusion"
+          },
+          {
+            "file": "DelayBuffer.sol",
+            "function": "update"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RollupCore.sol",
+        "description": "latestConfirmed must always point to an assertion with status == Confirmed, and confirmAssertionInternal must only be called on Pending assertions. The confirmed assertion chain must form a valid lineage from genesis.",
+        "attack_scenario": "If latestConfirmed points to a non-existent or non-confirmed assertion, the rollup state machine breaks. Stakers could be unable to withdraw, new assertions could reference invalid states, and outbox send roots could be set to attacker-controlled values.",
+        "invariant_logic": "getAssertion(latestConfirmed()).status == AssertionStatus.Confirmed AND (forall confirmAssertionInternal(h): pre(getAssertion(h).status) == AssertionStatus.Pending)",
+        "solidity_property": "function invariant_latestConfirmedIsConfirmed() public view { assert(getAssertion(latestConfirmed()).status == AssertionStatus.Confirmed); }",
+        "inventory_refs": [
+          {
+            "file": "RollupCore.sol",
+            "function": "confirmAssertionInternal"
+          },
+          {
+            "file": "RollupCore.sol",
+            "function": "initializeCore"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "RollupAdminLogic.sol",
+        "description": "forceCreateAssertion and forceConfirmAssertion can only be called when the rollup is paused (whenPaused modifier). This ensures emergency admin operations cannot interfere with live protocol operation. The pause/resume lifecycle must be respected.",
+        "attack_scenario": "If force operations could be called while unpaused, an admin (or compromised admin key) could bypass the challenge mechanism by force-confirming a malicious assertion while the rollup is live, preventing honest validators from challenging it through the normal dispute resolution process.",
+        "invariant_logic": "forceCreateAssertion() OR forceConfirmAssertion() => paused() == true",
+        "solidity_property": "function invariant_forceOpsRequirePause() public view { /* Cannot reach forceCreateAssertion/forceConfirmAssertion body when paused() == false */ }",
+        "inventory_refs": [
+          {
+            "file": "RollupAdminLogic.sol",
+            "function": "forceCreateAssertion"
+          },
+          {
+            "file": "RollupAdminLogic.sol",
+            "function": "forceConfirmAssertion"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RollupCore.sol",
+        "description": "An assertion hash must be unique and can only be created once. The assertion hash is computed from parentAssertionHash, afterState, and inboxAcc, ensuring no two different assertions share the same hash. Re-creation of an existing assertion must revert.",
+        "attack_scenario": "If assertion hash collisions were possible, an attacker could create a malicious assertion that shadows a legitimate one, potentially confirming the wrong state. The ASSERTION_SEEN check prevents this, but the hash construction must guarantee collision resistance.",
+        "invariant_logic": "forall createNewAssertion(hash): pre(getAssertion(hash).status) == NoAssertion",
+        "solidity_property": "function invariant_assertionUniqueness(bytes32 hash) public view { /* Before createNewAssertion, assertion must not exist */ }",
+        "inventory_refs": [
+          {
+            "file": "RollupCore.sol",
+            "function": "createNewAssertion"
+          },
+          {
+            "file": "RollupLib.sol",
+            "function": "assertionHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "SequencerInbox.sol",
+        "description": "Calldata-based batch data must have a valid header flag that cannot collide with the DATA_BLOB_HEADER_FLAG (0x50) or DATA_AUTHENTICATED_FLAG (0x40). The isValidCallDataFlag check prevents batch posters from spoofing blob-data batches via calldata, but only allows BROTLI (0x00), DAS (0x80), TREE_DAS|DAS (0x88), and ZERO_HEAVY (0x20) flags.",
+        "attack_scenario": "If a batch poster could submit calldata with DATA_BLOB_HEADER_FLAG (0x50), nodes would interpret the batch as containing blob data references when it actually contains arbitrary calldata. This would cause a consensus split between nodes that read the actual blobs vs nodes that process the spoofed calldata.",
+        "invariant_logic": "forall calldata batch with data.length > 0: data[0] IN {0x00, 0x80, 0x88, 0x20}",
+        "solidity_property": "function invariant_validCallDataFlag(bytes1 flag) public pure { assert(flag == 0x00 || flag == 0x80 || flag == 0x88 || flag == 0x20); }",
+        "inventory_refs": [
+          {
+            "file": "SequencerInbox.sol",
+            "function": "isValidCallDataFlag"
+          },
+          {
+            "file": "SequencerInbox.sol",
+            "function": "formCallDataHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "EdgeChallengeManager.sol",
+        "description": "An edge's timer cache must only increase via updateTimerCacheByChildren and updateTimerCacheByClaim. Decreasing the timer would allow an attacker to prevent legitimate edge confirmation by time, breaking the dispute resolution mechanism.",
+        "attack_scenario": "If an edge's timer cache could decrease, an attacker could repeatedly reset the timer of an honest edge, preventing it from ever accumulating enough unrivaled time to be confirmed. This would create a denial of the challenge resolution mechanism, permanently blocking assertion confirmation.",
+        "invariant_logic": "forall updateTimerCache(edgeId): post(edge.totalTimeUnrivaledCache) >= pre(edge.totalTimeUnrivaledCache)",
+        "solidity_property": "function invariant_timerMonotonic(bytes32 edgeId, uint256 oldCache, uint256 newCache) public pure { assert(newCache >= oldCache); }",
+        "inventory_refs": [
+          {
+            "file": "EdgeChallengeManager.sol",
+            "function": "updateTimerCacheByChildren"
+          },
+          {
+            "file": "EdgeChallengeManager.sol",
+            "function": "updateTimerCacheByClaim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "EdgeChallengeManager.sol",
+        "description": "Only one edge per mutual ID group can be confirmed (confirmedRivals mapping). Once an edge is confirmed for a mutual ID, no other rival edge with the same mutual ID should ever be confirmable. This ensures the dispute resolution produces a single winner.",
+        "attack_scenario": "If two rival edges with the same mutual ID could both be confirmed, the dispute resolution would produce contradictory results, potentially allowing both a valid and invalid assertion to be confirmed simultaneously, leading to double-spending or state corruption.",
+        "invariant_logic": "forall mutualId: |{e : confirmedRivals[mutualId] == e AND e != 0}| <= 1",
+        "solidity_property": "function invariant_singleConfirmedRival(bytes32 mutualId) public view { /* At most one non-zero confirmed rival per mutual id */ }",
+        "inventory_refs": [
+          {
+            "file": "EdgeChallengeManager.sol",
+            "function": "confirmEdgeByTime"
+          },
+          {
+            "file": "EdgeChallengeManager.sol",
+            "function": "confirmEdgeByOneStepProof"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "DelayBuffer.sol",
+        "description": "Buffer config allows replenishRateInBasis to be 0 (isValidBufferConfig only checks <= BASIS). If set to 0, the buffer never replenishes once depleted, permanently reducing the force inclusion window to the threshold value. This effectively makes the delay buffer a one-way ratchet.",
+        "attack_scenario": "If the admin misconfigures replenishRateInBasis to 0, and the buffer gets depleted by a transient sequencer outage, the force inclusion delay permanently shortens to threshold blocks. The sequencer can never recover the full delay window, making force inclusion attacks cheaper perpetually.",
+        "invariant_logic": "bufferConfig.replenishRateInBasis > 0 (should be enforced for operational safety)",
+        "solidity_property": "function invariant_replenishRateNonZero() public view { assert(buffer.replenishRateInBasis > 0); }",
+        "inventory_refs": [
+          {
+            "file": "DelayBuffer.sol",
+            "function": "isValidBufferConfig"
+          },
+          {
+            "file": "SequencerInbox.sol",
+            "function": "_setBufferConfig"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RollupCore.sol",
+        "description": "A staker must be inactive (their last staked assertion is latestConfirmed OR has a child) before their stake can be withdrawn or forcefully refunded. Active stakers have stake locked to defend against challenges.",
+        "attack_scenario": "If an active staker could withdraw their stake while their assertion is still being challenged, the challenge mechanism loses its economic security. The attacker could create a malicious assertion, stake on it, then withdraw the stake before the challenge resolves, suffering no economic penalty.",
+        "invariant_logic": "requireInactiveStaker(staker) => (latestStakedAssertion(staker) == latestConfirmed() OR getAssertion(latestStakedAssertion(staker)).firstChildBlock > 0)",
+        "solidity_property": "function invariant_activeStakeLocked(address staker) public view { if (isStaked(staker)) { bytes32 latest = latestStakedAssertion(staker); bool inactive = (latest == latestConfirmed()) || (getAssertion(latest).firstChildBlock > 0); /* Only inactive stakers can withdraw */ } }",
+        "inventory_refs": [
+          {
+            "file": "RollupCore.sol",
+            "function": "requireInactiveStaker"
+          },
+          {
+            "file": "RollupAdminLogic.sol",
+            "function": "forceRefundStaker"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-015",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "EdgeChallengeManager.sol",
+        "description": "Edge stake refund (via setRefunded) is a one-way irreversible operation. An edge can only be refunded once, and only if it has been confirmed. The refund goes to the original staker address recorded at edge creation time.",
+        "attack_scenario": "If refundStake could be called multiple times for the same edge, the contract's token balance would be drained. The setRefunded check prevents this, but if bypassed (e.g., via storage manipulation in an upgrade), it would allow draining all staked tokens from the EdgeChallengeManager.",
+        "invariant_logic": "forall refundStake(edgeId): pre(edge.refunded) == false AND post(edge.refunded) == true AND edge.status == Confirmed",
+        "solidity_property": "function invariant_singleRefund(bytes32 edgeId) public view { ChallengeEdge memory e = getEdge(edgeId); /* if refunded, it must be confirmed and cannot be refunded again */ }",
+        "inventory_refs": [
+          {
+            "file": "EdgeChallengeManager.sol",
+            "function": "refundStake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-016",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "AbsBoldStakingPool.sol",
+        "description": "A pool depositor can only withdraw up to their recorded depositBalance. The pool's token balance may be temporarily lower than total deposits (after createAssertion/createEdge sends tokens to rollup/challengeManager), so withdrawals may revert if the protocol move tokens haven't been returned yet. After protocol resolution, total withdrawable should equal total deposited.",
+        "attack_scenario": "If depositBalance tracking is incorrect (e.g., due to direct token transfers to the pool being counted), a depositor could withdraw more than they deposited. The pool explicitly documents that tokens sent directly are lost, and assumes the rollup/challengeManager won't return more than deposited. Violation of this assumption would leave excess tokens stuck forever.",
+        "invariant_logic": "forall depositor: withdrawAmount <= depositBalance[depositor] AND sum(depositBalance) == total tokens deposited via depositIntoPool",
+        "solidity_property": "function invariant_withdrawLimit(address user, uint256 amount) public view { assert(amount <= depositBalance[user]); }",
+        "inventory_refs": [
+          {
+            "file": "AbsBoldStakingPool.sol",
+            "function": "withdrawFromPool"
+          },
+          {
+            "file": "AbsBoldStakingPool.sol",
+            "function": "depositIntoPool"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-017",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "BOLDUpgradeAction.sol",
+        "description": "StateHashPreImageLookup.set() is publicly callable with no access control. While the hash validation (h == stateHash(executionState, inboxMaxCount)) prevents invalid data, anyone can populate pre-images for any state hash. The get() function uses inboxMaxCount != 0 as a sentinel for existence, meaning a valid state with inboxMaxCount == 0 would be treated as non-existent.",
+        "attack_scenario": "An attacker cannot corrupt the pre-image (hash validation prevents this), but if a legitimate state hash happened to have inboxMaxCount == 0, the upgrade action's get() would revert with 'Hash not yet set', potentially blocking the upgrade. In practice, the genesis inbox count should always be > 0 after initialization.",
+        "invariant_logic": "forall h in preImages: stateHash(decode(preImages[h])) == h AND inboxMaxCount > 0 for upgrade-critical lookups",
+        "solidity_property": "function invariant_preImageValidity(bytes32 h) public view { (ExecutionState memory es, uint256 count) = get(h); assert(stateHash(es, count) == h && count > 0); }",
+        "inventory_refs": [
+          {
+            "file": "BOLDUpgradeAction.sol",
+            "function": "StateHashPreImageLookup.set"
+          },
+          {
+            "file": "BOLDUpgradeAction.sol",
+            "function": "StateHashPreImageLookup.get"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-018",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "RollupCore.sol",
+        "description": "An assertion cannot advance from an ERRORED machine status. New assertions must have beforeState.machineStatus == FINISHED, and afterState must be either FINISHED or ERRORED. An ERRORED state requires admin intervention (wasm root update + force assertion) to recover.",
+        "attack_scenario": "If an assertion could be created with beforeState.machineStatus == ERRORED, the L2 state machine could proceed from an invalid state, potentially allowing arbitrary state transitions. The BAD_PREV_STATUS check prevents this, but if bypassed, an attacker could build a chain of assertions on top of an errored state.",
+        "invariant_logic": "forall createNewAssertion(inputs): inputs.beforeState.machineStatus == FINISHED AND (inputs.afterState.machineStatus == FINISHED OR inputs.afterState.machineStatus == ERRORED)",
+        "solidity_property": "function invariant_machineStatusTransition() public pure { /* beforeState must be FINISHED, afterState must be FINISHED or ERRORED */ }",
+        "inventory_refs": [
+          {
+            "file": "RollupCore.sol",
+            "function": "createNewAssertion"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-019",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "RollupProxy.sol",
+        "description": "RollupProxy.initializeProxy can only be called once. The guard checks that admin, primary implementation, and secondary implementation are all address(0). After initialization, subsequent calls fall through to the fallback. If any of these three values could be reset to zero (e.g., via storage collision in an upgrade), the proxy could be re-initialized with a malicious configuration.",
+        "invariant_logic": "initializeProxy succeeds => pre(_getAdmin()) == address(0) AND pre(_getImplementation()) == address(0) AND pre(_getSecondaryImplementation()) == address(0)",
+        "solidity_property": "function invariant_proxyInitOnce() public view { assert(!(_getAdmin() == address(0) && _getImplementation() == address(0) && _getSecondaryImplementation() == address(0))); }",
+        "inventory_refs": [
+          {
+            "file": "RollupProxy.sol",
+            "function": "initializeProxy"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-020",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "BOLDUpgradeAction.sol",
+        "description": "cleanupOldRollup caps staker iteration at 50. Stakers at index 50+ are not refunded during the upgrade cleanup. They must withdraw through the patched old rollup user logic post-upgrade. If the patched implementation doesn't properly handle their case, funds could be stuck.",
+        "attack_scenario": "If a rollup has more than 50 stakers, stakers beyond index 50 are not refunded during the upgrade action. If the IMPL_PATCHED_OLD_ROLLUP_USER doesn't properly allow all stakers to withdraw (especially those in active challenges at upgrade time), those stakers' funds could be permanently locked.",
+        "invariant_logic": "forall stakers s with index >= 50: s must be able to withdraw via IMPL_PATCHED_OLD_ROLLUP_USER post-upgrade",
+        "solidity_property": "function invariant_allStakersRefundable() public view { assert(ROLLUP_READER.stakerCount() <= 50 || /* patched implementation handles remaining stakers */true); }",
+        "inventory_refs": [
+          {
+            "file": "BOLDUpgradeAction.sol",
+            "function": "cleanupOldRollup"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-021",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "EdgeChallengeManager.sol",
+        "description": "createLayerZeroEdge for Block-level edges must validate that the claimed assertion is pending and that the predecessor has a second child (indicating a fork/dispute). This ensures edges can only be created for genuinely disputed assertions, preventing resource exhaustion from spurious challenges.",
+        "attack_scenario": "If Block-level layer zero edges could be created for assertions without actual disputes (no second child), an attacker could create edges for uncontested assertions, forcing honest validators to respond with stake and compute resources. The economic security of the challenge protocol depends on edges only being created where genuine disputes exist.",
+        "invariant_logic": "createLayerZeroEdge(Block) => assertionChain.isPending(claimId) == true AND assertionChain.getSecondChildCreationBlock(predecessorHash) > 0",
+        "solidity_property": "function invariant_blockEdgeRequiresDispute(bytes32 claimId, bytes32 predecessorHash) public view { assert(assertionChain.isPending(claimId) && assertionChain.getSecondChildCreationBlock(predecessorHash) > 0); }",
+        "inventory_refs": [
+          {
+            "file": "EdgeChallengeManager.sol",
+            "function": "createLayerZeroEdge"
+          }
+        ]
+      }
+    ]
+  }
+}

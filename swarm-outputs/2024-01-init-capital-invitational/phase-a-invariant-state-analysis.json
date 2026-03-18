@@ -1,0 +1,345 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T05:34:49.894Z",
+    "duration_ms": 487557
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "MarginTradingHook.sol",
+        "description": "updateOrder is missing the check that the order belongs to the caller's position (order.initPosId == initPosId). cancelOrder has this check, but updateOrder does not. Any user with ANY valid position can modify ANY active order's triggerPrice, limitPrice, collAmt, and tokenOut.",
+        "attack_scenario": "Attacker creates their own margin position, then calls updateOrder with their posId but a victim's orderId. They change the victim's stop-loss triggerPrice to an unreachable value (disabling protection), or set limitPrice to a highly disadvantageous value so when the order fills the victim receives far less. The attacker could also change tokenOut to a different token than the victim intended.",
+        "invariant_logic": "forall orderId, posId, caller: updateOrder(posId, orderId, ...) REQUIRES __orders[orderId].initPosId == initPosIds[caller][posId]",
+        "solidity_property": "function invariant_updateOrderAuth(uint orderId, uint posId) public view { Order memory order = __orders[orderId]; uint callerInitPosId = initPosIds[msg.sender][posId]; assert(order.initPosId == callerInitPosId); }",
+        "inventory_refs": [
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "updateOrder"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "cancelOrder"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MarginTradingHook.sol",
+        "description": "_calculateRepaySize returns (uint repayAmt, uint repayShares) but _calculateFillOrderInfo destructures the return as (repayShares, repayAmt), swapping the values. This causes fillOrder to use debt shares where amount is expected and vice versa, breaking order filling as interest accrues.",
+        "attack_scenario": "After interest accrues (shares != amount), fillOrder calls _calculateFillOrderInfo which swaps repayShares and repayAmt. The filler pays repayAmt (actually shares, too little) in borrow tokens, amtOut is computed with the wrong repayAmt (inflated for the recipient), and repay is called with repayShares (actually amount, too large). The repay function tries to transfer more borrow tokens than the hook holds, causing revert. This creates a permanent DoS on order filling once interest diverges shares from amounts.",
+        "invariant_logic": "In _calculateFillOrderInfo: (repayShares_local, repayAmt_local) = _calculateRepaySize(...) MUST have repayShares_local == actual_debt_shares AND repayAmt_local == actual_debt_amount; currently they are swapped",
+        "solidity_property": "// The destructuring (repayShares, repayAmt) = _calculateRepaySize(...) receives (returnPos0=repayAmt, returnPos1=repayShares) → repayShares gets the amount and repayAmt gets the shares",
+        "inventory_refs": [
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "_calculateFillOrderInfo"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "_calculateRepaySize"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "fillOrder"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MarginTradingHook.sol",
+        "description": "Order lifecycle must follow Active -> {Cancelled, Filled} with no backwards transitions. Orders cannot transition from Cancelled or Filled to Active. This is enforced by status checks in cancelOrder and fillOrder, but updateOrder only checks status == Active without verifying the caller owns the order's position.",
+        "invariant_logic": "forall orderId: (order.status == Cancelled || order.status == Filled) => no function can change order.status back to Active AND no function can modify order fields",
+        "solidity_property": "function invariant_orderLifecycle(uint orderId) public view { Order memory o = __orders[orderId]; assert(o.status == OrderStatus.Active || o.status == OrderStatus.Cancelled || o.status == OrderStatus.Filled); }",
+        "inventory_refs": [
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "cancelOrder"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "fillOrder"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "updateOrder"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "InitCore.sol",
+        "description": "During multicall, all positions whose health was potentially worsened (borrow, decollateralize, decollateralizeWLp, setPosMode) MUST be added to uncheckedPosIds and validated as healthy after all operations complete. If any position is missed, it can be left in an unhealthy state.",
+        "invariant_logic": "After multicall completes: forall posId in uncheckedPosIds_during_execution: getPosHealthCurrent_e18(posId) >= 1e18",
+        "solidity_property": "function invariant_multicallHealth() public { assert(!isMulticallTx); assert(uncheckedPosIds.length() == 0); }",
+        "inventory_refs": [
+          {
+            "file": "InitCore.sol",
+            "function": "multicall"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "borrow"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "decollateralize"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "InitCore.sol",
+        "description": "Multicall reentrancy lock: isMulticallTx must be false before multicall starts and must be restored to false after it ends. Nested multicall is forbidden. Flash loans are forbidden during multicall. If isMulticallTx gets stuck as true, all subsequent multicalls and flashes are permanently DoS'd.",
+        "invariant_logic": "At rest (outside any tx): isMulticallTx == false AND uncheckedPosIds.length() == 0",
+        "solidity_property": "function invariant_multicallNotStuck() public view { assert(!isMulticallTx); }",
+        "inventory_refs": [
+          {
+            "file": "InitCore.sol",
+            "function": "multicall"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "flash"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "WLpMoeMasterChef.sol",
+        "description": "LP price calculation when kLast == 0 uses current reserves (r0, r1) which are manipulable via flash-swaps. While the sqrt(r0*r1*p0*p1) formula is partially resistant, repeated swaps accumulate fees and increase k=r0*r1, inflating LP price. An attacker can inflate collateral value for borrowing or prevent liquidation.",
+        "invariant_logic": "calculatePrice_e36 should use manipulation-resistant values; when kLast == 0, reserves can be atomically manipulated to inflate r0*r1 via swap fees",
+        "solidity_property": "// price = 2 * sqrt(r0 * p0) * sqrt(r1 * p1) / totalSupply where r0,r1 are spot reserves — susceptible to fee-accumulation manipulation within a single tx",
+        "inventory_refs": [
+          {
+            "file": "WLpMoeMasterChef.sol",
+            "function": "calculatePrice_e36"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LiqIncentiveCalculator.sol",
+        "description": "When health factor is 0 (completely underwater position), getLiqIncentiveMultiplier_e18 returns 0, making liquidation incentive = 0. Combined with InitCore bypassing health-after-liq check for health_e18 == 0, liquidators repay debt but receive 0 collateral. Underwater positions can never be economically liquidated, causing permanent bad debt accumulation.",
+        "invariant_logic": "For healthFactor == 0: multiplier_e18 == 0 => repayAmtWithLiqIncentive == 0 => collateral shares returned == 0. No rational liquidator executes this, so bad debt persists indefinitely.",
+        "solidity_property": "function invariant_underwaterLiquidatable(uint posId) public { uint health = getPosHealthCurrent_e18(posId); if (health == 0) { /* position has bad debt that can never be cleared via liquidation */ } }",
+        "inventory_refs": [
+          {
+            "file": "LiqIncentiveCalculator.sol",
+            "function": "getLiqIncentiveMultiplier_e18"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "liquidate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MarginTradingHook.sol",
+        "description": "coreCallback for CloseExactOut uses strict equality check: balanceOf(tokenOut) == swapInfo.amtOut. If any dust amount of borrow token exists in the hook contract (from donation or previous operation residue), the check fails and reducePos reverts. This creates a griefing/DoS vector where an attacker front-runs by sending 1 wei of borrow token to the hook.",
+        "invariant_logic": "IERC20(swapInfo.tokenOut).balanceOf(address(this)) == swapInfo.amtOut — this strict equality is fragile and can be broken by dust token deposits",
+        "solidity_property": "// In coreCallback: _require(IERC20(swapInfo.tokenOut).balanceOf(address(this)) == swapInfo.amtOut, Errors.SLIPPAGE_CONTROL); // Should use >= instead of ==",
+        "inventory_refs": [
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "coreCallback"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONOTONE-001",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "PosManager.sol",
+        "description": "Position nonces must strictly increase per owner to ensure unique position IDs. nextNonces[owner] is incremented via post-increment (nextNonces[_owner]++), guaranteeing monotonic increase and preventing position ID collisions via the keccak256(owner, nonce) derivation.",
+        "invariant_logic": "forall owner: nextNonces[owner] is monotonically increasing AND forall (owner1, nonce1) != (owner2, nonce2): keccak256(owner1, nonce1) != keccak256(owner2, nonce2) with overwhelming probability",
+        "solidity_property": "function invariant_nonceMonotonic(address owner, uint oldNonce) public view { assert(nextNonces[owner] >= oldNonce); }",
+        "inventory_refs": [
+          {
+            "file": "PosManager.sol",
+            "function": "createPos"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "MarginTradingHook.sol",
+        "description": "Multiple stop-loss/take-profit orders on the same position can over-commit collateral. When creating orders, only current collateral is checked against the single order's collAmt, but the sum of collAmt across all active orders for a position is never validated. When orders fill sequentially, later orders may have insufficient collateral, leading to unexpected proportional scaling in _calculateRepaySize that changes the effective limit price for the user.",
+        "invariant_logic": "SUM(order.collAmt for all Active orders on posId) SHOULD be <= totalCollateral(posId). Currently only individual order.collAmt <= totalCollateral is checked at creation time.",
+        "solidity_property": "function invariant_orderCollateralCommitment(uint initPosId) public view { uint totalCommitted = 0; for (uint i = 0; i < __posOrderIds[initPosId].length; i++) { Order memory o = __orders[__posOrderIds[initPosId][i]]; if (o.status == OrderStatus.Active) totalCommitted += o.collAmt; } assert(totalCommitted <= IPosManager(POS_MANAGER).getCollAmt(initPosId, __marginPositions[initPosId].collPool)); }",
+        "inventory_refs": [
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "_createOrder"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "fillOrder"
+          },
+          {
+            "file": "MarginTradingHook.sol",
+            "function": "_calculateRepaySize"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-006",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "MoneyMarketHook.sol",
+        "description": "When executing on an existing position (posId != 0), the code reads initPosId = initPosIds[msg.sender][posId] but does not verify initPosId != 0 before using it. If posId does not exist in the mapping, initPosId defaults to 0, and ownerOf(0) is called. While this likely reverts (token 0 shouldn't exist), if a position with ID 0 existed and was owned by the hook, any user could operate on it.",
+        "invariant_logic": "For existing positions: initPosIds[msg.sender][posId] != 0 MUST be verified before operations",
+        "solidity_property": "function invariant_validInitPosId(address user, uint posId) public view { if (posId != 0) { assert(initPosIds[user][posId] != 0); } }",
+        "inventory_refs": [
+          {
+            "file": "MoneyMarketHook.sol",
+            "function": "execute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiqIncentiveCalculator.sol",
+        "description": "minLiqIncentiveMultiplier_e18 is applied after maxLiqIncentiveMultiplier_e18 cap via Math.max. If min > max for a mode (misconfiguration), the effective multiplier exceeds the intended max cap, allowing liquidators to extract more collateral than designed.",
+        "invariant_logic": "forall mode: minLiqIncentiveMultiplier_e18[mode] <= maxLiqIncentiveMultiplier_e18",
+        "solidity_property": "function invariant_liqIncentiveBounds(uint16 mode) public view { assert(minLiqIncentiveMultiplier_e18[mode] <= maxLiqIncentiveMultiplier_e18); }",
+        "inventory_refs": [
+          {
+            "file": "LiqIncentiveCalculator.sol",
+            "function": "getLiqIncentiveMultiplier_e18"
+          },
+          {
+            "file": "LiqIncentiveCalculator.sol",
+            "function": "setMinLiqIncentiveMultiplier_e18"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "InitOracle.sol",
+        "description": "Oracle price deviation threshold (maxPriceDeviations_e18) defaults to 0 for tokens where it hasn't been set. When both primary and secondary sources return valid prices for such a token, the deviation check (maxPrice/minPrice <= 0) always fails, causing a revert. This means adding a secondary source without setting deviation threshold creates a DoS on price fetching.",
+        "invariant_logic": "forall token where secondarySources[token] != address(0): maxPriceDeviations_e18[token] >= 1e18",
+        "solidity_property": "function invariant_deviationSet(address token) public view { if (secondarySources[token] != address(0)) { assert(maxPriceDeviations_e18[token] >= 1e18); } }",
+        "inventory_refs": [
+          {
+            "file": "InitOracle.sol",
+            "function": "getPrice_e36"
+          },
+          {
+            "file": "InitOracle.sol",
+            "function": "setMaxPriceDeviations_e18"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "InitCore.sol",
+        "description": "Liquidation requires position to be unhealthy (health < 1e18) AND position health after liquidation must not exceed maxHealthAfterLiq. However, for underwater positions (health == 0), the post-liquidation health check is bypassed. This means for health_e18 exactly 0, the liquidator can repay any amount of debt without constraint on resulting health, while for positions barely above 0, the check applies. The combined effect with zero incentive multiplier means underwater positions are economically un-liquidatable.",
+        "invariant_logic": "liquidate() requires health_e18 < 1e18 AND (health_e18 == 0 || postLiqHealth <= maxHealthAfterLiq). The health==0 bypass is intentional but combined with 0 incentive creates permanent bad debt.",
+        "solidity_property": "function invariant_liquidationHealth(uint posId) public { uint health = getPosHealthCurrent_e18(posId); if (health >= ONE_E18) { /* cannot liquidate healthy position */ } }",
+        "inventory_refs": [
+          {
+            "file": "InitCore.sol",
+            "function": "liquidate"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "_liquidateInternal"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "_ensurePosHealthAfterLiq"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "PosManager.sol",
+        "description": "WLp token can only be collateralized once across all positions (isCollateralized[wLp][tokenId] == true). It is set true on addCollateralWLp and only cleared on full removal (newWLpAmt == 0) in removeCollateralWLpTo. Partial removal keeps isCollateralized true, preventing re-collateralization. If collCount tracking gets out of sync with actual collateral entries, positions could exceed maxCollCount or underflow on removal.",
+        "invariant_logic": "isCollateralized[wLp][tokenId] == true IFF exists posId where posCollInfos[posId].ids[wLp].contains(tokenId)",
+        "solidity_property": "function invariant_wLpCollateral(address wLp, uint tokenId, uint posId) public view { if (isCollateralized[wLp][tokenId]) { /* exactly one position must hold this wLp tokenId */ } }",
+        "inventory_refs": [
+          {
+            "file": "PosManager.sol",
+            "function": "addCollateralWLp"
+          },
+          {
+            "file": "PosManager.sol",
+            "function": "removeCollateralWLpTo"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LendingPool.sol",
+        "description": "Interest accrual uses linear approximation (rate * time * debt) rather than compound interest. For large time gaps between accrueInterest calls, the linear approximation underestimates actual compound interest, slightly favoring borrowers. Conversely, frequent accrual slightly overstates interest via repeated multiplication effects on totalDebt.",
+        "invariant_logic": "accrued = borrowRate * timeDelta * totalDebt / 1e18; totalDebt_new = totalDebt + accrued. This is correct for continuous compounding approximation only when timeDelta is small relative to rate.",
+        "solidity_property": "function invariant_interestAccrual() public view { assert(lastAccruedTime <= block.timestamp); }",
+        "inventory_refs": [
+          {
+            "file": "LendingPool.sol",
+            "function": "accrueInterest"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-008",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "InitCore.sol",
+        "description": "Flash loans require pools to have distinct, sorted addresses to prevent paying flash fees once but borrowing from the same pool twice. The _validateFlash function uses isSortedAndNotDuplicate check. If this check were bypassed, an attacker could borrow 2x from the same pool but only need to repay 1x the balance difference.",
+        "invariant_logic": "_pools array in flash() must be sorted ascending with no duplicates AND _pools.length == _amts.length",
+        "solidity_property": "function invariant_flashDistinct(address[] calldata pools) public pure { assert(AddressArrayLib.isSortedAndNotDuplicate(pools)); }",
+        "inventory_refs": [
+          {
+            "file": "InitCore.sol",
+            "function": "flash"
+          },
+          {
+            "file": "InitCore.sol",
+            "function": "_validateFlash"
+          }
+        ]
+      }
+    ]
+  }
+}

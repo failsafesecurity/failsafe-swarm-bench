@@ -1,0 +1,739 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "IdentityStaking.sol",
+      "GTC.sol",
+      "SafeMath.sol",
+      "Upgrade.sol",
+      "IIdentityStaking.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T00:28:39.768Z",
+    "duration_ms": 442767
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "release() Fails to Update userTotalStaked — Permanent Fund Lockup After Slash Appeal",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The release() function restores slashedAmount back to stake.amount but never increments userTotalStaked[staker]. Since slash() decrements userTotalStaked, and release() does not reverse this, a permanent accounting desync is created. When the user later calls withdrawSelfStake or withdrawCommunityStake, the line `userTotalStaked[msg.sender] -= amount` will underflow (Solidity 0.8.x checked arithmetic) and revert, permanently locking the released tokens in the contract.",
+      "investigation_rationale": "This is a demonstrable code bug that breaks the protocol's stated invariant (userTotalStaked consistency). Every successful slash+release cycle permanently locks the released amount. This directly contradicts the protocol's appeal mechanism design intent.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "release",
+        "withdrawSelfStake",
+        "withdrawCommunityStake",
+        "slash"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "release"
+        },
+        {
+          "file": "IdentityStaking.sol",
+          "function": "withdrawSelfStake"
+        },
+        {
+          "file": "IdentityStaking.sol",
+          "function": "withdrawCommunityStake"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "343-380",
+        "pattern": "release() modifies selfStakes[staker].amount += amountToRelease and communityStakes[staker][stakee].amount += amountToRelease but NEVER executes userTotalStaked[staker] += amountToRelease. Compare with slash() at lines 276-310 which DOES execute userTotalStaked[staker] -= slashedAmount."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User has an active self-stake or community-stake",
+        "SLASHER_ROLE slashes the user (any percent, any amount > 0)",
+        "RELEASER_ROLE releases any portion of the slashed amount",
+        "User's lock period expires and they attempt withdrawal"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "slash: userTotalStaked[staker] -= slashedAmount; release: [missing] userTotalStaked[staker] += amountToRelease",
+        "manipulation_vector": "Any slash+release creates a permanent deficit: userTotalStaked < sum(stake.amounts). The deficit equals the total amount ever released.",
+        "profit_hypothesis": "No attacker profit — this is a fund lockup bug. Victim loses the released amount permanently. For each release of X tokens, X tokens become permanently unwithdrawable."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the total value at risk across all users who have been slashed and released?",
+          "Can affected users work around the bug by adding more stake to 'top up' userTotalStaked?",
+          "Does repeated slash+release compound the deficit?"
+        ],
+        "validation_requirements": [
+          "Trace: selfStake(100) → slash(50%) → release(50) → withdrawSelfStake(100) and confirm revert",
+          "Verify workaround: after release, user stakes 50 more (userTotalStaked=100), can withdraw 100 but remaining 50 is still locked",
+          "Confirm both self-stake and community-stake release paths are affected"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — this is a protocol bug, not an attack requiring capital",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A — no attacker profit; victim loss equals released amount",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent — locked tokens cannot be recovered without contract upgrade"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Triggers any time a slash is followed by a release",
+        "market_impact_assessment": "Proportional to total slashed-and-released GTC across all protocol users"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Any staker who has been slashed and subsequently had funds released via appeal",
+        "estimated_impact_per_user": "100% of the released amount is permanently unwithdrawable",
+        "total_value_at_risk": "All GTC that passes through the slash→release lifecycle"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Track userTotalStaked vs sum(stake.amounts) after release()",
+        "calculation_validation": "Verify underflow revert on withdrawal after release",
+        "execution_complexity": "low — automatic trigger on normal protocol operations",
+        "detection_difficulty": "low — any post-release withdrawal attempt reveals the bug"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "uint88 Intermediate Overflow in slash() Makes Large Stakes Immune to High-Percentage Slashing",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "In slash(), `uint88 slashedAmount = (percent * selfStakes[staker].amount) / 100` performs `uint88 * uint88` multiplication. Under Solidity 0.8.x checked arithmetic, this overflows and reverts when `percent * amount > type(uint88).max` (~309.5M with 18 decimals). A stake of ~3.09M GTC or more cannot be 100%-slashed. An attacker who accumulates >3.09M GTC (3.09% of total supply) becomes immune to high-percentage slashing, defeating the protocol's core Sybil resistance mechanism.",
+      "investigation_rationale": "The slash function is the protocol's primary enforcement mechanism. If large stakers cannot be slashed, they can engage in Passport manipulation without economic penalty, undermining the entire identity staking model.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "slash"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "slash"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "277-278",
+        "pattern": "uint88 slashedAmount = (percent * selfStakes[staker].amount) / 100 — both operands are uint88, multiplication is performed in uint88 space, overflows for percent * amount > 2^88 - 1. Same pattern at line 303 for community stakes."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker acquires and stakes >3.09M GTC (3.09% of 100M supply) in a single self-stake or community-stake",
+        "SLASHER_ROLE attempts to slash at a high percentage (e.g., 100%)",
+        "No workaround exists (SLASHER would need many small % slashes)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "uint88 max = 309,485,009,821,345,068,724,781,055. At 100% slash: 100 * 3,094,851e18 = 3.09e26 > 3.09e26 (overflows). At 50%: threshold is ~6.19M GTC. At 10%: ~30.9M GTC.",
+        "manipulation_vector": "Attacker stakes enough GTC to make any slash() call with high percent revert. SLASHER must use many small-percent slashes as workaround, which compound non-linearly and are gas-inefficient.",
+        "profit_hypothesis": "Attacker gains immunity from slashing penalties, allowing unrestricted Passport manipulation. Economic value = all benefits from gaming Passport scores without penalty risk."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the GTC market liquidity — can an attacker realistically acquire 3.09M GTC?",
+          "What is the economic value of Passport score manipulation that the attacker would gain?",
+          "Can the SLASHER work around this by issuing many 1% slashes?"
+        ],
+        "validation_requirements": [
+          "Confirm overflow: call slash([attacker], [], [], 100) with attacker having 4M GTC staked — should revert",
+          "Calculate exact threshold for each percent value (1-100)",
+          "Test workaround: 100 sequential 1% slashes vs single 100% slash"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "~3.09M GTC (at current prices, requires validation)",
+        "estimated_execution_cost": "Gas for selfStake transaction",
+        "potential_profit_range": "Value of unrestricted Passport manipulation minus capital lock-up cost",
+        "estimated_profit_margin": "Depends on Passport ecosystem value (requires validation)",
+        "attack_duration": "Persistent — immunity lasts as long as stake is maintained"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "3.09M GTC acquisition (3.09% of total supply)",
+        "optimal_timing": "Any time",
+        "market_impact_assessment": "GTC acquisition may move price significantly"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All Passport ecosystem users relying on slashing as Sybil deterrent",
+        "estimated_impact_per_user": "Degraded trust in Passport scoring system",
+        "total_value_at_risk": "Integrity of entire identity staking mechanism"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "uint88 max = 309,485,009,821,345,068,724,781,055; GTC supply = 100M",
+        "calculation_validation": "Confirm: uint88(100) * uint88(4_000_000e18) overflows in Solidity 0.8.23",
+        "execution_complexity": "low — single staking transaction",
+        "detection_difficulty": "low — slash transaction reverts visibly"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "lockAndBurn Does Not Zero totalSlashed for Burned Rounds — Stale Accounting Data Persists",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "After lockAndBurn transfers slashed tokens to burnAddress, totalSlashed[roundToBurn] retains its pre-burn value rather than being zeroed. While no current function path re-reads burned round data for state-changing operations, this stale data persists on-chain. A future upgrade that iterates over totalSlashed or uses it for solvency calculations could misinterpret the stale data, causing double-counting or over-burning.",
+      "investigation_rationale": "This is a code defect (clean state management violation) that creates latent risk. The UUPS upgrade pattern means future implementations could inadvertently interact with stale data, making this a ticking time bomb for contract evolution.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "lockAndBurn"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "lockAndBurn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "323-338",
+        "pattern": "lockAndBurn reads amountToBurn = totalSlashed[roundToBurn] and transfers to burnAddress, but never executes totalSlashed[roundToBurn] = 0 or delete totalSlashed[roundToBurn]"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-008",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Any slashing has occurred in a previous round",
+        "lockAndBurn is called successfully"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "After burn: totalSlashed[burnedRound] still equals pre-burn value instead of 0",
+        "manipulation_vector": "No direct current exploit; risk materializes if upgrade reads stale data",
+        "profit_hypothesis": "No immediate profit; latent insolvency risk in future upgrades"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Could a future upgrade function iterate totalSlashed and double-count burned amounts?",
+          "Does stale data affect off-chain integrations reading contract state?"
+        ],
+        "validation_requirements": [
+          "Verify totalSlashed[roundToBurn] != 0 after lockAndBurn",
+          "Confirm no current function reads burned round data for state changes"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — latent risk, not directly exploitable",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A currently; potential insolvency in future upgrades",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent stale data until upgrade"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "N/A currently"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Off-chain systems reading stale data; potential future upgrade victims",
+        "estimated_impact_per_user": "Incorrect on-chain accounting data visible to integrators",
+        "total_value_at_risk": "Latent — depends on future upgrade behavior"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check all reads of totalSlashed mapping across contract",
+        "calculation_validation": "Confirm burned round data is never used for transfers or accounting after burn",
+        "execution_complexity": "low",
+        "detection_difficulty": "high — stale data is silent until misused"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "burnAddress Not Validated in initialize() — Misconfigured Burn Address Can Brick Round Progression",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The initialize() function does not validate burnAddress. If set to address(0), and the GTC token reverts on transfers to zero address (as GTC does: `require(dst != address(0))`), then lockAndBurn will permanently revert whenever amountToBurn > 0. This bricks the entire slash/burn lifecycle: rounds cannot progress, appeals cannot complete, and new slashes accumulate in a single round indefinitely.",
+      "investigation_rationale": "The project documentation states burnAddress is set to the GTC token contract address because GTC cannot be transferred to the zero address. This confirms the zero-address failure mode is known. However, no code prevents misconfiguration. If burnAddress is set to ANY address that reverts on receive (a contract without fallback, or address(0)), lockAndBurn breaks permanently.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "burnAddress is set to an address that can receive GTC transfers without reverting"
+      ],
+      "config_evidence": "IdentityStaking.sol:initialize() lines 140-163 — no validation of _burnAddress parameter. deploy.ts does not deploy IdentityStaking, so no deployment evidence of actual burnAddress value.",
+      "affected_functions": [
+        "initialize",
+        "lockAndBurn"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "initialize"
+        },
+        {
+          "file": "IdentityStaking.sol",
+          "function": "lockAndBurn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "155-156",
+        "pattern": "burnAddress = _burnAddress with no validation (no AddressCannotBeZero check). tokenAddress IS validated but burnAddress is not."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "burnAddress configured to address(0) or address that reverts on ERC20 transfer",
+        "Any slash has occurred creating non-zero totalSlashed for a round"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "lockAndBurn: token.transfer(burnAddress, amountToBurn) — if burnAddress reverts, entire function reverts",
+        "manipulation_vector": "Misconfiguration bricks round progression; slashed funds accumulate permanently, rounds never advance",
+        "profit_hypothesis": "No direct attacker profit; all slashed users lose ability to complete appeal lifecycle"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What burnAddress is used in actual deployment?",
+          "If burnAddress is misconfigured, can the contract be upgraded to fix it?"
+        ],
+        "validation_requirements": [
+          "Verify GTC reverts on transfer to address(0)",
+          "Test lockAndBurn with burnAddress = address(0) and non-zero totalSlashed",
+          "Confirm UUPS upgrade can fix burnAddress (it can, since admin has upgrade authority)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — misconfiguration, not an active attack",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent until upgrade"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A — deployment-time misconfiguration",
+        "market_impact_assessment": "All slashing and burn operations halted"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All stakers subject to slashing",
+        "estimated_impact_per_user": "Slashed funds permanently locked, appeal process broken",
+        "total_value_at_risk": "All future slashed GTC"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check actual deployed burnAddress value",
+        "calculation_validation": "Test lockAndBurn with bad burnAddress",
+        "execution_complexity": "low",
+        "detection_difficulty": "low — first lockAndBurn with slashed funds reveals it"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "Missing __gap Storage Variable Risks Storage Collision on UUPS Upgrade",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "IdentityStaking does not define a `uint256[N] private __gap` storage variable. Under the UUPS upgrade pattern, if a future upgrade adds new base contracts to the inheritance chain or reorders inheritance, new state variables could collide with existing storage slots. This is an established best practice violation for upgradeable contracts per OpenZeppelin guidelines.",
+      "investigation_rationale": "The contract explicitly uses UUPS upgrade pattern and is designed to be upgraded (Upgrade.sol demonstrates this). Without __gap, any upgrade that modifies the inheritance hierarchy risks silently corrupting state variables, potentially affecting all financial state (stakes, slashed amounts, userTotalStaked).",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_authorizeUpgrade"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "_authorizeUpgrade"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "1-380",
+        "pattern": "No `uint256[N] private __gap` variable declared anywhere in IdentityStaking contract, despite inheriting from OpenZeppelin upgradeable contracts that all include __gap"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Contract is upgraded via UUPS",
+        "New implementation modifies inheritance chain or adds new base contracts"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Storage slots after last state variable (token) are unprotected; new base contracts could overlap with inherited storage",
+        "manipulation_vector": "Upgrade adds new inheritable base → storage collision → financial state corruption",
+        "profit_hypothesis": "Storage collision could corrupt stake.amount, slashedAmount, or userTotalStaked, enabling unauthorized withdrawals or preventing legitimate ones"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the current storage layout and where would new variables be placed?",
+          "Has any planned upgrade been designed that would trigger a collision?"
+        ],
+        "validation_requirements": [
+          "Generate storage layout for IdentityStaking and verify no existing collisions",
+          "Test upgrade to implementation with additional base contract to confirm collision"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — requires admin mistake during upgrade",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Potentially all staked GTC if storage corruption enables unauthorized withdrawals",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent once upgrade is applied"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A — requires upgrade",
+        "market_impact_assessment": "Complete protocol compromise if financial storage is corrupted"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All stakers if storage collision occurs",
+        "estimated_impact_per_user": "Potential total loss of staked funds",
+        "total_value_at_risk": "All GTC held by contract"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Generate and verify storage layout",
+        "calculation_validation": "Test upgrade scenarios with modified inheritance",
+        "execution_complexity": "low — standard storage layout analysis",
+        "detection_difficulty": "medium — requires comparing storage layouts pre/post upgrade"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "GTC Test Mock transferFrom Skips Allowance Check — Any Caller Can Transfer Any User's Tokens",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The GTC.sol test mock's transferFrom function has the allowance check removed (comment: '// Removed allowance check for easy testing'). If this contract is deployed as the actual token, any address can transfer any other address's GTC balance without approval. An attacker could drain all GTC from the IdentityStaking contract and all user wallets.",
+      "investigation_rationale": "While GTC.sol is labeled as test-only, the audit scope explicitly includes it. If this mock were mistakenly deployed to production (or on a testnet where economic value exists), the impact would be total loss of all GTC holdings.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "The GTC.sol test mock contract is deployed as the actual GTC token used by IdentityStaking"
+      ],
+      "config_evidence": "GTC.sol line 1-4 states 'THIS CONTRACT IS ONLY USED AS PART OF TESTING / THIS IS NOT PRODUCTION CODE'. deploy.ts does not deploy GTC.sol. Production deployment should use the real GTC token at its mainnet address.",
+      "affected_functions": [
+        "transferFrom"
+      ],
+      "affected_contracts": [
+        "GTC.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "GTC.sol",
+          "function": "transferFrom"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "GTC.sol",
+        "lines": "168-174",
+        "pattern": "transferFrom performs _transferTokens(src, dst, amount) without any allowance check. Comment: '// Removed allowance check for easy testing'"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "GTC.sol mock is deployed as the actual token contract (not the real GTC)",
+        "Any address holds GTC tokens"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "transferFrom(victim, attacker, victim.balance) succeeds without any approval",
+        "manipulation_vector": "Attacker calls transferFrom(IdentityStaking, attacker, fullBalance) to drain all staked GTC",
+        "profit_hypothesis": "Attacker extracts entire contract balance + any user wallet balance"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is the GTC.sol mock used in any non-test deployment?",
+          "Is there any deployment script that deploys this mock to a live network?"
+        ],
+        "validation_requirements": [
+          "Verify production deployment uses real GTC token address, not this mock",
+          "Test: call transferFrom(IdentityStaking, attacker, balance) without approval"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas cost only (~0.001 ETH)",
+        "estimated_execution_cost": "Single transaction gas",
+        "potential_profit_range": "Entire GTC balance of contract + all user wallets",
+        "estimated_profit_margin": "Near-infinite ROI",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Any time",
+        "market_impact_assessment": "Total protocol insolvency"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All GTC holders if mock is deployed as production token",
+        "estimated_impact_per_user": "100% loss of GTC holdings",
+        "total_value_at_risk": "Entire GTC token supply"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Verify which token address IdentityStaking.initialize receives",
+        "calculation_validation": "Confirm transferFrom has no allowance check",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "GTC Test Mock Mint Timing Check Disabled — Minter Can Inflate Supply Without Cooldown",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The GTC.sol test mock has the `mintingAllowedAfter` time check commented out (`// require(block.timestamp >= mintingAllowedAfter, ...)`). This allows the minter to mint 2% of totalSupply every transaction without waiting the required 365-day cooldown. Rapid repeated minting can inflate supply far beyond intended limits, diluting all holders and potentially undermining the IdentityStaking contract's collateral value.",
+      "investigation_rationale": "If the mock GTC is used with IdentityStaking, the minter could rapidly inflate supply, reducing the real value of all staked GTC. The mint cap of 2% compounds: after 100 rapid mints, supply grows by ~7.4x.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "The GTC.sol test mock is deployed as the actual GTC token"
+      ],
+      "config_evidence": "GTC.sol line 92: '// require(block.timestamp >= mintingAllowedAfter, ...)' — time check is commented out. Original GTC requires 365-day minimum between mints.",
+      "affected_functions": [
+        "mint"
+      ],
+      "affected_contracts": [
+        "GTC.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "GTC.sol",
+          "function": "mint"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "GTC.sol",
+        "lines": "89-92",
+        "pattern": "Commented out: // require(block.timestamp >= mintingAllowedAfter, 'GTC::mint: minting not allowed yet'); allows unlimited minting frequency"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "GTC.sol mock is deployed as the actual token",
+        "msg.sender == minter (minter role holder)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Each mint: up to 2% of totalSupply. With no time gate, 100 mints inflates supply ~7.4x. mintCap is % of CURRENT totalSupply, so it compounds.",
+        "manipulation_vector": "Minter rapidly mints new tokens, diluting staked GTC value and overwhelming slashing penalties",
+        "profit_hypothesis": "Minter extracts value proportional to inflated supply minus original"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is the GTC mock used in any deployment with real economic value?",
+          "How quickly could supply be inflated to make staking meaningless?"
+        ],
+        "validation_requirements": [
+          "Verify mint succeeds multiple times in same block without time check",
+          "Calculate compounding supply inflation after N mints"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas cost only (minter has privileges)",
+        "estimated_execution_cost": "Multiple transactions' gas",
+        "potential_profit_range": "Proportional to minted tokens at pre-inflation price",
+        "estimated_profit_margin": "Depends on market liquidity to sell minted tokens",
+        "attack_duration": "Minutes — repeated mint calls"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Sell pressure on inflated supply",
+        "optimal_timing": "Before market detects inflation",
+        "market_impact_assessment": "GTC price collapse from hyperinflation"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All GTC holders and stakers",
+        "estimated_impact_per_user": "Token value dilution proportional to inflation",
+        "total_value_at_risk": "Entire GTC market cap"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "mintCap=2%, minimumTimeBetweenMints=365 days (bypassed)",
+        "calculation_validation": "Verify compounding: (1.02)^100 ≈ 7.24x supply inflation",
+        "execution_complexity": "low",
+        "detection_difficulty": "low — supply changes visible on-chain"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "Duplicate Addresses in slash() Arrays Cause Compounding Slashes Exceeding Intended Percentage",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The slash() function does not deduplicate the selfStakers or communityStakers/communityStakees arrays. If the same address appears N times, the slash compounds: two 50% slashes result in 75% total slash (50% + 50% of remaining 50%), not the intended 50%. A negligent or malicious SLASHER could include duplicates to slash users far beyond the intended percentage.",
+      "investigation_rationale": "The slash percent parameter is validated (1-100), but the effective slash can exceed the intended percentage through duplication. This violates the economic fairness expectation that a 50% slash removes exactly 50% of the stake.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "slash"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "slash"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "255-315",
+        "pattern": "No deduplication of selfStakers array or communityStakers/communityStakees pairs. Each array element is processed independently, computing slashedAmount from the CURRENT (already-reduced) stake.amount."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "SLASHER_ROLE holder includes duplicate addresses in slash arrays",
+        "Target address has active stake with amount > 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Two entries at 50%: first slash = 50% of 100 = 50; second slash = 50% of 50 = 25. Total slashed = 75, not 50.",
+        "manipulation_vector": "SLASHER includes address 3x at 50% → slashes 87.5% instead of 50%",
+        "profit_hypothesis": "No attacker profit; victims lose more than intended slash percentage"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does the off-chain slashing system have deduplication?",
+          "What is the maximum practical compounding from realistic duplicate counts?"
+        ],
+        "validation_requirements": [
+          "Call slash([addr, addr], [], [], 50) and verify 75% total slash instead of 50%",
+          "Verify same for community stakes with duplicate staker/stakee pairs"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — requires SLASHER_ROLE",
+        "estimated_execution_cost": "Gas for slash transaction",
+        "potential_profit_range": "N/A — no direct profit; excess slashing of victims",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "Victim loses more than intended percentage"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users targeted by duplicated slash entries",
+        "estimated_impact_per_user": "Up to 100% loss from compounding even at low slash percentages",
+        "total_value_at_risk": "Full stake amount of targeted users"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Compound formula: remaining = amount * (1 - percent/100)^N for N duplicates",
+        "calculation_validation": "Test with specific duplicates and percentages",
+        "execution_complexity": "low — single slash call with repeated addresses",
+        "detection_difficulty": "medium — requires checking calldata for duplicates"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Repeated Slashing Rolls Forward Previous-Round Slashes Indefinitely, Preventing Burn Finality",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When a stake slashed in round N-1 is re-slashed in round N, the entire slashedAmount (old + new) is migrated to round N via totalSlashed[N-1] -= old, totalSlashed[N] += old. A SLASHER can repeatedly re-slash the same user each round (even at 1% with tiny resulting amounts), continuously rolling forward the old slashedAmount to the current round. This prevents those funds from ever being burned, as they're always in the 'current' round when lockAndBurn executes.",
+      "investigation_rationale": "The slash round migration logic is intended to prevent burning during active slashing, but it creates an indefinite deferral mechanism. A SLASHER could abuse this to prevent specific slashed funds from ever being burned, undermining the protocol's enforcement mechanism.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "slash",
+        "lockAndBurn"
+      ],
+      "affected_contracts": [
+        "IdentityStaking.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "IdentityStaking.sol",
+          "function": "slash"
+        },
+        {
+          "file": "IdentityStaking.sol",
+          "function": "lockAndBurn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "IdentityStaking.sol",
+        "lines": "280-291",
+        "pattern": "if (sStake.slashedInRound == currentSlashRound - 1) { totalSlashed[currentSlashRound - 1] -= sStake.slashedAmount; totalSlashed[currentSlashRound] += sStake.slashedAmount; } — migrates entire slashedAmount to current round on each re-slash"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "SLASHER_ROLE re-slashes same user every round before lockAndBurn",
+        "User has remaining stake amount > 0 (for non-zero new slash calculation)",
+        "burnRoundMinimumDuration elapses between each round transition"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Round N: slash user, slashedAmount=X in round N. Round N+1: re-slash at 1%, old X migrated to N+1, small new amount added. Repeat indefinitely.",
+        "manipulation_vector": "SLASHER prevents specific slashed funds from being burned by rolling them forward each round",
+        "profit_hypothesis": "No direct profit; disrupts burn mechanism for targeted slashes. Could be used to keep funds in 'appealable' state indefinitely if RELEASER colludes."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there a legitimate reason to re-slash users across rounds?",
+          "Could SLASHER+RELEASER collude to keep cycling funds between slashed and released states?"
+        ],
+        "validation_requirements": [
+          "Simulate: slash in round N, lockAndBurn to round N+1, re-slash in N+1, verify old amount migrated",
+          "Confirm indefinite rollover across 5+ rounds"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A — requires SLASHER_ROLE",
+        "estimated_execution_cost": "Gas for periodic slash transactions (every 90+ days)",
+        "potential_profit_range": "N/A — griefing/collusion scenario",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Indefinite — can continue as long as user has remaining stake"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Each round transition period",
+        "market_impact_assessment": "Minimal direct impact; undermines burn finality guarantee"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol integrity — burn mechanism circumvented for specific slashes",
+        "estimated_impact_per_user": "Slashed funds remain in limbo indefinitely instead of being burned",
+        "total_value_at_risk": "Slashed amounts that should be burned"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "burnRoundMinimumDuration = 90 days; attacker needs one slash per 90 days",
+        "calculation_validation": "Trace rollforward across multiple lockAndBurn cycles",
+        "execution_complexity": "medium — requires periodic SLASHER transactions",
+        "detection_difficulty": "medium — requires monitoring slash patterns per user across rounds"
+      }
+    }
+  ]
+}

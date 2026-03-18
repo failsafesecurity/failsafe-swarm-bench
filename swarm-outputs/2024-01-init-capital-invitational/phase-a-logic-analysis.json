@@ -1,0 +1,474 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T05:35:24.337Z",
+    "duration_ms": 522002
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-margin-open",
+        "source": "User via MarginTradingHook.openPos/increasePos",
+        "path": [
+          "User sends tokenIn + msg.value",
+          "depositNative wraps ETH to WNATIVE",
+          "_transmitTokenIn transfers tokenIn to hook",
+          "Multicall to InitCore: borrow -> callback -> mintTo -> collateralize",
+          "coreCallback sends ALL tokenIn balance to swapHelper",
+          "swapHelper swaps borrToken to collToken",
+          "collToken sent to collPool, minted, collateralized to position"
+        ],
+        "transformations": [
+          "Native ETH -> WNATIVE",
+          "borrToken -> collToken via swap",
+          "collToken -> collPool shares -> position collateral"
+        ],
+        "sinks": [
+          "Position collateral in PosManager",
+          "Debt shares in PosManager"
+        ],
+        "trust_changes": "User input transitions from user-controlled to protocol-managed via multicall",
+        "validation_points": [
+          "tokenIn must be collToken or borrToken",
+          "Position health checked after multicall",
+          "minHealth_e18 slippage control"
+        ],
+        "exposure_risks": [
+          "coreCallback uses balanceOf(this) for amtIn - residual tokens from prior operations get included",
+          "SwapHelper gets full token balance, could extract value if malicious"
+        ],
+        "manipulation_risks": [
+          "Swap routing controlled by user-provided _data parameter",
+          "MEV sandwich attacks on the swap"
+        ]
+      },
+      {
+        "flow_id": "DF-002-order-fill",
+        "source": "Executor via MarginTradingHook.fillOrder",
+        "path": [
+          "Executor calls fillOrder with orderId",
+          "Order loaded from storage, marginPos loaded",
+          "Trigger price validated against oracle",
+          "_calculateFillOrderInfo computes amtOut, repayShares, repayAmt",
+          "_calculateRepaySize returns (repayAmt, repayShares) - SWAPPED at call site",
+          "Executor transfers borrToken (repayAmt=shares_value) and tokenOut (amtOut) to hook/recipient",
+          "Hook repays debt with repayShares=amt_value",
+          "Hook decollateralizes collateral to executor"
+        ],
+        "transformations": [
+          "Debt shares -> token amounts via debtShareToAmtCurrent",
+          "Collateral shares -> underlying via toAmtCurrent",
+          "Price calculations using limitPrice_e36"
+        ],
+        "sinks": [
+          "Executor receives collateral",
+          "Order recipient receives tokenOut",
+          "Debt pool receives repayment"
+        ],
+        "trust_changes": "Order parameters trusted from storage but can be manipulated via updateOrder missing auth",
+        "validation_points": [
+          "Order must be Active",
+          "Trigger price validated against oracle markPrice",
+          "Limit price used for amtOut calculation"
+        ],
+        "exposure_risks": [
+          "Return value swap in _calculateRepaySize causes incorrect amounts",
+          "updateOrder has no authorization check allowing anyone to modify order parameters"
+        ],
+        "manipulation_risks": [
+          "Attacker updates victim's order via updateOrder (no auth check)",
+          "Sets tokenOut to worthless token, extreme triggerPrice/limitPrice",
+          "Fills the modified order to steal collateral"
+        ]
+      },
+      {
+        "flow_id": "DF-003-liquidation",
+        "source": "Liquidator via InitCore.liquidate/liquidateWLp",
+        "path": [
+          "Liquidator calls liquidate with posId, repay pool, collateral pool",
+          "Health checked: must be < 1e18",
+          "_repay: transfers borrToken from liquidator to pool, reduces debt",
+          "Liquidation incentive calculated based on health factor",
+          "Collateral shares calculated using oracle prices and incentive",
+          "Collateral transferred from position to liquidator",
+          "Post-liquidation health check (bypassed if health was 0)"
+        ],
+        "transformations": [
+          "repayAmt * liqIncentive / 1e18 = repayAmtWithLiqIncentive",
+          "(repayAmtWithLiqIncentive * repayTokenPrice) / collTokenPrice = collateral value",
+          "Value -> pool shares via toShares"
+        ],
+        "sinks": [
+          "Liquidator receives collateral shares",
+          "Pool receives debt repayment"
+        ],
+        "trust_changes": "Oracle prices trusted for incentive and collateral calculation",
+        "validation_points": [
+          "Position must be unhealthy (health < 1e18)",
+          "Post-liquidation health <= maxHealthAfterLiq (prevents over-liquidation)",
+          "minShares slippage control"
+        ],
+        "exposure_risks": [
+          "Oracle manipulation could affect liquidation incentive and collateral calculation",
+          "health_e18 == 0 returns multiplier 0 from LiqIncentiveCalculator - no incentive for underwater positions"
+        ],
+        "manipulation_risks": [
+          "Price manipulation to trigger unnecessary liquidations",
+          "Front-running liquidation calls",
+          "minLiqIncentiveMultiplier can exceed maxLiqIncentiveMultiplier via misconfiguration"
+        ]
+      },
+      {
+        "flow_id": "DF-004-lp-price",
+        "source": "WLpMoeMasterChef.calculatePrice_e36",
+        "path": [
+          "Get LP token reserves (r0, r1) and prices from oracle",
+          "Check kLast from pair contract",
+          "If kLast == 0: use reserve-based formula 2*sqrt(r0*p0)*sqrt(r1*p1)/totalSupply",
+          "If kLast != 0: use kLast-based formula 2*sqrt(kLast*p0*p1/totalSupply^2)",
+          "Price used for collateral valuation in InitCore"
+        ],
+        "transformations": [
+          "Reserves + oracle prices -> LP token price",
+          "Square root calculations for fair pricing"
+        ],
+        "sinks": [
+          "LP price used in collateral credit calculation",
+          "LP price used in liquidation calculations"
+        ],
+        "trust_changes": "On-chain reserves trusted directly when kLast == 0",
+        "validation_points": [
+          "Oracle prices validated in InitOracle"
+        ],
+        "exposure_risks": [
+          "When kLast == 0, reserves can be manipulated via flash loan + swap",
+          "Inflated LP price leads to excessive borrowing against LP collateral"
+        ],
+        "manipulation_risks": [
+          "Flash loan token0 -> swap in pair -> inflate r1/deflate r0 -> LP price increases",
+          "Borrow against inflated LP collateral",
+          "Reverse swap and repay flash loan"
+        ]
+      },
+      {
+        "flow_id": "DF-005-multicall-health",
+        "source": "Any authorized caller via InitCore.multicall",
+        "path": [
+          "Set isMulticallTx = true",
+          "Execute batched delegatecalls",
+          "Each borrow/decollateralize adds posId to uncheckedPosIds instead of immediate health check",
+          "After all calls, iterate uncheckedPosIds and verify health >= 1e18",
+          "Set isMulticallTx = false"
+        ],
+        "transformations": [
+          "Individual operations deferred health check to batch end"
+        ],
+        "sinks": [
+          "Position state changes committed if all health checks pass"
+        ],
+        "trust_changes": "Temporary unhealthy states allowed during multicall batch",
+        "validation_points": [
+          "Health check at end of multicall for all affected positions"
+        ],
+        "exposure_risks": [
+          "callback function allows external calls during multicall - potential for complex attack sequences",
+          "Callback can trigger arbitrary code execution on external contracts"
+        ],
+        "manipulation_risks": [
+          "Complex multi-step attacks that leave positions healthy at end but extract value during execution"
+        ]
+      },
+      {
+        "flow_id": "DF-006-money-market-repay",
+        "source": "User via MoneyMarketHook.execute",
+        "path": [
+          "User provides msg.value and repay params",
+          "_handleRepay calculates repayAmt from debt shares",
+          "If WNATIVE: wraps msg.value, reduces repayAmt by msg.value",
+          "Transfers remaining repayAmt from user",
+          "Multicall encodes repay with original _params[i].shares"
+        ],
+        "transformations": [
+          "Debt shares -> token amount via debtShareToAmtCurrent",
+          "msg.value deducted from repay amount"
+        ],
+        "sinks": [
+          "Lending pool receives repayment tokens"
+        ],
+        "trust_changes": "User-provided shares validated against position debt",
+        "validation_points": [
+          "repayShares capped at position debt shares",
+          "Repay amount calculated after interest accrual"
+        ],
+        "exposure_risks": [
+          "msg.value consumed by first WNATIVE repay, but msg.value immutable in call context",
+          "Second WNATIVE repay would try to re-deposit same msg.value, failing"
+        ],
+        "manipulation_risks": []
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Positions must maintain health >= 1e18 (collateral credit >= borrow credit) after state-changing operations",
+        "Collateral credit = sum(tokenValue * collFactor) with collFactor <= 1e18",
+        "Borrow credit = sum(tokenValue * borrFactor) with borrFactor >= 1e18, rounded up",
+        "Debt ceiling per mode per pool enforced by RiskManager on borrow",
+        "Virtual shares (10^8) and virtual assets (1) used to mitigate inflation attacks",
+        "Interest accrues per second based on double-slope IRM",
+        "Reserve factor portion of interest minted to treasury",
+        "Liquidation only when health < 1e18, post-liquidation health capped at maxHealthAfterLiq"
+      ],
+      "economic_incentives": [
+        "Lenders earn interest proportional to utilization and time",
+        "Borrowers pay interest that increases with utilization (double-slope)",
+        "Liquidators receive collateral worth (repayAmt * liqIncentiveMultiplier) - incentivized to maintain system health",
+        "Margin order executors profit from the spread between oracle price and execution terms",
+        "Protocol treasury accumulates reserve factor portion of all interest"
+      ],
+      "governance_mechanisms": [
+        "Governor can set oracle sources, collateral/borrow factors, mode configurations, quote assets",
+        "Guardian can set pool configs, IRM, reserve factor, risk manager parameters, max collateral counts",
+        "No timelock observed on governance actions - immediate effect"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "updateOrder called by non-owner to modify another user's active order parameters",
+          "expected_behavior": "Only the order owner (position owner) should be able to modify their orders",
+          "actual_behavior": "Any user with any valid position can modify any active order's triggerPrice, limitPrice, collAmt, and tokenOut. The function checks initPosId != 0 for the caller's position but never verifies order.initPosId == initPosId",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker modifies victim's order: sets tokenOut to worthless ERC20, sets extreme triggerPrice to ensure fillability, sets limitPrice to minimize amtOut. Then fills the order as executor: pays borrToken for debt repayment, sends near-zero worthless tokens as amtOut to victim, receives victim's real collateral. Profit = collateral value - debt repaid."
+        },
+        {
+          "scenario": "_calculateRepaySize return values destructured in wrong order in _calculateFillOrderInfo",
+          "expected_behavior": "repayShares should receive share count, repayAmt should receive token amount",
+          "actual_behavior": "_calculateRepaySize returns (repayAmt, repayShares) but call site destructures as (repayShares, repayAmt) = _calculateRepaySize(...), swapping the values. repayShares gets the token amount and repayAmt gets the share count.",
+          "risk_level": "high",
+          "exploitation_potential": "In fillOrder: executor transfers too few borrTokens (share count instead of token amount), tries to repay too many shares (token amount instead of share count). Transaction likely reverts for non-1:1 share ratios, but for early pools with 1:1 ratio, incorrect economic outcomes occur. All order fills are affected."
+        },
+        {
+          "scenario": "fillOrder auto-cancel when position collateral is 0 only updates memory, not storage",
+          "expected_behavior": "Order status should be set to Cancelled in storage when position has no collateral",
+          "actual_behavior": "Order is loaded into memory (Order memory order = __orders[_orderId]), memory copy's status is set to Cancelled, but __orders[_orderId] in storage remains Active. The CancelOrder event is emitted but the order remains fillable.",
+          "risk_level": "high",
+          "exploitation_potential": "Order remains permanently Active in storage. If collateral is later re-added to the position, the order could be filled. Also causes repeated gas-wasting calls and misleading events."
+        },
+        {
+          "scenario": "LP price calculation using reserves when kLast == 0",
+          "expected_behavior": "LP price should be manipulation-resistant",
+          "actual_behavior": "When kLast == 0, price = 2 * sqrt(r0*p0) * sqrt(r1*p1) / totalSupply uses live reserves that can be manipulated via flash-loan-funded swaps",
+          "risk_level": "high",
+          "exploitation_potential": "Flash loan attack: borrow large amount of token0, swap into pair to skew reserves, LP price inflates, borrow against wrapped LP collateral, reverse swap, repay flash loan, keep borrowed assets. Net extraction limited by collateral factor but could be significant."
+        },
+        {
+          "scenario": "LiqIncentiveCalculator returns 0 when health factor is exactly 0",
+          "expected_behavior": "Maximum incentive should be offered for deeply underwater positions",
+          "actual_behavior": "When _healthFactor_e18 == 0, getLiqIncentiveMultiplier_e18 returns 0. In liquidate, repayAmtWithLiqIncentive = repayAmt * 0 / 1e18 = 0, so liquidator gets 0 collateral shares.",
+          "risk_level": "medium",
+          "exploitation_potential": "Positions with exactly 0 health (zero collateral credit but nonzero debt) cannot be profitably liquidated, leading to bad debt accumulation. In practice, health reaching exactly 0 is rare but possible with collFactor set to 0 for a token."
+        },
+        {
+          "scenario": "reducePos does not check initPosId != 0",
+          "expected_behavior": "Should validate position exists before operating",
+          "actual_behavior": "initPosId defaults to 0 for non-existent positions. _reducePosInternal reads __marginPositions[0] which has zero addresses. Subsequent pool calls on address(0) would revert, but the error is unclear.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct value extraction but inconsistent error handling compared to other functions that check initPosId != 0"
+        },
+        {
+          "scenario": "Multiple orders reference same position collateral without aggregate check",
+          "expected_behavior": "Total collateral committed across all orders should not exceed position collateral",
+          "actual_behavior": "Each order's collAmt is checked individually against current position collateral at creation time. Multiple orders can be created that collectively exceed total collateral.",
+          "risk_level": "medium",
+          "exploitation_potential": "When orders are filled sequentially, later orders find insufficient collateral. _calculateRepaySize caps order.collAmt at remaining collateral, but proportional repay is lower than expected. Order owner may receive less value than anticipated."
+        },
+        {
+          "scenario": "coreCallback transfers entire token balance to swapHelper",
+          "expected_behavior": "Only the specific operation's tokens should be swapped",
+          "actual_behavior": "uint amtIn = IERC20(swapInfo.tokenIn).balanceOf(address(this)); transfers ALL balance. If prior operations left residual tokens, they are included in the swap.",
+          "risk_level": "medium",
+          "exploitation_potential": "If tokens are accidentally sent to the hook contract, they will be swept into the next user's operation. Could be exploited by donating tokens to manipulate swap amounts, though net benefit to the next user rather than the attacker."
+        },
+        {
+          "scenario": "MoneyMarketHook msg.value used in multiple WNATIVE operations",
+          "expected_behavior": "msg.value should be usable across operations or properly tracked",
+          "actual_behavior": "msg.value is immutable within a call. First WNATIVE deposit consumes all ETH. Second WNATIVE deposit call attempts to send msg.value again but has insufficient balance, causing revert.",
+          "risk_level": "low",
+          "exploitation_potential": "No security issue but users submitting multiple WNATIVE repay/deposit params will get unexpected reverts. Documented as 'msg.value should be used for 1 operation only' but not enforced."
+        },
+        {
+          "scenario": "InitOracle with two valid sources but maxPriceDeviation not set",
+          "expected_behavior": "Should function with default deviation or skip check",
+          "actual_behavior": "maxPriceDeviations_e18[_token] defaults to 0. Deviation check: (maxPrice * 1e18) / minPrice <= 0 always fails since prices > 0. Oracle reverts for any token with two valid sources but no deviation set.",
+          "risk_level": "low",
+          "exploitation_potential": "Configuration oversight blocks oracle functionality. No direct exploit but could cause denial of service for affected tokens."
+        },
+        {
+          "scenario": "minLiqIncentiveMultiplier_e18 set greater than maxLiqIncentiveMultiplier_e18",
+          "expected_behavior": "Min should not exceed max",
+          "actual_behavior": "No validation that min <= max. Math.max(Math.min(value, max), min) means min wins when min > max, potentially giving excessive liquidation incentives.",
+          "risk_level": "low",
+          "exploitation_potential": "Governor misconfiguration leads to excessive liquidation incentives, potentially draining positions during liquidation."
+        },
+        {
+          "scenario": "First wrap to WLpMoeMasterChef for a pid with lpSupply == 0",
+          "expected_behavior": "No rewards should be lost",
+          "actual_behavior": "updateRewards modifier: if lpSupply == 0, reward per share is not incremented. Any rewards distributed by MasterChef during the deposit call are lost since they cannot be attributed to any LP holder.",
+          "risk_level": "low",
+          "exploitation_potential": "Small amount of rewards lost on first deposit to a pid. Not exploitable for profit but represents value leakage."
+        }
+      ],
+      "assumption_violations": [
+        "Assumption: Order parameters can only be modified by position owner. Violation: updateOrder has no authorization check linking order to caller's position.",
+        "Assumption: _calculateRepaySize returns are correctly matched at call site. Violation: Return destructuring is swapped in _calculateFillOrderInfo.",
+        "Assumption: LP reserves accurately reflect fair value. Violation: Reserves can be manipulated when kLast == 0.",
+        "Assumption: Liquidation incentive is always positive for unhealthy positions. Violation: Returns 0 when health == 0.",
+        "Assumption: Storage is updated when fillOrder auto-cancels. Violation: Memory-only update."
+      ],
+      "game_theory_risks": [
+        "Order executors can front-run each other to capture fill opportunities (MEV)",
+        "Liquidators can manipulate oracle prices (if possible) to trigger liquidations and capture incentives",
+        "Users can create orders with extreme parameters to bait executors into unprofitable fills",
+        "With updateOrder vulnerability: attacker can systematically steal collateral from all users with active orders",
+        "Flash loan-based LP price manipulation to borrow against inflated collateral, then default"
+      ],
+      "integration_risks": [
+        "Merchant Moe MasterChef reward distribution assumes standard ERC20 reward tokens",
+        "MasterChef extraRewarder returning native token (address(0)) handled via WNATIVE wrapping in receive()",
+        "SwapHelper is trusted to perform honest swaps - malicious helper could steal tokens",
+        "Oracle failure of both primary and secondary sources causes complete system halt for affected tokens",
+        "Moe pair kLast depends on fee-on state which is controlled by Moe protocol governance"
+      ],
+      "calculation_errors": [
+        "CRITICAL: _calculateFillOrderInfo destructures _calculateRepaySize return as (repayShares, repayAmt) but function returns (repayAmt, repayShares) - values are swapped",
+        "In calculatePrice_e36 with kLast != 0: intermediate division prices_e36[0].mulDiv(prices_e36[1], totalSupply) may lose precision for tokens with very different decimal scales",
+        "getBorrowCreditCurrent_e36 uses ceilDiv for final division favoring borrowers (increasing borrow credit), which is correct for safety but reduces capital efficiency"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "WNATIVE",
+          "behaviors": [
+            "permit:false",
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Wrapped native token (WETH/WMANTLE). Used for native ETH handling. Deposit/withdraw pattern."
+        },
+        {
+          "address_or_symbol": "MOE",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Merchant Moe reward token distributed via MasterChef"
+        },
+        {
+          "address_or_symbol": "LendingPool shares",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": -1,
+          "notes": "Dynamic decimals = underlyingToken.decimals() + 8 (VIRTUAL_SHARE_DECIMALS). Only mintable/burnable by InitCore."
+        },
+        {
+          "address_or_symbol": "mUSD",
+          "behaviors": [
+            "rebasing:true",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Rebasing token (MUSD wrapping USDY). Uses shares-based accounting internally. Handled via mUSDUSDYHelper."
+        },
+        {
+          "address_or_symbol": "USDY",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Yield-bearing non-rebasing token. Used as underlying in lending pools. mUSD wraps/unwraps to USDY."
+        },
+        {
+          "address_or_symbol": "MoePair LP",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Merchant Moe AMM LP tokens. Wrapped into WLpMoeMasterChef NFTs for collateral use. kLast may be 0 if fee switch is off."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "position_health",
+          "state_vars": [
+            "collateralCredit_e36",
+            "borrowCredit_e36"
+          ],
+          "rule": "After any non-liquidation state change, collateralCredit_e36 / borrowCredit_e36 >= 1e18 (health >= 1)"
+        },
+        {
+          "name": "pool_accounting",
+          "state_vars": [
+            "cash",
+            "totalDebt",
+            "IERC20(underlyingToken).balanceOf(pool)"
+          ],
+          "rule": "IERC20(underlyingToken).balanceOf(pool) >= cash at all times"
+        },
+        {
+          "name": "debt_share_consistency",
+          "state_vars": [
+            "totalDebt",
+            "totalDebtShares",
+            "sum(position_debt_shares)"
+          ],
+          "rule": "sum of all position debt shares for a pool should equal pool.totalDebtShares"
+        },
+        {
+          "name": "collateral_balance_tracking",
+          "state_vars": [
+            "__collBalances[pool]",
+            "IERC20(pool).balanceOf(POS_MANAGER)",
+            "sum(posCollAmts[pool])"
+          ],
+          "rule": "__collBalances[pool] == IERC20(pool).balanceOf(POS_MANAGER) and sum of all position collateral for pool <= __collBalances[pool]"
+        },
+        {
+          "name": "mode_debt_ceiling",
+          "state_vars": [
+            "modeDebtShares",
+            "ceilAmt"
+          ],
+          "rule": "debtShareToAmt(modeDebtShares) <= ceilAmt when increasing debt"
+        },
+        {
+          "name": "supply_cap",
+          "state_vars": [
+            "totalAssets()",
+            "supplyCap"
+          ],
+          "rule": "pool.totalAssets() <= supplyCap after mint"
+        },
+        {
+          "name": "reward_accounting",
+          "state_vars": [
+            "pidAccRewardPerShares_e18",
+            "idAccRewardPerShares_e18"
+          ],
+          "rule": "pidAccRewardPerShares_e18 >= idAccRewardPerShares_e18 for all active wrapped LP tokens"
+        }
+      ]
+    }
+  }
+}

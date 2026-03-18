@@ -1,0 +1,68 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Guard Checks Wrong Parameter for disableModule — Renter Can Disable Stop Policy Module and Permanently Lock Lender NFTs",
+      "severity": "high",
+      "summary": "The disableModule(address prevModule, address module) function in Gnosis Safe's ModuleManager has two address parameters. The first (prevModule) is a linked-list pointer used internally, and the second (module) is the actual module being disabled. The constant gnosis_safe_disable_module_offset = 0x24 in RentalConstants.sol is used by Guard._checkTransaction to extract the address to validate from calldata. For bytes memory data, _loadValueFromCalldata with offset 0x24 reads at memory position da",
+      "description": [
+        {
+          "file": "src/libraries/RentalConstants.sol",
+          "line_start": 62,
+          "line_end": 62,
+          "desc": "gnosis_safe_disable_module_offset is set to 0x24 which points to the first argument (prevModule) instead of 0x44 which would point to the second argument (module being disabled). The Guard validates prevModule against the whitelist instead of the module being disabled."
+        }
+      ],
+      "impact": "A malicious renter can permanently lock all rented ERC721/ERC1155 assets in their rental safe by disabling the Stop policy module. The lender permanently loses their assets. This requires at least one whitelisted extension to exist in the protocol (reasonable assumption for production). The escrowed ERC20 payments also become unrecoverable since settlePayment is called after the failed reclaim.",
+      "proof_of_concept": "1. Rental safe is deployed with module linked list: SENTINEL -> stopPolicy -> SENTINEL\n2. Renter calls enableModule(whitelistedExtension) on the safe — Guard reads offset 0x24 = whitelistedExtension, checks whitelist, passes\n3. Module linked list becomes: SENTINEL -> whitelistedExtension -> stopPolicy -> SENTINEL\n4. Renter calls disableModule(whitelistedExtension, stopPolicy) — Guard reads offset 0x24 = whitelistedExtension (the prevModule, not the module being disabled), checks whitelist, passes\n5. The Stop policy module is disabled from the safe\n6. When the rental period ends and stopRent() is called, _reclaimRentedItems() calls ISafe(rentalWallet).execTransactionFromModule() which requires Stop to be an enabled module — this call fails with Gnosis Safe error GS104\n7. Lender's NFTs are permanently locked in the renter's safe; the Guard still blocks direct transfers, so neither party can retrieve them",
+      "remediation": "Change gnosis_safe_disable_module_offset from 0x24 to 0x44 in RentalConstants.sol to correctly point to the second argument (the module being disabled). Alternatively, extract and validate BOTH parameters."
+    },
+    {
+      "title": "Guard Does Not Block setFallbackHandler — Renter Can Alter Safe's Callback Support and Interfere With Protocol Operations",
+      "severity": "high",
+      "summary": "Gnosis Safe's setFallbackHandler(address) function allows changing the fallback handler contract that processes all calls to the Safe that don't match known function selectors, including critical ERC-721/ERC-1155 token callbacks (onERC721Received, onERC1155Received, onERC1155BatchReceived) via the TokenCallbackHandler. The Factory contract sets the TokenCallbackHandler as the initial fallback handler during safe deployment (Factory.sol line 167). A renter can change the fallback handler to addre",
+      "description": [
+        {
+          "file": "src/policies/Guard.sol",
+          "line_start": 195,
+          "line_end": 293,
+          "desc": "The Guard's _checkTransaction function does not include the Gnosis Safe setFallbackHandler(address) selector (0xf08a0323) in its list of blocked or checked selectors. The Guard blocks setGuard (0xe19a9dd9), enableModule (0x610b5925), and disableModule (0xe009cfde), but overlooks setFallbackHandler which has equal security significance for safe configuration integrity."
+        }
+      ],
+      "impact": "Renter can permanently alter the safe's fallback handler configuration, breaking ERC token receiver compliance and potentially disrupting hook-based interactions or future protocol operations that depend on the safe being able to receive tokens via safeTransferFrom.",
+      "proof_of_concept": "1. Renter calls safe.setFallbackHandler(address(0)) — Guard does not block this\n2. The safe loses its TokenCallbackHandler, no longer implementing onERC721Received/onERC1155Received\n3. Any new incoming safeTransferFrom to the safe will fail because the callback is not implemented\n4. Alternatively, renter sets a malicious fallback handler that selectively reverts on certain calls, creating targeted DoS conditions\n5. The fallback handler change persists permanently since the Guard blocks setGuard removal but doesn't track or restrict fallback handler changes",
+      "remediation": "Add setFallbackHandler(address) selector (0xf08a0323) to the Guard's always-blocked selectors list, similar to how setGuard(address) is handled at lines 287-291."
+    },
+    {
+      "title": "Guard Does Not Inspect Gnosis Safe Gas Refund Parameters — Renter Can Drain ETH and ERC20 Tokens From Rental Safe",
+      "severity": "high",
+      "summary": "Gnosis Safe's execTransaction includes a built-in gas refund mechanism via handlePayment(). When gasPrice > 0, the safe automatically transfers (gasUsed + baseGas) * gasPrice worth of tokens to the refundReceiver. If gasToken is address(0), ETH is sent; if gasToken is an ERC20 address, that ERC20 token is transferred via the token's transfer function. This payment occurs AFTER the main transaction execution and AFTER both guard checks (checkTransaction and checkAfterExecution), regardless of whe",
+      "description": [
+        {
+          "file": "src/policies/Guard.sol",
+          "line_start": 309,
+          "line_end": 321,
+          "desc": "The Guard's checkTransaction function receives but deliberately ignores the gas payment parameters (safeTxGas, baseGas, gasPrice, gasToken, refundReceiver) from Gnosis Safe's execTransaction. These parameters control an automatic gas refund mechanism that transfers ETH or ERC20 tokens from the safe regardless of whether the main transaction succeeds or fails."
+        }
+      ],
+      "impact": "Any ETH or ERC20 tokens that accumulate in a rental safe through airdrops, protocol rewards, accidental transfers, or any other mechanism can be freely drained by the renter via the gas refund mechanism. While rented NFTs cannot be drained this way (handlePayment uses ERC20 transfer, not ERC721 transfer), all fungible value associated with holding NFTs in the safe is at risk.",
+      "proof_of_concept": "1. An NFT project airdrops 10,000 USDC to all holders of an NFT collection, including a rental safe that holds a rented NFT from that collection\n2. The renter (safe owner) crafts a Gnosis Safe transaction with: to=safe_address, data=0x00000000 (dummy 4-byte selector to pass length check), value=0, gasPrice=10000e6, baseGas=1, safeTxGas=0, gasToken=USDC_ADDRESS, refundReceiver=renter_EOA, operation=Call\n3. The Guard checks to/data/operation — all benign — the transaction passes checkTransaction\n4. The main transaction executes (or reverts, doesn't matter)\n5. Gnosis Safe's handlePayment calculates payment = (0 + 1) * 10000e6 = 10000e6 and calls USDC.transfer(renter_EOA, 10000e6)\n6. The 10,000 USDC airdrop that rightfully should remain with the NFT holder is stolen by the renter",
+      "remediation": "The Guard should validate gas payment parameters. The simplest fix is to require gasPrice == 0 in checkTransaction to completely disable the gas refund mechanism for rental safes: if (gasPrice > 0) revert. Alternatively, restrict gasToken to address(0) only and cap gasPrice to a reasonable maximum."
+    },
+    {
+      "title": "ERC1155 Partial Burn Permanently DoS's Rental Reclaim — Lender Assets Locked Forever",
+      "severity": "high",
+      "summary": "The Guard contract blocks standard ERC1155 transfer functions (safeTransferFrom, safeBatchTransferFrom, setApprovalForAll) for rented tokens, but does not block burn functions such as ERC1155Burnable.burn(address,uint256,uint256) or burnBatch(address,uint256[],uint256[]). These are standard OpenZeppelin extensions widely used by ERC1155 token contracts. If a renter burns even 1 unit of a rented ERC1155 token, the safe's actual balance becomes less than the amount recorded in the rental order. Wh",
+      "description": [
+        {
+          "file": "src/packages/Reclaimer.sol",
+          "line_start": 42,
+          "line_end": 49,
+          "desc": "The Reclaimer's _transferERC1155 always attempts to transfer the full rented amount (item.amount) back to the lender. If the safe's balance is even 1 unit less than item.amount (due to burn or other balance-reducing mechanism not blocked by the Guard), the safeTransferFrom will revert, permanently preventing the rental order from being stopped."
+        }
+      ],
+      "impact": "A malicious renter can permanently lock all of a lender's rented ERC1155 tokens (minus the small amount burned) by burning just 1 unit. The attack cost is minimal (1 unit) but the damage is permanent loss of (N-1) units for the lender. For overlapping ERC1155 rentals to the same safe, one burn can DoS reclaim of multiple orders. Escrowed ERC20 payments also become unrecoverable since settlePayment is called after the failed reclaim in stopRent.",
+      "proof_of_concept": "1. Lender creates order to rent 10 units of ERC1155(token, id=5) to renter's safe\n2. rentedAssets[hash(safe, token, 5)] = 10, safe holds 10 units\n3. Renter calls token.burn(safe, 5, 1) from the safe — Guard does not block burn selector\n4. Safe now holds 9 units, but rentedAssets still records 10\n5. Rental expires, anyone calls stopRent(order)\n6. _reclaimRentedItems calls _transferERC1155 which attempts: IERC1155(token).safeTransferFrom(safe, lender, 5, 10, '') — REVERTS because safe only has 9\n7. stopRent permanently fails; lender cannot recover their remaining 9 tokens\n8. With overlapping rentals: burning 1 unit can DoS reclaim for a DIFFERENT order that rents the same token/id to the same safe",
+      "remediation": "1. Add ERC1155Burnable burn/burnBatch selectors to the Guard's blocked list for rented tokens. 2. Alternatively, modify the Reclaimer to use a try-catch around ERC1155 transfers and transfer whatever balance is available (min(item.amount, balanceOf(safe, id))) rather than reverting on the full amount. 3. Consider adding a check in _reclaimRentedItems that verifies the safe holds sufficient balance before attempting the transfer."
+    }
+  ]
+}

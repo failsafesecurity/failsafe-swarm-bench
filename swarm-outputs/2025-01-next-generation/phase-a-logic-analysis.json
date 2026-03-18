@@ -1,0 +1,492 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:19:45.549Z",
+    "duration_ms": 309091
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-MINT",
+        "source": "MINTER_ROLE or MASTER_MINTER caller",
+        "path": [
+          "mint(to, amount)",
+          "check roles & _operating",
+          "check minterAllowed (MINTER only)",
+          "deduct minterAllowed",
+          "_mint(to, amount)"
+        ],
+        "transformations": [
+          "minterAllowed[_msgSender()] -= amount",
+          "totalSupply += amount",
+          "balanceOf[to] += amount"
+        ],
+        "sinks": [
+          "recipient 'to' balance",
+          "totalSupply"
+        ],
+        "trust_changes": "Minter creates unbacked tokens; no adminSanity or blacklist/pause checks applied",
+        "validation_points": [
+          "role check (MINTER_ROLE or MASTER_MINTER)",
+          "_operating flag",
+          "minterAllowed >= amount (MINTER only)",
+          "amount > 0"
+        ],
+        "exposure_risks": [
+          "MASTER_MINTER has unlimited minting with no allowance check",
+          "Mint bypasses pause and blacklist checks"
+        ],
+        "manipulation_risks": [
+          "Compromised MASTER_MINTER can mint unlimited supply",
+          "Tokens can be minted to blacklisted addresses"
+        ]
+      },
+      {
+        "flow_id": "DF-02-TRANSFER-WITH-FEES",
+        "source": "Token holder (_msgSender)",
+        "path": [
+          "transfer(recipient, amount)",
+          "transferSanity(sender, recipient, amount)",
+          "adminSanity(sender, recipient)",
+          "_payTxFee(sender, amount)",
+          "super.transfer(recipient, amount)"
+        ],
+        "transformations": [
+          "txFees = (amount * _txfeeRate) / 10000",
+          "balanceOf[sender] -= txFees (to feesFaucet)",
+          "balanceOf[sender] -= amount",
+          "balanceOf[recipient] += amount"
+        ],
+        "sinks": [
+          "recipient balance",
+          "_feesFaucet balance"
+        ],
+        "trust_changes": "Fee deduction occurs before actual transfer via _update; fees bypass pause/blacklist since already checked",
+        "validation_points": [
+          "adminSanity: pause check, blacklist check (bypassed for ADMIN)",
+          "balance >= txFees + amount",
+          "_feesFaucet != address(0) for fee deduction"
+        ],
+        "exposure_risks": [
+          "When _feesFaucet == address(0) but _txfeeRate > 0, balance check requires fee+amount but fee is never deducted (phantom fee)",
+          "Small transfers produce zero fees due to integer division rounding"
+        ],
+        "manipulation_risks": [
+          "Admin can set fee rate to 100% (10000), requiring 2x the transfer amount",
+          "Rounding-based fee avoidance on small amounts"
+        ]
+      },
+      {
+        "flow_id": "DF-03-META-TX-FORWARDER",
+        "source": "User signs ForwardRequest off-chain",
+        "path": [
+          "Relayer calls Forwarder.execute()",
+          "_verifyNonce(req)",
+          "_verifySig(req, domainSeparator, ...)",
+          "_updateNonce(req)",
+          "req.to.call(abi.encodePacked(req.data, req.from))",
+          "Token._msgSender() extracts req.from from appended calldata",
+          "_eurf.payGaslessBasefee(req.from, msg.sender)"
+        ],
+        "transformations": [
+          "nonces[req.from]++",
+          "token transfer of amount",
+          "gasless basefee transferred from payer to paymaster"
+        ],
+        "sinks": [
+          "transfer recipient balance",
+          "paymaster receives basefee"
+        ],
+        "trust_changes": "Domain separator is caller-supplied (not contract-derived), enabling potential cross-domain signature replay; trust transitions from signed message to on-chain execution",
+        "validation_points": [
+          "nonce match",
+          "ECDSA signature recovery == req.from",
+          "req.to == _eurfAddress",
+          "selector == transfer(address,uint256)",
+          "typeHashes[requestTypeHash] registered"
+        ],
+        "exposure_risks": [
+          "Domain separator not validated against contract's own domain - potential cross-chain/cross-contract replay",
+          "Forwarder ETH balance drainable via req.value (mitigated by req.to restriction and token lacking receive)"
+        ],
+        "manipulation_risks": [
+          "Attacker-supplied domainSeparator enables signature portability across deployments",
+          "First-time users on multiple chains have same nonce=0, enabling cross-chain replay if same Forwarder address"
+        ]
+      },
+      {
+        "flow_id": "DF-04-PERMIT",
+        "source": "Off-chain EIP-712 signature from token holder",
+        "path": [
+          "permit(owner, spender, value, deadline, v, r, s)",
+          "check deadline",
+          "build structHash with _PERMIT_TYPEHASH",
+          "_useNonce(owner)",
+          "_hashTypedDataV4(structHash)",
+          "ECDSA.recover(hash, v, r, s)",
+          "_approve(owner, spender, value)"
+        ],
+        "transformations": [
+          "_nonces[owner]++",
+          "allowance[owner][spender] = value"
+        ],
+        "sinks": [
+          "ERC20 allowance mapping"
+        ],
+        "trust_changes": "Off-chain signature authorizes on-chain approval; nonce shared with transferWithAuthorization",
+        "validation_points": [
+          "block.timestamp <= deadline",
+          "recovered signer == owner"
+        ],
+        "exposure_risks": [
+          "Shared nonce pool with transferWithAuthorization - executing one invalidates the other",
+          "No pause or blacklist check on permit"
+        ],
+        "manipulation_risks": [
+          "Front-running permit with another permit/TWA to consume nonce and grief user",
+          "Nonce ordering dependency creates denial-of-service vector for batched authorizations"
+        ]
+      },
+      {
+        "flow_id": "DF-05-TRANSFER-WITH-AUTHORIZATION",
+        "source": "Off-chain EIP-712 signature from holder",
+        "path": [
+          "Token.transferWithAuthorization()",
+          "transferSanity(holder, spender, value)",
+          "adminSanity + _payTxFee",
+          "super.transferWithAuthorization()",
+          "ERC20MetaTx._useNonce(holder)",
+          "ECDSA verify",
+          "_update(holder, spender, value)"
+        ],
+        "transformations": [
+          "txFees deducted from holder",
+          "_nonces[holder]++",
+          "balanceOf[holder] -= value",
+          "balanceOf[spender] += value"
+        ],
+        "sinks": [
+          "spender balance",
+          "_feesFaucet balance"
+        ],
+        "trust_changes": "Signed authorization executed by any third party; fees deducted before signature verification",
+        "validation_points": [
+          "adminSanity checks",
+          "balance check for fees + amount",
+          "deadline check",
+          "signature verification"
+        ],
+        "exposure_risks": [
+          "Fee deduction happens BEFORE signature verification in super call - fees paid even if signature later fails (though nonce increment would cause different hash)",
+          "Non-standard EIP-3009 implementation uses sequential nonces instead of random bytes32"
+        ],
+        "manipulation_risks": [
+          "Anyone can trigger fee deduction from holder by submitting with valid signature",
+          "Shared nonce with permit creates invalidation vector"
+        ]
+      },
+      {
+        "flow_id": "DF-06-SAFETY-SWITCH",
+        "source": "CONTROLLER or previous _operatingController or DEFAULT_ADMIN_ROLE",
+        "path": [
+          "safetySwitch()",
+          "check _operating state",
+          "toggle _operating",
+          "update _operatingController"
+        ],
+        "transformations": [
+          "_operating: true→false or false→true",
+          "_operatingController: sender or address(0)"
+        ],
+        "sinks": [
+          "_operating state variable",
+          "_operatingController state variable"
+        ],
+        "trust_changes": "A removed controller (no longer CONTROLLER role) can still re-enable operations if they were the one who disabled",
+        "validation_points": [
+          "CONTROLLER role check (for disabling)",
+          "DEFAULT_ADMIN_ROLE or _operatingController match (for re-enabling)"
+        ],
+        "exposure_risks": [
+          "Removed controller retains re-enable authority"
+        ],
+        "manipulation_risks": [
+          "Removed controller can re-enable operations against admin's wishes"
+        ]
+      },
+      {
+        "flow_id": "DF-07-GASLESS-BASEFEE",
+        "source": "Forwarder contract (trusted forwarder)",
+        "path": [
+          "Forwarder.execute() completes transfer",
+          "_eurf.payGaslessBasefee(req.from, msg.sender)",
+          "check isTrustedForwarder(msg.sender)",
+          "check payer balance >= _gaslessBasefee",
+          "_update(payer, paymaster, _gaslessBasefee)"
+        ],
+        "transformations": [
+          "balanceOf[payer] -= _gaslessBasefee",
+          "balanceOf[paymaster] += _gaslessBasefee"
+        ],
+        "sinks": [
+          "paymaster (relayer) balance"
+        ],
+        "trust_changes": "No adminSanity checks - bypasses pause and blacklist for basefee payment",
+        "validation_points": [
+          "isTrustedForwarder(msg.sender)",
+          "balance >= _gaslessBasefee"
+        ],
+        "exposure_risks": [
+          "Basefee payment bypasses blacklist and pause checks",
+          "Paymaster address (relayer) not validated against blacklist"
+        ],
+        "manipulation_risks": [
+          "Blacklisted paymaster can receive tokens via basefee",
+          "Basefee charged even if contract is paused (via forwarder path)"
+        ]
+      },
+      {
+        "flow_id": "DF-08-SET-OWNER",
+        "source": "Current OWNER",
+        "path": [
+          "setOwner(newOwner)",
+          "check newOwner != address(0)",
+          "check newOwner != current owner",
+          "grantRole(OWNER, newOwner)",
+          "revokeRole(OWNER, getRoleMember(OWNER, 0))"
+        ],
+        "transformations": [
+          "OWNER role granted to newOwner",
+          "OWNER role revoked from member at index 0"
+        ],
+        "sinks": [
+          "AccessControl role mapping"
+        ],
+        "trust_changes": "Brief window where two addresses hold OWNER role between grant and revoke (single tx, not exploitable)",
+        "validation_points": [
+          "grantRole checks caller has DEFAULT_ADMIN_ROLE",
+          "revokeRole checks caller has DEFAULT_ADMIN_ROLE"
+        ],
+        "exposure_risks": [
+          "Relies on EnumerableSet ordering - index 0 assumed to be the old owner"
+        ],
+        "manipulation_risks": [
+          "If OWNER set somehow has >1 member, revokeRole removes index 0 which may not be the caller"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Tiered minting: OWNER → MASTER_MINTER (unlimited) → MINTER (allowance-bounded)",
+        "MINTER_ROLE admin is MASTER_MINTER; all other role admins are DEFAULT_ADMIN_ROLE",
+        "Transfers require: not paused (unless ADMIN), sender not blacklisted (unless ADMIN), recipient not blacklisted (always), not to contract address",
+        "Percentage-based tx fees deducted before transfer, sent to _feesFaucet",
+        "Gasless meta-transactions: only transfer() forwarded, basefee paid to relayer post-execution",
+        "Safety switch halts minting/burning; re-enabled by original controller or OWNER",
+        "6 decimal precision (fiat-standard for EUR stablecoin)"
+      ],
+      "economic_incentives": [
+        "Fee rate configurable 0-100% (0-10000 bps) with FEE_RATIO=10000 denominator",
+        "Gasless basefee compensates relayers for gas costs",
+        "Minter allowances cap token creation per minter",
+        "MASTER_MINTER bypasses allowance entirely - unlimited minting authority"
+      ],
+      "governance_mechanisms": [
+        "Single OWNER (DEFAULT_ADMIN_ROLE) controls all role assignments and upgrades",
+        "ADMIN manages pause, blacklist, fees, forwarder settings",
+        "No timelock on any privileged operation",
+        "No multi-sig requirement for critical operations",
+        "UUPS upgradeable by OWNER with no delay"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "_feesFaucet is address(0) while _txfeeRate > 0",
+          "expected_behavior": "Fees should either be collected or not required",
+          "actual_behavior": "Balance check requires fee+amount, but fee is never deducted. Users need excess balance that remains unspent (phantom fee requirement)",
+          "risk_level": "medium",
+          "exploitation_potential": "Denial of service: users with exact transfer amount in balance cannot transfer even though no fee would actually be taken"
+        },
+        {
+          "scenario": "Small transfer amounts with integer division rounding",
+          "expected_behavior": "All transfers should incur proportional fees",
+          "actual_behavior": "For txAmount * _txfeeRate < 10000, fee rounds to 0. E.g., 1 unit transfer with 1bps fee = 0 fee",
+          "risk_level": "low",
+          "exploitation_potential": "Splitting large transfers into many small ones to avoid fees entirely"
+        },
+        {
+          "scenario": "Shared nonce between permit() and transferWithAuthorization()",
+          "expected_behavior": "Separate nonce spaces or at least documentation of interaction",
+          "actual_behavior": "Using _useNonce(owner) in both functions means executing a permit invalidates a pending transferWithAuthorization and vice versa",
+          "risk_level": "medium",
+          "exploitation_potential": "Griefing: front-run a transferWithAuthorization with a permit (or vice versa) to invalidate the pending signed transaction"
+        },
+        {
+          "scenario": "setTxFeeRate set to FEE_RATIO (10000) = 100% fee",
+          "expected_behavior": "Fee rate should be bounded to reasonable maximum",
+          "actual_behavior": "100% fee rate is allowed. Users need 2x the transfer amount (fee equals transfer). Malicious admin can effectively block transfers or extract maximum value",
+          "risk_level": "high",
+          "exploitation_potential": "Malicious ADMIN sets 100% fee rate, every transfer sends equal amount to feesFaucet, effectively doubling cost"
+        },
+        {
+          "scenario": "Forwarder domainSeparator is caller-provided, not contract-derived",
+          "expected_behavior": "Domain separator should be contract-specific to prevent cross-domain replay",
+          "actual_behavior": "Any domain separator is accepted as long as signature recovers to req.from. Cross-chain replay possible for users with same nonce on different chains",
+          "risk_level": "high",
+          "exploitation_potential": "Replay a user's signed ForwardRequest from chain A on chain B where same Forwarder is deployed at same address, if user has same nonce (e.g., both 0 for new user)"
+        },
+        {
+          "scenario": "Removed controller can re-enable operations",
+          "expected_behavior": "Only active controllers or admin should re-enable",
+          "actual_behavior": "safetySwitch re-enable checks _operatingController == _msgSender(), not the CONTROLLER role. Removed controller retains re-enable authority",
+          "risk_level": "medium",
+          "exploitation_potential": "A compromised controller whose role was revoked can still turn operations back on"
+        },
+        {
+          "scenario": "Minting to blacklisted addresses",
+          "expected_behavior": "Blacklisted addresses should not receive tokens",
+          "actual_behavior": "mint() does not call adminSanity(); blacklist is not checked. Minter can mint directly to blacklisted addresses",
+          "risk_level": "medium",
+          "exploitation_potential": "Compliance bypass: tokens can be created for blacklisted entities via minting"
+        },
+        {
+          "scenario": "Minting and burning while contract is paused",
+          "expected_behavior": "Paused state should halt all token operations",
+          "actual_behavior": "mint() and burn() only check _operating flag, not paused(). Minting and burning work during pause",
+          "risk_level": "medium",
+          "exploitation_potential": "Token supply manipulation continues even when transfers are paused for emergency"
+        },
+        {
+          "scenario": "address(0) granted ADMIN and MASTER_MINTER roles during initialization",
+          "expected_behavior": "Placeholder roles should not create exploitable conditions",
+          "actual_behavior": "hasRole(ADMIN, address(0)) returns true until setAdministrator is called. If any code path returns address(0) from _msgSender(), ADMIN privileges are obtained",
+          "risk_level": "low",
+          "exploitation_potential": "Theoretical only since _msgSender() cannot practically return address(0) through legitimate paths (ECDSA revert on zero recovery)"
+        },
+        {
+          "scenario": "payGaslessBasefee called on paused contract",
+          "expected_behavior": "No token movements during pause",
+          "actual_behavior": "payGaslessBasefee only checks isTrustedForwarder, not paused(). Since Forwarder calls transfer() which checks pause, this only occurs if transfer succeeded. But if ADMIN initiated the meta-tx (bypasses pause), basefee still transfers tokens",
+          "risk_level": "low",
+          "exploitation_potential": "Edge case with ADMIN-as-meta-tx-signer during pause"
+        },
+        {
+          "scenario": "burn() does not check amount > 0",
+          "expected_behavior": "Consistent validation with mint()",
+          "actual_behavior": "burn(0) succeeds and emits Burn event with 0 amount. mint(0) reverts with InvalidAmount",
+          "risk_level": "low",
+          "exploitation_potential": "Event spam or misleading analytics"
+        },
+        {
+          "scenario": "MASTER_MINTER who also has MINTER_ROLE",
+          "expected_behavior": "MASTER_MINTER should have unlimited minting regardless",
+          "actual_behavior": "mint() first checks if caller has MASTER_MINTER (passes), then checks if caller has MINTER_ROLE - if yes, applies allowance limit. So a dual-role holder is limited by minter allowance",
+          "risk_level": "low",
+          "exploitation_potential": "Unexpected restriction on MASTER_MINTER if they were also granted MINTER_ROLE"
+        }
+      ],
+      "assumption_violations": [
+        "setTxFeeRate and setGaslessBasefee contain dead code: uint256 can never be < 0, making the checks 'newTxFeeRate < 0' and 'newGaslessBasefee < 0' always false",
+        "mint() uses 'amount <= 0' check but uint256 cannot be negative, so this is effectively 'amount == 0'",
+        "Forwarder assumes domainSeparator is honest (caller-provided), violating EIP-712's intent of domain binding",
+        "Missing __gap storage slots in ERC20ControlerMinterUpgradeable, ERC20AdminUpgradeable, ERC20MetaTxUpgradeable, and FeesHandlerUpgradeable risk storage collisions on upgrade",
+        "EnumerableSet ordering assumption in setOwner: always assumes current owner is at index 0",
+        "TransferWithAuthorization type hash uses 'owner' field name but function parameter is 'holder' - inconsistency may confuse integrators"
+      ],
+      "game_theory_risks": [
+        "Fee avoidance via dust transfers: splitting large transfers into many sub-threshold amounts to round fees to zero",
+        "Nonce griefing: front-run a signed transferWithAuthorization by executing a permit for the same owner (consuming their nonce, invalidating the TWA)",
+        "Admin centralization: single ADMIN can set 100% fee rate, pause at will, blacklist arbitrarily, force transfer - no timelock or multi-sig",
+        "Forwarder relayer MEV: relayer can sandwich the forwarded transfer with their own trades since they control execution timing",
+        "Cross-chain signature replay via Forwarder's unchecked domain separator"
+      ],
+      "integration_risks": [
+        "UUPS upgrade has no timelock - owner can immediately change implementation, potentially rugpulling all holders",
+        "Forwarder is a separate contract (not upgradeable via same proxy) - must be redeployed separately; if Forwarder has bugs, trusted forwarder must be re-set",
+        "No ERC20 return value issues since built on OZ ERC20, but integrators must account for fee-on-transfer behavior",
+        "EIP-2612 permit implementation uses custom nonce scheme (not OZ standard Nonces.sol) which may conflict with off-chain tooling expectations",
+        "Non-standard EIP-3009 implementation: sequential nonces, different type hash field names, shared nonce pool"
+      ],
+      "calculation_errors": [
+        "Fee calculation (txAmount * _txfeeRate) / FEE_RATIO truncates toward zero, creating fee-free zones for small transactions. With 6 decimals and min fee rate of 1bps, transfers under 10000 units (0.01 EURF) pay zero fees",
+        "No overflow risk in fee calculation with uint256 but precision loss is systematic",
+        "payGaslessBasefee has no overflow concern since _gaslessBasefee is admin-set, but it's not bounded by any maximum - admin could set it to drain user balance"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "EURF",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:false",
+            "permit:true",
+            "pausable",
+            "blacklist",
+            "clawback",
+            "mint_burn_restricted"
+          ],
+          "decimals": 6,
+          "approval_model": "bounded",
+          "transfer_model": "fee",
+          "accounting_model": "balanceOf",
+          "notes": "Stablecoin with admin-configurable percentage fees (0-100%). Fee deducted BEFORE transfer via separate _update call to feesFaucet. Integrators must account for fee deduction reducing sender balance prior to transfer. forceTransfer allows ADMIN clawback. Uses custom EIP-2612 and EIP-3009 with shared sequential nonces. When feesFaucet is address(0), phantom balance requirement exists (fee checked but not deducted)."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation",
+          "state_vars": [
+            "totalSupply",
+            "sum(balanceOf)"
+          ],
+          "rule": "totalSupply == sum of all balanceOf at all times; minting increases both equally, burning decreases both equally, transfers and fees redistribute without changing total"
+        },
+        {
+          "name": "minter_allowance_monotonic_decrease",
+          "state_vars": [
+            "minterAllowed[minter]"
+          ],
+          "rule": "For MINTER_ROLE, minterAllowed decreases on each mint and is only increased by MASTER_MINTER via updateMintingAllowance or addMinter"
+        },
+        {
+          "name": "single_owner",
+          "state_vars": [
+            "getRoleMemberCount(DEFAULT_ADMIN_ROLE)"
+          ],
+          "rule": "Exactly 1 member should hold DEFAULT_ADMIN_ROLE at steady state; transiently 2 during setOwner execution"
+        },
+        {
+          "name": "operating_controller_consistency",
+          "state_vars": [
+            "_operating",
+            "_operatingController"
+          ],
+          "rule": "_operating == true implies _operatingController == address(0); _operating == false implies _operatingController != address(0)"
+        },
+        {
+          "name": "fee_balance_sufficiency",
+          "state_vars": [
+            "balanceOf[sender]",
+            "_txfeeRate",
+            "transfer_amount"
+          ],
+          "rule": "balanceOf[sender] >= calculateTxFee(amount) + amount must hold for any transfer when _txfeeRate > 0"
+        },
+        {
+          "name": "nonce_monotonic_increase",
+          "state_vars": [
+            "_nonces[owner]"
+          ],
+          "rule": "Nonce for each address strictly increases by 1 on each permit() or transferWithAuthorization() call involving that address as signer"
+        }
+      ]
+    }
+  }
+}

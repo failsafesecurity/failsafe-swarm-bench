@@ -1,0 +1,251 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T03:48:52.778Z",
+    "duration_ms": 81925
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin/Governance",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "GaugeManager.killGauge",
+          "GaugeManager.setFarmingParam",
+          "BribeFactoryV3.recoverERC20From",
+          "Bribes.emergencyRecoverERC20",
+          "MinterUpgradeable.setTeamRate",
+          "Black.mint"
+        ],
+        "failure_modes": [
+          "Compromised admin key can drain reward tokens via emergency recovery functions",
+          "Malicious governance can kill legitimate gauges, freezing emissions",
+          "Admin can arbitrarily mint BLACK tokens if minter role is compromised"
+        ],
+        "attack_vectors": [
+          "Privilege escalation",
+          "Rug pull via emergency withdraws",
+          "Centralization risks"
+        ]
+      },
+      {
+        "boundary": "Public/User Input",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "GaugeManager.createGauge",
+          "GaugeManager.distributeFees",
+          "Bribes.notifyRewardAmount",
+          "GaugeCL.deposit",
+          "GaugeCL.withdraw"
+        ],
+        "failure_modes": [
+          "Unbounded arrays causing Out-Of-Gas (OOG) errors",
+          "Malicious tokens added as bribes causing distribution failures",
+          "Spamming gauge creation to bloat the pools array"
+        ],
+        "attack_vectors": [
+          "Denial of Service (DoS) via block gas limit",
+          "Front-running reward notifications",
+          "Sybil attacks on gauge creation"
+        ]
+      },
+      {
+        "boundary": "External Contracts (Algebra Pools & Automation)",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "EpochController.performUpkeep",
+          "GaugeCL.claimFees"
+        ],
+        "failure_modes": [
+          "Automation registry fails to call upkeep, delaying epoch transitions",
+          "Algebra pool returns unexpected fee amounts or reverts",
+          "Reentrancy during fee claims"
+        ],
+        "attack_vectors": [
+          "Upkeep timing manipulation",
+          "Read-only reentrancy on pool state"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Current Epoch",
+        "to_state": "Next Epoch",
+        "trigger": "MinterUpgradeable.update_period()",
+        "conditions": [
+          "block.timestamp >= active_period + WEEK",
+          "_initializer == address(0)"
+        ],
+        "invariants": [
+          "Weekly emissions follow the defined growth/decay schedule",
+          "Rebase amounts are correctly calculated to prevent veNFT dilution"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Pool without Gauge",
+        "to_state": "Pool with Active Gauge",
+        "trigger": "GaugeManager.createGauge()",
+        "conditions": [
+          "Pool must not already have a gauge",
+          "Tokens must be whitelisted or connectors",
+          "Pool must be a valid pair"
+        ],
+        "invariants": [
+          "isGauge[_gauge] is true",
+          "isAlive[_gauge] is true",
+          "Internal and external bribes are deployed and linked"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Unclaimed Bribes",
+        "to_state": "Claimed Bribes",
+        "trigger": "Bribes.getReward()",
+        "conditions": [
+          "Caller must be GaugeManager",
+          "User must have earned rewards > 0"
+        ],
+        "invariants": [
+          "lastEarn timestamp is updated to block.timestamp",
+          "Token balances are correctly reduced and transferred"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service with Block Gas Limit",
+        "locations": [
+          "GaugeManager.sol: distributeFees()",
+          "GaugeManager.sol: distributeAll()"
+        ],
+        "severity": "medium",
+        "evidence": "The functions iterate over the `pools` array using a unbounded `for` loop. As anyone can create gauges, the `pools` array can grow indefinitely.",
+        "exploitation_method": "An attacker can create many valid gauges for dust pools. When the array becomes too large, calling `distributeAll()` or `distributeFees()` will exceed the block gas limit, halting protocol emissions.",
+        "affected_assets": [
+          "Protocol emissions",
+          "LP fee distributions"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service with Block Gas Limit",
+        "locations": [
+          "Bribes.sol: earned(uint256,address)"
+        ],
+        "severity": "medium",
+        "evidence": "The function contains a loop `for (uint256 i = 0; i < numEpochs; i++)` where `numEpochs` is the difference between the current epoch and the last claimed epoch.",
+        "exploitation_method": "If a user does not claim their bribes for a very long time (e.g., years), `numEpochs` will be extremely large. Attempting to claim will run out of gas, permanently locking the user's rewards.",
+        "affected_assets": [
+          "User bribe rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-118",
+        "pattern": "State Inconsistency / Centralization Risk",
+        "locations": [
+          "Bribes.sol: emergencyRecoverERC20(address,uint256)"
+        ],
+        "severity": "high",
+        "evidence": "The function allows the owner to transfer any ERC20 token out of the contract but does NOT update the `tokenRewardsPerEpoch` mapping.",
+        "exploitation_method": "If the admin uses this to withdraw active reward tokens, the contract's actual balance will fall below the recorded accounting. When users subsequently try to claim their earned rewards, the transaction will revert due to insufficient balance.",
+        "affected_assets": [
+          "User bribe rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Transaction Order Dependence",
+        "locations": [
+          "GaugeManager.sol: notifyRewardAmount(uint256)"
+        ],
+        "severity": "low",
+        "evidence": "The `index` is incremented by `_ratio = amount * 1e18 / Math.max(totalWeight, 1)`. `totalWeight` is dynamically fetched from the Voter contract.",
+        "exploitation_method": "A user could front-run the epoch flip / reward notification by altering the total voting weight (e.g., via flash-locking or resetting votes), manipulating the global reward index.",
+        "affected_assets": [
+          "Gauge emissions"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "GaugeManager.sol",
+          "function": "killGauge(address)",
+          "guards": [
+            "Governance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can permanently stop emissions to a gauge"
+        },
+        {
+          "contract": "Bribes.sol",
+          "function": "emergencyRecoverERC20(address,uint256)",
+          "guards": [
+            "onlyAllowed"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can drain reward tokens without updating internal accounting"
+        },
+        {
+          "contract": "MinterUpgradeable.sol",
+          "function": "setTeamRate(uint256)",
+          "guards": [
+            "team"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can change the protocol fee emission rate up to MAX_TEAM_RATE"
+        },
+        {
+          "contract": "Black.sol",
+          "function": "mint(address,uint256)",
+          "guards": [
+            "minter"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Minter role can arbitrarily mint tokens"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "LP-TWAP",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "AlgebraPoolAPI.sol",
+              "lines": "120-125",
+              "function": "_poolAddressToInfo"
+            }
+          ],
+          "compositional_usage": [
+            "Read globalState (sqrtPriceX96, tick) for UI/API consumption"
+          ]
+        }
+      ]
+    }
+  }
+}

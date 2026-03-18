@@ -1,0 +1,271 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T17:03:15.170Z",
+    "duration_ms": 144019
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Loan Origination and Repayment",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "LendingTerm.borrow",
+          "LendingTerm.addCollateral",
+          "LendingTerm.partialRepay",
+          "LendingTerm.repay"
+        ],
+        "failure_modes": [
+          "Borrowing beyond debt ceiling",
+          "Undercollateralized borrowing",
+          "Flash loan manipulation of issuance"
+        ],
+        "attack_vectors": [
+          "Exploiting precision loss in interest calculation",
+          "Bypassing minimum borrow limits via partial repayments"
+        ]
+      },
+      {
+        "boundary": "Liquidation and Auction",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "LendingTerm.call",
+          "AuctionHouse.startAuction",
+          "AuctionHouse.bid",
+          "LendingTerm.onBid"
+        ],
+        "failure_modes": [
+          "Auction concluding with zero recovery",
+          "Reentrancy during collateral transfer",
+          "Griefing auctions via tiny bids"
+        ],
+        "attack_vectors": [
+          "MEV extraction on Dutch auction timing",
+          "Exploiting PnL notification underflow"
+        ]
+      },
+      {
+        "boundary": "Gauge Voting and Slashing",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "GuildToken.incrementGauge",
+          "GuildToken.decrementGauge",
+          "GuildToken.applyGaugeLoss"
+        ],
+        "failure_modes": [
+          "Inability to slash users due to debt ceiling constraints",
+          "Users locked out of transferring tokens"
+        ],
+        "attack_vectors": [
+          "Front-running loss notification to un-vote",
+          "Utilizing debt ceiling to DoS slashing mechanism"
+        ]
+      },
+      {
+        "boundary": "Governance and Emergency Actions",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "LendingTerm.forgive",
+          "AuctionHouse.forgive",
+          "CoreRef.emergencyAction"
+        ],
+        "failure_modes": [
+          "Malicious or compromised governor bricking terms",
+          "Incorrect arbitrary calldata execution"
+        ],
+        "attack_vectors": [
+          "Compromised Timelock executing malicious upgrades"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Loan Open",
+        "to_state": "Loan Called",
+        "trigger": "LendingTerm.call()",
+        "conditions": [
+          "Term is deprecated OR partial repay delay passed",
+          "Loan is not already closed or called"
+        ],
+        "invariants": [
+          "Loan debt is fixed at call time",
+          "Auction is initiated in AuctionHouse"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Auction Active",
+        "to_state": "Auction Closed",
+        "trigger": "AuctionHouse.bid()",
+        "conditions": [
+          "Auction is ongoing",
+          "Bidder provides required CREDIT"
+        ],
+        "invariants": [
+          "Collateral is distributed proportionally",
+          "PnL is correctly reported to ProfitManager",
+          "Issuance is decreased by original borrow amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Gauge Active",
+        "to_state": "Gauge Deprecated",
+        "trigger": "LendingTermOffboarding.offboard()",
+        "conditions": [
+          "Quorum reached in offboard poll",
+          "Poll is within valid duration"
+        ],
+        "invariants": [
+          "Gauge is removed from GuildToken",
+          "PSM redemptions are paused"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service via Debt Ceiling Check",
+        "locations": [
+          "GuildToken.sol:_decrementGaugeWeight",
+          "GuildToken.sol:applyGaugeLoss"
+        ],
+        "severity": "critical",
+        "evidence": "`_decrementGaugeWeight` requires `issuance <= debtCeilingAfterDecrement`. If a term is highly utilized, reducing gauge weight reverts. `applyGaugeLoss` calls this function to slash users.",
+        "exploitation_method": "Borrowers utilize a term up to its debt ceiling. When bad debt occurs, the term remains highly utilized. Anyone calling `applyGaugeLoss` to slash voters will face a revert because removing the slashed weight drops the debt ceiling below current issuance. Voters are protected from slashing, and users cannot transfer GUILD tokens or un-vote.",
+        "affected_assets": [
+          "GUILD tokens",
+          "CREDIT tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow / Logic Error",
+        "locations": [
+          "ProfitManager.sol:notifyPnL"
+        ],
+        "severity": "high",
+        "evidence": "`uint256 newCreditMultiplier = (creditMultiplier * (creditTotalSupply - loss)) / creditTotalSupply;` If `loss > creditTotalSupply`, the subtraction underflows and reverts.",
+        "exploitation_method": "If `creditMultiplier` drops due to previous losses, the `principal` of older loans increases in terms of CREDIT. A subsequent default can result in a `loss` that exceeds the current `creditTotalSupply`. This causes `notifyPnL` to revert, preventing the auction from concluding and permanently locking the bad debt and collateral.",
+        "affected_assets": [
+          "CREDIT tokens",
+          "Borrower Collateral"
+        ]
+      },
+      {
+        "swc_id": "SWC-110",
+        "pattern": "Division by Zero",
+        "locations": [
+          "LendingTerm.sol:debtCeiling"
+        ],
+        "severity": "medium",
+        "evidence": "When a gauge is deprecated, its weight is subtracted from `totalTypeWeight`. If it was the only gauge of its type, `totalWeight` becomes 0. `debtCeiling()` divides by `totalWeight` without checking if it is 0.",
+        "exploitation_method": "Offboard the only active term of a specific type. `totalTypeWeight` becomes 0. Any subsequent call to `debtCeiling()` reverts. This breaks `_decrementGaugeWeight`, permanently locking users from transferring GUILD tokens or un-voting from the deprecated gauge until all loans are closed.",
+        "affected_assets": [
+          "GUILD tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Unit Mismatch",
+        "locations": [
+          "LendingTerm.sol:_partialRepay"
+        ],
+        "severity": "medium",
+        "evidence": "`require(borrowAmount - issuanceDecrease > ProfitManager(refs.profitManager).minBorrow())`. `borrowAmount` is the unscaled original CREDIT amount, while `minBorrow()` returns the scaled current CREDIT amount.",
+        "exploitation_method": "If `creditMultiplier` drops significantly, `minBorrow()` increases. Borrowers attempting a valid partial repayment will be blocked because their unscaled remaining principal is compared against the scaled minimum borrow limit, forcing them to either fully repay or face liquidation.",
+        "affected_assets": [
+          "Borrower Collateral"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "LendingTerm.sol",
+          "function": "forgive(bytes32)",
+          "guards": [
+            "onlyCoreRole(CoreRoles.GOVERNOR)"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Emergency function to forgive a loan and realize total loss"
+        },
+        {
+          "contract": "ProfitManager.sol",
+          "function": "setProfitSharingConfig(uint256,uint256,uint256,uint256,address)",
+          "guards": [
+            "onlyCoreRole(CoreRoles.GOVERNOR)"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "GuildToken.sol",
+          "function": "enableTransfer()",
+          "guards": [
+            "onlyCoreRole(CoreRoles.GOVERNOR)"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "SimplePSM.sol",
+          "function": "setRedemptionsPaused(bool)",
+          "guards": [
+            "onlyCoreRole(CoreRoles.GOVERNOR)"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "CoreRef.sol",
+          "function": "emergencyAction(Call[])",
+          "guards": [
+            "onlyCoreRole(CoreRoles.GOVERNOR)"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Executes arbitrary calldata"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "src/loan/LendingTerm.sol",
+              "lines": "250-255",
+              "function": "getLoanDebt"
+            }
+          ],
+          "compositional_usage": [
+            "creditMultiplier"
+          ]
+        }
+      ]
+    }
+  }
+}

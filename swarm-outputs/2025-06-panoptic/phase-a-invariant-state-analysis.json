@@ -1,0 +1,275 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T07:47:27.506Z",
+    "duration_ms": 408192
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "PanopticVaultAccountant.sol",
+        "description": "Token1 premium exposure sign is inverted relative to token0 in computeNAV. For token0: shortPremium - longPremium (correct: net earned). For token1: longPremium - shortPremium (inverted: net owed). This asymmetric treatment distorts NAV, affecting all deposit/withdrawal fulfillment pricing.",
+        "attack_scenario": "If the vault has earned net token1 premiums (shortPremium.leftSlot > longPremium.leftSlot), the NAV is understated. During deposit fulfillment, depositors receive more shares than deserved (diluting existing shareholders). During withdrawal fulfillment, withdrawers receive fewer assets than deserved. The reverse occurs when the vault owes net token1 premiums. A malicious manager could structure positions to maximize this discrepancy.",
+        "invariant_logic": "poolExposure1_from_premiums == int256(shortPremium.leftSlot()) - int256(longPremium.leftSlot()), consistent with poolExposure0_from_premiums == int256(shortPremium.rightSlot()) - int256(longPremium.rightSlot())",
+        "solidity_property": "function invariant_premiumSignConsistency(int256 shortLeft, int256 longLeft, int256 shortRight, int256 longRight) public pure { int256 net0 = shortRight - longRight; int256 net1 = shortLeft - longLeft; /* code computes net1 = longLeft - shortLeft instead */ assert(false); }",
+        "inventory_refs": [
+          {
+            "file": "PanopticVaultAccountant.sol",
+            "function": "computeNAV"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "HypoVault.sol",
+        "description": "The manage() function allows the manager to execute arbitrary calls from the vault, including transferring underlying tokens that back reservedWithdrawalAssets. No check prevents draining assets reserved for already-fulfilled withdrawal requests, breaking the invariant that reserved assets must remain available for user claims.",
+        "attack_scenario": "Manager calls manage(underlyingToken, abi.encodeWithSelector(IERC20.transfer.selector, attacker, reservedWithdrawalAssets), 0). This drains all reserved withdrawal assets. Users who have fulfilled but unexecuted withdrawals call executeWithdrawal(), which attempts SafeTransferLib.safeTransfer but reverts due to insufficient balance. Users' withdrawal claims become permanently stuck.",
+        "invariant_logic": "IERC20(underlyingToken).balanceOf(vault) >= reservedWithdrawalAssets at all times after any manage() call",
+        "solidity_property": "function invariant_reservedAssetsBacked() public view { assert(IERC20(underlyingToken).balanceOf(address(this)) >= reservedWithdrawalAssets); }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "manage"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "executeWithdrawal"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillWithdrawals"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "HypoVault.sol",
+        "description": "If feeWallet is address(0) (default) and a withdrawal has positive performance fee, executeWithdrawal will attempt SafeTransferLib.safeTransfer to address(0). Many ERC20 tokens revert on transfer to address(0), which would permanently block all profitable withdrawal executions until the owner sets a valid feeWallet.",
+        "attack_scenario": "Owner deploys vault but forgets to call setFeeWallet(). The vault operates, deposits/withdrawals are queued and fulfilled. When a user calls executeWithdrawal() with profit (assetsToWithdraw > withdrawnBasis), the performance fee transfer to address(0) reverts, making the withdrawal unexecutable. All users with profitable positions are locked out of their assets indefinitely.",
+        "invariant_logic": "performanceFeeBps > 0 implies feeWallet != address(0) before any executeWithdrawal can succeed with profit",
+        "solidity_property": "function invariant_feeWalletSet() public view { if (performanceFeeBps > 0) { assert(feeWallet != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "executeWithdrawal"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "setFeeWallet"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "PanopticVaultAccountant.sol",
+        "description": "computeNAV clamps each pool's combined exposure to max(0), meaning negative exposure (debt) in one pool is silently discarded rather than reducing the total NAV. This allows the vault NAV to be inflated by ignoring real debt obligations in underwater pools while counting gains in profitable pools.",
+        "attack_scenario": "The manager opens positions across two Panoptic pools. Pool A has +100 underlying exposure, Pool B has -80 underlying exposure. Real NAV should be 20, but computeNAV returns max(100,0) + max(-80,0) = 100. During deposit fulfillment, totalAssets is inflated, depositors receive fewer shares than fair value. During withdrawal fulfillment, withdrawers receive more assets than fair value, draining the vault. When Pool B's debt must be settled, remaining shareholders absorb the loss.",
+        "invariant_logic": "NAV should equal sum(poolExposure) where negative pools reduce total, not max(sum(poolExposure0 + poolExposure1), 0) per pool",
+        "solidity_property": "function invariant_navDebtAccounting(int256[] memory poolExposures) public pure { int256 correctNAV = 0; for (uint i = 0; i < poolExposures.length; i++) correctNAV += poolExposures[i]; /* code computes sum of max(exposure_i, 0) instead */ }",
+        "inventory_refs": [
+          {
+            "file": "PanopticVaultAccountant.sol",
+            "function": "computeNAV"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "HypoVault.sol",
+        "description": "depositEpoch and withdrawalEpoch must strictly increase and never decrease. Each fulfillment cycle increments the respective epoch by exactly 1. Any violation would corrupt the epoch-based queueing system, allowing double-fulfillment or unfulfillable epochs.",
+        "invariant_logic": "After fulfillDeposits: depositEpoch == old(depositEpoch) + 1; After fulfillWithdrawals: withdrawalEpoch == old(withdrawalEpoch) + 1; No other function modifies these values.",
+        "solidity_property": "function invariant_epochMonotonicity(uint128 oldDepositEpoch, uint128 oldWithdrawalEpoch) public view { assert(depositEpoch >= oldDepositEpoch); assert(withdrawalEpoch >= oldWithdrawalEpoch); }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillDeposits"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillWithdrawals"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "HypoVault.sol",
+        "description": "fulfillDeposits and fulfillWithdrawals overwrite (SET, not accumulate) the next epoch's state. If any deposits or withdrawals were somehow queued for the next epoch before fulfillment (e.g., via reentrancy or a race), they would be silently erased. While current code prevents this via ordering, the pattern is fragile and depends on no reentrancy through accountant.computeNAV.",
+        "attack_scenario": "If the accountant contract is replaced by owner with a malicious accountant that reenters the vault during computeNAV (bypassed by STATICCALL restriction), or if future code changes break the ordering assumption, epoch state for queued but unfulfilled requests could be overwritten. Users' deposits or withdrawal requests would be lost with no recourse.",
+        "invariant_logic": "depositEpochState[depositEpoch + 1].assetsDeposited == 0 at the start of fulfillDeposits; withdrawalEpochState[withdrawalEpoch + 1].sharesWithdrawn == 0 at the start of fulfillWithdrawals (excluding rollover from current epoch)",
+        "solidity_property": "function invariant_nextEpochClean() public view { uint256 nextDep = depositEpoch + 1; assert(depositEpochState[nextDep].assetsDeposited == 0 || true /* only safe if rollover only */); }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillDeposits"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillWithdrawals"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "HypoVault.sol",
+        "description": "Users cannot cancel their own deposit or withdrawal requests — only the manager can cancel via cancelDeposit/cancelWithdrawal. If the manager becomes unresponsive, compromised, or malicious, users have no mechanism to recover queued assets before fulfillment. Combined with the manager's ability to delay fulfillment indefinitely, this creates a fund-locking risk.",
+        "attack_scenario": "A user deposits 1000 USDC via requestDeposit. The manager goes offline or is compromised. The user cannot cancel their deposit (cancelDeposit is onlyManager). The deposit epoch is never fulfilled (fulfillDeposits is onlyManager). The user's 1000 USDC is locked in the vault indefinitely. Even the owner cannot fulfill deposits — only change the manager, who could then selectively refuse to process specific users.",
+        "invariant_logic": "For every queued deposit or withdrawal, there must exist a path for the user to recover their assets without requiring manager cooperation",
+        "solidity_property": "/* No on-chain assertion possible — this is a missing feature. Users should be able to self-cancel after a timeout. */",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "cancelDeposit"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "cancelWithdrawal"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "requestDeposit"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "requestWithdrawal"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "HypoVault.sol",
+        "description": "The sum of all user balances must always be less than totalSupply by exactly the virtual offset (1_000_000) plus any shares that have been added to totalSupply via fulfillDeposits but not yet claimed via executeDeposit, minus shares burned via requestWithdrawal but not yet removed from totalSupply via fulfillWithdrawals. Rounding in pro-rata calculations during executeDeposit and executeWithdrawal causes dust shares that are permanently orphaned in totalSupply.",
+        "attack_scenario": "Over many epochs with partial fulfillments and many users, rounding dust accumulates. Each executeDeposit rounds down shares received, leaving some fulfilled shares permanently unclaimable. Similarly, each executeWithdrawal rounds down sharesToFulfill, leaving dust in reservedWithdrawalAssets that is never released. Over thousands of epochs, this could become material, effectively inflating totalSupply relative to actual claimable shares.",
+        "invariant_logic": "totalSupply >= 1_000_000 + sum(all balanceOf) + sum(all pendingWithdrawal.amount across unfulfilled epochs)",
+        "solidity_property": "function invariant_supplyGap() public view { /* sum all balances + pending amounts <= totalSupply - 1_000_000 */ assert(totalSupply >= 1_000_000); }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillDeposits"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "executeDeposit"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillWithdrawals"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "executeWithdrawal"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "HypoVault.sol",
+        "description": "When executeDeposit rolls over unfulfilled amounts to epoch+1, it updates only the user's queuedDeposit mapping but NOT depositEpochState[epoch+1].assetsDeposited. This relies on the invariant that fulfillDeposits already rolled over the aggregate unfulfilled amount. If fulfillDeposits is called with assetsToFulfill=0, assetsRemaining equals the full deposit, and the rollover is correct. But if a user calls executeDeposit for an epoch where they have rollover that was NOT included in the fulfillment rollover (impossible in current code, but fragile), their assets become unaccounted for.",
+        "attack_scenario": "In current code this is safe because fulfillDeposits always rolls over aggregate unfulfilled. However, the per-user rollover in executeDeposit does not update epoch-level state, creating a dependency between fulfill-level and execute-level accounting. If future changes allow epoch-level state to be modified (e.g., a new fulfillment mechanism), the user-level rollovers could become inconsistent with epoch-level totals.",
+        "invariant_logic": "For any epoch e: sum(queuedDeposit[user][e] for all users) == depositEpochState[e].assetsDeposited",
+        "solidity_property": "function invariant_depositEpochConsistency(uint256 epoch, address[] memory users) public view { uint256 sum = 0; for (uint i = 0; i < users.length; i++) sum += queuedDeposit[users[i]][epoch]; assert(sum == depositEpochState[epoch].assetsDeposited); }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "executeDeposit"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "fulfillDeposits"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "PanopticVaultAccountant.sol",
+        "description": "Vault lock is a one-way irreversible transition. Once lockVault is called, there is no unlockVault function. The pool configuration hash for a locked vault can never be updated. If the accountant owner locks a vault with an incorrect pool configuration, or if pools need to be updated due to protocol upgrades, the vault's NAV computation is permanently frozen to the locked configuration.",
+        "attack_scenario": "Owner locks a vault with a pool configuration containing a pool that becomes deprecated or compromised. The vault manager cannot get accurate NAV from the locked accountant because the pool data is fixed. The owner cannot update the pool hash. The only recourse is deploying a new accountant entirely (if the vault owner is cooperative) or the vault becomes permanently unable to fulfill deposits/withdrawals at correct prices.",
+        "invariant_logic": "vaultLocked[vault] == true implies vaultLocked[vault] is permanently true (no transition back to false)",
+        "solidity_property": "function invariant_lockIrreversible(address vault) public view { /* once vaultLocked[vault] is true, it can never become false */ }",
+        "inventory_refs": [
+          {
+            "file": "PanopticVaultAccountant.sol",
+            "function": "lockVault"
+          },
+          {
+            "file": "PanopticVaultAccountant.sol",
+            "function": "updatePoolsHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "HypoVault.sol",
+        "description": "The userBasis mapping must be conserved across all state transitions. When shares are transferred, basis moves proportionally. When withdrawals are requested, basis moves to PendingWithdrawal. When withdrawals are cancelled, basis returns. When withdrawals execute partially, basis is split proportionally. Any violation results in incorrect performance fee calculation, either overcharging users (basis too low) or undercharging (basis too high).",
+        "attack_scenario": "A user with balance=100 and basis=100 transfers 50 shares. basisToTransfer = 100*50/100 = 50. Correct. But if the user has pending virtual burns (requestWithdrawal reduces balance but shares aren't removed from totalSupply), the effective balance used in basis calculation may not reflect the economic reality. A user could requestWithdrawal for most shares (reducing balance), then transfer remaining shares. The transfer calculates basis proportionally to the reduced balance, transferring a disproportionately large basis per share.",
+        "invariant_logic": "For any user: userBasis[user] + sum(queuedWithdrawal[user][epoch].basis for all epochs) == total assets deposited by user minus total assets withdrawn by user plus sum of basis received via transfers minus sum of basis sent via transfers",
+        "solidity_property": "function invariant_basisConservation(address user) public view { /* total basis in system must equal sum of all fulfilled deposit assets minus all withdrawn basis */ }",
+        "inventory_refs": [
+          {
+            "file": "HypoVault.sol",
+            "function": "_transferBasis"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "requestWithdrawal"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "cancelWithdrawal"
+          },
+          {
+            "file": "HypoVault.sol",
+            "function": "executeWithdrawal"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "PanopticVaultAccountant.sol",
+        "description": "The oracle staleness check compares manager-supplied prices against TWAPs but does not verify the underlying oracle's last update timestamp. A TWAP computed over a window where the oracle has not been updated (stale Chainlink feed, inactive Uniswap pool) will pass the deviation check but reflect outdated prices. The twapWindow parameter sets window length but cannot guarantee observations exist within it.",
+        "attack_scenario": "A Uniswap pool used as poolOracle has low activity. The TWAP uses the last available observations, which may be hours or days old. The manager provides a price within maxPriceDeviation of this stale TWAP, but far from the actual market price. NAV is calculated using the stale price, allowing the manager to fulfill deposits at artificially low NAV (issuing excess shares) or withdrawals at artificially high NAV (draining excess assets).",
+        "invariant_logic": "For each oracle used in computeNAV: lastObservationTimestamp(oracle) > block.timestamp - maxStalenessThreshold",
+        "solidity_property": "/* No on-chain assertion in current code — staleness check against actual oracle update time is missing */",
+        "inventory_refs": [
+          {
+            "file": "PanopticVaultAccountant.sol",
+            "function": "computeNAV"
+          }
+        ]
+      }
+    ]
+  }
+}

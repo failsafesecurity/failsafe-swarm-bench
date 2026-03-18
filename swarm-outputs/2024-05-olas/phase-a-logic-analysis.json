@@ -1,0 +1,491 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T21:39:01.530Z",
+    "duration_ms": 385856
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "ETH donations via Treasury to Tokenomics.trackServiceDonations",
+        "path": [
+          "Treasury calls trackServiceDonations with donator, serviceIds, amounts, donationETH",
+          "_trackServiceDonations splits amounts across service units",
+          "mapUnitIncentives accumulates pendingRelativeReward/pendingRelativeTopUp per unit",
+          "mapEpochTokenomics accumulates totalDonationsETH, sumUnitTopUpsOLAS",
+          "checkpoint() finalizes epoch: calculates IDF, splits incentives into treasury/component/agent rewards",
+          "accountOwnerIncentives finalizes pending incentives and returns reward/topUp",
+          "Dispenser.claimOwnerIncentives calls Treasury.withdrawToAccount"
+        ],
+        "transformations": [
+          "amounts[i] / numServiceUnits (integer truncation per unit)",
+          "pendingRelativeReward * rewardUnitFraction / 100 (precision loss)",
+          "pendingRelativeTopUp * totalTopUpsOLAS * topUpUnitFraction / (100 * sumUnitTopUpsOLAS)",
+          "IDF calculation via PRBMath UD60x18"
+        ],
+        "sinks": [
+          "mapOwnerRewards",
+          "mapOwnerTopUps",
+          "Treasury ETH/OLAS balances"
+        ],
+        "trust_changes": "Treasury is trusted caller; external registry calls for service/unit validation",
+        "validation_points": [
+          "Treasury access check in trackServiceDonations",
+          "Donator blacklist check",
+          "Service existence check",
+          "veOLAS threshold check for top-up eligibility",
+          "Unit ownership verification in accountOwnerIncentives"
+        ],
+        "exposure_risks": [
+          "Truncation in amount/numServiceUnits loses ETH allocation to units",
+          "pendingRelativeReward/topUp stored as uint96 could overflow with massive donations"
+        ],
+        "manipulation_risks": [
+          "Flash loan to inflate veOLAS for top-up eligibility (mitigated by same-block check)",
+          "Creating many-unit services to dilute per-unit rewards"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "OLAS inflation schedule via Tokenomics.checkpoint",
+        "path": [
+          "checkpoint() calculates inflationPerEpoch from inflationPerSecond * epoch duration",
+          "Year-change logic splits inflation across two year periods",
+          "inflationPerEpoch split into: maxBond fraction, component/agent topUp fractions, staking fraction",
+          "effectiveBond updated with maxBond delta",
+          "mapEpochStakingPoints[eCounter].stakingIncentive accumulates staking allocation + refunds",
+          "Dispenser.calculateStakingIncentives reads stakingIncentive and distributes per voting weight"
+        ],
+        "transformations": [
+          "inflationPerSecond * diffNumSeconds for same-year epochs",
+          "Split across year boundary: partial_year1 + partial_year2",
+          "Fraction-based splits: (inflationPerEpoch * fraction) / 100",
+          "Staking distribution: (availableStakingAmount * stakingWeight) / 1e18"
+        ],
+        "sinks": [
+          "effectiveBond",
+          "maxBond",
+          "mapEpochStakingPoints",
+          "Deposit processors via Dispenser"
+        ],
+        "trust_changes": "Anyone can call checkpoint; epoch timing is permissionless",
+        "validation_points": [
+          "DelegatecallOnly check (proxy pattern)",
+          "SameBlockNumberViolation prevents flash-loan donation+checkpoint",
+          "Epoch length check: diffNumSeconds >= epochLen && <= MAX_EPOCH_LENGTH"
+        ],
+        "exposure_risks": [
+          "Delayed checkpoint causes inflation undercount for passing year",
+          "Year skip scenario with >1 year gap (mitigated by MAX_EPOCH_LENGTH < ONE_YEAR)"
+        ],
+        "manipulation_risks": [
+          "Timing checkpoint to maximize/minimize inflation per epoch around year boundaries",
+          "Delaying checkpoint to extend epoch and get more inflation (bounded by MAX_EPOCH_LENGTH)"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Dispenser staking incentive claims",
+        "path": [
+          "User calls claimStakingIncentives/claimStakingIncentivesBatch",
+          "calculateStakingIncentives loops over epochs, reads VoteWeighting for nominee relative weight",
+          "Compares with minStakingWeight threshold; adjusts by maxStakingAmount cap",
+          "Accounts for bridging decimals normalization",
+          "Deducts withheld amounts from transfer",
+          "Mints OLAS via Treasury.withdrawToAccount",
+          "Distributes to L2 via deposit processor bridge"
+        ],
+        "transformations": [
+          "stakingIncentive = (availableStakingAmount * stakingWeight) / 1e18",
+          "Bridge decimal normalization: stakingIncentive / 10^(18-bridgingDecimals) * 10^(18-bridgingDecimals)",
+          "Withheld amount deduction from transferAmount"
+        ],
+        "sinks": [
+          "L2 staking contracts via bridge",
+          "mapChainIdWithheldAmounts",
+          "mapLastClaimedStakingEpochs"
+        ],
+        "trust_changes": "Anyone can trigger claim; deposit processor must be correctly configured by owner",
+        "validation_points": [
+          "Reentrancy guard",
+          "Pause state check",
+          "Nominee existence and epoch range validation",
+          "Ascending order check for batch targets"
+        ],
+        "exposure_risks": [
+          "Bridge failure can cause OLAS to be stuck in deposit processor",
+          "Withheld amount sync failure between L1 and L2"
+        ],
+        "manipulation_risks": [
+          "Claiming for removed nominees up to removal epoch",
+          "Repeatedly calling calculateStakingIncentives (public function) triggers checkpointNominee"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "L2 DefaultTargetDispenserL2 receives bridge message",
+        "path": [
+          "_receiveMessage validates relayer and source processor",
+          "_processData decodes targets and amounts",
+          "For each target: stakingFactory.verifyInstanceAndGetEmissionsAmount (low-level call)",
+          "Valid targets receive OLAS via approve+deposit",
+          "Invalid/excess amounts withheld locally",
+          "Insufficient balance causes queueing for later redeem"
+        ],
+        "transformations": [
+          "Amount capped by limitAmount from factory verification",
+          "withheldAmount accumulated for sync back to L1"
+        ],
+        "sinks": [
+          "Staking contracts on L2",
+          "withheldAmount",
+          "stakingQueueingNonces"
+        ],
+        "trust_changes": "Bridge relayer and L1 deposit processor are trusted origins",
+        "validation_points": [
+          "Message relayer address check",
+          "Source processor address check",
+          "Reentrancy guard",
+          "Staking factory verification (low-level call, never reverts)"
+        ],
+        "exposure_risks": [
+          "Low-level call to stakingFactory means verification failure is silent",
+          "Queued items can be redeemed without re-verification of staking target"
+        ],
+        "manipulation_risks": [
+          "Owner can call processDataMaintenance with arbitrary data",
+          "Staking target could become invalid between queuing and redeeming"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Service staking in StakingBase",
+        "path": [
+          "User calls stake(serviceId) - transfers NFT service to contract",
+          "Checkpoint called periodically - calculates rewards based on liveness",
+          "ActivityChecker.getMultisigNonces and isRatioPass determine eligibility",
+          "Rewards accumulated in mapServiceInfo[serviceId].reward",
+          "Inactivity tracked and leads to eviction if exceeding threshold",
+          "User unstakes - service returned, rewards withdrawn"
+        ],
+        "transformations": [
+          "eligibleServiceRewards = rewardsPerSecond * ts",
+          "If totalRewards > availableRewards: proportional scaling with dust to first service",
+          "Inactivity accumulation: previous_inactivity + current_period_inactivity"
+        ],
+        "sinks": [
+          "Service owner multisig (rewards)",
+          "availableRewards balance"
+        ],
+        "trust_changes": "ActivityChecker is trusted external contract (low-level call pattern)",
+        "validation_points": [
+          "Service state must be Deployed",
+          "Multisig proxy hash verification",
+          "Agent IDs, config hash, threshold checks",
+          "Minimum staking deposit",
+          "Minimum staking duration for unstaking"
+        ],
+        "exposure_risks": [
+          "ActivityChecker failure (returns false by default) treats service as inactive",
+          "Reward dust systematically favors first service in array"
+        ],
+        "manipulation_risks": [
+          "Staking right before checkpoint to get time-weighted reward",
+          "Unstaking right after checkpoint to extract accumulated rewards"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "veOLAS voting in VoteWeighting",
+        "path": [
+          "User calls voteForNomineeWeights with account, chainId, weight",
+          "Reads user's veOLAS slope and lockEnd",
+          "Calculates new slope based on weight allocation (weight/10000 of user slope)",
+          "Updates pointsWeight for nominee and pointsSum for all nominees",
+          "Schedules slope changes at lock expiration times",
+          "Weight used in Dispenser.calculateStakingIncentives via nomineeRelativeWeight"
+        ],
+        "transformations": [
+          "newSlope.slope = uint256(uint128(userSlope)) * weight / MAX_WEIGHT",
+          "newBias = newSlope.slope * (lockEnd - nextTime)",
+          "Relative weight: 1e18 * nomineeWeight / totalSum"
+        ],
+        "sinks": [
+          "pointsWeight",
+          "pointsSum",
+          "changesWeight",
+          "changesSum"
+        ],
+        "trust_changes": "Permissionless voting; veOLAS data is trusted from VotingEscrow",
+        "validation_points": [
+          "Lock expiration check",
+          "Weight <= MAX_WEIGHT (10000)",
+          "WEIGHT_VOTE_DELAY (10 days between votes)",
+          "Total power used <= MAX_WEIGHT"
+        ],
+        "exposure_risks": [
+          "Removed nominees' future slope changes still affect changesSum if not revoked",
+          "MAX_NUM_WEEKS (53) cap means >1 year gap prevents full checkpoint catch-up"
+        ],
+        "manipulation_risks": [
+          "Strategic voting just before epoch end to maximize weight for specific target",
+          "Not revoking votes on removed nominees to distort total weight sum"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Epoch-based tokenomics: rewards and inflation distributed per epoch",
+        "rewardComponentFraction + rewardAgentFraction + rewardTreasuryFraction = 100%",
+        "maxBondFraction + topUpComponentFraction + topUpAgentFraction + stakingFraction <= 100%",
+        "Inflation per second derived from yearly inflation schedule, adjusted at year boundaries",
+        "effectiveBond = accumulated maxBond credits minus reserved bond programs",
+        "Staking incentives capped by: (1) total veOLAS directed to staking, (2) per-nominee maxStakingAmount, (3) minStakingWeight threshold",
+        "Service staking requires minimum deposit, deployed state, correct multisig proxy hash",
+        "Activity verification via external checker with configurable liveness ratio"
+      ],
+      "economic_incentives": [
+        "ETH donations to services generate rewards for component/agent owners",
+        "veOLAS holders above threshold qualify service owners for OLAS top-ups",
+        "OLAS inflation funds bonding programs, developer top-ups, and staking incentives",
+        "Staking rewards proportional to time staked and activity level (rewardsPerSecond * ts)",
+        "Voting weight determines staking incentive allocation per nominee",
+        "Retainer mechanism returns unallocated staking incentives to inflation"
+      ],
+      "governance_mechanisms": [
+        "Owner controls: parameter changes (deferred to next epoch), manager addresses, registries",
+        "DAO/Timelock controls: pause state, staking params, maintenance functions",
+        "Permissionless: checkpoint, nominee addition, staking/unstaking, claiming",
+        "Parameter changes take effect at next epoch via flag-based deferred update system"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Tokenomics.refundFromStaking error message references wrong address (depository instead of dispenser)",
+          "expected_behavior": "Error should show dispenser address as the required manager",
+          "actual_behavior": "Error message shows depository address: revert ManagerOnly(msg.sender, depository)",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit but misleading error information for debugging"
+        },
+        {
+          "scenario": "EthereumDepositProcessor._deposit reverts entire batch if any target has zero limitAmount",
+          "expected_behavior": "Graceful handling like L2 dispensers (withhold and continue)",
+          "actual_behavior": "revert TargetEmissionsZero(target) blocks all targets in batch",
+          "risk_level": "medium",
+          "exploitation_potential": "A single invalid/disabled staking target on L1 blocks incentive distribution for all L1 targets in the same batch; could be weaponized by front-running disablement of a staking instance"
+        },
+        {
+          "scenario": "Donation amount split across service units truncates to zero for small amounts",
+          "expected_behavior": "All donated ETH allocated proportionally to units",
+          "actual_behavior": "uint96(amounts[i] / numServiceUnits) truncates; e.g., 99 wei across 100 units = 0 per unit; 99 wei lost from unit reward allocation",
+          "risk_level": "low",
+          "exploitation_potential": "Negligible amounts lost per truncation; systematically favors services with fewer units"
+        },
+        {
+          "scenario": "StakingBase checkpoint reward dust allocation to first eligible service",
+          "expected_behavior": "Equal proportional distribution when totalRewards > availableRewards",
+          "actual_behavior": "Loop starts from i=1, processes service[0] last and assigns rounding dust to it",
+          "risk_level": "low",
+          "exploitation_potential": "First service in setServiceIds systematically receives a few extra wei; order depends on staking sequence and eviction history"
+        },
+        {
+          "scenario": "Tokenomics.checkpoint has no reentrancy guard despite external call to Treasury.rebalanceTreasury",
+          "expected_behavior": "Reentrancy should be prevented on checkpoint",
+          "actual_behavior": "_locked variable exists but is not checked in checkpoint(). External call to treasury occurs before epochCounter increment.",
+          "risk_level": "medium",
+          "exploitation_potential": "If treasury contract is compromised/malicious, reentrant call to checkpoint could double-process epoch data. Mitigated by: (1) treasury is owner-set trusted contract, (2) same block.timestamp means epoch time check would pass identically leading to state corruption"
+        },
+        {
+          "scenario": "VoteWeighting.removeNominee does not zero slope or clean up changesWeight/changesSum for future timestamps",
+          "expected_behavior": "All weight-related data for removed nominee cleaned up",
+          "actual_behavior": "Only bias at nextTime is zeroed. Future slope changes in changesSum remain unless users call revokeRemovedNomineeVotingPower",
+          "risk_level": "medium",
+          "exploitation_potential": "If users do not revoke voting power from removed nominees, changesSum will be incorrectly decremented at lock expiration times, reducing total weight sum and increasing relative weight of remaining nominees"
+        },
+        {
+          "scenario": "DefaultTargetDispenserL2.redeem does not re-verify staking target validity",
+          "expected_behavior": "Target validity should be checked at redemption time",
+          "actual_behavior": "Only checks that queueHash exists; no re-verification against stakingFactory",
+          "risk_level": "medium",
+          "exploitation_potential": "A staking target disabled after queuing can still receive OLAS through redeem; the amount was already adjusted at queue time but contract validity may have changed"
+        },
+        {
+          "scenario": "StakingFactory.setInstanceStatus only allows deployer to change status",
+          "expected_behavior": "Factory owner should be able to disable malicious instances",
+          "actual_behavior": "Only the original deployer can enable/disable an instance; factory owner has no override",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious deployer can create an instance that passes initial verification but later behaves maliciously, and the factory owner cannot disable it"
+        },
+        {
+          "scenario": "Dispenser.calculateStakingIncentives compares stakingIncentive (OLAS) with totalWeightSum (veOLAS bias units)",
+          "expected_behavior": "Comparison between amounts in same units",
+          "actual_behavior": "availableStakingAmount (OLAS inflation amount) compared with totalWeightSum (veOLAS bias/voting power). Units are fundamentally different",
+          "risk_level": "low",
+          "exploitation_potential": "By design: caps staking distribution by total veOLAS directed to staking. Low veOLAS participation means less staking incentive distributed regardless of allocated OLAS amount. Not exploitable but could lead to underdistribution of staking incentives"
+        },
+        {
+          "scenario": "Dispenser.calculateStakingIncentives is a public function that modifies external state",
+          "expected_behavior": "View-only calculation or protected by access control",
+          "actual_behavior": "Calls IVoteWeighting.checkpointNominee which modifies state; anyone can call to checkpoint nominees at no cost beyond gas",
+          "risk_level": "low",
+          "exploitation_potential": "Anyone can trigger nominee checkpoint; the doc says to use staticcall but there is no enforcement. Could be used to keep nominees checkpointed for free"
+        },
+        {
+          "scenario": "Tokenomics._finalizeIncentivesForUnitId top-up calculation can result in zero for small contributions",
+          "expected_behavior": "Proportional top-up allocation",
+          "actual_behavior": "topUp = (pendingRelativeTopUp * totalTopUpsOLAS * topUpUnitFraction) / (100 * sumUnitTopUpsOLAS). With small pendingRelativeTopUp relative to sumUnitTopUpsOLAS, result truncates to zero",
+          "risk_level": "low",
+          "exploitation_potential": "Small contributors lose their top-up allocation to truncation. Large contributors systematically benefit from accumulated rounding in their favor"
+        },
+        {
+          "scenario": "Dispenser.claimOwnerIncentives reverts if reward and topUp are both zero",
+          "expected_behavior": "Graceful return with zero values",
+          "actual_behavior": "success remains false when (reward + topUp) == 0, causing revert ClaimIncentivesFailed",
+          "risk_level": "low",
+          "exploitation_potential": "Not exploitable; just bad UX. Users calling with no accumulated incentives get a confusing revert"
+        },
+        {
+          "scenario": "Year boundary inflation split assumes at most one year change per epoch",
+          "expected_behavior": "Handle multiple year changes if epoch spans more than one year",
+          "actual_behavior": "Only calculates inflation for two year periods. MAX_EPOCH_LENGTH < ONE_YEAR prevents >1 year epochs",
+          "risk_level": "low",
+          "exploitation_potential": "Protected by MAX_EPOCH_LENGTH constraint. If constraint were removed, inflation calculation would be incorrect for multi-year epochs"
+        }
+      ],
+      "assumption_violations": [
+        "Treasury rebalanceTreasury is assumed to not re-enter tokenomics; no explicit reentrancy guard on checkpoint",
+        "Bridge message delivery is assumed reliable; failure requires DAO intervention via maintenance functions",
+        "All users are assumed to eventually revoke votes from removed nominees; unrevoked votes distort weight calculations",
+        "ActivityChecker is assumed to be correctly implemented; failures default to inactive (safe default)",
+        "StakingFactory deployers are assumed to be non-malicious for instance management; owner cannot override",
+        "Service registry ownerOf is assumed to return correct owners; compromised registry breaks reward distribution",
+        "Block.timestamp is assumed to be reasonably accurate; miners can manipulate by ~15 seconds (negligible impact)"
+      ],
+      "game_theory_risks": [
+        "Services with fewer units receive proportionally more reward per unit from donations (inversely proportional to numServiceUnits)",
+        "Strategic checkpoint timing: delaying checkpoint accumulates more inflation per epoch, benefiting current epoch recipients",
+        "Vote weight manipulation: concentrating votes on specific nominees just before epoch end to maximize their allocation",
+        "Staking sandwich: staking immediately before checkpoint and unstaking after to capture disproportionate time-weighted rewards",
+        "Retainer voting power can be used to reduce staking incentive distribution, returning funds to inflation pool",
+        "Cross-chain arbitrage: withheld amounts on L2 offset future L1 transfers, creating credit that could be exploited if sync timing is manipulated"
+      ],
+      "integration_risks": [
+        "Five different bridge implementations with varying failure modes and recovery mechanisms",
+        "Wormhole bridge has 8-decimal precision limit, causing truncation loss on each transfer",
+        "Bridge message failures require DAO votes for maintenance recovery (processDataMaintenance, syncWithheldAmountMaintenance)",
+        "VoteWeighting MAX_NUM_WEEKS=53 means checkpoints must happen within ~1 year to avoid stale weights",
+        "External ActivityChecker contract failures (revert or wrong data) treated as inactive service, possibly causing unjust eviction",
+        "Polygon FxPortal requires separate fxChildTunnel/fxRootTunnel setup that must be consistent with l2TargetDispenser",
+        "Arbitrum address aliasing must be correctly computed for L1->L2 message validation"
+      ],
+      "calculation_errors": [
+        "Tokenomics.refundFromStaking error message uses depository address instead of dispenser: revert ManagerOnly(msg.sender, depository) should be revert ManagerOnly(msg.sender, dispenser)",
+        "Donation amount truncation: uint96(amounts[i] / numServiceUnits) loses remainder that is still counted in totalDonationsETH but never distributed to units",
+        "Bridge decimal normalization can lose up to 10^(18-bridgingDecimals)-1 tokens per transfer (e.g., up to ~10^10 wei for Wormhole with 8 decimals)"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "OLAS",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Standard ERC20 with inflation schedule. Initial 1B cap for 10 years, then 2% annual inflation. Minted via Treasury. Used as staking deposit token and incentive distribution token across chains."
+        },
+        {
+          "address_or_symbol": "veOLAS",
+          "behaviors": [
+            "rebasing:false",
+            "non_transferable",
+            "time_weighted_voting"
+          ],
+          "decimals": 18,
+          "notes": "Vote-escrowed OLAS. Provides voting power for VoteWeighting gauge. Slope/bias model. Used for top-up eligibility threshold checks in Tokenomics."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "fraction_sum_rewards",
+          "state_vars": [
+            "rewardComponentFraction",
+            "rewardAgentFraction",
+            "rewardTreasuryFraction"
+          ],
+          "rule": "rewardComponentFraction + rewardAgentFraction + rewardTreasuryFraction == 100"
+        },
+        {
+          "name": "fraction_sum_topups",
+          "state_vars": [
+            "maxBondFraction",
+            "topUpComponentFraction",
+            "topUpAgentFraction",
+            "stakingFraction"
+          ],
+          "rule": "maxBondFraction + topUpComponentFraction + topUpAgentFraction + stakingFraction <= 100"
+        },
+        {
+          "name": "effective_bond_accounting",
+          "state_vars": [
+            "effectiveBond",
+            "maxBond"
+          ],
+          "rule": "effectiveBond = accumulated maxBond credits - reserved bond programs + leftovers"
+        },
+        {
+          "name": "staking_rewards_conservation",
+          "state_vars": [
+            "availableRewards",
+            "balance",
+            "sum(mapServiceInfo[*].reward)"
+          ],
+          "rule": "balance >= availableRewards + sum(mapServiceInfo[*].reward) for all staked services"
+        },
+        {
+          "name": "epoch_monotonicity",
+          "state_vars": [
+            "epochCounter",
+            "mapEpochTokenomics[*].epochPoint.endTime"
+          ],
+          "rule": "endTime strictly increasing across epochs; epochCounter only increments by 1"
+        },
+        {
+          "name": "claimed_epoch_monotonicity",
+          "state_vars": [
+            "mapLastClaimedStakingEpochs"
+          ],
+          "rule": "mapLastClaimedStakingEpochs[nomineeHash] only increases or stays the same"
+        },
+        {
+          "name": "vote_power_bounded",
+          "state_vars": [
+            "voteUserPower"
+          ],
+          "rule": "voteUserPower[user] <= MAX_WEIGHT (10000) for all users"
+        },
+        {
+          "name": "withheld_amount_conservation",
+          "state_vars": [
+            "mapChainIdWithheldAmounts",
+            "withheldAmount (L2)"
+          ],
+          "rule": "L2 withheldAmount should eventually sync to L1 mapChainIdWithheldAmounts and offset future transfers"
+        }
+      ]
+    }
+  }
+}

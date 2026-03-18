@@ -1,0 +1,523 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T05:21:33.050Z",
+    "duration_ms": 180562
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "External SGX quote binary (user-supplied)",
+        "path": [
+          "AutomataDcapV3Attestation.verifyAttestation(bytes)",
+          "AutomataDcapV3Attestation._verify(bytes)",
+          "V3Parser.parseInput(bytes,address)",
+          "V3Parser.parseAndVerifyHeader(bytes)",
+          "V3Parser.parseAuthDataAndVerifyCertType(bytes,address)",
+          "V3Parser.parseCerificationChainBytes(bytes,address)",
+          "PEMCertChainLib.splitCertificateChain(bytes,uint256)",
+          "PEMCertChainLib.decodeCert(bytes,bool)",
+          "AutomataDcapV3Attestation._verifyParsedQuote()"
+        ],
+        "transformations": [
+          "Raw quote bytes parsed into V3Struct.ParsedV3QuoteStruct",
+          "PEM cert chain split and Base64 decoded into DER",
+          "DER decoded into ECSha256Certificate structs",
+          "Signature bytes extracted and verified via ES256/RSA",
+          "sha256 hash of quote computed for return data"
+        ],
+        "sinks": [
+          "Return value (bool success, bytes retData)"
+        ],
+        "trust_changes": "Untrusted external data goes through parsing and cryptographic verification to become trusted attestation result",
+        "validation_points": [
+          "Quote length > MINIMUM_QUOTE_LENGTH",
+          "Header version, attestation key type, tee type, vendor ID checks",
+          "Cert type must be 1-5",
+          "MrEnclave and MrSigner trust checks (conditional)",
+          "QE identity verification",
+          "TCB level verification",
+          "Certificate chain verification including expiry and revocation",
+          "ECDSA signature verification on enclave reports"
+        ],
+        "exposure_risks": [
+          "verifyParsedQuote is external and accepts pre-parsed struct - bypasses raw quote parsing validation",
+          "parseCerificationChainBytes calls pemCertLib via staticcall on user-provided address in parseInput"
+        ],
+        "manipulation_risks": [
+          "If owner sets permissive TCB info or QE identity, invalid attestations could pass",
+          "Owner can toggle _checkLocalEnclaveReport to bypass MRENCLAVE/MRSIGNER checks",
+          "Owner can remove revoked serial numbers to accept revoked certificates"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "L1 block data (_l1BlockHash, _l1StateRoot, _l1BlockId, _parentGasUsed)",
+        "path": [
+          "TaikoL2.anchor() called by GOLDEN_TOUCH_ADDRESS",
+          "Verify publicInputHash integrity",
+          "Calculate basefee via _calc1559BaseFee",
+          "Conditionally sync L1 state root to SignalService",
+          "Store l2Hashes and update publicInputHash"
+        ],
+        "transformations": [
+          "publicInputHash computed from blockhashes ring buffer",
+          "basefee computed from gasExcess + parentGasUsed via EIP-1559 bonding curve",
+          "gasExcess adjusted by L1 block issuance"
+        ],
+        "sinks": [
+          "l2Hashes mapping",
+          "publicInputHash state variable",
+          "gasExcess state variable",
+          "lastSyncedBlock state variable",
+          "SignalService.syncChainData"
+        ],
+        "trust_changes": "GOLDEN_TOUCH_ADDRESS is trusted system address providing L1 data to L2",
+        "validation_points": [
+          "msg.sender == GOLDEN_TOUCH_ADDRESS",
+          "Non-zero _l1BlockHash, _l1StateRoot, _l1BlockId",
+          "_parentGasUsed must be non-zero after block 1",
+          "publicInputHash integrity check",
+          "basefee mismatch check (unless skipFeeCheck)"
+        ],
+        "exposure_risks": [
+          "If GOLDEN_TOUCH_ADDRESS is compromised, arbitrary L1 data can be anchored"
+        ],
+        "manipulation_risks": [
+          "L1 block sync only happens when _l1BlockId > lastSyncedBlock + BLOCK_SYNC_THRESHOLD, allowing gaps in state root syncing"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Cross-chain owner message via bridge",
+        "path": [
+          "CrossChainOwned.onMessageInvocation(bytes)",
+          "Decode (txId, txdata)",
+          "Verify txId == nextTxId",
+          "Verify bridge context (srcChainId, from)",
+          "address(this).call(txdata)"
+        ],
+        "transformations": [
+          "ABI decode _data into (uint64 txId, bytes txdata)",
+          "txdata executed as call to self"
+        ],
+        "sinks": [
+          "address(this) via low-level call with arbitrary txdata"
+        ],
+        "trust_changes": "Bridge-delivered message from owner on remote chain gets executed as local self-call",
+        "validation_points": [
+          "onlyFromNamed('bridge')",
+          "txId == nextTxId sequential check",
+          "ctx.srcChainId == ownerChainId",
+          "ctx.from == owner()"
+        ],
+        "exposure_risks": [
+          "The self-call with arbitrary txdata allows calling any public/external function on the contract",
+          "Not guarded by nonReentrant - explicitly noted in code comment"
+        ],
+        "manipulation_risks": [
+          "If bridge contract is compromised, arbitrary txdata can be executed",
+          "Sequential txId prevents replay but allows DoS if a txId is skipped"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "Merkle proof and claim data from users",
+        "path": [
+          "ERC20Airdrop.claimAndDelegate() or ERC20Airdrop2.claim() or ERC721Airdrop.claim()",
+          "MerkleClaimable._verifyClaim(data, proof)",
+          "keccak256(abi.encode('CLAIM_TAIKO_AIRDROP', data))",
+          "Check isClaimed[hash]",
+          "MerkleProof.verify(proof, merkleRoot, hash)",
+          "Set isClaimed[hash] = true",
+          "Transfer tokens"
+        ],
+        "transformations": [
+          "User+amount encoded with prefix string and hashed",
+          "Hash verified against merkle root with proof"
+        ],
+        "sinks": [
+          "isClaimed mapping",
+          "Token transfers from vault to user"
+        ],
+        "trust_changes": "Untrusted user proof verified against trusted merkle root set by owner",
+        "validation_points": [
+          "ongoingClaim modifier checks merkleRoot, claimStart, claimEnd",
+          "isClaimed prevents double claims",
+          "MerkleProof.verify validates inclusion"
+        ],
+        "exposure_risks": [
+          "ERC20Airdrop.claimAndDelegate: delegationData can be crafted by anyone calling the function"
+        ],
+        "manipulation_risks": [
+          "Owner can change merkleRoot via setConfig at any time, potentially invalidating pending claims or enabling new ones",
+          "ERC20Airdrop2: claimed amounts are stored per-user but claim hash is based on (user, amount) - a user cannot claim different amounts"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Grant parameters from owner, withdrawal requests from recipients",
+        "path": [
+          "TimelockTokenPool.grant(address, Grant)",
+          "Validate grant parameters",
+          "Store in recipients mapping",
+          "TimelockTokenPool.withdraw() or withdraw(address, bytes)",
+          "getMyGrantSummary computes amountOwned, amountUnlocked, amountToWithdraw, costToWithdraw",
+          "Transfer taikoToken from sharedVault to recipient",
+          "Transfer costToken from recipient to sharedVault"
+        ],
+        "transformations": [
+          "_calcAmount: linear vesting based on block.timestamp relative to start/cliff/period",
+          "costToWithdraw = (amountUnlocked / 1e18) * costPerToken - costPaid",
+          "amountToWithdraw = amountUnlocked - amountWithdrawn"
+        ],
+        "sinks": [
+          "recipients mapping (amountWithdrawn, costPaid)",
+          "totalAmountGranted, totalAmountVoided, totalAmountWithdrawn, totalCostPaid",
+          "Token transfers"
+        ],
+        "trust_changes": "Owner sets grant parameters; recipient can only withdraw according to vesting schedule",
+        "validation_points": [
+          "Grant validation: amount > 0, cliff constraints",
+          "ALREADY_GRANTED check prevents overwriting",
+          "Signature verification for delegated withdrawal"
+        ],
+        "exposure_risks": [
+          "taikoToken.transferFrom (not safeTransferFrom) used for token transfer from vault"
+        ],
+        "manipulation_risks": [
+          "Precision loss in costToWithdraw calculation due to division before multiplication",
+          "withdraw(address, bytes) allows anyone to trigger withdrawal with valid signature"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "DER-encoded certificate bytes",
+        "path": [
+          "PEMCertChainLib.decodeCert(bytes, bool)",
+          "ASN1 parsing via Asn1Decode library",
+          "Extract serial number, validity dates, public key, signature",
+          "For PCK certs: extract SGX extensions (FMSPC, PCEID, TCB SVNs)",
+          "_findPckTcbInfo iterates through extensions",
+          "_findTcb extracts CPU SVN values and PCESVN"
+        ],
+        "transformations": [
+          "DER bytes parsed into ASN1 tree structure",
+          "Date strings converted to timestamps via X509DateUtils",
+          "Public key and signature bytes trimmed to expected lengths",
+          "SGX extension OIDs matched and values extracted",
+          "SVN byte values converted to uint16 with endianness handling"
+        ],
+        "sinks": [
+          "ECSha256Certificate struct returned to caller"
+        ],
+        "trust_changes": "Raw DER bytes are parsed without cryptographic validation at this stage - validation happens later in _verifyCertChain",
+        "validation_points": [
+          "PCK cert issuer name validation",
+          "PCK cert common name validation",
+          "Date tag validation (0x17 or 0x18)",
+          "Extension tag 0xA3 check",
+          "OID matching for SGX extensions"
+        ],
+        "exposure_risks": [
+          "Malformed DER could cause out-of-bounds in ASN1 parsing"
+        ],
+        "manipulation_risks": [
+          "The _findTcb function has an off-by-one risk: iterates SGX_TCB_CPUSVN_SIZE+1 times but cpusvns array is only SGX_TCB_CPUSVN_SIZE, so when PCESVN OID is not the last element, array index can overflow",
+          "notBefore tag validation has a logic bug: (notBeforeTag != 0x17 && notBeforeTag == 0x18) always passes for 0x18 tags incorrectly"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "EIP-1559 gas parameters",
+        "path": [
+          "TaikoL2._calc1559BaseFee(config, _l1BlockId, _parentGasUsed)",
+          "gasExcess + _parentGasUsed = excess",
+          "Calculate numL1Blocks = _l1BlockId - lastSyncedBlock",
+          "issuance = numL1Blocks * gasTargetPerL1Block",
+          "excess -= issuance (or set to 1)",
+          "Lib1559Math.basefee(gasExcess_, adjustmentFactor)",
+          "LibFixedPointMath.exp(input)"
+        ],
+        "transformations": [
+          "Gas excess accumulation with parent gas used",
+          "Gas issuance subtraction based on L1 block count",
+          "Exponential function for base fee calculation",
+          "Clamped to uint64 max"
+        ],
+        "sinks": [
+          "basefee_ return value",
+          "gasExcess_ state update"
+        ],
+        "trust_changes": "System-level calculation, inputs from trusted anchor transaction",
+        "validation_points": [
+          "gasExcess > 0 check (0 means disabled)",
+          "lastSyncedBlock > 0 check",
+          "excess clamped to 1 minimum (not 0)",
+          "basefee minimum of 1"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If gasExcess is 0, base fee is always 1 regardless of congestion",
+          "Large gap between lastSyncedBlock and _l1BlockId could cause large issuance subtraction resetting excess to 1"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "SGX attestation must pass full verification chain: quote parsing, enclave identity, TCB check, cert chain, signature verification",
+        "TaikoL2 anchor must be called by GOLDEN_TOUCH_ADDRESS and maintains a ring buffer of block hashes for public input integrity",
+        "Cross-chain ownership requires sequential transaction IDs and bridge-verified source chain + owner",
+        "Merkle airdrop claims are one-time per leaf hash and bounded by time window",
+        "TimelockTokenPool enforces vesting (grant) and unlock schedules independently with linear interpolation",
+        "Certificate chain trust is anchored to ROOTCA_PUBKEY_HASH constant"
+      ],
+      "economic_incentives": [
+        "EIP-1559 base fee adjusts based on gas usage vs target, incentivizing optimal gas usage",
+        "TimelockTokenPool costPerToken creates a purchase requirement for token vesting",
+        "ERC20Airdrop2 linear withdrawal window prevents immediate dump of airdropped tokens"
+      ],
+      "governance_mechanisms": [
+        "AutomataDcapV3Attestation owner can configure trusted enclaves, TCB info, QE identity, and revocation lists",
+        "TaikoL2EIP1559Configurable owner can change EIP-1559 parameters",
+        "MerkleClaimable owner can update merkle root, claim start, and claim end at any time",
+        "CrossChainOwned allows remote chain owner to execute arbitrary functions via bridge"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "PEMCertChainLib.decodeCert notBefore tag validation has logic error",
+          "expected_behavior": "Should reject certificates where notBefore tag is neither 0x17 (UTCTime) nor 0x18 (GeneralizedTime)",
+          "actual_behavior": "The condition (notBeforeTag != 0x17 && notBeforeTag == 0x18) is equivalent to (notBeforeTag == 0x18), meaning it ONLY rejects 0x18 tags (GeneralizedTime) while accepting any other non-0x17 tag. This is inverted from intended behavior.",
+          "risk_level": "high",
+          "exploitation_potential": "A crafted certificate with an invalid notBefore tag type (e.g., 0x19) would pass validation, potentially allowing certificates with incorrectly parsed validity dates to be accepted as valid. The timestamp parsing would produce garbage values."
+        },
+        {
+          "scenario": "PEMCertChainLib._findTcb cpusvns array index overflow when PCESVN is not the last SVN entry",
+          "expected_behavior": "Should correctly populate cpusvns[0..15] with CPU SVN values and separately store PCESVN",
+          "actual_behavior": "The loop iterates SGX_TCB_CPUSVN_SIZE+1 (17) times. The array cpusvns has size 16. If PCESVN OID is matched, pcesvn is set but the else branch is skipped. However, if a non-PCESVN entry appears at index 16, it would write to cpusvns[16] which is out of bounds. In Solidity 0.8.x this would revert.",
+          "risk_level": "medium",
+          "exploitation_potential": "If the PCK certificate has SVN entries in unexpected order (PCESVN not at the end), or has unexpected extra entries, the function could revert, causing denial of service for attestation verification."
+        },
+        {
+          "scenario": "TimelockTokenPool costToWithdraw precision loss",
+          "expected_behavior": "Cost should be proportional to tokens unlocked with full precision",
+          "actual_behavior": "costToWithdraw = (amountUnlocked / 1e18) * costPerToken - costPaid. Division by 1e18 before multiplication truncates, losing up to (1e18 - 1) units per calculation. For tokens with non-zero costPerToken, this means the recipient pays slightly less cost than intended.",
+          "risk_level": "medium",
+          "exploitation_potential": "By withdrawing in small increments, a recipient could accumulate precision loss benefits. Each withdrawal loses up to costPerToken * (1e18 - 1) / 1e18 in cost. With many small withdrawals this could be meaningful, but the grant is one-time per recipient limiting exploitation."
+        },
+        {
+          "scenario": "TimelockTokenPool _calcAmount truncation with uint64 cast",
+          "expected_behavior": "Linear vesting should compute _amount * elapsed / _period precisely",
+          "actual_behavior": "_amount * uint64(block.timestamp - _start) / _period — the uint64 cast of (block.timestamp - _start) truncates if the time difference exceeds uint64 max, but this is ~584 billion years so practically safe. However, _amount is uint128 and _period is uint32, so _amount * uint64(elapsed) can overflow uint128 for large amounts and long periods.",
+          "risk_level": "low",
+          "exploitation_potential": "For very large grant amounts (close to uint128 max) combined with large elapsed times, the multiplication could overflow. However, grant amounts are validated as uint128 and practical elapsed time is bounded."
+        },
+        {
+          "scenario": "ERC20Airdrop2 withdrawal window boundary",
+          "expected_behavior": "Linear unlock from claimEnd to claimEnd + withdrawalWindow",
+          "actual_behavior": "getBalance computes timeBasedAllowance = balance * (min(timestamp, claimEnd + withdrawalWindow) - claimEnd) / withdrawalWindow. If withdrawalWindow is 0, this causes division by zero revert.",
+          "risk_level": "medium",
+          "exploitation_potential": "If initialized with withdrawalWindow = 0, no user can ever withdraw. This is an initialization configuration issue."
+        },
+        {
+          "scenario": "AutomataDcapV3Attestation._checkTcbLevels returns (true, TCB_UNRECOGNIZED) when no TCB level matches",
+          "expected_behavior": "Should indicate failure or unrecognized status clearly",
+          "actual_behavior": "When no TCB level matches the PCK's SVNs, it returns (true, TCB_UNRECOGNIZED). The TCB_UNRECOGNIZED status is then checked by _attestationTcbIsValid which returns false for it. So the final result is correct, but the intermediate 'true' is misleading and could be a source of bugs if _checkTcbLevels result is used differently in the future.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploitation currently since _attestationTcbIsValid correctly rejects TCB_UNRECOGNIZED, but a future code change relying on the bool return could introduce a vulnerability."
+        },
+        {
+          "scenario": "AutomataDcapV3Attestation owner has no transfer mechanism",
+          "expected_behavior": "Owner should be transferable via 2-step process or similar safety mechanism",
+          "actual_behavior": "The owner is set in constructor and there is no function to change it. If the owner key is lost, all admin functions become inaccessible permanently.",
+          "risk_level": "medium",
+          "exploitation_potential": "Not an exploitation risk but an operational risk. No way to update TCB info, revoke certificates, or change trusted enclaves if owner key is compromised or lost."
+        },
+        {
+          "scenario": "V3Parser.parseInput and validateParsedInput dual path",
+          "expected_behavior": "Both paths should enforce equivalent validation",
+          "actual_behavior": "verifyParsedQuote(ParsedV3QuoteStruct) accepts pre-parsed input and calls validateParsedInput which checks struct field lengths but NOT the raw quote binary structure. Some validations from parseInput (like localAuthDataSize consistency) are bypassed. The signedQuoteData is reconstructed from struct fields via abi.encodePacked which may not match the original raw quote bytes.",
+          "risk_level": "high",
+          "exploitation_potential": "An attacker could craft a ParsedV3QuoteStruct that passes validateParsedInput checks but where the reconstructed signedQuoteData differs from what was actually signed. The signature verification uses the reconstructed bytes, so if the reconstruction matches the attestation key's signature, it passes. However, the header and enclave report fields must still match. The risk is that abi.encodePacked reconstruction may produce different bytes than the original binary format."
+        },
+        {
+          "scenario": "SigVerifyLib.verifyES256Signature uses assert(success) for external staticcall",
+          "expected_behavior": "Should handle failure gracefully",
+          "actual_behavior": "assert(success) will consume all remaining gas on failure and revert with Panic. If ES256VERIFIER contract is not deployed or has a bug, verification always reverts instead of returning false.",
+          "risk_level": "medium",
+          "exploitation_potential": "If ES256VERIFIER is destroyed or becomes non-functional, all ES256 signature verifications will fail with panic, causing DoS for the entire attestation system."
+        },
+        {
+          "scenario": "TaikoL2 gasExcess = 0 disables dynamic base fee",
+          "expected_behavior": "Base fee should always reflect network congestion",
+          "actual_behavior": "When gasExcess is 0, _calc1559BaseFee skips all computation and returns basefee_ = 1. The anchor function adds _parentGasUsed to gasExcess but only if gasExcess > 0. So once gasExcess reaches 0, it stays at 0 permanently.",
+          "risk_level": "medium",
+          "exploitation_potential": "If gasExcess somehow reaches 0 (through large issuance subtraction), the base fee is permanently stuck at 1, enabling very cheap spam transactions on L2."
+        },
+        {
+          "scenario": "ERC20Airdrop uses transferFrom instead of safeTransferFrom for token transfer",
+          "expected_behavior": "Should safely handle non-standard ERC20 tokens",
+          "actual_behavior": "IERC20(token).transferFrom(vault, user, amount) does not use SafeERC20, so tokens that don't return bool on transferFrom would cause a revert.",
+          "risk_level": "low",
+          "exploitation_potential": "If the airdropped token is non-standard, claims would fail. Since token is set at initialization and is expected to be TaikoToken, risk is low."
+        },
+        {
+          "scenario": "CrossChainOwned.onMessageInvocation lacks nonReentrant guard",
+          "expected_behavior": "Should prevent reentrant calls for safety",
+          "actual_behavior": "Explicitly noted that nonReentrant is NOT used because the function calls address(this).call(txdata) which re-enters the contract. This means the called function could potentially call back into onMessageInvocation if it goes through the bridge.",
+          "risk_level": "medium",
+          "exploitation_potential": "The sequential txId check (txId == nextTxId) provides some protection, but if the self-call increments nextTxId (via another bridge message processed within the call), re-entrancy could execute multiple transactions in one call."
+        },
+        {
+          "scenario": "MerkleClaimable setConfig can change merkleRoot mid-claim period",
+          "expected_behavior": "Should not allow changing root during active claims or should have migration period",
+          "actual_behavior": "Owner can call setConfig at any time to change claimStart, claimEnd, and merkleRoot. This can invalidate ongoing claims or enable previously invalid claims.",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious or compromised owner could change the merkle root to include unauthorized recipients or exclude legitimate ones. Already-claimed hashes remain marked, but new root could have different leaves."
+        }
+      ],
+      "assumption_violations": [
+        "PEMCertChainLib assumes DER encoding follows strict X.509 structure; malformed DER could cause unexpected parsing behavior in ASN1 library",
+        "V3Parser assumes quote binary format strictly matches Intel SGX DCAP V3 specification; deviations could cause incorrect parsing",
+        "TimelockTokenPool assumes taikoToken and costToken are standard ERC20 with no fee-on-transfer; fee tokens would break accounting",
+        "TaikoL2 assumes blockhash() returns correct values for recent blocks; on non-standard EVM chains this might differ",
+        "SigVerifyLib assumes ES256VERIFIER always returns without reverting (assert); if it reverts, entire attestation fails",
+        "Certificate chain validation assumes exactly 3 certificates (PCK, Intermediate, Root); different chain lengths would fail",
+        "ERC20Airdrop2 assumes claimEnd + withdrawalWindow does not overflow uint64"
+      ],
+      "game_theory_risks": [
+        "AutomataDcapV3Attestation owner is a single point of trust for all attestation configuration - centralization risk",
+        "TimelockTokenPool void function allows owner to claw back unvested tokens, creating trust asymmetry between owner and recipients",
+        "ERC20Airdrop2 linear unlock can be gamed by claiming right before claimEnd to maximize withdrawal window",
+        "TaikoL2EIP1559Configurable owner can manipulate gas pricing by changing config and gasExcess simultaneously"
+      ],
+      "integration_risks": [
+        "PEMCertChainLib is called via interface cast in V3Parser.parseCerificationChainBytes - if address changes or is wrong, cert parsing fails silently",
+        "SignalService integration in TaikoL2.anchor relies on resolve('signal_service') returning correct address",
+        "Bridge integration in CrossChainOwned relies on resolve('bridge') and correct IBridge.context() implementation",
+        "ES256VERIFIER external contract dependency in SigVerifyLib - if contract is upgraded or destroyed, all ECDSA verification breaks",
+        "ERC20Airdrop vault must have sufficient allowance for the airdrop contract to transfer tokens"
+      ],
+      "calculation_errors": [
+        {
+          "location": "PEMCertChainLib.decodeCert validity date tag check",
+          "description": "Line: (notBeforeTag != 0x17 && notBeforeTag == 0x18) — this condition is logically equivalent to (notBeforeTag == 0x18). The intended check should be (notBeforeTag != 0x17 && notBeforeTag != 0x18) to reject invalid tags. Current code rejects GeneralizedTime (0x18) notBefore tags while accepting arbitrary invalid tags.",
+          "impact": "Certificates with non-standard date encoding types in notBefore field are incorrectly accepted"
+        },
+        {
+          "location": "TimelockTokenPool.getMyGrantSummary costToWithdraw",
+          "description": "uint128 _amountUnlocked = amountUnlocked / 1e18; costToWithdraw = _amountUnlocked * r.grant.costPerToken - r.costPaid; Division before multiplication causes precision loss of up to 1e18-1 tokens worth of cost",
+          "impact": "Recipients pay slightly less cost than intended per withdrawal"
+        },
+        {
+          "location": "PEMCertChainLib._findTcb SVN parsing",
+          "description": "svnValue = svnValueBytes.length < 2 ? uint16(bytes2(svnValueBytes)) / 256 : uint16(bytes2(svnValueBytes)); For 1-byte values, bytes2() left-pads the byte into the high byte, then divides by 256 to get the value. This works correctly for single bytes but the approach is fragile and assumes specific ASN1 integer encoding.",
+          "impact": "Low - works correctly for standard Intel SGX certificate format but fragile to non-standard encodings"
+        },
+        {
+          "location": "V3Parser.packQEReport byte swapping",
+          "description": "isvProdIdPackBE = (enclaveReport.isvProdId >> 8) | (enclaveReport.isvProdId << 8) — for uint16, the left shift by 8 produces correct byte swap. This is correct for uint16 big-endian conversion.",
+          "impact": "None - calculation is correct"
+        }
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "taikoToken",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:assumed_false"
+          ],
+          "decimals": 18,
+          "notes": "Used in TimelockTokenPool with transferFrom (not safeTransferFrom). Used in ERC20Airdrop with transferFrom. Assumes standard ERC20 behavior. If fee-on-transfer, accounting in TimelockTokenPool breaks."
+        },
+        {
+          "address_or_symbol": "costToken",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:assumed_false"
+          ],
+          "decimals": 18,
+          "notes": "Used in TimelockTokenPool with safeTransferFrom. USD stablecoin expected. Precision in costToWithdraw depends on 1e18 divisor."
+        },
+        {
+          "address_or_symbol": "ERC20Airdrop.token",
+          "behaviors": [
+            "permit:true"
+          ],
+          "decimals": 18,
+          "notes": "Must support IVotes.delegateBySig for ERC20Airdrop.claimAndDelegate. transferFrom used without SafeERC20 wrapper."
+        },
+        {
+          "address_or_symbol": "ERC20Airdrop2.token",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:assumed_false"
+          ],
+          "decimals": 18,
+          "notes": "Used with transferFrom in withdraw. If fee-on-transfer, users receive less than withdrawableAmount computed by getBalance."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "totalAmountGranted_conservation",
+          "state_vars": [
+            "totalAmountGranted",
+            "totalAmountVoided",
+            "sum(recipients[x].grant.amount)"
+          ],
+          "description": "totalAmountGranted = sum of all original grant amounts. After voiding, totalAmountGranted unchanged, totalAmountVoided tracks reduced amounts."
+        },
+        {
+          "name": "withdrawal_bounded",
+          "state_vars": [
+            "recipients[x].amountWithdrawn",
+            "_getAmountUnlocked(recipients[x].grant)"
+          ],
+          "description": "amountWithdrawn <= amountUnlocked at all times for each recipient"
+        },
+        {
+          "name": "public_input_hash_integrity",
+          "state_vars": [
+            "publicInputHash",
+            "l2Hashes",
+            "block.chainid"
+          ],
+          "description": "publicInputHash must equal keccak256 of the 256-element ring buffer containing 255 blockhashes + chainid"
+        },
+        {
+          "name": "claim_uniqueness",
+          "state_vars": [
+            "isClaimed[hash]"
+          ],
+          "description": "Each claim hash can only be claimed once regardless of merkle root changes"
+        },
+        {
+          "name": "gasExcess_nonzero_invariant",
+          "state_vars": [
+            "gasExcess"
+          ],
+          "description": "If gasExcess starts > 0, after _calc1559BaseFee it should remain >= 1 (excess is set to max(excess-issuance, 1)). However if it starts at 0, it stays at 0."
+        },
+        {
+          "name": "cert_chain_trust_anchor",
+          "state_vars": [
+            "ROOTCA_PUBKEY_HASH"
+          ],
+          "description": "All certificate chain verifications must terminate at a certificate whose issuer public key hashes to ROOTCA_PUBKEY_HASH"
+        }
+      ]
+    }
+  }
+}

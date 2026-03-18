@@ -1,0 +1,3147 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "C",
+    "process": "threat_deduplication",
+    "deduplicator_model": null,
+    "timestamp": "2026-03-08T17:45:18.151Z",
+    "original_threat_count": 82,
+    "deduplicated_threat_count": 38,
+    "removed_threat_count": 44
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H002",
+      "title": "Silent uint128 Truncation of Reward Accumulators Corrupts Accounting and Breaks Monotonicity",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Both `accCantoPerShare` and `secRewardsPerShare` are stored as uint128 but computed in uint256. In Solidity 0.8.17, explicit narrowing casts like `uint128(value)` silently truncate (higher-order bits are cut off) without reverting. When `marketSupply` is very small (e.g., 1 wei) and rewards are active, `(cantoReward * 1e18) / marketSupply` can exceed uint128.max (~3.4e38), wrapping accCantoPerShare to a dramatically lower value and destroying the monotonicity invariant.",
+      "investigation_rationale": "With marketSupply=1 and cantoPerBlock=1e18, the accumulator grows by ~5e35 per block. It overflows uint128 in ~680 blocks (~22 minutes). This permanently corrupts reward accounting for the market: existing users lose accumulated unclaimed rewards, and future reward calculations are based on a corrupted base value.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "66-67",
+        "pattern": "`market.accCantoPerShare += uint128((cantoReward * 1e18) / marketSupply)` and `market.secRewardsPerShare += uint128((blockDelta * 1e18) / marketSupply)` - explicit uint128 cast silently truncates overflow"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market is whitelisted with nonzero cantoPerBlock and nonzero gauge weight",
+        "lendingMarketTotalBalance is very small (1 wei achievable by attacker withdrawing all but dust)",
+        "Enough blocks pass between updates for the accumulator to overflow uint128"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 66-67",
+        "vulnerable_pattern": "uint128() explicit cast on uint256 arithmetic result",
+        "specific_concern": "With marketSupply=1, cantoPerBlock=1e18, weight=5e17: per-block increment = 5e17 * 1e18 / 1 = 5e35. uint128.max ≈ 3.4e38. Overflow in ~680 blocks.",
+        "missing_safeguards": "No overflow check before cast, no minimum market supply requirement"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can an attacker controllably reduce marketSupply to 1 wei by withdrawing from the lending market?",
+          "After truncation/wrap, what is the exact impact on existing users' claimable rewards?",
+          "Can the attacker profit directly from the truncation or only cause griefing?"
+        ],
+        "validation_requirements": [
+          "Calculate exact overflow block count for realistic parameter ranges",
+          "Simulate the truncation and trace its effect on claim() for existing users",
+          "Verify that Solidity 0.8.17 uint128() cast truncates (not reverts)"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker deposits 1 wei into a whitelisted market, then withdraws all other liquidity. With nonzero rewards, accCantoPerShare grows exponentially fast. After ~680 blocks, it overflows uint128, wrapping to a small value. All other users' unclaimed rewards are destroyed. The attacker claims just before overflow to capture rewards, then lets the accumulator corrupt.",
+      "prerequisites": [
+        "Ability to deposit/withdraw through a whitelisted lending market",
+        "Low liquidity market or ability to drain liquidity"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete loss of accumulated unclaimed rewards for all users in the affected market",
+        "affected_users": "All depositors in the affected market",
+        "recovery_possibility": "Requires contract upgrade or market migration; accumulated accounting is permanently corrupted"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No test for accumulator overflow with low market supply",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "Minimal (1 wei deposit)",
+        "execution_timing": "~680 blocks wait time with aggressive parameters",
+        "detection_analysis": "Detectable by monitoring accCantoPerShare for non-monotonic behavior"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "Reentrancy in update_market Loop via GaugeController External Call Allows Double-Counting of Rewards",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The `update_market` function modifies `accCantoPerShare` incrementally inside a loop but only sets `lastRewardBlock = block.number` AFTER the loop completes. Inside each loop iteration, an external call to `gaugeController.gauge_relative_weight_write()` occurs. If this external call triggers a callback into LendingLedger (directly or indirectly), a re-entrant call to update_market for the same market would find `lastRewardBlock` still at its old value and re-run the entire loop, double-counting all reward blocks.",
+      "investigation_rationale": "The `_write` suffix on gauge_relative_weight_write implies state mutation in GaugeController. If GaugeController has any callback mechanism, hooks, or if it's upgradeable, a re-entrant path exists. The code has no reentrancy guard. The state (accCantoPerShare) is modified before the protective state (lastRewardBlock) is updated, violating CEI within the loop context.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "GaugeController implementation does not trigger callbacks to LendingLedger during gauge_relative_weight_write"
+      ],
+      "config_evidence": "GaugeController is set at construction (LendingLedger.sol line 40) and cannot be changed. No GaugeController source provided to verify callback safety.",
+      "affected_functions": [
+        "update_market",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "57-72",
+        "pattern": "accCantoPerShare modified inside loop (line 66) with external call to gaugeController.gauge_relative_weight_write (line 64) BEFORE lastRewardBlock is set (line 71). Loop variable `i` is local and unaffected by nested calls."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "GaugeController.gauge_relative_weight_write() must trigger a callback path into LendingLedger",
+        "Market must be whitelisted",
+        "There must be blocks to process (block.number > lastRewardBlock)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 57-72",
+        "vulnerable_pattern": "State modification (accCantoPerShare +=) inside loop with external call, protective state (lastRewardBlock) set only after loop",
+        "specific_concern": "Re-entrant update_market sees stale lastRewardBlock and re-processes all blocks, doubling accCantoPerShare. The outer loop continues after the callback, adding even more.",
+        "missing_safeguards": "No reentrancy guard (nonReentrant modifier), no in-loop update of lastRewardBlock"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does GaugeController.gauge_relative_weight_write() have any callback or hook mechanism?",
+          "Is GaugeController upgradeable or does it delegate to other contracts?",
+          "Can the GaugeController implementation trigger any external call that loops back?"
+        ],
+        "validation_requirements": [
+          "Review GaugeController source code for callback paths",
+          "Trace complete execution of gauge_relative_weight_write for re-entrancy vectors",
+          "Simulate re-entrant update_market and quantify accCantoPerShare inflation"
+        ]
+      },
+      "preliminary_attack_scenario": "If GaugeController re-enters update_market during gauge_relative_weight_write, accCantoPerShare is inflated by 2x or more. The attacker then claims the inflated rewards, draining the contract's CANTO balance. Even without malicious intent, an upgraded or compromised GaugeController could trigger this inadvertently.",
+      "prerequisites": [
+        "GaugeController with callback mechanism or upgradeability"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "2x or more inflation of accCantoPerShare leading to complete drainage of contract CANTO balance",
+        "affected_users": "All users - early claimers drain funds, later claimers get nothing",
+        "recovery_possibility": "Requires contract upgrade and manual accounting correction"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No reentrancy test for update_market via GaugeController callback",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Nested update_market execution cost",
+        "capital_requirements": "None - any user with deposits can trigger",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Detectable by monitoring accCantoPerShare for abnormal jumps"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "Re-Whitelisting Market Creates Stale accCantoPerShare Without Resetting User Positions",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When a market is re-whitelisted, `lastRewardBlock` is reset to `block.number` but `accCantoPerShare` retains its old value. Users who had deposits before de-listing still have nonzero `user.amount` and old `rewardDebt` values. The lending market could not call `sync_ledger` during the de-listing period, so if users withdrew from the actual lending market during that period, `lendingMarketTotalBalance` and `user.amount` in LendingLedger are now stale and inconsistent with reality.",
+      "investigation_rationale": "After re-whitelisting, the user.amount in LendingLedger no longer reflects actual lending market positions. New rewards accrue based on stale, inflated total balances, diluting legitimate depositors. Users who withdrew from the actual lending market during de-listing still earn rewards post re-listing based on phantom balances.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whiteListLendingMarket",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket(address,bool)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "119-122",
+        "pattern": "whiteListLendingMarket only updates lastRewardBlock when re-whitelisting; accCantoPerShare, lendingMarketTotalBalance, and all userInfo entries remain unchanged"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market was whitelisted with active users",
+        "Governance de-whitelists and later re-whitelists the market",
+        "Users interacted with the actual lending market during the de-listing period"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 119-122",
+        "vulnerable_pattern": "Only lastRewardBlock is reset on re-whitelist; all user accounting preserved",
+        "specific_concern": "sync_ledger reverts during de-listing, so lending market cannot update LendingLedger state. Post re-whitelist, LendingLedger state diverges from actual market positions.",
+        "missing_safeguards": "No state reconciliation mechanism on re-whitelist, no forced sync"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What happens if a lending market catches sync_ledger reverts and processes user withdrawals anyway?",
+          "Can phantom balances earn and claim rewards post re-whitelisting?",
+          "Is there any mechanism for the lending market to reconcile state after re-whitelisting?"
+        ],
+        "validation_requirements": [
+          "Simulate de-whitelist → user withdraws from market → re-whitelist → user claims",
+          "Verify whether phantom balances accrue rewards",
+          "Check if lending market implementation handles sync_ledger reverts"
+        ]
+      },
+      "preliminary_attack_scenario": "Market is de-whitelisted. User withdraws cNOTE from the actual lending market (sync_ledger reverts, ignored). Market is re-whitelisted. LendingLedger still shows user with large balance. New rewards accrue and user claims CANTO based on phantom balance they no longer have.",
+      "prerequisites": [
+        "Market de-whitelisted and re-whitelisted",
+        "Users active during de-listing period"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Users can claim rewards based on phantom balances they no longer hold",
+        "affected_users": "Legitimate current depositors whose rewards are diluted by phantom positions",
+        "recovery_possibility": "Lending market must manually reconcile all user positions after re-whitelisting"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for de-whitelist → re-whitelist state consistency",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "Existing deposits in the market",
+        "execution_timing": "After re-whitelisting event",
+        "detection_analysis": "Detectable by comparing LendingLedger balances with actual market balances"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H011",
+      "title": "Governance role can be permanently lost by setting governance to an unusable address (irrecoverable admin DoS)",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "setGovernance() has no safety checks (e.g., non-zero, acceptance handshake). If governance is set to address(0) or a non-responsive contract, all onlyGovernance functions (setRewards/whiteListLendingMarket/future governance changes) become permanently unreachable, freezing configuration and potentially leaving markets stuck or insolvent.",
+      "investigation_rationale": "This is a code defect with protocol-wide impact because it can brick all future administrative remediation (including fixing misconfigurations or whitelisting changes). Even without malicious governance, operational mistakes are common and become irreversible here.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setGovernance(address)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setGovernance()",
+          "base_name": "setGovernance"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "41-74",
+        "pattern": "setGovernance(address _governance) assigns governance=_governance with no validation (zero address / accept pattern) under onlyGovernance"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Current governance calls setGovernance with an unusable address (0x0 or non-callable contract)",
+        "No alternative privileged role exists (single-admin model)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 41-74",
+        "vulnerable_pattern": "unsafe admin transfer (no checks / no 2-step acceptance)",
+        "specific_concern": "irreversible loss of governance blocks reward configuration and whitelist maintenance permanently",
+        "missing_safeguards": "no require(_governance != address(0)); no pendingGovernance + acceptGovernance()"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Is there any off-contract recovery mechanism (e.g., GaugeController admin can compensate) that mitigates this?",
+          "Does any deployment tooling enforce a safe governance transfer procedure?"
+        ],
+        "validation_requirements": [
+          "Simulate governance transfer to address(0) and confirm onlyGovernance calls become impossible",
+          "Confirm no other privileged backdoor exists"
+        ]
+      },
+      "preliminary_attack_scenario": "Governance (or compromised key) sets governance=address(0). Thereafter, setRewards/whiteListLendingMarket cannot be called, preventing any response to reward insolvency, broken markets, or required future integrations—resulting in long-term protocol paralysis.",
+      "prerequisites": [
+        "Ability to call setGovernance (i.e., current governance key control)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Indirect but material: inability to manage emissions/whitelists can lead to reward insolvency and prolonged user loss of yield access",
+        "affected_users": "All users across all markets",
+        "recovery_possibility": "Low—may require redeploying a new ledger and migrating integrations"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests indicated for governance transfer safety / recovery",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "none",
+        "capital_requirements": "none",
+        "execution_timing": "single transaction",
+        "detection_analysis": "on-chain: governance address becomes unusable; admin calls revert forever"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H012",
+      "title": "Contract can be force-funded with native CANTO, potentially masking insolvency assumptions and breaking external accounting expectations",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The contract accepts native CANTO via receive(). Additionally, native currency can always be forced via SELFDESTRUCT. Third-party systems may treat address(this).balance as meaningful (solvency indicator, rewards runway), but attackers can manipulate the balance upward without changing any reward liabilities, potentially misleading integrators or off-chain monitors.",
+      "investigation_rationale": "While not directly draining funds, balance manipulation is a practical on-chain vector that can mislead automated safety systems (e.g., monitoring that pauses markets when balance falls below a threshold). Because this protocol relies on manual funding for claims, integrator heuristics are likely.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "External systems (frontends, bots, coordinators) use LendingLedger balance as an input to risk decisions (e.g., enable/disable deposits, show APR, or assert solvency)"
+      ],
+      "config_evidence": "No deployment/integration code provided showing how solvency/runway is computed; receive() exists allowing balance changes without state correlation.",
+      "affected_functions": [
+        "receive()"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "receive()",
+          "base_name": "receive"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "150-151",
+        "pattern": "receive() external payable {} enables arbitrary native deposits; balance can also be forced via SELFDESTRUCT"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-004",
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "At least one external component uses address(this).balance as a signal (solvency/runway/health)",
+        "Attacker can send/force-send native CANTO to the ledger"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 150-151",
+        "vulnerable_pattern": "unrestricted balance manipulation surface",
+        "specific_concern": "balance != liabilities; attackers can spoof apparent funding",
+        "missing_safeguards": "no dedicated funding function emitting events / tracking accounted reserves"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Do any official integrations, keepers, or UIs use address(this).balance as solvency/runway signal?",
+          "Is there an internal accounting of funded reserves vs obligations (there is not in this contract)?"
+        ],
+        "validation_requirements": [
+          "Review coordinator/third-party integration code for balance-based gating",
+          "Simulate forced-send and confirm no state changes occur while balance changes"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker force-sends CANTO to make the ledger look solvent, prompting integrators to continue routing deposits or displaying high APR. Later, when claims occur, the real insolvency (liabilities > true managed reserves) manifests, harming users and protocol reputation.",
+      "prerequisites": [
+        "A contract capable of SELFDESTRUCT (or direct transfer) and enough native CANTO to spoof the targeted threshold"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Moderate, indirect: users can be induced (by automation, not phishing) into entering markets under false solvency assumptions",
+        "affected_users": "Users of integrated platforms relying on solvency heuristics",
+        "recovery_possibility": "Medium—monitoring can be updated, but historical damage remains"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Likely no tests for balance spoofing / monitoring assumptions",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "none",
+        "capital_requirements": "enough CANTO to exceed any off-chain threshold",
+        "execution_timing": "single transaction (force-send)",
+        "detection_analysis": "on-chain detectable: unexpected balance increases without corresponding events/state changes"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "Epoch Boundary Miscalculation Applies Wrong Reward Rate and Gauge Weight to Cross-Epoch Blocks",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In update_market(), `nextEpoch = i + BLOCK_EPOCH` fails to align with actual epoch boundaries when `i` is mid-epoch (the common case). This causes the loop to apply one epoch's cantoPerBlock rate and gauge weight to blocks that actually belong to a different epoch. For example, with lastRewardBlock=150,000 and block.number=350,000, the first chunk covers 150k-250k using epoch 100k's parameters, but blocks 200k-250k actually belong to epoch 200k. This systematically misallocates rewards whenever cantoPerBlock or gauge weights differ across epochs.",
+      "investigation_rationale": "This is a concrete code defect in the core reward distribution loop. The correct calculation should be `nextEpoch = ((i / BLOCK_EPOCH) + 1) * BLOCK_EPOCH`. Since reward rates and gauge weights change per epoch, incorrect boundary detection directly over/under-distributes CANTO. An attacker who knows rate schedules can strategically trigger update_market to maximize misallocation in their favor.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "60-72",
+        "pattern": "`uint256 nextEpoch = i + BLOCK_EPOCH` instead of `((i / BLOCK_EPOCH) + 1) * BLOCK_EPOCH` — fails to advance to actual epoch boundary when i is mid-epoch"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market lastRewardBlock is not aligned to epoch boundary (extremely common after first update)",
+        "cantoPerBlock or gauge weights differ across adjacent epochs",
+        "Market has non-zero supply (marketSupply > 0)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "nextEpoch = i + BLOCK_EPOCH where i is mid-epoch, overshooting the real epoch boundary",
+        "manipulation_vector": "Attacker delays triggering update_market to maximize the number of blocks incorrectly attributed to a higher-rate epoch",
+        "profit_hypothesis": "If epoch N has rate R1 and epoch N+1 has rate R2 < R1, up to BLOCK_EPOCH/2 blocks in epoch N+1 use rate R1, yielding excess (R1-R2)*blocks*gaugeWeight/totalSupply per user"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the maximum reward misallocation per epoch transition?",
+          "Can an attacker control when update_market is called to maximize the misalignment benefit?",
+          "Does the gauge weight misalignment compound the cantoPerBlock misallocation?"
+        ],
+        "validation_requirements": [
+          "Trace reward calculation across epoch boundaries with varying rates",
+          "Compare buggy calculation to correct epoch-aligned calculation across 3+ epochs",
+          "Quantify attacker profit from strategic update_market timing"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal - only requires depositing in the lending market (existing position is enough)",
+        "estimated_execution_cost": "Gas for calling claim() or triggering sync_ledger",
+        "potential_profit_range": "Proportional to rate differential × misaligned blocks × attacker share of total supply",
+        "estimated_profit_margin": "Depends on rate schedule; up to 50,000 blocks worth of rate differential per epoch transition",
+        "attack_duration": "Ongoing - every epoch transition misallocates rewards"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None - exploitable with existing positions",
+        "optimal_timing": "Most impactful when there's a large rate decrease between epochs",
+        "market_impact_assessment": "No market impact; purely internal accounting error"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users in affected markets (overpaid or underpaid depending on rate direction)",
+        "estimated_impact_per_user": "Up to 50% of one epoch's rewards misallocated per transition",
+        "total_value_at_risk": "Cumulative across all epoch transitions for all markets"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "BLOCK_EPOCH=100,000; analyze with varying cantoPerBlock across epochs",
+        "calculation_validation": "Build test with lastRewardBlock=150k, rates changing at 200k boundary",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "Gas Exhaustion DoS Permanently Bricks Stale Markets via update_market Loop",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "update_market() loops from lastRewardBlock to block.number in chunks. Each iteration makes an external state-writing call to gaugeController.gauge_relative_weight_write(). If a market goes many epochs without any interaction, the loop accumulates hundreds of iterations, each with expensive external SSTORE operations. After sufficient staleness, every call to claim(), sync_ledger(), or update_market() exceeds the block gas limit, permanently bricking the market.",
+      "investigation_rationale": "With BLOCK_EPOCH=100,000 blocks (~1 week), 6 months of inactivity creates ~26 loop iterations with external storage-writing calls. The gas cost per iteration depends on gauge_relative_weight_write complexity, but at ~50-100k gas per SSTORE-heavy external call, 26+ iterations could approach block gas limits. Markets with low activity are natural targets, and the DoS is permanent with no incremental catch-up mechanism.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "58-73",
+        "pattern": "Unbounded while loop with external call `gaugeController.gauge_relative_weight_write(_market, epoch)` per iteration, no incremental update mechanism"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A whitelisted market exists with extended period of no interaction",
+        "gaugeController.gauge_relative_weight_write involves storage writes (implied by _write suffix)",
+        "Block gas limit insufficient for the accumulated loop iterations"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Loop iterations = (block.number - lastRewardBlock) / effectiveChunkSize, with external call per iteration",
+        "manipulation_vector": "Natural inactivity on low-volume markets; could be accelerated by attacker intentionally not interacting",
+        "profit_hypothesis": "Griefing attack: users with deposits in the market cannot claim or withdraw. Locked rewards and potentially locked lending market funds."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the gas cost per iteration of the update_market loop on Canto?",
+          "How many epochs of staleness before the gas limit is exceeded?",
+          "Are there any markets that naturally have low activity?"
+        ],
+        "validation_requirements": [
+          "Profile gas usage of gauge_relative_weight_write",
+          "Calculate maximum staleness before DoS given Canto block gas limits",
+          "Test update_market with 50+ epochs of staleness"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Zero for griefing (just avoid interacting with target market)",
+        "estimated_execution_cost": "None",
+        "potential_profit_range": "No direct profit; grief locks user rewards and potentially lending market funds",
+        "estimated_profit_margin": "N/A - denial of service",
+        "attack_duration": "Requires weeks-months of inactivity; permanent DoS once triggered"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Target low-activity or newly whitelisted markets",
+        "market_impact_assessment": "Permanent loss of access to market rewards for all users"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with deposits in the stale market",
+        "estimated_impact_per_user": "100% of accumulated unclaimed rewards locked",
+        "total_value_at_risk": "All rewards for the affected market since last update"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Canto block gas limit, gauge_relative_weight_write gas cost",
+        "calculation_validation": "Simulate update_market with increasing staleness and measure gas",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "Retroactive Reward Rate Modification via setRewards for Unconsumed Past Epochs",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "setRewards() can modify cantoPerBlock for any epoch, including past epochs that have not yet been processed by update_market for all markets. Since update_market is lazily evaluated (only runs when explicitly called), governance calling setRewards for a past epoch changes the reward rate that will be retroactively applied when a stale market's update_market finally runs. This is a missing validation — there is no check that `_fromEpoch >= current_epoch`.",
+      "investigation_rationale": "Even non-malicious governance could accidentally overwrite past epoch rates during a routine rate-setting operation. The code should enforce that only future/current epochs can be modified. Since different markets may be at different lastRewardBlock positions, modifying a past epoch affects markets inconsistently — some may have already consumed that epoch's rate while others haven't, creating unfair reward distribution.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setRewards",
+        "update_market"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "107-113",
+        "pattern": "setRewards validates epoch alignment but NOT that epochs are current or future; cantoPerBlock[past_epoch] can be overwritten"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance calls setRewards with _fromEpoch pointing to an already-elapsed epoch",
+        "At least one market has lastRewardBlock before the modified epoch (hasn't consumed it yet)",
+        "onlyGovernance access"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "cantoPerBlock[past_epoch] overwritten after epoch has elapsed",
+        "manipulation_vector": "Governance (mistakenly or maliciously) changes past rates; stale markets retroactively get different rewards",
+        "profit_hypothesis": "Markets that haven't been updated receive inflated or deflated rewards compared to markets that were already updated with the original rate"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many markets are typically stale enough to be affected by a past-epoch change?",
+          "What is the maximum reward differential from a single retroactive rate change?",
+          "Can governance accidentally set past epochs through a range that includes both past and future?"
+        ],
+        "validation_requirements": [
+          "Test setRewards for a past epoch and verify it changes cantoPerBlock",
+          "Call update_market on a stale market after the change and verify altered rewards",
+          "Compare rewards between a market that processed the epoch before vs after the change"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None beyond governance access",
+        "estimated_execution_cost": "Gas for setRewards transaction",
+        "potential_profit_range": "Up to entire epoch's reward allocation for affected markets",
+        "estimated_profit_margin": "Depends on rate differential and stale market balances",
+        "attack_duration": "Single transaction to modify; effect realized on next update_market call"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "When multiple markets are stale and haven't consumed recent epochs",
+        "market_impact_assessment": "Unfair reward distribution across markets"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users in markets that haven't been updated recently",
+        "estimated_impact_per_user": "Proportional to retroactive rate change magnitude",
+        "total_value_at_risk": "All rewards for affected epochs across stale markets"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical governance setRewards call patterns, market staleness",
+        "calculation_validation": "Verify no time-guard exists on setRewards epoch range",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "Compromised Whitelisted Market Fabricates Balances to Drain CANTO Rewards",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "sync_ledger trusts msg.sender (whitelisted market) to report accurate _lender and _delta values without any cross-validation against actual token balances. A compromised or buggy whitelisted market can call sync_ledger(attacker, 1e30) to credit the attacker with a massive phantom balance. The attacker then calls claim() to extract the proportional share of all accumulated CANTO rewards. No on-chain verification prevents fabricated deltas.",
+      "investigation_rationale": "The security model trusts whitelisted markets completely for balance reporting. Any vulnerability in a whitelisted lending market's contract (e.g., access control bug, upgrade vulnerability, governance compromise) becomes a direct attack vector on LendingLedger's reward pool. The blast radius extends to all CANTO held by the contract.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Whitelisted lending markets are secure and honestly report balance changes"
+      ],
+      "config_evidence": "LendingLedger.sol:82-99 — sync_ledger uses msg.sender as market address with only whitelist check, no delta validation",
+      "affected_functions": [
+        "sync_ledger",
+        "claim"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "sync_ledger"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "82-99",
+        "pattern": "sync_ledger accepts arbitrary _lender and _delta from any whitelisted msg.sender with no balance cross-check"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A whitelisted lending market is compromised, has a bug, or allows arbitrary sync_ledger calls",
+        "LendingLedger has CANTO balance to drain",
+        "The compromised market can call sync_ledger with arbitrary parameters"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "user.amount += uint256(_delta) with no upper bound or cross-validation",
+        "manipulation_vector": "Fabricated large positive _delta inflates attacker's share of reward pool",
+        "profit_hypothesis": "Attacker's claim = (fabricatedAmount * accCantoPerShare / 1e18) - rewardDebt, up to entire contract CANTO balance"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What whitelisted markets exist and what is their security posture?",
+          "Is there any external mechanism (Neofinance Coordinator) that validates sync_ledger calls?",
+          "What is the maximum extractable value from the contract balance?"
+        ],
+        "validation_requirements": [
+          "Review whitelisted market contracts for access control on sync_ledger triggering",
+          "Verify no external validation exists outside LendingLedger",
+          "Test sync_ledger with fabricated large delta and subsequent claim"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Zero if market is compromisable",
+        "estimated_execution_cost": "Gas for sync_ledger + claim",
+        "potential_profit_range": "Entire CANTO balance of LendingLedger",
+        "estimated_profit_margin": "Near infinite if market compromise is achievable",
+        "attack_duration": "Single block atomic execution after market compromise"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When contract holds maximum CANTO rewards",
+        "market_impact_assessment": "Complete drainage of reward pool"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All legitimate users across all markets",
+        "estimated_impact_per_user": "100% loss of claimable rewards",
+        "total_value_at_risk": "Entire CANTO balance held by contract"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Audit whitelisted lending market contracts",
+        "calculation_validation": "Verify sync_ledger has no hidden bounds checks",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "No Solvency Check Enables Early-Claimer Advantage and Late-Claimer DoS",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "claim() sends CANTO without checking if the contract holds sufficient balance. Combined with the epoch boundary bug (ECON-H001) that can over-allocate rewards, and the lack of any funding-to-obligation reconciliation, early claimers can drain the contract's CANTO balance, leaving later claimers unable to claim. The .call{value} would fail, reverting the entire transaction (preserving state), but users' earned rewards become permanently inaccessible if the contract is never refunded.",
+      "investigation_rationale": "The stated invariant from project documentation is 'total rewards sent for one block should never exceed configured rewards.' But the epoch boundary bug violates this, and even without it, there's no mechanism enforcing that `address(this).balance >= total pending claims`. setRewards creates obligations without requiring corresponding CANTO deposits. This creates a race condition where informed users claim first.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim",
+        "setRewards"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "103-108",
+        "pattern": "msg.sender.call{value: uint256(cantoToSend)} with no prior check that address(this).balance >= cantoToSend"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Total accumulated reward obligations exceed contract CANTO balance",
+        "Can result from epoch bug over-allocating, governance underfunding, or multiple markets accumulating simultaneously"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No balance check: claim sends cantoToSend without verifying contract solvency",
+        "manipulation_vector": "Informed users race to claim before contract balance is exhausted",
+        "profit_hypothesis": "Early claimers extract full rewards; late claimers get permanent DoS on their earned rewards"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the expected mismatch between reward obligations and contract funding?",
+          "Does the epoch boundary bug systematically create excess obligations?",
+          "How quickly could informed claimers drain the contract?"
+        ],
+        "validation_requirements": [
+          "Calculate total theoretical reward obligations across all markets",
+          "Compare against expected contract funding patterns",
+          "Simulate race-to-claim scenario with underfunded contract"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Existing staking position sufficient",
+        "estimated_execution_cost": "Gas for claim()",
+        "potential_profit_range": "Full entitled reward amount (claiming before others)",
+        "estimated_profit_margin": "Depends on how many users are competing",
+        "attack_duration": "Single claim transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When contract balance is insufficient to cover all claims",
+        "market_impact_assessment": "Later claimers permanently locked out of rewards"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users who claim later",
+        "estimated_impact_per_user": "100% of their unclaimed rewards",
+        "total_value_at_risk": "All accumulated rewards exceeding contract balance"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Contract funding model, reward accumulation rate across all markets",
+        "calculation_validation": "Sum all pending claims across all markets vs contract balance",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H012",
+      "title": "Secondary Rewards Unscaled for Non-18 Decimal Tokens",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "The `secRewardsPerShare` calculation divides by `marketSupply` but does not adjust for the underlying token's decimals, leaving a `TODO: Scaling` comment. If the whitelisted market uses a token with fewer than 18 decimals (e.g., USDC with 6), `marketSupply` will be nominally much smaller, causing `secRewardsPerShare` to inflate massively.",
+      "investigation_rationale": "Third-party lending platforms rely on `secRewardDebt` to distribute their own secondary rewards. This scaling mismatch will cause those platforms to over-distribute secondary rewards by orders of magnitude, potentially draining their reward reserves instantly.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "At least one whitelisted lending market uses a token with decimals other than 18 (e.g., USDC or USDT)"
+      ],
+      "config_evidence": "LendingLedger.sol:65 contains 'TODO: Scaling' comment indicating developers knew about the issue but did not implement a fix.",
+      "affected_functions": [
+        "update_market",
+        "marketInfo"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "marketInfo(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "65",
+        "pattern": "market.secRewardsPerShare += uint128((blockDelta * 1e18) / marketSupply); // TODO: Scaling"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Market must be whitelisted",
+        "Market's underlying token must have decimals != 18",
+        "Third-party platform must be actively using secRewardDebt for distributions"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "(blockDelta * 1e18) / marketSupply (without decimal normalization)",
+        "manipulation_vector": "Users deposit USDC (6 decimals) and receive 1e12 times more secondary rewards than an equivalent nominal deposit in an 18-decimal token.",
+        "profit_hypothesis": "Attacker drains third-party secondary reward pools due to inflated secRewardDebt."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Which tokens are planned for whitelisting?",
+          "How exactly do third-party platforms consume secRewardDebt?",
+          "What is the financial impact on those third-party platforms?"
+        ],
+        "validation_requirements": [
+          "Simulate update_market with a 6-decimal token supply",
+          "Calculate the resulting secRewardDebt for a standard deposit",
+          "Compare against the intended emission schedule of the third-party platform"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Standard deposit amount in the low-decimal token",
+        "estimated_execution_cost": "Standard gas costs",
+        "potential_profit_range": "Up to the entire balance of the third-party secondary reward pool",
+        "estimated_profit_margin": "Massive (1e12 multiplier on expected ROI)",
+        "attack_duration": "Single block (deposit, wait 1 block, claim/sync)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None specific",
+        "optimal_timing": "Immediately after the third-party platform funds its secondary reward pool",
+        "market_impact_assessment": "Drains partner protocols, damaging the ecosystem and trust in the LendingLedger"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Third-party lending platforms integrated with Neofinance Coordinator",
+        "estimated_impact_per_user": "N/A (Protocol-level loss)",
+        "total_value_at_risk": "Entire secondary reward pools of integrated platforms"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Token decimals of whitelisted markets",
+        "calculation_validation": "Verify the exact multiplier effect (e.g., 1e12 for USDC)",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H013",
+      "title": "Intra-Epoch Claiming Allows Front-Running of Gauge Weight Changes",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The NatSpec documentation explicitly states that `claim()` can 'only be performed for prior (i.e. finished) epochs, not the current one'. However, the code loops up to `block.number` and allows immediate claiming of rewards for the current, unfinished epoch.",
+      "investigation_rationale": "If gauge weights or reward rates are meant to be finalized at the end of an epoch, allowing intra-epoch claims lets users lock in current favorable weights before they are adjusted downward. This violates the documented economic design and could enable MEV-like extraction if weights fluctuate.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim",
+        "userInfo"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim(address)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "userInfo(address,address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "89-90",
+        "pattern": "Missing check to enforce claiming only for prior epochs as stated in NatSpec"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Gauge weights must be adjustable mid-epoch",
+        "User must have accrued rewards in the current epoch"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "while (i < block.number) { ... } in update_market allows up-to-the-block accumulation",
+        "manipulation_vector": "User observes a pending transaction or governance action that will lower their market's gauge weight, and claims immediately to secure rewards at the higher weight.",
+        "profit_hypothesis": "Profit = accrued_rewards * (current_weight - future_weight)"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How frequently do gauge weights change?",
+          "Are gauge weights meant to be time-weighted averages or point-in-time?",
+          "Does the GaugeController allow intra-epoch manipulation?"
+        ],
+        "validation_requirements": [
+          "Review GaugeController implementation to understand weight volatility",
+          "Simulate a mid-epoch weight drop and compare claim amounts before and after"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Existing deposit in the market",
+        "estimated_execution_cost": "Standard gas costs",
+        "potential_profit_range": "Depends on gauge weight volatility",
+        "estimated_profit_margin": "Low to Medium (preservation of yield rather than outright theft)",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Right before a gauge weight decrease",
+        "market_impact_assessment": "Unfair distribution of rewards compared to users who wait for epoch finalization"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Other users in the protocol (dilution)",
+        "estimated_impact_per_user": "Minor reduction in relative yield",
+        "total_value_at_risk": "A portion of the current epoch's reward emission"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Gauge weight update frequency",
+        "calculation_validation": "Verify that update_market correctly applies the current weight to the current blockDelta",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "Zero-Supply Reward Wastage Enables Strategic Reward Manipulation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When `marketSupply == 0`, the update_market loop skips reward accumulation (`if (marketSupply > 0)` guard) but still advances `lastRewardBlock` past those blocks. Configured rewards for zero-supply blocks are permanently lost. A whale who controls most of a market's supply can withdraw everything (making supply 0), wait for high-reward blocks to pass, then re-deposit. The lost rewards during zero-supply period represent protocol waste that cannot be recaptured.",
+      "investigation_rationale": "While the attacker doesn't directly profit from wasted rewards, this creates an asymmetric economic attack: the attacker can prevent the protocol from distributing configured rewards by briefly emptying a market, then re-deposit to capture future rewards at no additional cost.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "59-70",
+        "pattern": "`if (marketSupply > 0)` skips reward accumulation but `market.lastRewardBlock = uint64(block.number)` advances past those blocks regardless, permanently losing configured rewards"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker controls majority of a market's supply",
+        "cantoPerBlock > 0 and gauge weight > 0 for the target market",
+        "Lending market allows full withdrawal (supply reaches 0)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Withdraw-all then re-deposit pattern around high-reward periods",
+        "admin_dependency": "None — normal user operations",
+        "exploitation_window": "Any time a single user dominates a market's supply"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What percentage of total supply does the largest depositor hold per market?",
+          "How much CANTO is wasted during zero-supply periods vs total configured rewards?",
+          "Should rewards for zero-supply periods be deferred rather than lost?"
+        ],
+        "validation_requirements": [
+          "Simulate withdraw-all pattern and measure reward wastage",
+          "Compare protocol-intended reward distribution vs actual with supply manipulation",
+          "Assess economic incentive for attacker vs protocol loss"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Accumulate majority of a low-liquidity market's supply",
+        "phase_2": "Withdraw all funds right before a high-reward epoch begins",
+        "phase_3": "Wait for high-reward blocks to pass with zero supply (rewards lost)",
+        "phase_4": "Re-deposit after high-reward period ends; capture future rewards normally",
+        "coordination_requirements": "None — single whale"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "N/A",
+        "operational_disruption": "Permanent loss of configured reward funds",
+        "recovery_difficulty": "Lost rewards cannot be recovered or redistributed",
+        "affected_operations": "Protocol reward efficiency and token economics"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Low — timing withdrawals around epoch boundaries",
+        "technical_skills": "Basic DeFi knowledge",
+        "operational_timing": "Before high-reward periods in low-liquidity markets"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Markets where totalBalance drops to 0 temporarily",
+        "operational_anomalies": "Large withdrawals followed by re-deposits around epoch boundaries",
+        "behavioral_patterns": "Single address performing withdraw-deposit cycles",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "No CANTO Recovery Mechanism Allows Permanent Fund Lock on Contract Deprecation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The contract has a `receive() external payable` function to accept CANTO funding but provides no governance function to withdraw excess or remaining CANTO. If the contract needs to be deprecated, migrated, or has excess funding beyond reward obligations, the CANTO is permanently locked. Additionally, if all markets are de-whitelisted, no one can call claim() to extract remaining funds.",
+      "investigation_rationale": "This is a missing functionality defect. The contract accumulates native CANTO but has no drain/sweep mechanism. Combined with the de-whitelisting DoS (OPS-H010), this creates a scenario where funded CANTO becomes permanently inaccessible.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "receive"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "receive"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "139",
+        "pattern": "`receive() external payable {}` accepts CANTO but no `withdrawCanto()` or `rescueFunds()` function exists for governance to recover excess or stranded funds"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Contract holds CANTO balance",
+        "Contract needs to be deprecated or has excess funding",
+        "All markets de-whitelisted or no active claimers"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "CANTO can flow in but has no administrative extraction path beyond user claims",
+        "admin_dependency": "Governance cannot withdraw CANTO under any circumstances",
+        "exploitation_window": "Permanent — design limitation"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "How much CANTO is expected to be held by this contract at any time?",
+          "Is there a planned migration path for contract upgrades?",
+          "Can governance create a mechanism to claim remaining funds?"
+        ],
+        "validation_requirements": [
+          "Confirm no hidden withdrawal mechanism exists",
+          "Assess total CANTO at risk of permanent lock",
+          "Verify whether selfdestruct or other patterns could recover funds"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "N/A — structural code defect",
+        "phase_2": "N/A",
+        "phase_3": "N/A",
+        "phase_4": "N/A",
+        "coordination_requirements": "N/A"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "N/A",
+        "operational_disruption": "Permanent loss of contract-held CANTO on deprecation",
+        "recovery_difficulty": "Irrecoverable without deploying a new contract and having users claim first",
+        "affected_operations": "Protocol treasury management"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "N/A",
+        "coordination_complexity": "N/A",
+        "technical_skills": "N/A",
+        "operational_timing": "N/A"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Contract CANTO balance growing with no corresponding claims",
+        "operational_anomalies": "Failed governance attempts to recover funds",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H013",
+      "title": "Unauthorized market can mutate reward indices via GaugeController if gauge_relative_weight_write lacks access control (cross-contract privilege escalation)",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "LendingLedger.update_market() calls GaugeController.gauge_relative_weight_write(_market, epoch) for an arbitrary whitelisted _market. If GaugeController’s write-path is not strictly access-controlled, any user can call LendingLedger.update_market() to trigger state updates in GaugeController for markets/epochs they shouldn’t be able to mutate, potentially forcing favorable weights or corrupting the weight history used to compute rewards. This can enable draining CANTO rewards or permanently distorting emissions.",
+      "investigation_rationale": "The call target is an external \"_write\" function invoked by an unprivileged entry point (public update_market). Even if LendingLedger’s math is correct, a missing guard in GaugeController would convert update_market into a privilege-escalation trampoline that real attackers can exploit fully on-chain.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "GaugeController.gauge_relative_weight_write(address,uint256) is callable by LendingLedger and has side effects that influence weights",
+        "GaugeController does not enforce strict caller/role checks on gauge_relative_weight_write (or has a permissive allowlist that includes LendingLedger but can be abused via parameters)"
+      ],
+      "config_evidence": "No GaugeController source provided in scope; access control and side effects of gauge_relative_weight_write must be verified in Phase D.",
+      "affected_functions": [
+        "update_market(address)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol",
+        "GaugeController.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "src/LendingLedger.sol",
+        "lines": "56-73",
+        "pattern": "Unprivileged update_market() calls external gaugeController.gauge_relative_weight_write(_market, epoch) inside a loop"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "_market is whitelisted in lendingMarketWhitelist",
+        "GaugeController.gauge_relative_weight_write mutates state that affects returned weights (now or later)",
+        "GaugeController does not strictly restrict who may trigger writes or what parameters may be written"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Public function triggers external state-mutating 'write' call; caller is not governance and not the market",
+        "admin_dependency": "Depends on GaugeController’s internal authorization model and how it treats LendingLedger calls",
+        "exploitation_window": "Any time update_market can be called; amplified when lastRewardBlock is stale causing multiple iterations"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does gauge_relative_weight_write have side effects that can be abused by unprivileged callers via LendingLedger?",
+          "Can an attacker induce GaugeController to write/commit weights for arbitrary markets/epochs?",
+          "Does this influence future reward computations or allow attacker-favored weights?"
+        ],
+        "validation_requirements": [
+          "Review GaugeController.gauge_relative_weight_write access control and parameter validation",
+          "Simulate calls from arbitrary EOAs to LendingLedger.update_market and observe GaugeController state changes",
+          "Check whether written weights persist and affect LendingLedger reward calculations"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Pick a whitelisted market with meaningful emissions",
+        "phase_2": "Call update_market(market) repeatedly to force GaugeController write-path execution across epochs",
+        "phase_3": "If GaugeController is mutable via this path, steer/lock weights to maximize cantoReward for attacker-controlled balances",
+        "phase_4": "Accumulate inflated rewards and claim CANTO"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Indirect control over gauge weight state (if GaugeController is vulnerable), undermining governance-controlled emissions",
+        "operational_disruption": "Incorrect emission allocation across markets; potential permanent corruption of weight history",
+        "recovery_difficulty": "High if weight history is on-chain and relied upon by other modules",
+        "affected_operations": "All reward updates and claims for affected markets/epochs"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Intermediate cross-contract analysis",
+        "operational_timing": "Any time; more effective when market has stale lastRewardBlock"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Unexpected GaugeController storage writes correlated with update_market calls by random EOAs",
+        "operational_anomalies": "Abrupt changes in gauge weights without governance/voting events",
+        "behavioral_patterns": "Repeated update_market calls targeting a single market across many epochs",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "ECON2-H004",
+      "title": "Rounding Truncation in Reward Debt Calculation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The rewardDebt calculation in sync_ledger uses truncating integer division. An attacker can split a large deposit into many tiny 'dust' deposits. On each deposit, the truncation discards a fraction of the rewardDebt increase, allowing the attacker to artificially minimize their rewardDebt and claim slightly more CANTO than entitled.",
+      "investigation_rationale": "While the profit per transaction is small, cheap gas on CANTO makes looping this attack potentially profitable, systematically draining protocol rewards.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "sync_ledger"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "80-82",
+        "pattern": "user.rewardDebt += int256((uint256(_delta) * market.accCantoPerShare) / 1e18);"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Gas costs are lower than the value of the truncated reward debt per transaction",
+        "Attacker can rapidly execute many sync_ledger calls via a smart contract"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "(uint256(_delta) * market.accCantoPerShare) / 1e18",
+        "manipulation_vector": "Attacker chooses _delta such that the product is just under 1e18, resulting in 0 rewardDebt increase",
+        "profit_hypothesis": "Attacker gains free user.amount without corresponding rewardDebt, leading to free CANTO claims"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the maximum truncation loss per deposit?",
+          "Does the accumulated truncation profit exceed CANTO gas costs?"
+        ],
+        "validation_requirements": [
+          "Calculate optimal _delta for maximum truncation",
+          "Simulate a loop of 1000 deposits and measure net profit vs gas"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal (dust amounts)",
+        "estimated_execution_cost": "Gas cost for looped sync_ledger calls",
+        "potential_profit_range": "Marginal per tx, scales with loop count",
+        "estimated_profit_margin": "Low to Medium (highly dependent on gas price)",
+        "attack_duration": "Single block execution (looped)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When gas prices are at their absolute minimum",
+        "market_impact_assessment": "Slow, systematic drain of reward pool"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol treasury",
+        "estimated_impact_per_user": "Negligible direct impact, slow dilution",
+        "total_value_at_risk": "Continuous marginal drain"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "accCantoPerShare value vs optimal _delta",
+        "calculation_validation": "Gas cost vs truncation profit equation",
+        "execution_complexity": "medium",
+        "detection_difficulty": "high"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H010",
+      "title": "Unbounded Gauge Weight Return Value Allows Per-Block Reward Cap Violation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The update_market function consumes the return value of gaugeController.gauge_relative_weight_write(_market, epoch) without validating it is bounded to [0, 1e18]. If the GaugeController returns a weight exceeding 1e18 for any market (due to a bug, manipulation, or non-standard implementation), the calculated cantoReward will exceed cantoPerBlock[epoch] * blockDelta, directly violating the project's stated invariant that 'total rewards sent for one block should never be higher than configured rewards.' This drains the contract's CANTO balance faster than governance intended, causing insolvency for later claimers.",
+      "investigation_rationale": "The LendingLedger performs no defensive validation on the external return value used as a critical multiplier in reward computation. The documentation explicitly states a total-reward-per-block cap invariant, but no code enforces it. If gauge weights for multiple markets sum to more than 1e18 (or a single market exceeds 1e18), the protocol overpays rewards. This is a code-level missing check, not a configuration issue.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market(address)",
+        "claim(address)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        },
+        {
+          "file": "GaugeController.sol",
+          "function": "gauge_relative_weight_write(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "65-67",
+        "pattern": "cantoReward = (blockDelta * cantoPerBlock[epoch] * gaugeController.gauge_relative_weight_write(_market, epoch)) / 1e18 — no bounds check on external return value; if weight > 1e18, reward exceeds configured per-block cap"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "GaugeController returns gauge_relative_weight_write value > 1e18 for at least one market, OR the sum across all markets for the same epoch exceeds 1e18",
+        "cantoPerBlock[epoch] > 0 for the relevant epoch",
+        "Market has non-zero lendingMarketTotalBalance (marketSupply > 0)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "cantoReward = (blockDelta * cantoPerBlock[epoch] * weight) / 1e18 where weight is unchecked external value",
+        "manipulation_vector": "Manipulate gauge voting or exploit GaugeController bug to produce weight > 1e18, directly inflating per-block reward beyond governance-approved rate",
+        "profit_hypothesis": "With weight = 2e18, attacker's market earns 2x intended rewards per block, draining contract balance at double rate; profit = excess_reward_rate * blocks_elapsed * attacker_share"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can gauge_relative_weight_write return a value > 1e18 in the deployed GaugeController implementation?",
+          "What is the cost to accumulate enough voting power to skew weights beyond normalization bounds?",
+          "How quickly would over-distribution drain the contract, making it insolvent for other claimers?"
+        ],
+        "validation_requirements": [
+          "Audit GaugeController.gauge_relative_weight_write to verify output bounds",
+          "Test with mocked GaugeController returning weight > 1e18 to confirm reward inflation",
+          "Calculate total reward leakage rate vs contract CANTO balance"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Depends on veRWA voting costs in GaugeController (requires validation)",
+        "estimated_execution_cost": "Gas for gauge voting + claim transactions",
+        "potential_profit_range": "Up to 100% of contract CANTO balance if weight significantly exceeds 1e18",
+        "estimated_profit_margin": "High if weight manipulation is achievable (requires validation)",
+        "attack_duration": "Continuous extraction over multiple epochs"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Sufficient veRWA tokens or voting power to manipulate gauge weights",
+        "optimal_timing": "Any time cantoPerBlock is set for active epochs",
+        "market_impact_assessment": "Contract insolvency affects all users' ability to claim rewards"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All reward claimers across all whitelisted markets",
+        "estimated_impact_per_user": "Later claimers lose 100% of pending rewards when contract runs dry",
+        "total_value_at_risk": "Entire CANTO balance held by LendingLedger contract"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "GaugeController.gauge_relative_weight_write return value range for all markets",
+        "calculation_validation": "Confirm reward exceeds cantoPerBlock when weight > 1e18",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H012",
+      "title": "GaugeController Revert Permanently Bricks All Market Operations With No Recovery Path",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Every call to update_market (and transitively, claim and sync_ledger) depends on gaugeController.gauge_relative_weight_write succeeding. If the GaugeController reverts for any reason — pause, self-destruct, access control change, internal bug, checkpoint overflow — ALL LendingLedger market operations fail. There is no try/catch, no fallback weight, and no ability to change the gaugeController reference (set immutably in the constructor). This creates a single point of failure that permanently bricks the entire reward system across all markets simultaneously.",
+      "investigation_rationale": "The external call to gaugeController occurs within update_market's loop without error handling. A revert propagates up through update_market → claim/sync_ledger, making all user-facing functions inoperable. The constructor binds gaugeController permanently (no setter exists, unlike governance which has setGovernance). If the GaugeController becomes non-functional for any reason, the LendingLedger cannot adapt.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market(address)",
+        "claim(address)",
+        "sync_ledger(address,int256)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "constructor"
+        },
+        {
+          "file": "GaugeController.sol",
+          "function": "gauge_relative_weight_write(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "44-47, 65-67",
+        "pattern": "Constructor at line 45 sets gaugeController immutably (no setter function exists); line 67 calls gaugeController.gauge_relative_weight_write without try/catch — revert kills all operations"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "GaugeController becomes non-functional (revert on gauge_relative_weight_write calls)",
+        "No alternative GaugeController setter exists in LendingLedger",
+        "No try/catch wrapping the external call"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "gaugeController.gauge_relative_weight_write(_market, epoch) is called with no error handling in a critical path",
+        "manipulation_vector": "GaugeController governance action, bug, or external manipulation causes gauge_relative_weight_write to revert",
+        "profit_hypothesis": "No direct attacker profit — but all CANTO rewards become permanently locked in the LendingLedger contract, and lending market users cannot sync their positions"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What conditions can cause gauge_relative_weight_write to revert?",
+          "Does the GaugeController have admin-pausable or self-destruct capabilities?",
+          "How much total CANTO could be locked if all markets are simultaneously bricked?"
+        ],
+        "validation_requirements": [
+          "Review GaugeController source for revert conditions",
+          "Test LendingLedger behavior when GaugeController reverts",
+          "Verify no governance path exists to replace gaugeController"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Depends on GaugeController's own governance mechanism",
+        "estimated_execution_cost": "Single transaction to trigger GaugeController failure condition",
+        "potential_profit_range": "No direct profit; damage = all locked CANTO + frozen lending positions",
+        "estimated_profit_margin": "N/A (systemic DoS)",
+        "attack_duration": "Permanent — no recovery mechanism exists"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None for the LendingLedger side",
+        "optimal_timing": "When maximum CANTO rewards are pending",
+        "market_impact_assessment": "Total protocol shutdown for reward distribution"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users across all whitelisted markets",
+        "estimated_impact_per_user": "100% loss of pending and future CANTO rewards",
+        "total_value_at_risk": "Entire CANTO balance of LendingLedger + all future reward obligations"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "GaugeController failure modes and admin capabilities",
+        "calculation_validation": "Confirm revert propagation from GaugeController to all user-facing functions",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H013",
+      "title": "Immutable GaugeController Binding Enables Irrecoverable Reward Misdirection via Gauge Vote Manipulation",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The constructor permanently binds the LendingLedger to a specific GaugeController address with no setter function (contrast with governance which has setGovernance). An attacker who accumulates sufficient voting power in the VotingEscrow / GaugeController system can permanently redirect disproportionate reward allocation to markets they control. Since gauge_relative_weight_write return values directly multiply cantoPerBlock to compute rewards per market, biased weights translate directly to economic extraction. The lack of a gaugeController update mechanism means this cannot be corrected without full contract redeployment and state migration.",
+      "investigation_rationale": "The asymmetry between governance (has setter at line 49) and gaugeController (no setter, only constructor at line 45) suggests an oversight. If the GaugeController's voting mechanism can be gamed (e.g., through flash-loaned voting power or concentration of veRWA tokens), the reward distribution is permanently skewed. This is a code-level defect: a critical dependency with no update path.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market(address)",
+        "claim(address)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "constructor"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "44-47, 49-52",
+        "pattern": "Constructor sets gaugeController at line 45 with no corresponding setter function; setGovernance exists at line 49 but no setGaugeController; gauge weights at line 67 directly determine per-market reward allocation"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker can accumulate sufficient voting power in GaugeController/VotingEscrow",
+        "Attacker controls or has deposits in at least one whitelisted lending market",
+        "cantoPerBlock is set to a non-zero value for active epochs"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "cantoReward = blockDelta * cantoPerBlock[epoch] * gaugeController.gauge_relative_weight_write(_market, epoch) / 1e18",
+        "manipulation_vector": "Accumulate voting power to set high gauge weight for attacker-controlled market, earning disproportionate share of all CANTO rewards",
+        "profit_hypothesis": "If attacker can shift weight from 10% to 80% for their market, they earn 8x their fair share of cantoPerBlock rewards indefinitely"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the cost to acquire enough veRWA voting power to meaningfully shift gauge weights?",
+          "Is there a cooldown or lock-up period that prevents rapid weight changes?",
+          "Can flash loans be used to temporarily inflate voting power for gauge weight manipulation?"
+        ],
+        "validation_requirements": [
+          "Analyze VotingEscrow lock mechanisms and minimum lock durations",
+          "Calculate cost of acquiring dominant voting power vs expected reward extraction",
+          "Verify whether gaugeController has anti-manipulation protections"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Proportional to total veRWA supply — significant capital for meaningful weight manipulation",
+        "estimated_execution_cost": "Gas for locking tokens + voting transactions",
+        "potential_profit_range": "Proportional to cantoPerBlock * duration * weight bias achieved",
+        "estimated_profit_margin": "Requires cost-benefit analysis of lock-up cost vs extracted rewards",
+        "attack_duration": "Persistent as long as voting power is maintained"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Access to sufficient governance tokens (RWA) to lock in VotingEscrow",
+        "optimal_timing": "Before high-reward epochs are set via setRewards",
+        "market_impact_assessment": "Other markets' users receive diluted rewards proportional to weight stolen"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users in all other whitelisted markets",
+        "estimated_impact_per_user": "Reward dilution proportional to weight shift",
+        "total_value_at_risk": "Significant fraction of total CANTO reward pool"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Total veRWA supply, current gauge weight distribution, cantoPerBlock rates",
+        "calculation_validation": "Cost of voting power acquisition vs extracted reward value",
+        "execution_complexity": "medium",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "OPS2-H003",
+      "title": "Market De-whitelisting Permanently Freezes Accrued User Rewards",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If governance de-whitelists a market, `update_market` reverts. Because `claim()` calls `update_market`, users are permanently blocked from claiming rewards they have already accrued. There is no grace period or emergency claim path.",
+      "investigation_rationale": "This is a severe operational flaw where standard administrative action (deprecating a market) results in immediate, unrecoverable loss of user funds (rewards).",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim",
+        "sync_ledger",
+        "whiteListLendingMarket"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "54",
+        "pattern": "require(lendingMarketWhitelist[_market], \"Market not whitelisted\");"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Users have accrued but unclaimed rewards",
+        "Governance sets lendingMarketWhitelist to false"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "update_market reverts if market is not whitelisted, and claim() depends on update_market.",
+        "admin_dependency": "Governance controls the whitelist.",
+        "exploitation_window": "Immediately upon governance de-whitelisting a market."
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is there any alternative path for users to claim rewards if a market is de-whitelisted?",
+          "Does the lending market contract handle sync_ledger reverts gracefully?"
+        ],
+        "validation_requirements": [
+          "Test the claim function after a market is de-whitelisted."
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Governance decides to deprecate a lending market and calls whiteListLendingMarket(market, false).",
+        "phase_2": "Users attempt to call claim() to retrieve their accrued rewards.",
+        "phase_3": "Transactions revert because update_market requires the market to be whitelisted.",
+        "phase_4": "Users' rewards are permanently locked in the contract.",
+        "coordination_requirements": "Requires governance action."
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Loss of user funds (rewards) and potential freezing of lending market withdrawals if sync_ledger reverts.",
+        "recovery_difficulty": "Medium - governance must re-whitelist the market to allow claims.",
+        "affected_operations": "Claiming and syncing for the de-whitelisted market."
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Governance control required.",
+        "coordination_complexity": "Low - simple admin action.",
+        "technical_skills": "None",
+        "operational_timing": "Any time after users have accrued rewards."
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "whiteListLendingMarket calls setting status to false.",
+        "operational_anomalies": "Reverting claim transactions for specific markets.",
+        "behavioral_patterns": "Governance deprecating markets without warning.",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational-2",
+      "original_specialist": "operational-2"
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "De-Whitelisting Market Permanently Locks Accrued User Rewards with No Emergency Claim Path",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When governance de-whitelists a market via `whiteListLendingMarket(_market, false)`, the `update_market` function reverts with 'Market not whitelisted'. Since both `claim()` and `sync_ledger()` call `update_market` first, ALL operations for the market are permanently blocked. Users with accrued but unclaimed CANTO rewards lose access with no emergency withdrawal or grace period mechanism.",
+      "investigation_rationale": "This is a design-level deficiency where governance has the power to irreversibly lock user funds. While documented trust assumptions say governance is non-malicious, there is no grace period, emergency claim function, or user notification mechanism. Even accidental de-whitelisting with immediate re-whitelisting resets lastRewardBlock, potentially skipping reward periods.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whiteListLendingMarket",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket(address,bool)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "56,117-122",
+        "pattern": "Line 56: `require(lendingMarketWhitelist[_market])` blocks all operations. Line 117-122: de-whitelisting provides no grace period. No emergency claim function exists."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance de-whitelists a market with active users having unclaimed rewards",
+        "No emergency claim mechanism exists"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 56 and 117-122",
+        "vulnerable_pattern": "Whitelist check gates all operations with no bypass for existing claims",
+        "specific_concern": "De-whitelisting instantly blocks claim() and sync_ledger(). If lending market depends on sync_ledger for user withdrawals, user deposits in the actual market may also be stuck.",
+        "missing_safeguards": "No emergency claim function, no grace period, no state preservation on de-whitelist"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can governance re-whitelist to allow claims, and does this correctly preserve reward accounting?",
+          "Does the lending market implementation handle sync_ledger reverts gracefully?",
+          "What is the total value at risk across all active markets?"
+        ],
+        "validation_requirements": [
+          "Test de-whitelist → re-whitelist cycle and verify claim correctness",
+          "Verify lending market behavior when sync_ledger reverts",
+          "Assess whether re-whitelisting creates accounting gaps"
+        ]
+      },
+      "preliminary_attack_scenario": "Governance de-whitelists a market (accidentally or due to policy change). Users with pending CANTO rewards are immediately locked out. The lending market may also be unable to process withdrawals if it requires sync_ledger to succeed. Even re-whitelisting creates issues (TECH-H007: stale state, lastRewardBlock reset).",
+      "prerequisites": [
+        "Governance de-whitelists a market with active users"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "All accrued unclaimed CANTO rewards for the market are permanently inaccessible",
+        "affected_users": "All users with unclaimed rewards in the de-whitelisted market",
+        "recovery_possibility": "Partial recovery via re-whitelisting but with accounting inconsistencies"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for user claim behavior after market de-whitelisting",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Instant upon governance de-whitelist action",
+        "detection_analysis": "Immediately visible when users attempt to claim"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "Retroactive Reward Rate Modification via setRewards for Un-Updated Markets",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The `setRewards()` function can set `cantoPerBlock[epoch]` for ANY epoch, including past epochs. Since `update_market()` uses lazy evaluation (only processes blocks when called), governance can retroactively change reward rates for past epochs that haven't been consumed yet by any market's update. This allows governance to arbitrarily increase or decrease rewards for specific markets after the fact.",
+      "investigation_rationale": "There is no check in setRewards that `epoch >= block.number`. Governance can call `setRewards(past_epoch, past_epoch, newRate)` to change the rate for a past epoch. If no market has been updated through that epoch yet, the new rate applies retroactively when update_market eventually processes those blocks.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setRewards",
+        "update_market"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards(uint256,uint256,uint256)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "108-113",
+        "pattern": "setRewards only validates epoch alignment (`_fromEpoch % BLOCK_EPOCH == 0`), no check that epochs are in the future. Any epoch's rate can be overwritten."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance calls setRewards for a past epoch",
+        "At least one whitelisted market has lastRewardBlock before the modified epoch",
+        "The market has not been updated through the modified epoch yet"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 108-113",
+        "vulnerable_pattern": "No temporal validation on epoch parameters",
+        "specific_concern": "cantoPerBlock[pastEpoch] can be overwritten to any value. Markets with stale lastRewardBlock will use the new rate when eventually updated.",
+        "missing_safeguards": "No check `_fromEpoch >= currentEpoch`, no immutability for past epochs"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can governance strategically modify past rates to favor specific markets?",
+          "How many markets typically have stale lastRewardBlock values?",
+          "Does the stated invariant 'total rewards per block should never exceed configured' hold with retroactive changes?"
+        ],
+        "validation_requirements": [
+          "Test setRewards for past epoch followed by update_market",
+          "Verify reward amounts change based on retroactive rate modification",
+          "Assess whether this violates the protocol's stated invariant"
+        ]
+      },
+      "preliminary_attack_scenario": "Governance sets cantoPerBlock[epoch_100000] = 1e18 initially. At block 300000, governance modifies cantoPerBlock[epoch_100000] = 100e18. Market X, which hasn't been updated since block 50000, eventually gets updated. It receives 100x the originally intended rewards for epoch 100000, potentially draining the contract.",
+      "prerequisites": [
+        "Governance modifies past epoch rates",
+        "Markets with stale lastRewardBlock"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Arbitrary inflation or deflation of rewards for specific markets",
+        "affected_users": "All users in markets affected by retroactive rate changes",
+        "recovery_possibility": "Cannot undo once update_market processes the modified rates"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for retroactive rate modification impact",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Requires governance action + stale market",
+        "detection_analysis": "Detectable by monitoring setRewards calls for past epochs"
+      },
+      "original_category": "technical",
+      "original_specialist": "technical"
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "De-Whitelisting Market Permanently Locks All User Rewards with No Recovery Path",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When governance sets lendingMarketWhitelist[market] = false, update_market() reverts with 'Market not whitelisted', which blocks both claim() and sync_ledger(). All users with pending unclaimed rewards in that market permanently lose access. If the lending market depends on sync_ledger for withdrawal accounting, users may also be unable to withdraw their deposits from the lending market. There is no emergency claim function, no grace period, and no migration path.",
+      "investigation_rationale": "This is a code design defect: there is no emergency claim path for de-whitelisted markets. Even honest governance needing to de-whitelist a compromised market would inadvertently lock all user rewards. The missing escape hatch is a concrete code omission that transforms a routine governance action into permanent user fund loss.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whiteListLendingMarket",
+        "claim",
+        "sync_ledger",
+        "update_market"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "56-57",
+        "pattern": "`require(lendingMarketWhitelist[_market], 'Market not whitelisted')` in update_market blocks ALL downstream operations including claim()"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance de-whitelists a market",
+        "Users have non-zero pending rewards (accumulatedCanto > rewardDebt)",
+        "No alternative claim mechanism exists"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "update_market whitelist check gates ALL functions including claim",
+        "manipulation_vector": "Governance action (even well-intentioned) permanently locks user funds",
+        "profit_hypothesis": "No attacker profit; pure user fund loss. CANTO remains in contract with no extraction path for entitled users."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the total value at risk across all markets that could be de-whitelisted?",
+          "Does re-whitelisting restore claim ability for pre-existing pending rewards?",
+          "Do lending markets depend on sync_ledger for withdrawal processing?"
+        ],
+        "validation_requirements": [
+          "Test claim() after de-whitelisting and verify revert",
+          "Test re-whitelisting and verify if old rewards are claimable",
+          "Verify lending market withdrawal path independence from sync_ledger"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - requires governance action",
+        "estimated_execution_cost": "Gas for whiteListLendingMarket",
+        "potential_profit_range": "No profit; pure loss scenario for users",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent once de-whitelisted"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "When market has maximum pending unclaimed rewards",
+        "market_impact_assessment": "Complete loss of pending rewards for all market users"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with pending claims in the de-whitelisted market",
+        "estimated_impact_per_user": "100% of unclaimed CANTO rewards",
+        "total_value_at_risk": "Sum of all pending claims for the market"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Current market whitelist status, pending reward totals",
+        "calculation_validation": "Verify claim reverts after de-whitelist, test re-whitelist recovery",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H015",
+      "title": "Market De-whitelisting Permanently Freezes Unclaimed User Rewards",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The `whiteListLendingMarket` function allows governance to instantly de-whitelist a market. Because `claim()` calls `update_market()`, which requires the market to be whitelisted, de-whitelisting instantly reverts all claim attempts. There is no grace period for users to claim already-earned rewards.",
+      "investigation_rationale": "This creates a severe rug-pull vector or accidental DoS risk. If governance de-whitelists a market due to an emergency (e.g., the market is hacked), they inadvertently freeze all legitimately earned CANTO rewards for all users of that market, punishing the victims further.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whiteListLendingMarket",
+        "claim",
+        "lendingMarketWhitelist"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket(address,bool)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "lendingMarketWhitelist(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "54, 125",
+        "pattern": "require(lendingMarketWhitelist[_market], 'Market not whitelisted'); inside update_market blocks claim()"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Users must have accrued, unclaimed rewards in a market",
+        "Governance must call whiteListLendingMarket(market, false)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Revert on claim() if whitelist == false",
+        "manipulation_vector": "Governance de-whitelists a market, locking all pending CANTO in the LendingLedger.",
+        "profit_hypothesis": "No direct profit for attacker, but results in massive loss of yield for users."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any emergency withdrawal mechanism?",
+          "Can governance re-whitelist the market safely without breaking the accumulator?"
+        ],
+        "validation_requirements": [
+          "Simulate de-whitelisting with pending rewards",
+          "Verify that claim() reverts",
+          "Simulate re-whitelisting and check if the gap period causes accounting errors"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A (Governance action)",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "0 (DoS)",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Instant"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "Destroys user trust and freezes capital"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users of the de-whitelisted market",
+        "estimated_impact_per_user": "100% loss of unclaimed rewards",
+        "total_value_at_risk": "All pending rewards for that market"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Governance operational security",
+        "calculation_validation": "Check re-whitelisting continuity (INV-STATE-007)",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "ECON-H016",
+      "title": "Governance Can Retroactively Alter Historical Reward Rates",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The `setRewards` function allows governance to change `cantoPerBlock` for any epoch, including past epochs. Because `update_market` is lazy and only calculates rewards when called, changing a past epoch's rate will retroactively alter the rewards for that epoch if `update_market` hasn't processed it yet.",
+      "investigation_rationale": "This breaks the immutability of historical reward rates. Users deposit expecting a certain advertised yield, but governance can slash that yield retroactively before the user claims, violating core DeFi trust assumptions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setRewards",
+        "cantoPerBlock"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards(uint256,uint256,uint256)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "cantoPerBlock(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "112-119",
+        "pattern": "No check that _fromEpoch >= current epoch; allows overwriting past cantoPerBlock"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A market must not have had update_market called for a past epoch",
+        "Governance must call setRewards for that past epoch"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "cantoPerBlock[i] = _amountPerBlock; without time bounds",
+        "manipulation_vector": "Governance intentionally or accidentally lowers the rate for a past epoch, stealing yield from users who haven't updated.",
+        "profit_hypothesis": "Protocol saves CANTO at the expense of user yield."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there a legitimate use case for retroactive changes?",
+          "How long do markets typically go without an update_market call?"
+        ],
+        "validation_requirements": [
+          "Simulate a retroactive rate change and verify the impact on a delayed claim()"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A (Governance action)",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Variable based on rate change",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Instant"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Before a large market calls update_market",
+        "market_impact_assessment": "Loss of user trust"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users who haven't claimed recently",
+        "estimated_impact_per_user": "Reduction in expected yield",
+        "total_value_at_risk": "Difference between old and new rates for the elapsed blocks"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Governance timelocks (none exist)",
+        "calculation_validation": "Verify lazy evaluation impact",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic",
+      "original_specialist": "economic"
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "Missing Solvency Check Allows Early Claimers to Drain Contract at Expense of Later Claimers",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "claim() sends CANTO to users without checking that the contract holds sufficient balance to cover all outstanding obligations. Combined with the epoch boundary bug (OPS-H001) which can cause over-distribution of rewards, and governance's ability to set arbitrarily high cantoPerBlock without depositing corresponding CANTO, early claimers can drain the contract's CANTO balance. Later claimers' transactions revert on the transfer, permanently blocking their ability to receive earned rewards.",
+      "investigation_rationale": "There is no on-chain enforcement that address(this).balance >= total pending claims. The epoch boundary bug can cause more rewards to accumulate than intended, making solvency harder for governance to maintain even with good faith funding.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim",
+        "setRewards"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "105-110",
+        "pattern": "claim() sends `uint256(cantoToSend)` via `msg.sender.call{value}` with no prior check that `address(this).balance >= cantoToSend` or total pending obligations"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Contract's CANTO balance is less than total outstanding claimable rewards",
+        "Multiple users have pending claims exceeding contract balance",
+        "Caused by epoch boundary bug (OPS-H001) over-distributing or governance under-funding"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "First-come-first-served claim with no pro-rata or solvency guarantee",
+        "admin_dependency": "Governance must manually fund contract with sufficient CANTO — no enforcement",
+        "exploitation_window": "Whenever actual pending claims exceed contract balance"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does the epoch boundary bug cause systematic over-distribution relative to funded amount?",
+          "How does governance calculate required CANTO funding?",
+          "Is there monitoring for contract balance vs pending obligations?"
+        ],
+        "validation_requirements": [
+          "Calculate total pending claims vs contract balance after epoch boundary bug effects",
+          "Simulate race-to-claim scenario with underfunded contract",
+          "Quantify over-distribution from epoch bug across typical usage patterns"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Monitor contract CANTO balance and total outstanding claims",
+        "phase_2": "When insolvency is detected or anticipated, claim immediately",
+        "phase_3": "Later claimers receive nothing — their transactions revert",
+        "phase_4": "N/A",
+        "coordination_requirements": "None — race condition among claimers"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "N/A",
+        "operational_disruption": "Users unable to claim legitimately earned rewards",
+        "recovery_difficulty": "Governance must deposit additional CANTO; no mechanism to prioritize affected users",
+        "affected_operations": "All reward claims across all markets"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic monitoring of contract balance",
+        "operational_timing": "When contract is underfunded relative to obligations"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Contract CANTO balance declining relative to accumulated rewards",
+        "operational_anomalies": "Failed claim transactions due to insufficient balance",
+        "behavioral_patterns": "Coordinated claiming activity during low-balance periods",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "Market De-Whitelisting Permanently Freezes User Unclaimed Rewards with No Recovery Path",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When governance calls `whiteListLendingMarket(_market, false)`, the `update_market` require check `require(lendingMarketWhitelist[_market])` blocks all subsequent calls to `claim()` and `sync_ledger()` for that market. Users with accrued but unclaimed CANTO rewards permanently lose access to those rewards. There is no emergency claim path, no grace period, and no migration mechanism. Re-whitelisting resets `lastRewardBlock` to current block, creating a gap in reward coverage.",
+      "investigation_rationale": "This is a dead-end state: once de-whitelisted, users with pending rewards have no path to claim them. The code provides no emergency withdrawal or admin-triggered distribution mechanism. Even governance cannot recover the situation without contract changes.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whiteListLendingMarket",
+        "claim",
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "55-56",
+        "pattern": "`require(lendingMarketWhitelist[_market], \"Market not whitelisted\")` in update_market blocks all claim/sync operations; no alternative claim path exists when whitelist is false"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance de-whitelists a market",
+        "Users have unclaimed CANTO rewards (rewardDebt < accumulatedCanto)",
+        "No emergency claim function exists"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "De-whitelisting immediately and irreversibly blocks all user claims",
+        "admin_dependency": "Governance action triggers the freeze — no user recourse",
+        "exploitation_window": "Instant upon de-whitelisting"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Under what circumstances would governance de-whitelist a market?",
+          "How much CANTO could be locked per market at de-whitelisting time?",
+          "Could governance pre-call update_market before de-whitelisting to minimize impact?"
+        ],
+        "validation_requirements": [
+          "Confirm that claim() reverts after de-whitelisting",
+          "Test re-whitelisting behavior and its effect on pending rewards",
+          "Verify no alternative claim mechanism exists"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "N/A — requires governance action (trusted per docs)",
+        "phase_2": "Governance de-whitelists market for any operational reason",
+        "phase_3": "All users with pending rewards lose access permanently",
+        "phase_4": "CANTO remains locked in contract with no extraction path",
+        "coordination_requirements": "Governance decision"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "N/A",
+        "operational_disruption": "Permanent loss of user rewards for de-whitelisted market",
+        "recovery_difficulty": "No recovery mechanism exists in the contract",
+        "affected_operations": "All users of the de-whitelisted market"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Governance role required",
+        "coordination_complexity": "Low — single governance transaction",
+        "technical_skills": "None",
+        "operational_timing": "Any time governance decides to de-whitelist"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "whiteListLendingMarket calls with false parameter",
+        "operational_anomalies": "Failed claim transactions after de-whitelisting",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H011",
+      "title": "Retroactive Reward Rate Modification via setRewards for Unprocessed Past Epochs",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "setRewards can modify `cantoPerBlock` for any epoch, including past epochs that have not yet been consumed by update_market. Since update_market is lazy (only processes blocks when explicitly called), governance can change reward rates for fully-elapsed epochs before any market processes them. When update_market finally runs for a stale market, it uses the modified (not original) rate, retroactively changing rewards that users expected to earn based on the original configuration.",
+      "investigation_rationale": "This violates the principle that past rewards should be immutable once earned. Markets that haven't been updated recently are vulnerable to having their reward calculations altered retroactively, even by well-intentioned governance corrections.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setRewards",
+        "update_market"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "115-121",
+        "pattern": "setRewards writes to `cantoPerBlock[i]` for any epoch in range with no check that `i + BLOCK_EPOCH > block.number` (i.e., epoch hasn't fully elapsed); update_market reads cantoPerBlock lazily"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance calls setRewards with epoch range that includes past epochs",
+        "At least one market has lastRewardBlock before the modified epochs",
+        "No one has called update_market for those markets since the modified epochs"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Governance can silently rewrite past reward rates before markets process them",
+        "admin_dependency": "Requires governance to call setRewards for past epochs",
+        "exploitation_window": "Between epoch elapsing and update_market processing those blocks"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "How frequently is update_market called for active markets?",
+          "Has governance ever called setRewards for already-elapsed epochs?",
+          "What is the typical staleness of market lastRewardBlock values?"
+        ],
+        "validation_requirements": [
+          "Test setRewards modifying a past epoch followed by update_market consuming it",
+          "Confirm no guard prevents past-epoch modification",
+          "Measure impact on user rewards from retroactive rate changes"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Governance identifies markets with stale lastRewardBlock",
+        "phase_2": "Governance calls setRewards to modify rates for unprocessed past epochs",
+        "phase_3": "When update_market is called, modified rates are applied retroactively",
+        "phase_4": "Users receive different rewards than originally configured",
+        "coordination_requirements": "Governance access required"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Governance can silently alter reward history",
+        "operational_disruption": "Users receive unexpected reward amounts",
+        "recovery_difficulty": "Cannot undo retroactive changes after update_market processes them",
+        "affected_operations": "Reward distribution for all stale markets"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Governance role",
+        "coordination_complexity": "Low",
+        "technical_skills": "Understanding of lazy evaluation and epoch mapping",
+        "operational_timing": "When markets have stale lastRewardBlock"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "setRewards calls targeting past epoch ranges",
+        "operational_anomalies": "Reward rate changes for elapsed epochs",
+        "behavioral_patterns": "Governance modifying rewards before market updates",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H012",
+      "title": "setGovernance Lacks Zero-Address Check Enabling Permanent Governance Loss",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The `setGovernance` function accepts any address including `address(0)` without validation. If governance accidentally calls `setGovernance(address(0))`, all governance-restricted functions (setRewards, whiteListLendingMarket, setGovernance) become permanently inaccessible. There is no two-step ownership transfer pattern, no confirmation mechanism, and no recovery path. The protocol loses all administrative capability permanently.",
+      "investigation_rationale": "This is a missing input validation defect on a critical admin function. Single-step governance transfer without confirmation is a well-known anti-pattern that can lead to irreversible loss of protocol control.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setGovernance",
+        "setRewards",
+        "whiteListLendingMarket"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setGovernance"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "44-46",
+        "pattern": "`function setGovernance(address _governance) external onlyGovernance { governance = _governance; }` — no `require(_governance != address(0))` check; no two-step transfer pattern"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Governance calls setGovernance with address(0) or an incorrect address",
+        "No external recovery mechanism for governance role"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Single-step governance transfer with no validation or confirmation",
+        "admin_dependency": "Self-inflicted — governance error permanently locks all admin functions",
+        "exploitation_window": "Single transaction"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is governance a multisig that would require multiple approvals?",
+          "Has this pattern been flagged in previous audits?",
+          "Are there off-chain safeguards (e.g., transaction simulation) before governance calls?"
+        ],
+        "validation_requirements": [
+          "Confirm setGovernance(address(0)) succeeds and locks all admin functions",
+          "Verify no recovery mechanism exists on-chain",
+          "Test with incorrect (non-zero but wrong) addresses"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "N/A — operational error, not active attack",
+        "phase_2": "Governance accidentally passes wrong address to setGovernance",
+        "phase_3": "All governance functions become permanently inaccessible",
+        "phase_4": "Protocol cannot set rewards, whitelist markets, or transfer governance",
+        "coordination_requirements": "N/A"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Complete loss of administrative control",
+        "operational_disruption": "Cannot modify rewards or whitelist; protocol frozen in current config",
+        "recovery_difficulty": "Irrecoverable — requires new contract deployment",
+        "affected_operations": "All governance-controlled functions"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Current governance role",
+        "coordination_complexity": "None — single erroneous transaction",
+        "technical_skills": "None",
+        "operational_timing": "Any governance transfer"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "setGovernance calls with suspicious target addresses",
+        "operational_anomalies": "Governance functions failing after transfer",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "OPS-H017",
+      "title": "Malicious or compromised whitelisted market can fabricate deposits to drain all CANTO rewards",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "sync_ledger trusts msg.sender (a whitelisted market) to report arbitrary _lender and _delta values, and LendingLedger never verifies actual cNOTE balances. A malicious/compromised market can credit attacker-controlled addresses with huge user.amount (and increase lendingMarketTotalBalance accordingly), then the attacker calls claim() to withdraw essentially all available CANTO from the ledger over time.",
+      "investigation_rationale": "While it requires control of a whitelisted market (off-chain compromise or malicious integration), this is a direct and complete drain path and matches real-world incidents where integrated contracts are exploited to drain reward distributors.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "At least one whitelisted market can be compromised or upgraded maliciously",
+        "Users can still call claim() for that market while it remains whitelisted"
+      ],
+      "config_evidence": "Whitelist management is on-chain via whiteListLendingMarket, but no deployment evidence is provided showing how markets are vetted or whether they are upgradeable.",
+      "affected_functions": [
+        "sync_ledger(address,int256)",
+        "claim(address)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "sync_ledger(address,int256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "src/LendingLedger.sol",
+        "lines": "78-96",
+        "pattern": "sync_ledger sets user.amount and debts purely from _delta supplied by msg.sender; no balance verification"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker controls a whitelisted lending market contract or its privileged functions",
+        "Market can call sync_ledger with arbitrary parameters",
+        "LendingLedger holds non-trivial native CANTO balance"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No authentication that _lender corresponds to actual depositor; market is treated as truth oracle",
+        "admin_dependency": "Requires governance to have whitelisted the market and not removed it before drain completes",
+        "exploitation_window": "While market remains whitelisted and ledger has funds"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are whitelisted markets upgradeable/proxy-based (increasing compromise risk)?",
+          "Is there monitoring for anomalous sync_ledger deltas (e.g., huge deltas)?",
+          "Are there caps on per-market/ per-user amounts in the market contract?"
+        ],
+        "validation_requirements": [
+          "Review market contract(s) that call sync_ledger for parameter integrity",
+          "Simulate fabricated sync_ledger calls from a whitelisted market",
+          "Assess feasibility of rapid drain given ledger funding and claim frequency"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise or deploy a malicious whitelisted market",
+        "phase_2": "Call sync_ledger(attacker, very_large_positive_delta) to inflate attacker amount",
+        "phase_3": "Call claim(market) to withdraw accumulated rewards; repeat as update_market accrues",
+        "phase_4": "Optionally distribute fabricated balances across multiple addresses to evade simple monitoring"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Indirect capture of reward outflows for that market",
+        "operational_disruption": "Ledger insolvency; legitimate users cannot claim",
+        "recovery_difficulty": "High (requires governance response + potential compensation)",
+        "affected_operations": "All reward claims funded by the ledger"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium (requires market control)",
+        "technical_skills": "Intermediate",
+        "operational_timing": "As soon as market control is obtained"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Large positive sync_ledger deltas not matched by corresponding on-chain cNOTE events in the market",
+        "operational_anomalies": "Sudden jump in lendingMarketTotalBalance for a market",
+        "behavioral_patterns": "High-frequency claims by newly credited addresses",
+        "detection_difficulty": "medium"
+      },
+      "original_category": "operational",
+      "original_specialist": "operational"
+    },
+    {
+      "hypothesis_id": "TECH2-H006",
+      "title": "De-whitelisting a Market Permanently Freezes User Rewards",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If governance de-whitelists a market, the update_market function will revert. Because claim() calls update_market(), users are permanently prevented from claiming rewards they already earned prior to the de-whitelisting.",
+      "investigation_rationale": "Administrative actions should not confiscate legitimately earned user funds. The lack of a grace period or emergency claim path means a routine governance action will unintentionally harm users.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market",
+        "claim",
+        "whiteListLendingMarket"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "54",
+        "pattern": "require(lendingMarketWhitelist[_market]) blocks all state access"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance de-whitelists a market",
+        "Users have unclaimed rewards in that market"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol line 54",
+        "vulnerable_pattern": "Strict access control blocking withdrawal paths",
+        "specific_concern": "No bypass for claiming past rewards when a market is deactivated",
+        "missing_safeguards": "Missing emergencyClaim function"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Is there any alternative path for users to recover their rewards?",
+          "Does de-whitelisting also freeze withdrawals on the lending market side?"
+        ],
+        "validation_requirements": [
+          "Simulate a de-whitelisting event and verify that all claim attempts revert"
+        ]
+      },
+      "preliminary_attack_scenario": "Governance decides to deprecate an old lending market and de-whitelists it. Immediately, all users who haven't claimed their CANTO rewards lose access to them. If the lending market calls sync_ledger on withdrawal, users also cannot withdraw their underlying deposits.",
+      "prerequisites": [
+        "Governance action"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Loss of earned rewards and potentially frozen underlying deposits",
+        "affected_users": "All users in the deprecated market",
+        "recovery_possibility": "Governance must re-whitelist the market to allow claims"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "Missing tests for user claims after market de-whitelisting",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Post-governance action",
+        "detection_analysis": "Visible as reverted claim transactions"
+      },
+      "original_category": "technical-2",
+      "original_specialist": "technical-2"
+    },
+    {
+      "hypothesis_id": "TECH2-H007",
+      "title": "Re-whitelisting a Market Creates Reward Accounting Discontinuity",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When a market is re-whitelisted, lastRewardBlock is set to block.number, but accCantoPerShare is not reset. Users who maintained deposits during the de-whitelisted period will have their rewardDebt calculated against the old accumulator upon withdrawal, causing incorrect reward calculations.",
+      "investigation_rationale": "State transitions for administrative actions must maintain accounting invariants. The failure to properly adjust accumulators on re-whitelisting corrupts user balances.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whiteListLendingMarket",
+        "sync_ledger",
+        "claim"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "whiteListLendingMarket"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "128-130",
+        "pattern": "Partial state reset on re-whitelisting"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance de-whitelists and then re-whitelists a market",
+        "Users maintained deposits during the gap"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LendingLedger.sol lines 128-130",
+        "vulnerable_pattern": "Incomplete state initialization",
+        "specific_concern": "lastRewardBlock is updated but accCantoPerShare is left stale",
+        "missing_safeguards": "Missing accumulator adjustment logic for re-whitelisting"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How exactly does the stale accumulator affect a user's rewardDebt upon their next sync_ledger call?",
+          "Can this lead to underflows in claim()?"
+        ],
+        "validation_requirements": [
+          "Trace the math for a user who deposits, waits, experiences a de-whitelist/re-whitelist cycle, and then claims"
+        ]
+      },
+      "preliminary_attack_scenario": "Market is de-whitelisted and later re-whitelisted. A user who deposited before the de-whitelisting calls claim(). Their rewards are calculated using the stale accumulator, potentially granting them phantom rewards or causing an underflow depending on how the market supply changed.",
+      "prerequisites": [
+        "Governance de-whitelist and re-whitelist actions"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Incorrect reward distribution (overpayment or underpayment)",
+        "affected_users": "Users who held deposits through a de-whitelist cycle",
+        "recovery_possibility": "Difficult to correct without manual state manipulation"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "low",
+      "test_coverage_gap": "Missing tests for the full lifecycle of de-whitelisting and re-whitelisting",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "None",
+        "capital_requirements": "None",
+        "execution_timing": "Post-governance action",
+        "detection_analysis": "Requires deep state inspection"
+      },
+      "original_category": "technical-2",
+      "original_specialist": "technical-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H007",
+      "title": "Permanent Freeze of Rewards on Market De-whitelisting",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If governance de-whitelists a market, the update_market function immediately reverts for that market. Because claim() relies on update_market, users are permanently blocked from claiming rewards they have already earned. There is no grace period or emergency claim mechanism.",
+      "investigation_rationale": "While requiring admin action, this is a severe code defect in state handling. It traps user funds without recourse, turning a routine administrative action (deprecating a market) into a catastrophic loss event.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim",
+        "update_market",
+        "whiteListLendingMarket"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "51-53",
+        "pattern": "require(lendingMarketWhitelist[_market], \"Market not whitelisted\");"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance calls whiteListLendingMarket(market, false)",
+        "Users have accrued but unclaimed CANTO rewards in that market"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Strict whitelist requirement blocks access to historical reward debt",
+        "manipulation_vector": "Governance action triggers immediate DoS on all user claims",
+        "profit_hypothesis": "Protocol treasury retains unpaid rewards at the expense of users"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any alternative path to extract rewardDebt?",
+          "Does re-whitelisting restore access without corrupting the accumulator?"
+        ],
+        "validation_requirements": [
+          "Simulate de-whitelisting and attempt to claim",
+          "Analyze state continuity if market is re-whitelisted later"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None",
+        "estimated_execution_cost": "None (admin action)",
+        "potential_profit_range": "None for attacker; 100% loss for victims",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Instant upon admin transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "Massive loss of user trust and frozen capital"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users of the de-whitelisted market",
+        "estimated_impact_per_user": "100% loss of unclaimed rewards",
+        "total_value_at_risk": "All pending rewards for the market"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Whitelist state transitions",
+        "calculation_validation": "N/A",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H008",
+      "title": "Arbitrary Balance Inflation by Compromised Market",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "The sync_ledger function implicitly trusts the msg.sender (which must be a whitelisted market) to report accurate _lender addresses and _delta amounts. If a whitelisted market is compromised or turns malicious, it can report massive fabricated deposits for an attacker address, allowing the attacker to drain the entire CANTO reward pool.",
+      "investigation_rationale": "This highlights a critical trust boundary vulnerability. The protocol delegates all accounting authority to external contracts without any cross-verification of actual token balances, making the entire reward system as weak as the weakest whitelisted market.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "sync_ledger"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "sync_ledger"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "79-81",
+        "pattern": "user.amount += uint256(_delta);"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A whitelisted lending market is compromised via external exploit or malicious upgrade",
+        "The compromised market calls sync_ledger with a massive positive _delta for an attacker address"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Unverified state update based purely on msg.sender input",
+        "manipulation_vector": "Compromised market inflates attacker's user.amount to 99.9% of total supply",
+        "profit_hypothesis": "Attacker claims nearly 100% of all future CANTO rewards allocated to that market, draining protocol funds"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the security posture of the intended whitelisted markets?",
+          "Is there any upper bound on lendingMarketTotalBalance?"
+        ],
+        "validation_requirements": [
+          "Review architecture for potential cross-verification mechanisms",
+          "Simulate market compromise and subsequent reward drain"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (requires off-chain compromise of market)",
+        "estimated_execution_cost": "Standard transaction gas",
+        "potential_profit_range": "Total drain of market's allocated CANTO rewards",
+        "estimated_profit_margin": "Infinite (no capital risked)",
+        "attack_duration": "Single block execution post-compromise"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Immediately after compromising the market",
+        "market_impact_assessment": "Total loss of protocol reward funds"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol treasury and legitimate users",
+        "estimated_impact_per_user": "Extreme dilution of rewards",
+        "total_value_at_risk": "All CANTO allocated to the compromised market"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Trust model of external markets",
+        "calculation_validation": "N/A",
+        "execution_complexity": "high (requires external compromise)",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H009",
+      "title": "Retroactive Reward Rate Manipulation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The setRewards function allows governance to modify cantoPerBlock for any epoch, including past epochs. Because update_market is evaluated lazily, changing a past epoch's rate will retroactively alter the reward calculation for any market that has not been updated since that epoch, creating severe economic inconsistencies.",
+      "investigation_rationale": "This breaks the immutability of historical economic state. It allows governance to retroactively steal earned rewards or unfairly inflate rewards for specific inactive markets.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setRewards",
+        "update_market"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "setRewards"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "114-116",
+        "pattern": "cantoPerBlock[i] = _amountPerBlock;"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governance calls setRewards for an epoch that has already passed",
+        "At least one market has a lastRewardBlock prior to the modified epoch"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No check ensuring _fromEpoch >= current epoch",
+        "manipulation_vector": "Governance retroactively lowers rates to erase user debt, or raises rates to enrich insiders in a stale market",
+        "profit_hypothesis": "Value is transferred arbitrarily between the protocol treasury and users based on retroactive state changes"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any legitimate operational reason to modify past epochs?",
+          "How much value can be retroactively altered based on typical update frequencies?"
+        ],
+        "validation_requirements": [
+          "Simulate retroactive rate reduction and measure impact on pending claims",
+          "Verify lack of historical immutability checks"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None",
+        "estimated_execution_cost": "None (admin action)",
+        "potential_profit_range": "Variable, depends on the magnitude of the rate change",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Instant upon admin transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When a market has been inactive for a long period",
+        "market_impact_assessment": "Loss of trust in protocol's economic guarantees"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users of inactive markets",
+        "estimated_impact_per_user": "Arbitrary reduction in earned rewards",
+        "total_value_at_risk": "All pending rewards in stale markets"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Epoch timing vs update frequency",
+        "calculation_validation": "Retroactive math impact",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H014",
+      "title": "External State Mutation by gauge_relative_weight_write During Mid-Loop Reward Accumulation Creates Cross-Contract Reentrancy Surface",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Within update_market's epoch iteration loop, gaugeController.gauge_relative_weight_write is called as a state-modifying external function. This call occurs before the current iteration's rewards are added to accCantoPerShare and before lastRewardBlock is updated. If the GaugeController (or a contract it calls) can reenter LendingLedger during this call — for example, by triggering a whitelisted lending market that calls sync_ledger — the reward accumulation state would be mid-update: some iterations complete, some not, with lastRewardBlock still pointing to the old value. A subsequent update_market call from the reentrant path would re-process already-counted blocks, double-counting rewards.",
+      "investigation_rationale": "The LendingLedger has no reentrancy guard. The external call in the loop (line 67) happens before state is finalized (lastRewardBlock updated at line 73). While standard GaugeController implementations don't typically callback into other contracts, the `_write` suffix indicates state mutation, and Solidity's composability means callbacks are architecturally possible. The constructor's immutable binding means this surface persists permanently.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "update_market(address)",
+        "sync_ledger(address,int256)",
+        "claim(address)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "GaugeController.sol",
+          "function": "gauge_relative_weight_write(address,uint256)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "update_market(address)"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "constructor"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "60-73",
+        "pattern": "External state-modifying call at line 67 occurs within while loop (lines 61-71) before lastRewardBlock is updated (line 73); no reentrancy guard; reentrant update_market would re-read stale lastRewardBlock and re-accumulate rewards"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "GaugeController.gauge_relative_weight_write triggers a callback that reenters LendingLedger",
+        "The reentrant call path reaches update_market for the same market before the original call completes",
+        "No external reentrancy protections in GaugeController's call chain"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "lastRewardBlock is only updated after the entire loop completes (line 73); external call at line 67 happens mid-loop",
+        "manipulation_vector": "Reenter update_market during gauge_relative_weight_write callback; stale lastRewardBlock causes re-accumulation of rewards for already-processed blocks",
+        "profit_hypothesis": "Double-counted rewards inflate accCantoPerShare, allowing attacker to claim excess CANTO = (double_counted_blocks * cantoPerBlock * weight / 1e18 * attacker_share / marketSupply)"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Does gauge_relative_weight_write have any callback mechanism or cross-contract calls?",
+          "Can the GaugeController's state mutation trigger events that lead back to LendingLedger?",
+          "What is the maximum reward inflation from a single reentrancy event?"
+        ],
+        "validation_requirements": [
+          "Trace full execution path of gauge_relative_weight_write for callback possibilities",
+          "Test reentrancy via mocked GaugeController that callbacks into LendingLedger",
+          "Calculate reward inflation from double-processing N blocks"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal if callback path exists — standard deposit position needed",
+        "estimated_execution_cost": "Single transaction gas cost",
+        "potential_profit_range": "Up to 2x the rewards for the re-processed block range",
+        "estimated_profit_margin": "High if reentrancy is achievable",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None beyond existing market position",
+        "optimal_timing": "When large number of blocks need processing (stale market)",
+        "market_impact_assessment": "Inflated accCantoPerShare affects all future reward calculations"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All depositors in the affected market (diluted by inflated accumulator)",
+        "estimated_impact_per_user": "Depends on magnitude of double-counting",
+        "total_value_at_risk": "Contract CANTO balance"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "GaugeController callback behavior, number of stale blocks",
+        "calculation_validation": "Simulate reentrancy and measure accCantoPerShare inflation",
+        "execution_complexity": "high",
+        "detection_difficulty": "high"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "ECON2-H015",
+      "title": "Missing Constructor Validation Enables Permanent Protocol Bricking via Zero or Malicious GaugeController Address",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The constructor accepts _gaugeController and _governance addresses without any validation (zero-address check, code-existence check, or interface support verification). If deployed with _gaugeController set to address(0) or a non-contract address, every call to update_market will revert on the external call to gauge_relative_weight_write, permanently bricking all claim and sync_ledger operations. Since gaugeController has no setter function, this misconfiguration is irrecoverable without full redeployment.",
+      "investigation_rationale": "Unlike governance which has setGovernance for recovery, gaugeController is permanently fixed at construction. The constructor at lines 44-47 performs no validation on either address. While this requires a deployment error, the irreversibility and total protocol impact warrant flagging as a code defect (missing defensive validation on a critical, immutable parameter).",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Deployed with incorrect _gaugeController address (zero address or non-contract)"
+      ],
+      "config_evidence": "Constructor at LendingLedger.sol:44-47 performs no address validation; no deployment script provided to verify deployment parameters",
+      "affected_functions": [
+        "update_market(address)",
+        "claim(address)",
+        "sync_ledger(address,int256)"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "constructor"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LendingLedger.sol",
+        "lines": "44-47",
+        "pattern": "constructor(address _gaugeController, address _governance) sets gaugeController = GaugeController(_gaugeController) with no require(_gaugeController != address(0)) or code-size check; no setter exists for recovery"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "LendingLedger deployed with _gaugeController = address(0) or non-contract address",
+        "No ability to change gaugeController post-deployment"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "gaugeController.gauge_relative_weight_write(_market, epoch) called on potentially invalid address",
+        "manipulation_vector": "Deployment error — not an active attack but an irrecoverable misconfiguration",
+        "profit_hypothesis": "No direct profit — all CANTO sent to the contract becomes permanently locked"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there a deployment script that validates the GaugeController address?",
+          "What is the total value at risk if the protocol is deployed incorrectly?",
+          "Could a governance attacker use setGovernance to take control and then benefit from a bricked protocol?"
+        ],
+        "validation_requirements": [
+          "Review deployment scripts for address validation",
+          "Test constructor with address(0) to confirm permanent DoS",
+          "Verify no recovery mechanism exists"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None — deployment error",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "No profit — all contract funds become inaccessible",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent from deployment"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "At deployment time",
+        "market_impact_assessment": "Total protocol failure if misconfigured"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All future users who deposit or send CANTO to the contract",
+        "estimated_impact_per_user": "100% loss of rewards and inability to sync positions",
+        "total_value_at_risk": "All CANTO sent to the contract + all lending market integrations broken"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Deployment configuration and scripts",
+        "calculation_validation": "Confirm revert behavior with invalid gaugeController",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      },
+      "original_category": "economic-2",
+      "original_specialist": "economic-2"
+    },
+    {
+      "hypothesis_id": "OPS2-H014",
+      "title": "Solvency failure mode: rewards accrue without enforced funding; early claimers can drain contract balance causing widespread claim outages",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "There is no mechanism ensuring address(this).balance is sufficient to cover accrued rewards, and setRewards can configure arbitrary cantoPerBlock. If funding lags emissions, users’ claim() calls will revert due to failed native transfer. While state will revert and not burn rewardDebt, users experience an operational outage until the contract is funded. Attackers can accelerate depletion by claiming frequently when underfunding exists (capturing available balance ahead of others) without requiring transaction ordering advantages.",
+      "investigation_rationale": "Even if not a code exploit in isolation, this is a high-probability production incident pattern for reward contracts paying from a finite balance with no enforced funding discipline; it becomes an attacker-amplified bank-run dynamic during underfunding events.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Rewards are configured (setRewards) at rates that can exceed or approach the contract’s funded native balance over time",
+        "The contract is not continuously topped up to maintain solvency"
+      ],
+      "config_evidence": "No deployment scripts or treasury funding automation provided; receive() exists but no enforced funding logic in contract.",
+      "affected_functions": [
+        "claim(address)",
+        "receive()"
+      ],
+      "affected_contracts": [
+        "LendingLedger.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LendingLedger.sol",
+          "function": "receive()"
+        },
+        {
+          "file": "LendingLedger.sol",
+          "function": "claim(address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "src/LendingLedger.sol",
+        "lines": "112-124",
+        "pattern": "msg.sender.call{value: uint256(cantoToSend)}(\"\"); require(success, \"Failed to send CANTO\"); // no pre-check of balance; no funding enforcement"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Contract native balance is less than aggregate pending claimable rewards",
+        "At least one user has positive pending rewards in some whitelisted market",
+        "Users (or attacker) can call claim() repeatedly to extract remaining balance until depletion"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Rewards are obligations but the contract has no liability accounting or funding guardrails; payouts depend on ad-hoc funding via receive().",
+        "admin_dependency": "Governance sets emission rates; treasury must fund contract externally.",
+        "exploitation_window": "Any underfunded period; attackers can claim as soon as balance becomes available."
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is there an operational process/keeper that tops up the contract proportional to emissions?",
+          "What is the maximum daily/weekly emission vs current treasury funding plans?",
+          "Are there monitoring/alerts for approaching insolvency (balance vs estimated liabilities)?"
+        ],
+        "validation_requirements": [
+          "Build an off-chain liability estimator (approximate) from events/state snapshots and compare to balance.",
+          "Simulate partial funding and claim behavior to assess how quickly balance is drained and outage duration.",
+          "Review treasury ops for replenishment cadence and authorization paths."
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Detect (on-chain) that contract balance is low relative to expected emissions.",
+        "phase_2": "Claim frequently across markets/addresses controlled by attacker to capture any topped-up funds immediately after funding transactions land.",
+        "phase_3": "Maintain this behavior to starve other users of timely payouts until operations respond."
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None.",
+        "operational_disruption": "Claim outages and user trust loss; perceived 'stuck rewards' until funding replenished.",
+        "recovery_difficulty": "Medium; requires funding and possibly emission reduction, plus user comms.",
+        "affected_operations": "Reward claiming across all markets."
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "0",
+        "coordination_complexity": "Low.",
+        "technical_skills": "Low.",
+        "operational_timing": "During underfunding windows; no mempool visibility required."
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Frequent claim attempts reverting with Failed to send CANTO; balance approaching zero.",
+        "operational_anomalies": "Treasury top-ups followed immediately by rapid balance depletion.",
+        "behavioral_patterns": "A few addresses claiming at high frequency shortly after top-ups.",
+        "detection_difficulty": "low"
+      },
+      "original_category": "operational-2",
+      "original_specialist": "operational-2"
+    }
+  ]
+}

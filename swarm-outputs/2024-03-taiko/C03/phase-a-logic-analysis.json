@@ -1,0 +1,562 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T05:21:34.541Z",
+    "duration_ms": 178950
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User (proposer) via proposeBlock()",
+        "path": [
+          "TaikoL1.proposeBlock()",
+          "LibProposing.proposeBlock() decodes BlockParams from _data",
+          "Validates proposer permissions and block limits",
+          "LibDepositing.processDeposits() processes pending ETH deposits",
+          "Constructs BlockMetadata with L1 data",
+          "Stores Block in ring buffer at state.blocks[numBlocks % ringBufferSize]",
+          "Increments state.slotB.numBlocks",
+          "Iterates hookCalls forwarding all ETH balance",
+          "Checks TKO balance increased by livenessBond",
+          "LibVerifying.verifyBlocks() called if proving not paused"
+        ],
+        "transformations": [
+          "abi.decode(_data) -> BlockParams",
+          "keccak256(abi.encode(deposits_)) -> depositsHash",
+          "keccak256(abi.encodePacked(prevrandao, numBlocks, block.number)) -> difficulty",
+          "keccak256(abi.encode(meta_)) -> metaHash",
+          "blobhash(0) or keccak256(_txList) -> blobHash"
+        ],
+        "sinks": [
+          "state.blocks[slot] - Block stored in ring buffer",
+          "state.slotB.numBlocks - incremented",
+          "state.reusableBlobs[blobHash] - optionally set",
+          "Hook contracts receive ETH via value transfer"
+        ],
+        "trust_changes": "User-supplied BlockParams is partially trusted after validation; hooks are called with full contract ETH balance creating trust dependency on hook behavior",
+        "validation_points": [
+          "assignedProver != address(0)",
+          "proposer permission check via _isProposerPermitted",
+          "numBlocks < lastVerifiedBlockId + blockMaxProposals + 1",
+          "parentMetaHash check if non-zero",
+          "txListByteSize > 0 and <= blockMaxTxListBytes",
+          "hookCalls ordering (ascending addresses)",
+          "TKO balance delta == livenessBond after hooks"
+        ],
+        "exposure_risks": [
+          "All ETH forwarded to hooks - malicious hook could steal proposer ETH",
+          "Hook ordering check uses >= (not >) allowing same hook address if it passes the ascending check incorrectly"
+        ],
+        "manipulation_risks": [
+          "Proposer can choose arbitrary assignedProver address",
+          "Proposer controls hookCalls array and data passed to hooks",
+          "Multiple proposeBlock calls in same tx share blobhash(0)"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "User (prover/contester) via proveBlock()",
+        "path": [
+          "TaikoL1.proveBlock() decodes (BlockMetadata, Transition, TierProof) from _input",
+          "Validates _blockId == meta.id",
+          "LibProving.proveBlock() validates transition non-zero fields",
+          "Checks meta.id in valid range (lastVerifiedBlockId < id < numBlocks)",
+          "Loads block from ring buffer, verifies metaHash integrity",
+          "_createTransition() finds or creates transition by parentHash",
+          "Validates proof tier >= meta.minTier and >= ts.tier",
+          "Resolves tier_provider and gets tier config",
+          "_checkProverPermission() enforces proving window rules",
+          "Resolves and calls verifier contract",
+          "Handles bond transfers based on proving vs contesting",
+          "LibVerifying.verifyBlocks() called"
+        ],
+        "transformations": [
+          "abi.decode(_input) -> (BlockMetadata, Transition, TierProof)",
+          "keccak256(abi.encode(_meta)) compared to stored metaHash",
+          "Bond calculations: reward = contestBond >> 2 or validityBond >> 2 or validityBond >> 1"
+        ],
+        "sinks": [
+          "state.transitions[slot][tid] - TransitionState updated",
+          "TKO token transfers to prover/contester/contract",
+          "state.slotB.lastVerifiedBlockId potentially updated"
+        ],
+        "trust_changes": "User-supplied metadata is verified against stored metaHash; transition data verified by external verifier; tier provider is trusted external contract",
+        "validation_points": [
+          "parentHash, blockHash, stateRoot all non-zero",
+          "Block ID in valid range",
+          "metaHash integrity check",
+          "Tier >= minTier and >= current tier",
+          "Verifier contract verification",
+          "Prover permission check"
+        ],
+        "exposure_risks": [
+          "External verifier contract is called and trusted completely for proof validity",
+          "Tier provider is trusted to return correct tier configurations"
+        ],
+        "manipulation_risks": [
+          "Top-tier prover can signal RETURN_LIVENESS_BOND via proof data to recover bonds",
+          "Contesting with same tier doesn't require proving the alternative - only posts bond",
+          "Griefing: repeated contesting to delay verification"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "LibVerifying.verifyBlocks()",
+        "path": [
+          "Loads lastVerifiedBlockId from slotB",
+          "Iterates sequential blocks checking ring buffer",
+          "For each block finds transition matching previous blockHash as parentHash",
+          "Checks contester == address(0) (no active contest)",
+          "Checks cooldown window has passed",
+          "Marks block verified, returns bonds",
+          "Syncs chain data to signal service if threshold met"
+        ],
+        "transformations": [
+          "bondToReturn = validityBond + livenessBond",
+          "If prover != assignedProver: bondToReturn -= livenessBond >> 1",
+          "Sequential blockHash chaining from verified blocks"
+        ],
+        "sinks": [
+          "state.slotB.lastVerifiedBlockId updated",
+          "TKO transferred to prover",
+          "SignalService.syncChainData() called with stateRoot"
+        ],
+        "trust_changes": "Verified block state root is synced to signal service, becomes trusted cross-chain data",
+        "validation_points": [
+          "Block ID matches ring buffer slot",
+          "Transition exists with correct parentHash",
+          "No active contester",
+          "Cooldown window elapsed"
+        ],
+        "exposure_risks": [
+          "State root synced to signal service affects cross-chain security"
+        ],
+        "manipulation_risks": [
+          "If livenessBond was already returned to assignedProver via RETURN_LIVENESS_BOND, the verifyBlocks still tries to add it to bondToReturn leading to double-payment from contract's TKO balance"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "User via depositEtherToL2()",
+        "path": [
+          "TaikoL1.depositEtherToL2()",
+          "LibDepositing.depositEtherToL2()",
+          "canDepositEthToL2() validates amount and ring buffer capacity",
+          "Sends msg.value to bridge contract",
+          "Encodes deposit in ethDeposits ring buffer",
+          "Increments numEthDeposits"
+        ],
+        "transformations": [
+          "_encodeEthDeposit: (uint160(addr) << 96) | amount",
+          "Deposit fee calculation in processDeposits: min(ethDepositMaxFee, basefee * ethDepositGas)"
+        ],
+        "sinks": [
+          "Bridge contract receives ETH",
+          "state.ethDeposits[slot] stores encoded deposit",
+          "state.slotA.numEthDeposits incremented"
+        ],
+        "trust_changes": "ETH sent to bridge contract, deposit recorded for L2 processing",
+        "validation_points": [
+          "Amount within min/max range",
+          "Ring buffer has capacity"
+        ],
+        "exposure_risks": [
+          "Deposit ring buffer overflow could overwrite unprocessed deposits"
+        ],
+        "manipulation_risks": [
+          "Fee deposit in processDeposits adds to numEthDeposits, consuming ring buffer space",
+          "If fee deposit amount is 0, it still occupies a slot"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Prover (SGX instance) via SgxVerifier.verifyProof()",
+        "path": [
+          "Called by TaikoL1 (onlyFromNamed 'taiko')",
+          "Returns early if contesting",
+          "Parses proof.data: 4 bytes id + 20 bytes newInstance + 65 bytes signature",
+          "ECDSA.recover to get oldInstance from signed hash",
+          "_isInstanceValid checks id maps to oldInstance and not expired",
+          "_replaceInstance rotates to newInstance"
+        ],
+        "transformations": [
+          "getSignedHash: keccak256(abi.encode('VERIFY_PROOF', chainId, address(this), _tran, _newInstance, _prover, _metaHash))",
+          "ECDSA.recover(hash, signature) -> oldInstance address"
+        ],
+        "sinks": [
+          "instances[id] replaced with newInstance",
+          "addressRegistered not updated for newInstance in _replaceInstance"
+        ],
+        "trust_changes": "SGX instance key rotation: old key is trusted via registry, new key becomes active immediately",
+        "validation_points": [
+          "Proof data length == 89",
+          "ECDSA signature recovery",
+          "Instance validity (registered, not expired, correct id)"
+        ],
+        "exposure_risks": [
+          "Side-channel attack on SGX could expose private key",
+          "Instance expiry is 180 days - long window"
+        ],
+        "manipulation_risks": [
+          "_replaceInstance does not set addressRegistered[newInstance] = true, allowing the same newInstance address to be used across multiple instance IDs",
+          "_replaceInstance also does not clear addressRegistered[oldInstance], preventing re-attestation with same key"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Guardian via GuardianProver.approve()",
+        "path": [
+          "Guardian calls approve(meta, tran, proof)",
+          "Validates proof.tier == TIER_GUARDIAN",
+          "Computes hash = keccak256(abi.encode(_meta, _tran))",
+          "Calls internal Guardians.approve(meta.id, hash) to record approval bit",
+          "If minGuardians threshold met, deletes approval and calls TaikoL1.proveBlock()",
+          "TaikoL1.proveBlock forwards to LibProving.proveBlock"
+        ],
+        "transformations": [
+          "keccak256(abi.encode(_meta, _tran)) -> approval hash",
+          "Approval bits: _approvals[version][hash] |= 1 << (guardianId - 1)"
+        ],
+        "sinks": [
+          "_approvals mapping updated",
+          "TaikoL1.proveBlock() called with guardian proof"
+        ],
+        "trust_changes": "Guardian multisig approval converts to top-tier proof submission; guardians are highly trusted actors",
+        "validation_points": [
+          "proof.tier must be TIER_GUARDIAN",
+          "Guardian must be registered (guardianIds[msg.sender] != 0)",
+          "minGuardians threshold"
+        ],
+        "exposure_risks": [
+          "Guardian key compromise could submit malicious proofs",
+          "No validation that _proof.data is valid when forwarded to TaikoL1"
+        ],
+        "manipulation_risks": [
+          "Guardians can override any lower-tier proof since TIER_GUARDIAN is top tier with contestBond=0",
+          "Guardian approval hash only covers meta+tran, not proof data, so proof.data could differ between approving guardians"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "AssignmentHook.onBlockProposed()",
+        "path": [
+          "Called by TaikoL1 during proposeBlock",
+          "Decodes Input containing ProverAssignment",
+          "Validates assignment expiry and constraints",
+          "Hashes assignment with blobHash for signature verification",
+          "Verifies assignedProver's signature",
+          "Transfers livenessBond from assignedProver to TaikoL1",
+          "Pays prover fee from proposer (ETH or ERC20)",
+          "Optionally pays tip to block.coinbase",
+          "Returns remaining ETH to TaikoL1"
+        ],
+        "transformations": [
+          "hashAssignment: keccak256(abi.encode('PROVER_ASSIGNMENT', chainId, taikoL1Address, hookAddress, ...))",
+          "_getProverFee: linear search for tier fee matching minTier"
+        ],
+        "sinks": [
+          "TKO token: assignedProver -> TaikoL1 (livenessBond)",
+          "ETH/ERC20: proposer -> assignedProver (prover fee)",
+          "ETH: proposer -> block.coinbase (tip)"
+        ],
+        "trust_changes": "Prover's signed assignment is verified; proposer trusts that the prover will eventually prove the block",
+        "validation_points": [
+          "Assignment not expired",
+          "metaHash/parentMetaHash/maxBlockId/maxProposedIn constraints",
+          "Signature validity"
+        ],
+        "exposure_risks": [
+          "Prover fee paid upfront before proving - proposer has no recourse if prover fails",
+          "MAX_GAS_PAYING_PROVER limits gas for ETH payment but could cause prover not to receive ETH if their receive/fallback is expensive"
+        ],
+        "manipulation_risks": [
+          "If feeToken is a malicious ERC20, safeTransferFrom could have side effects",
+          "Proposer sets meta.coinbase - if using ERC20 fee payment, proposer could set coinbase to a different address than msg.sender"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Blocks must be proposed, proven, and verified sequentially (ring buffer with sequential IDs)",
+        "Each block requires a livenessBond from the assigned prover deposited at proposal time",
+        "Proofs must meet minimum tier requirements determined pseudo-randomly per block",
+        "Higher-tier proofs can override lower-tier proofs",
+        "Contested transitions require higher-tier proof resolution",
+        "Verification requires sequential parent-child hash chain from last verified block",
+        "Cooldown windows must elapse before block verification",
+        "Guardian tier is the top tier with zero bonds, acting as ultimate arbiter"
+      ],
+      "economic_incentives": [
+        "Assigned prover stakes livenessBond (250 TKO) - returned if they prove the block",
+        "Provers stake validityBond when submitting proofs",
+        "Contesters stake contestBond to challenge proofs",
+        "Winner of contest receives loser's bond divided by 4 as reward (75% burned)",
+        "If actual prover != assigned prover, assigned prover loses half livenessBond",
+        "Prover fee paid upfront by proposer to assigned prover via AssignmentHook",
+        "ETH deposit fees compensate proposers for processing L1->L2 deposits"
+      ],
+      "governance_mechanisms": [
+        "TaikoGovernor with 1-day voting delay and 1-week voting period",
+        "0.01% of total supply (100K TKO) proposal threshold",
+        "4% quorum fraction",
+        "TaikoTimelockController: admin can bypass minimum delay",
+        "Guardian set managed by owner with version-based approval invalidation",
+        "Minimum 5 guardians with at least ceil(n/2) required to approve"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Top-tier (guardian) proof with RETURN_LIVENESS_BOND signal followed by verification",
+          "expected_behavior": "Liveness bond returned once to assignedProver, not double-counted at verification",
+          "actual_behavior": "LibProving transfers livenessBond to assignedProver and sets blk.livenessBond=0. During verification, bondToReturn = ts.validityBond + blk.livenessBond = 0 + 0 = 0 for guardian tier (validityBond=0). This is correct since blk.livenessBond is zeroed.",
+          "risk_level": "low",
+          "exploitation_potential": "Minimal - the zeroing of blk.livenessBond prevents double payment"
+        },
+        {
+          "scenario": "Ring buffer collision: blockRingBufferSize blocks proposed without verification",
+          "expected_behavior": "Should revert when ring buffer is full",
+          "actual_behavior": "Protected by check: numBlocks >= lastVerifiedBlockId + blockMaxProposals + 1 reverts with L1_TOO_MANY_BLOCKS. With blockRingBufferSize = blockMaxProposals + 100, ring buffer has margin.",
+          "risk_level": "low",
+          "exploitation_potential": "None - the limit prevents overwriting unverified blocks"
+        },
+        {
+          "scenario": "Transition ID overflow in _createTransition (nextTransitionId wraps around uint32)",
+          "expected_behavior": "Should never realistically overflow",
+          "actual_behavior": "Uses unchecked increment of uint32. Comment says 'Not realistic 2**32 different fork choice'. True but theoretically possible over very long timeframes.",
+          "risk_level": "low",
+          "exploitation_potential": "Theoretical only - would require 4 billion transitions per block"
+        },
+        {
+          "scenario": "processDeposits fee deposit when totalFee is zero",
+          "expected_behavior": "Fee deposit with zero amount should not waste ring buffer space",
+          "actual_behavior": "Even if totalFee=0, a fee deposit entry is still written to ring buffer and numEthDeposits is incremented. This wastes one slot per block processed.",
+          "risk_level": "low",
+          "exploitation_potential": "Minor inefficiency, not exploitable since ring buffer check in canDepositEthToL2 uses < (size-1)"
+        },
+        {
+          "scenario": "Block contestBond initialized to 1 in _createTransition",
+          "expected_behavior": "ContestBond of 1 wei should not affect logic",
+          "actual_behavior": "In _overrideWithHigherProof when contester==address(0), reward = ts.validityBond >> 1. The contestBond=1 is only used for gas savings and doesn't affect the reward calculation since it's only relevant when contester != address(0).",
+          "risk_level": "low",
+          "exploitation_potential": "None - the contestBond=1 sentinel is properly handled"
+        },
+        {
+          "scenario": "Proving window calculated with lastUnpausedAt after unpause",
+          "expected_behavior": "Proving window should restart from unpause time to be fair to assigned prover",
+          "actual_behavior": "_checkProverPermission uses max(ts.timestamp, lastUnpausedAt) + provingWindow*60. This correctly extends the window after an unpause, preventing unfairness.",
+          "risk_level": "low",
+          "exploitation_potential": "None"
+        },
+        {
+          "scenario": "SgxVerifier._replaceInstance does not update addressRegistered for newInstance",
+          "expected_behavior": "New instance address should be registered to prevent reuse across different instance IDs",
+          "actual_behavior": "addressRegistered[newInstance] is never set to true during replacement. This means a newInstance address could later be used in registerInstance() to get a separate instance ID, bypassing the uniqueness check.",
+          "risk_level": "medium",
+          "exploitation_potential": "An SGX enclave could register the same address under multiple instance IDs through key rotation followed by re-attestation, potentially allowing proof replay across different IDs"
+        },
+        {
+          "scenario": "Contest bond reward calculation leaves funds stuck in contract",
+          "expected_behavior": "All bond funds should be distributed or explicitly burned",
+          "actual_behavior": "When a higher-tier proof resolves a contest: reward is 1/4 of loser's bond, paid to winner. The remaining 3/4 stays in the TaikoL1 contract. When overriding without contest: reward is 1/2 of previous validityBond, with the other 1/2 staying in contract. These retained funds are effectively burned/locked.",
+          "risk_level": "medium",
+          "exploitation_potential": "Not directly exploitable, but TKO tokens accumulate in the contract without a recovery mechanism. The livenessBond check in proposeBlock only checks delta, so accumulated tokens don't interfere."
+        },
+        {
+          "scenario": "ETH deposit ring buffer overflow via fee deposits",
+          "expected_behavior": "Fee deposits should not overwrite unprocessed user deposits",
+          "actual_behavior": "In processDeposits, the fee deposit is written to slot numEthDeposits % ethDepositRingBufferSize and numEthDeposits is incremented. canDepositEthToL2 checks numEthDeposits - nextEthDepositToProcess < ethDepositRingBufferSize - 1. However fee deposits increment numEthDeposits without the same capacity check, potentially allowing the pending count to reach ethDepositRingBufferSize-1 and blocking user deposits.",
+          "risk_level": "low",
+          "exploitation_potential": "Fee deposits are only created during block proposals which are rate-limited; unlikely to cause overflow"
+        },
+        {
+          "scenario": "TaikoTimelockController admin bypasses minimum delay",
+          "expected_behavior": "Timelock should enforce minimum delay for all operations",
+          "actual_behavior": "getMinDelay returns 0 for accounts with TIMELOCK_ADMIN_ROLE. This allows admin to execute operations immediately, bypassing the timelock protection entirely.",
+          "risk_level": "high",
+          "exploitation_potential": "If admin role is compromised, attacker can execute governance actions without any delay, negating the purpose of the timelock"
+        },
+        {
+          "scenario": "Hook receives all contract ETH balance including other proposers' deposits",
+          "expected_behavior": "Hook should only receive the proposer's msg.value",
+          "actual_behavior": "proposeBlock sends address(this).balance to hooks. Since TaikoL1 has receive() that accepts ETH during nonReentrant calls, and depositEtherToL2 forwards to bridge, the balance should normally only contain the proposer's msg.value. But if any ETH is sent to the contract via other mechanisms (e.g., selfdestruct), hooks would receive that too.",
+          "risk_level": "low",
+          "exploitation_potential": "Limited - receive() restricts incoming ETH to reentrant context, and depositEtherToL2 forwards to bridge"
+        },
+        {
+          "scenario": "Assigned prover submits proof at tier 0 which is invalid",
+          "expected_behavior": "Tier 0 proofs should not be accepted",
+          "actual_behavior": "LibProving checks _proof.tier == 0 and reverts with L1_INVALID_TIER. Correctly handled.",
+          "risk_level": "low",
+          "exploitation_potential": "None"
+        },
+        {
+          "scenario": "Guardian proof approval hash doesn't include proof.data",
+          "expected_behavior": "All guardians should agree on exact same proof data",
+          "actual_behavior": "In GuardianProver.approve(), hash = keccak256(abi.encode(_meta, _tran)). The _proof parameter is not included in the hash. The last guardian to trigger the threshold determines the actual proof.data passed to TaikoL1. If proof.data contains RETURN_LIVENESS_BOND magic value, one guardian could trigger liveness bond return that others didn't approve.",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious guardian who triggers the threshold could pass different proof.data than what other guardians intended, specifically to trigger RETURN_LIVENESS_BOND"
+        },
+        {
+          "scenario": "verifyBlocks called with _maxBlocksToVerify = 0",
+          "expected_behavior": "Should be a no-op",
+          "actual_behavior": "Returns immediately. Correct behavior.",
+          "risk_level": "low",
+          "exploitation_potential": "None"
+        },
+        {
+          "scenario": "Multiple blocks proposed in same L1 transaction share same blobhash(0)",
+          "expected_behavior": "Each block should have distinct blob data",
+          "actual_behavior": "If proposeBlock is called multiple times in same transaction (e.g., via multicall), they share the same blob. This is documented but could lead to identical L2 blocks.",
+          "risk_level": "medium",
+          "exploitation_potential": "Proposer could deliberately create duplicate L2 blocks sharing same blob data"
+        }
+      ],
+      "assumption_violations": [
+        "TKO token is assumed to not have fee-on-transfer behavior - the livenessBond balance check in proposeBlock would fail if fees are taken",
+        "External verifier contracts are assumed to be correctly implemented and non-malicious",
+        "Tier provider is assumed to return consistent and valid tier configurations",
+        "SignalService is assumed to correctly implement cross-chain data syncing",
+        "ECDSA.recover is assumed to always return address(0) for invalid signatures (OpenZeppelin implementation does revert on some malformed inputs)",
+        "block.prevrandao is assumed to provide sufficient randomness for tier selection - validators could potentially influence this",
+        "EIP-4844 blobhash opcode is assumed to be available on deployment chain"
+      ],
+      "game_theory_risks": [
+        "Assigned prover can intentionally not prove, losing livenessBond but potentially profiting if prover fee > livenessBond/2 (half goes to actual prover)",
+        "Contesting is relatively cheap (loss only 1/4 of contestBond) compared to potential gains, encouraging speculative contesting",
+        "Guardian provers have ultimate power with zero bonds - collusion among minGuardians can override any proof",
+        "Proposers can grief provers by proposing blocks with manipulated parameters that make proving difficult/impossible",
+        "Block proposer controls coinbase parameter which receives ERC20 prover fees - mismatch between msg.sender and meta.coinbase in fee routing"
+      ],
+      "integration_risks": [
+        "Dependency on external tier_provider contract for tier configurations - if misconfigured, could break proving",
+        "Dependency on external verifier contracts - if verifier is compromised, invalid proofs accepted",
+        "SignalService integration for cross-chain state syncing - if compromised, cross-chain bridge security affected",
+        "AddressManager is single point of failure for all named address resolutions",
+        "UUPS proxy pattern - incorrect upgrade could brick the contract",
+        "automata_dcap_attestation dependency for SGX remote attestation - if service unavailable, no new SGX instances"
+      ],
+      "calculation_errors": [
+        "In _overrideWithHigherProof: when contester==address(0) and !sameTransition, reward = validityBond >> 1 and contestations += 1. But this path means a higher-tier proof is overriding without a formal contest, and the original prover loses half their bond. The new prover's net cost is max(0, validityBond - reward) = validityBond - validityBond/2 = validityBond/2, which is correctly less than full validityBond.",
+        "In verifyBlocks: bondToReturn = validityBond + livenessBond. If prover != assignedProver: bondToReturn -= livenessBond >> 1. The assigned prover loses livenessBond/2, not the full amount. The other livenessBond/2 is implicitly burned (stays in contract).",
+        "ETH deposit fee calculation: fee = min(ethDepositMaxFee, basefee * ethDepositGas). If basefee is very high, fee is capped at ethDepositMaxFee (0.1 ETH). If deposit amount < fee, fee is capped at deposit amount, potentially leaving zero amount for recipient."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "TKO (TaikoToken)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "snapshot",
+            "mint_burn_restricted",
+            "blacklist_self_transfer"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Custom transfer/transferFrom reject transfers to self (address(this)). Uses ERC20Votes and ERC20Snapshot. Total supply 1B. Owner can burn from any address. LibProving and LibVerifying use raw transfer/transferFrom (not SafeERC20) on TKO, relying on TKO being a known, trusted token.",
+          "evidence_refs": [
+            {
+              "file": "TaikoToken.sol",
+              "lines": [
+                67,
+                82
+              ],
+              "function": "transfer/transferFrom"
+            }
+          ],
+          "confidence": "high"
+        },
+        {
+          "address_or_symbol": "ETH (native)",
+          "behaviors": [],
+          "decimals": 18,
+          "notes": "Used for L1->L2 deposits via depositEtherToL2, proposer hook payments, and tip to block.coinbase. LibAddress.sendEther uses ExcessivelySafeCall with gas limit and return data cap for safety."
+        },
+        {
+          "address_or_symbol": "assignment.feeToken (arbitrary ERC20)",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "Used in AssignmentHook for prover fee payment. SafeERC20.safeTransferFrom is used. Arbitrary ERC20 chosen by prover in assignment - could be fee-on-transfer, rebasing, or malicious. No balance-before-after check performed.",
+          "evidence_refs": [
+            {
+              "file": "AssignmentHook.sol",
+              "lines": [
+                112
+              ],
+              "function": "onBlockProposed"
+            }
+          ],
+          "confidence": "medium"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "sequential_block_verification",
+          "state_vars": [
+            "state.slotB.lastVerifiedBlockId",
+            "blockHash chain"
+          ],
+          "description": "Blocks must be verified sequentially with each verified block's transition having parentHash equal to the previous verified block's blockHash"
+        },
+        {
+          "name": "ring_buffer_no_overwrite",
+          "state_vars": [
+            "state.slotB.numBlocks",
+            "state.slotB.lastVerifiedBlockId",
+            "config.blockMaxProposals"
+          ],
+          "description": "numBlocks - lastVerifiedBlockId <= blockMaxProposals ensures ring buffer doesn't overwrite unverified blocks"
+        },
+        {
+          "name": "liveness_bond_conservation",
+          "state_vars": [
+            "blk.livenessBond",
+            "TKO.balanceOf(TaikoL1)"
+          ],
+          "description": "Each proposed block's livenessBond should be transferred in exactly once and returned/distributed exactly once during verification or via RETURN_LIVENESS_BOND"
+        },
+        {
+          "name": "eth_deposit_ordering",
+          "state_vars": [
+            "state.slotA.numEthDeposits",
+            "state.slotA.nextEthDepositToProcess"
+          ],
+          "description": "nextEthDepositToProcess <= numEthDeposits always holds; deposits are processed in order"
+        },
+        {
+          "name": "transition_tier_monotonic",
+          "state_vars": [
+            "ts.tier",
+            "proof.tier"
+          ],
+          "description": "A transition's tier can only increase or be re-proved at the same tier (with different hash for contesting or top-tier re-proving)"
+        },
+        {
+          "name": "guardian_approval_versioning",
+          "state_vars": [
+            "version",
+            "_approvals[version]"
+          ],
+          "description": "Changing guardian set increments version, invalidating all pending approvals"
+        }
+      ]
+    }
+  }
+}

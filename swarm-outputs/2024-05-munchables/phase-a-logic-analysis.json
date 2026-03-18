@@ -1,0 +1,374 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T21:40:41.775Z",
+    "duration_ms": 264773
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-lock",
+        "source": "User (msg.sender or _tokenOwner)",
+        "path": [
+          "lockOnBehalf/lock entry point",
+          "Modifier checks (notPaused, onlyActiveToken, onlyConfiguredToken, nonReentrant)",
+          "accountManager.getPlayer(_lockRecipient) - verify main account and registration",
+          "Check msg.value or ERC20 allowance",
+          "accountManager.forceHarvest(_lockRecipient)",
+          "Compute NFTs if lockdrop active",
+          "nftOverlord.addReveal if NFTs earned",
+          "ERC20 transferFrom if not ETH",
+          "Update lockedToken storage (remainder, quantity, lastLockTime, unlockTime)",
+          "Update playerSettings.lockDuration"
+        ],
+        "transformations": [
+          "quantity = _quantity + lockedToken.remainder",
+          "remainder = quantity % configuredToken.nftCost",
+          "numberNFTs = (quantity - remainder) / configuredToken.nftCost",
+          "unlockTime = uint32(block.timestamp) + uint32(_lockDuration)"
+        ],
+        "sinks": [
+          "lockedTokens mapping",
+          "playerSettings mapping",
+          "contract ETH/token balance",
+          "nftOverlord state"
+        ],
+        "trust_changes": "User-provided _onBehalfOf is trusted as lock recipient without recipient consent; _lockDuration derived from recipient's stored settings or fallback to lockdrop.minLockDuration",
+        "validation_points": [
+          "Sub-account check via accountManager",
+          "Registration date != 0",
+          "msg.value == _quantity for ETH",
+          "allowance >= _quantity for ERC20",
+          "Lock duration within lockdrop range (only if lockdrop active)"
+        ],
+        "exposure_risks": [
+          "lockedToken state is fully overwritten for unlockTime and lastLockTime on each lock call, including lock-on-behalf"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: lockOnBehalf allows anyone to reset victim's unlockTime by locking tiny/zero amount, extending their lock indefinitely",
+          "Fee-on-transfer tokens: contract records _quantity but receives less, creating accounting surplus for the user on unlock",
+          "Zero quantity lock on ERC20 still updates lastLockTime and unlockTime, enabling zero-cost griefing via lockOnBehalf",
+          "Remainder from previous lockdrop is zeroed if new lock occurs outside lockdrop period"
+        ]
+      },
+      {
+        "flow_id": "DF-02-unlock",
+        "source": "User (msg.sender)",
+        "path": [
+          "unlock entry point with notPaused and nonReentrant",
+          "Check lockedToken.quantity >= _quantity",
+          "Check lockedToken.unlockTime <= block.timestamp",
+          "accountManager.forceHarvest(msg.sender)",
+          "Decrement lockedToken.quantity",
+          "Transfer ETH via .transfer() or ERC20 via .transfer()"
+        ],
+        "transformations": [
+          "lockedToken.quantity -= _quantity"
+        ],
+        "sinks": [
+          "User address (ETH or ERC20 transfer)",
+          "lockedTokens mapping update"
+        ],
+        "trust_changes": "No trust change; msg.sender verified as token owner",
+        "validation_points": [
+          "Sufficient locked balance",
+          "Unlock time expired"
+        ],
+        "exposure_risks": [
+          "ETH sent via .transfer() with 2300 gas stipend may fail for smart contract wallets",
+          "ERC20 .transfer() return value not checked (though OZ ERC20 reverts on failure)"
+        ],
+        "manipulation_risks": [
+          "If fee-on-transfer tokens were locked, user can withdraw recorded _quantity which exceeds actual contract balance eventually leading to last-user-can't-withdraw",
+          "Remainder is not returned on unlock, locked forever if user fully unlocks"
+        ]
+      },
+      {
+        "flow_id": "DF-03-setLockDuration",
+        "source": "User (msg.sender)",
+        "path": [
+          "setLockDuration entry point with notPaused",
+          "Check _duration <= MaxLockDuration",
+          "Set playerSettings.lockDuration",
+          "Iterate all configuredTokenContracts",
+          "For each token with quantity > 0: check new unlockTime not before old unlockTime",
+          "Update unlockTime = lastLockTime + _duration"
+        ],
+        "transformations": [
+          "unlockTime = lastLockTime + uint32(_duration)"
+        ],
+        "sinks": [
+          "playerSettings mapping",
+          "lockedTokens[].unlockTime"
+        ],
+        "trust_changes": "No trust change",
+        "validation_points": [
+          "_duration <= MaxLockDuration",
+          "uint32(block.timestamp) + uint32(_duration) >= existing unlockTime (FLAWED CHECK)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "HIGH: The reduction check compares (block.timestamp + _duration) vs old unlockTime, but the ACTUAL new unlockTime is (lastLockTime + _duration). When significant time has passed since lastLockTime, a small _duration passes the check but sets unlockTime to a past timestamp, enabling early unlock.",
+          "No minimum duration check - user can set duration to 0",
+          "Unbounded iteration over configuredTokenContracts array could cause DOS"
+        ]
+      },
+      {
+        "flow_id": "DF-04-usd-price-governance",
+        "source": "PriceFeed roles (1-5)",
+        "path": [
+          "proposeUSDPrice: proposer creates proposal, auto-approves (approvalsCount=1)",
+          "approveUSDPrice: other operators approve, incrementing approvalsCount",
+          "disapproveUSDPrice: operators disapprove, incrementing disapprovalsCount",
+          "When approvalsCount >= APPROVE_THRESHOLD: _execUSDPriceUpdate called",
+          "_execUSDPriceUpdate: sets usdPrice on all listed token contracts"
+        ],
+        "transformations": [
+          "Single proposedPrice applied to ALL contracts in the proposal",
+          "configuredTokens[tokenContract].usdPrice = proposedPrice"
+        ],
+        "sinks": [
+          "configuredTokens[].usdPrice"
+        ],
+        "trust_changes": "3-of-5 multisig threshold elevates individual feed proposals to executed price updates",
+        "validation_points": [
+          "Role check for all three operations",
+          "Proposal existence checks",
+          "Duplicate approval/disapproval checks via _usdProposalId",
+          "Price matching check in approve/disapprove"
+        ],
+        "exposure_risks": [
+          "USD price directly affects getLockedWeightedValue which determines reward distribution"
+        ],
+        "manipulation_risks": [
+          "HIGH: A disapprover can ALSO approve the same proposal since disapproveUSDPrice only sets disapprovals[msg.sender] but approveUSDPrice only checks approvals[msg.sender]. This means a single operator can inflate both counters.",
+          "MEDIUM: Same price applied to all contracts in proposal - cannot set different prices for different tokens in one proposal, and a malicious proposer could include unrelated tokens",
+          "LOW: With APPROVE_THRESHOLD=1, the proposer's auto-approval should trigger execution but _execUSDPriceUpdate is not called in proposeUSDPrice, requiring 2 approvals minimum regardless of threshold"
+        ]
+      },
+      {
+        "flow_id": "DF-05-weighted-value-calculation",
+        "source": "lockedTokens and configuredTokens storage",
+        "path": [
+          "getLockedWeightedValue called externally",
+          "Iterate all configuredTokenContracts",
+          "For each active token with quantity > 0: compute weighted value",
+          "deltaDecimal = 10^(18 - decimals)",
+          "lockedWeighted += deltaDecimal * quantity * usdPrice / 1e18"
+        ],
+        "transformations": [
+          "Decimal normalization: quantity scaled up by deltaDecimal",
+          "USD conversion: normalized_quantity * usdPrice / 1e18"
+        ],
+        "sinks": [
+          "Return value used by external callers for reward calculation"
+        ],
+        "trust_changes": "Relies on admin-set decimals and multisig-set usdPrice",
+        "validation_points": [
+          "Only active tokens counted",
+          "Implicit: decimals <= 18"
+        ],
+        "exposure_risks": [
+          "If configuredToken.decimals > 18, the subtraction underflows (Solidity 0.8.25 reverts), DOSing the function for all users",
+          "Manipulated usdPrice directly inflates/deflates weighted values"
+        ],
+        "manipulation_risks": [
+          "Admin misconfiguration of decimals can brick the weighted value calculation",
+          "Overflow possible for very large quantities with high usdPrice (deltaDecimal * quantity * usdPrice before division)"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Users lock ERC20 or ETH for a configurable duration to earn schnibbles and NFTs",
+        "Lock duration is per-player, applied globally across all their tokens",
+        "During lockdrop periods, locked amounts earn NFT reveals based on token-specific nftCost",
+        "Tokens can only be unlocked after unlockTime has passed",
+        "USD price updates require 3-of-5 multisig approval",
+        "Only main accounts (not sub-accounts) can lock tokens",
+        "Tokens must be active to lock but can be inactive for unlock"
+      ],
+      "economic_incentives": [
+        "Longer lock durations incentivized by higher schnibble accrual rates (external to this contract)",
+        "NFT rewards proportional to locked amount during lockdrop events",
+        "Remainder from NFT cost division carries forward to next lock during lockdrop"
+      ],
+      "governance_mechanisms": [
+        "5 PriceFeed roles propose/approve/disapprove USD price updates",
+        "APPROVE_THRESHOLD (default 3) approvals needed to execute price update",
+        "DISAPPROVE_THRESHOLD (default 3) disapprovals needed to cancel proposal",
+        "Thresholds configurable by admin only when no proposal is active",
+        "Proposer auto-approves and cannot approve again or disapprove"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "lockOnBehalf with 0 quantity ERC20 token to grief victim's unlock time",
+          "expected_behavior": "Should not modify existing lock parameters for the recipient or should require non-zero amount",
+          "actual_behavior": "unlockTime is reset to block.timestamp + recipient's lockDuration, extending active locks. lastLockTime is reset. Zero-cost for ERC20 tokens (0 amount transferFrom usually succeeds).",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker repeatedly calls lockOnBehalf(token, 0, victim) to indefinitely extend victim's lock, permanently freezing their funds. For ETH locks, costs only 1 wei per extension."
+        },
+        {
+          "scenario": "setLockDuration check uses block.timestamp instead of lastLockTime for new unlockTime comparison",
+          "expected_behavior": "New unlockTime (lastLockTime + newDuration) should never be less than old unlockTime",
+          "actual_behavior": "Check compares (block.timestamp + newDuration) >= old unlockTime, but sets unlockTime = lastLockTime + newDuration. After enough time passes, a small newDuration passes the check yet sets unlockTime to a past date.",
+          "risk_level": "high",
+          "exploitation_potential": "User locks for 90 days. After ~89 days, calls setLockDuration(1 day). Check: (now + 1 day ≈ lockTime + 90 days) >= unlockTime passes. New unlockTime = lockTime + 1 day = 88 days ago. User unlocks immediately, bypassing ~1 day of remaining lock. Severity scales with the ratio between old and new durations."
+        },
+        {
+          "scenario": "PriceFeed operator disapproves then approves the same proposal",
+          "expected_behavior": "An operator should only be able to cast one vote (approve OR disapprove)",
+          "actual_behavior": "disapproveUSDPrice sets disapprovals[sender] = _usdProposalId, but approveUSDPrice only checks approvals[sender]. A disapprover can subsequently approve, incrementing both counts.",
+          "risk_level": "high",
+          "exploitation_potential": "2 colluding operators + proposer can pass any price: proposer auto-approves (1), colluder1 disapproves then approves (approval count 2), colluder2 approves (approval count 3 = threshold). The disapproval was meaningless. Conversely, reaching disapproval threshold becomes harder as disapprovers can switch to approve."
+        },
+        {
+          "scenario": "Fee-on-transfer ERC20 token locked",
+          "expected_behavior": "lockedToken.quantity should reflect actual received amount",
+          "actual_behavior": "lockedToken.quantity += _quantity (the requested amount, not the received amount). For fee-on-transfer tokens, the contract receives less but records the full amount.",
+          "risk_level": "high",
+          "exploitation_potential": "Over time, total recorded quantities exceed actual contract balance. Last users to unlock cannot withdraw their full amounts. Also inflates NFT calculation during lockdrops."
+        },
+        {
+          "scenario": "Locking outside lockdrop period zeroes stored remainder",
+          "expected_behavior": "Remainder from previous lockdrop should be preserved or used in next lockdrop",
+          "actual_behavior": "Variable 'remainder' defaults to 0, and lockedToken.remainder is unconditionally set to this value. Any lock outside lockdrop sets remainder to 0.",
+          "risk_level": "medium",
+          "exploitation_potential": "User loses accumulated remainder tokens toward their next NFT. Small but real value loss."
+        },
+        {
+          "scenario": "configuredToken.decimals set to value > 18",
+          "expected_behavior": "Should be validated or handled gracefully",
+          "actual_behavior": "getLockedWeightedValue computes 10^(18 - decimals) which underflows and reverts, breaking weighted value calculation for ALL users",
+          "risk_level": "medium",
+          "exploitation_potential": "Admin misconfiguration (or malicious admin) DOSes the getLockedWeightedValue function, blocking reward distribution for all players"
+        },
+        {
+          "scenario": "APPROVE_THRESHOLD set to 1",
+          "expected_behavior": "Proposer's auto-approval (count=1) should immediately execute the price update",
+          "actual_behavior": "_execUSDPriceUpdate is only called inside approveUSDPrice, never in proposeUSDPrice. Proposal sits with 1 approval and requires a second operator to call approveUSDPrice.",
+          "risk_level": "low",
+          "exploitation_potential": "Functional bug - threshold semantics don't match implementation. With threshold 1, minimum 2 approvals are still required."
+        },
+        {
+          "scenario": "Rebasing token locked in contract",
+          "expected_behavior": "User should be able to withdraw at least what they locked",
+          "actual_behavior": "If token rebases down, contract balance decreases but lockedToken.quantity is unchanged. Later unlocks may fail due to insufficient balance.",
+          "risk_level": "medium",
+          "exploitation_potential": "For positive rebases, excess tokens are stuck in contract. For negative rebases, last users cannot withdraw."
+        },
+        {
+          "scenario": "Migration manager bypass of NFT minting during lockdrop",
+          "expected_behavior": "Migration locks should not mint NFTs (by design)",
+          "actual_behavior": "When msg.sender == migrationManager, NFT calculation is skipped but remainder is also not calculated, so remainder stays 0",
+          "risk_level": "low",
+          "exploitation_potential": "Migrated users lose any remainder benefit. Minor value loss."
+        },
+        {
+          "scenario": "lockOnBehalf overwrites recipient's playerSettings.lockDuration",
+          "expected_behavior": "Lock on behalf should not modify recipient's personal settings",
+          "actual_behavior": "If recipient's lockDuration is 0, _lock sets it to lockdrop.minLockDuration and saves to playerSettings, overwriting the recipient's implicit preference",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker can force-set a victim's lock duration by being the first to lock on their behalf before the victim sets their own preference"
+        }
+      ],
+      "assumption_violations": [
+        "Assumes all ERC20 tokens transfer exactly _quantity (violated by fee-on-transfer and rebasing tokens)",
+        "Assumes configuredToken.decimals <= 18 (no validation, overflow if violated)",
+        "Assumes lockOnBehalf callers are benevolent (no recipient consent required)",
+        "Assumes block.timestamp fits in uint32 (overflows in 2106)",
+        "Assumes configuredTokenContracts array stays small enough for iteration in setLockDuration",
+        "Assumes ERC20.transfer/transferFrom always revert on failure (not true for non-standard tokens like USDT on some chains)",
+        "Assumes that checking (block.timestamp + duration >= unlockTime) is equivalent to checking (lastLockTime + duration >= unlockTime) - INCORRECT"
+      ],
+      "game_theory_risks": [
+        "Lock-on-behalf griefing: rational adversary can freeze victim funds indefinitely at near-zero cost",
+        "Price feed collusion: 3 of 5 operators can set arbitrary prices, manipulating weighted values and reward distribution",
+        "Disapprove-then-approve voting: reduces effective security of multisig from 3-of-5 to 2-of-5 (proposer + 1 colluder who disapproves then approves + 1 honest approver)",
+        "Lock duration manipulation allows slight early unlock, reducing effective staking security for protocol"
+      ],
+      "integration_risks": [
+        "accountManager.forceHarvest() is called before state updates in _lock - if it calls back into LockManager, state could be inconsistent (mitigated by nonReentrant)",
+        "nftOverlord.addReveal() called before token transfer - if it reverts, lock fails entirely (denial of service vector)",
+        "configStorage dependency - if configStorage returns unexpected values, contract behavior is undefined",
+        "migrationManager address comparison (msg.sender != address(migrationManager)) - if migrationManager is not set, any lock during lockdrop would mint NFTs"
+      ],
+      "calculation_errors": [
+        "setLockDuration: unlockTime = lastLockTime + _duration but check uses block.timestamp + _duration >= old unlockTime. These are not equivalent when block.timestamp >> lastLockTime.",
+        "getLockedWeightedValue: potential overflow in (deltaDecimal * quantity * usdPrice) before the /1e18 division for tokens with large supplies and high prices",
+        "NFT count uses uint16 max check (65535) but nftCost denominated in raw token units may lead to unexpected NFT counts depending on token decimals and nftCost configuration",
+        "approvalsCount and disapprovalsCount can exceed the number of unique operators due to the disapprove-then-approve loophole"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "address(0) [Native ETH]",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Locked via msg.value. Unlocked via payable.transfer() with 2300 gas stipend. No fee-on-transfer concern."
+        },
+        {
+          "address_or_symbol": "Generic ERC20 (configuredTokenContracts[])",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:unknown",
+            "permit:unknown",
+            "non_standard_return"
+          ],
+          "decimals": -1,
+          "notes": "Contract uses raw transfer/transferFrom without SafeERC20. Does not measure actual received amount via balance delta. Tokens with fee-on-transfer, rebasing, or non-standard return values will cause accounting errors. Decimals stored in configuredTokens but not validated <= 18."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "lock_quantity_conservation",
+          "state_vars": [
+            "lockedTokens[player][token].quantity",
+            "contract.balance / IERC20.balanceOf(this)"
+          ],
+          "notes": "VIOLATED for fee-on-transfer tokens: sum of all lockedTokens quantities can exceed actual contract balance"
+        },
+        {
+          "name": "unlock_time_monotonicity",
+          "state_vars": [
+            "lockedTokens[player][token].unlockTime"
+          ],
+          "notes": "VIOLATED: setLockDuration can reduce unlockTime to before lastLockTime + original duration due to flawed check; lockOnBehalf can both extend and (in theory with short recipient duration) reduce unlockTime"
+        },
+        {
+          "name": "vote_exclusivity",
+          "state_vars": [
+            "usdUpdateProposal.approvalsCount",
+            "usdUpdateProposal.disapprovalsCount"
+          ],
+          "notes": "VIOLATED: An operator can disapprove then approve the same proposal, incrementing both counters"
+        },
+        {
+          "name": "remainder_preservation",
+          "state_vars": [
+            "lockedTokens[player][token].remainder"
+          ],
+          "notes": "VIOLATED: Locking outside lockdrop period zeros remainder unconditionally"
+        },
+        {
+          "name": "recipient_settings_sovereignty",
+          "state_vars": [
+            "playerSettings[player].lockDuration"
+          ],
+          "notes": "VIOLATED: lockOnBehalf can overwrite recipient's lockDuration if it was previously 0"
+        }
+      ]
+    }
+  }
+}

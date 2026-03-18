@@ -1,0 +1,385 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "ETH Fallback in _transferOutAndCallV5 Sends Funds to Aggregator Target Instead of User Recipient",
+      "severity": "high",
+      "summary": "When the aggregator's swapOutV5 call fails in the ETH path of _transferOutAndCallV5, the fallback sends ETH to `aggregationPayload.target` (the aggregator contract) instead of `aggregationPayload.recipient` (the intended user). This is a regression from V4's transferOutAndCall which correctly falls back to the recipient (`to`). Any failed aggregator swap results in user ETH being sent to an unintended contract.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 5,
+          "line_end": 5,
+          "desc": "Wrong recipient in fallback: sends to aggregator target instead of user recipient"
+        }
+      ],
+      "impact": "Every failed aggregator swap in the V5 ETH path results in user funds being sent to the aggregator contract instead of the user. Impact severity depends on: (1) frequency of aggregator swap failures (common due to slippage, MEV, liquidity), (2) whether whitelisted aggregators have rescue mechanisms (THORChain_Aggregator does have rescueFunds, but requires owner intervention), (3) volume of ETH-based aggregated swaps. The full msg.value of each failed swap is affected. This is a direct regression from V4 which handled this correctly.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ERC20 Tokens Irrecoverably Lost When Aggregator swapOutV5 Fails in _transferOutAndCallV5",
+      "severity": "high",
+      "summary": "In _transferOutAndCallV5 ERC20 path, tokens are transferred to the aggregator via `transfer()`, then `swapOutV5` is called. If swapOutV5 fails, the return value `_dexAggSuccess` is completely ignored and no fallback exists. Tokens remain stranded at the aggregator with no router-side recovery mechanism. The transaction succeeds and emits events as if the operation completed.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 20,
+          "line_end": 20,
+          "desc": "Unchecked return value after token transfer; no recovery on failure"
+        }
+      ],
+      "impact": "HIGH impact. Any ERC20 aggregated swap where the aggregator's swapOutV5 fails results in complete loss of the swapped amount for the user. The vault allowance is decremented (cannot retry), tokens are at the aggregator (not recoverable by the router), and the event signals completion to Bifrost. Recovery requires aggregator cooperation via rescueFunds or similar. For whitelisted aggregators this may be recoverable via their owner, but the code itself has no recovery mechanism. This affects all users receiving ERC20 via cross-chain aggregated swaps whenever the final-mile swap fails.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Aggregator swapIn Deposits Entire Contract ETH Balance Including Pre-existing Funds",
+      "severity": "high",
+      "summary": "In THORChain_Aggregator.swapIn, after the DEX swap, `_safeAmount = address(this).balance` captures the entire ETH balance of the aggregator contract, not just the output of the current swap. Any pre-existing ETH (from direct sends, failed operations, or other sources) is attributed to the current caller's deposit. An attacker can steal any ETH sitting in the aggregator by calling swapIn with minimal tokens.",
+      "description": [
+        {
+          "file": "THORChain_Aggregator.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Uses total contract balance instead of swap output delta"
+        },
+        {
+          "file": "AvaxAggregator.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: swapIn"
+        }
+      ],
+      "impact": "MEDIUM-HIGH severity. The financial impact depends on how much ETH/AVAX accumulates in the aggregator. Sources include: (1) direct sends via receive(), (2) failed _transferOutAndCallV5 ETH fallbacks that send to the aggregator target instead of the recipient (confirmed separate bug in THORChain_Router), (3) any other mechanism that sends native tokens to the aggregator. The AvaxAggregator is more vulnerable because it lacks a rescueFunds function, meaning accumulated AVAX has no authorized recovery path and can only exit through swapIn. THORChain_Aggregator has owner-controlled rescueFunds, but between rescue operations, any swapIn caller can sweep the balance.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AvaxAggregator swapIn safeApprove Reverts on Non-Zero to Non-Zero Approval",
+      "severity": "high",
+      "summary": "AvaxAggregator uses OpenZeppelin's SafeERC20.safeApprove which reverts if the current allowance is non-zero and the new value is also non-zero. If a previous swapIn left a stale approval (e.g., due to fee-on-transfer where _safeAmount < amount, leaving leftover approval), subsequent swapIn calls for the same token will revert permanently.",
+      "description": [
+        {
+          "file": "AvaxAggregator.sol",
+          "line_start": 20,
+          "line_end": 20,
+          "desc": "OZ safeApprove reverts on non-zero to non-zero; stale approval from fee-on-transfer tokens"
+        }
+      ],
+      "impact": "MEDIUM severity. Permanent DoS of swapIn for any fee-on-transfer token after the first successful swap. All users attempting to swap that token through AvaxAggregator will have their transactions revert. Recovery requires redeploying the aggregator contract since there is no owner rescue function that could reset the approval (AvaxAggregator has no owner/admin). The contract has no rescueFunds or approve-reset function. The financial impact is denial of service rather than direct fund loss.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AvaxRouter deposit() Is Public, Bypassing Expiry Protection",
+      "severity": "high",
+      "summary": "AvaxRouter's deposit() function is public, unlike THORChain_Router where _deposit is private (only accessible through depositWithExpiry). Users or contracts calling deposit() directly on AvaxRouter bypass the expiration check, allowing stale transactions to execute at unfavorable times. THORChain_Router V5 deliberately made _deposit private to enforce expiry.",
+      "description": [
+        {
+          "file": "AvaxRouter.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Public deposit function bypasses expiration enforcement"
+        }
+      ],
+      "impact": "Medium severity. Users calling deposit() directly on AvaxRouter have no protection against stale transactions. This is particularly dangerous during volatile market conditions or network congestion on Avalanche. While sophisticated users may always use depositWithExpiry, the public deposit() function creates an unnecessary attack surface that THORChain_Router V5 deliberately eliminated by making _deposit private. The EvilCallback.sol test contract demonstrates that external contracts do call deposit() directly, confirming real-world usage patterns.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Any account can spoof vault-originated TransferAllowance events with ETH asset (amount=0), potentially confusing off-chain observers and cross-chain accounting",
+      "severity": "high",
+      "summary": "Because transferAllowance() has no vault whitelist/on-chain auth and allows asset==address(0) with amount==0, any EOA can emit TransferAllowance events that appear to originate from a THORChain vault rotation flow. If Bifrost/THORNode off-chain logic relies on the event stream (or memo parsing) without strictly authenticating msg.sender as an active vault, an attacker can inject misleading churn/allowance-move signals.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 115,
+          "line_end": 133,
+          "desc": "transferAllowance() external nonReentrant; if router==this calls _adjustAllowances; emits TransferAllowance(msg.sender,...). No vault whitelist; amount can be 0; asset can be address(0)"
+        }
+      ],
+      "impact": "On-chain impact: None — no state changes with amount=0. Off-chain impact: Potentially HIGH if Bifrost event parsers do not strictly validate msg.sender against the active vault set before acting on TransferAllowance events. Could cause operational confusion, false churn signals, or accounting errors in cross-chain state. The TransferAllowance event is specifically used for vault rotation (churn) operations, making it a high-signal event in THORChain's architecture.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Reentrancy-adjacent cross-contract call risk: THORChain_Aggregator.rescueFunds uses low-level transfer without return-value decoding, enabling silent failure for non-standard ERC20s",
+      "severity": "high",
+      "summary": "rescueFunds() performs a low-level call to token.transfer(destination,amount) and only checks the call-level success boolean, not decoding a returned boolean. For ERC20 tokens that return false (without reverting) on failure, rescueFunds may report success even though no tokens moved. This can strand funds and create inconsistent operational assumptions during incident response.",
+      "description": [
+        {
+          "file": "THORChain_Aggregator.sol",
+          "line_start": 63,
+          "line_end": 79,
+          "desc": "asset.call(abi.encodeWithSignature('transfer(address,uint256)',destination,amount)); require(success,'Transfer failed'); does not decode return bool"
+        },
+        {
+          "file": "THORChain_Failing_Aggregator.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: rescueFunds(address,uint256,address)"
+        }
+      ],
+      "impact": "Medium severity. The defect affects an admin emergency recovery function. For tokens that return false on failure (a known ERC20 non-standard behavior pattern), rescue operations would silently fail. This could prolong stuck-fund incidents and cause incorrect reconciliation during incident response. The impact is limited by: (1) only affects non-standard tokens, (2) only affects the rescue path, and (3) can be caught by post-transaction balance verification.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permissionless swapOutV5 Allows Draining ERC20 Tokens Stuck in Aggregator",
+      "severity": "high",
+      "summary": "THORChain_Aggregator.swapOutV5 is public with no access control. When called with fromAsset != address(0), it approves the swapRouter to spend fromAmount of fromAsset from the aggregator's own balance, then calls swapExactTokensForETH. Any ERC20 tokens stuck in the aggregator (from failed V5 ERC20 swaps per ECON-H002, or any other source) can be drained by anyone calling swapOutV5 with the stuck token as fromAsset and themselves as recipient.",
+      "description": [
+        {
+          "file": "THORChain_Aggregator.sol",
+          "line_start": 115,
+          "line_end": 145,
+          "desc": "No access control; safeApprove(fromAsset, swapRouter, fromAmount) approves aggregator's own tokens; low-level .call makes aggregator the msg.sender for swapRouter"
+        }
+      ],
+      "impact": "HIGH - Any ERC20 tokens that end up in the aggregator contract (from failed V5 ERC20 swaps, accidental transfers, or any other mechanism) can be immediately drained by any external caller. The rescueFunds function exists as an owner-only recovery mechanism, but it can be front-run by an attacker's swapOutV5 call. This directly violates the intended custody model where only the owner should be able to recover stuck funds.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "batchTransferOutAndCallV5 Reuses msg.value for Each ETH Aggregation Call, Enabling Double-Spend or Revert",
+      "severity": "high",
+      "summary": "In batchTransferOutAndCallV5, each _transferOutAndCallV5 call for ETH (fromAsset == address(0)) uses msg.value as the value sent to the aggregator. If a batch contains N ETH-based entries, the first call sends all msg.value; subsequent calls attempt to send msg.value again, either draining pre-existing router ETH or causing cascading fallback failures.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 268,
+          "line_end": 290,
+          "desc": "_transferOutAndCallV5 uses msg.value in target.call{value: msg.value} inside a loop; msg.value is constant per transaction"
+        }
+      ],
+      "impact": "CRITICAL: Any batch containing more than one ETH-based aggregation entry will revert entirely, blocking all outbound transfers in that batch including unrelated ERC20 transfers. Additionally, if the router accumulates ETH from other operations, subsequent ETH entries can drain those funds to unrelated aggregators. The mismatch between msg.value and fromAmount also means even single ETH entries may receive incorrect amounts.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AvaxAggregator Has No Owner or Rescue Function — Stuck Funds Permanently Lost",
+      "severity": "high",
+      "summary": "AvaxAggregator has no owner, no rescueFunds function, and no mechanism to recover stuck tokens or AVAX. Unlike THORChain_Aggregator which has owner + rescueFunds, any assets stuck in AvaxAggregator (from failed swaps, direct sends, etc.) are permanently irrecoverable.",
+      "description": [
+        {
+          "file": "AvaxAggregator.sol",
+          "line_start": 1,
+          "line_end": 100,
+          "desc": "No owner variable, no rescueFunds function, no withdrawal mechanism; has receive() payable accepting arbitrary AVAX"
+        }
+      ],
+      "impact": "MEDIUM severity. Any ERC20 tokens stuck in AvaxAggregator are permanently irrecoverable — there is no function to extract them and no admin role exists. For AVAX, the swapIn balance sweep provides incidental but improper recovery (it credits stuck AVAX to the wrong user). Over time, cumulative stuck value can become significant. This is a clear deficiency compared to THORChain_Aggregator which has identical operational patterns but includes proper rescue capabilities.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Arbitrary ETH Drain via transferOutV5 and batchTransferOutV5",
+      "severity": "high",
+      "summary": "In `THORChain_Router.sol`, the `_transferOutV5` function uses `transferOutPayload.amount` instead of `msg.value` when transferring ETH. Because `transferOutV5` and `batchTransferOutV5` are public and lack access control or validation that `msg.value == amount`, any attacker can call these functions with `amount` set to the router's entire ETH balance and `msg.value` set to 0, completely draining the router's ETH.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 164,
+          "line_end": 165,
+          "desc": "bool success = transferOutPayload.to.send(transferOutPayload.amount);"
+        }
+      ],
+      "impact": "CRITICAL: Any ETH held by the THORChain_Router contract can be drained by any external address. This includes ETH from: (1) msg.value surpluses from batch operations, (2) operational ETH residuals, (3) deliberate deposits. While the THORChain router design intends for ETH to be transient (forwarded immediately), the V5 code defect means any ETH that does accumulate — even temporarily within a batch call — is at risk. The batchTransferOutV5 function processes items sequentially, so ETH from msg.value sits in the contract between iterations and could theoretically be exploited if combined with other issues.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Phishing Vulnerability via tx.origin in ETH_RUNE transferTo",
+      "severity": "high",
+      "summary": "The `transferTo` function in `ETH_RUNE` uses `tx.origin` instead of `msg.sender` to determine the source of funds. This allows any intermediate contract called by a user to drain their entire ETH_RUNE balance without requiring an explicit ERC20 approval.",
+      "description": [
+        {
+          "file": "eth_rune.sol",
+          "line_start": 136,
+          "line_end": 139,
+          "desc": "_transfer(tx.origin, recipient, amount);"
+        }
+      ],
+      "impact": "CRITICAL. Any user holding ETH_RUNE tokens who interacts with an untrusted contract can have their entire balance stolen in a single transaction. The vulnerability bypasses the entire ERC20 allowance model. Recovery is impossible as transfers are final. The contract comments explicitly state it is 'intended only to be a transitionary asset' and acknowledges the phishing risk, but no mitigation is implemented. The attack cost is essentially zero (only gas for deploying the malicious contract), while the potential gain is the victim's entire ETH_RUNE balance.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permissionless ETH transferOut Allows Event Spoofing",
+      "severity": "high",
+      "summary": "`transferOut` is public and payable. Anyone can call it with `asset == address(0)` and emit a `TransferOut` event with themselves as the `vault`. If Bifrost does not strictly validate the `vault` address against an active validator list, attackers can spoof outbound transfers.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 136,
+          "line_end": 144,
+          "desc": "Public function with no access control allows anyone to emit TransferOut for ETH"
+        }
+      ],
+      "impact": "The on-chain defect is real: missing access control on transferOut's ETH path allows event spoofing. The actual impact depends on whether Bifrost validates the vault address in TransferOut events against the active vault set. If Bifrost does validate (which is likely given THORChain's maturity), the impact is negligible. If not, it could lead to state corruption on THORChain L1, potentially enabling double-spend or unlocking funds. The on-chain code has a missing safeguard regardless of off-chain mitigation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AvaxRouter.returnVaultAssets AVAX Send Failure Reverts Entire Token Migration",
+      "severity": "high",
+      "summary": "In returnVaultAssets, AVAX is sent to asgard via `asgard.send(msg.value)` with a hard `require(success)` AFTER all ERC20 allowance adjustments. If the new asgard address cannot receive AVAX (e.g., it's a contract without a receive function, or gas limit of 2300 is insufficient), the entire transaction reverts, rolling back all ERC20 allowance transfers. This blocks the entire vault migration, not just the AVAX component.",
+      "description": [
+        {
+          "file": "AvaxRouter.sol",
+          "line_start": 160,
+          "line_end": 180,
+          "desc": "require(success) after asgard.send(msg.value) reverts all prior ERC20 _adjustAllowances"
+        }
+      ],
+      "impact": "HIGH - If triggered, this defect blocks the entire vault rotation (churn) process. All ERC20 tokens in the old vault cannot be migrated to the new asgard. This affects all users with funds in the rotating vault and could leave the protocol in a degraded state where old vaults remain active longer than intended. The defect exists in both AvaxRouter.sol and THORChain_Router.sol.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "THORChain_Aggregator safeApprove Residual Causes Permanent swapIn DoS for USDT-Like Tokens",
+      "severity": "high",
+      "summary": "THORChain_Aggregator.swapIn calls safeApprove(token, swapRouter, amount) using the original `amount` parameter, not `_safeAmount` (balance-diff). For fee-on-transfer tokens, _safeAmount < amount, and the DEX swap uses _safeAmount, leaving a residual approval of (amount - _safeAmount). If the token requires approve(0) before non-zero approve (like USDT), subsequent swapIn calls permanently revert because safeApprove doesn't reset to 0 first.",
+      "description": [
+        {
+          "file": "THORChain_Aggregator.sol",
+          "line_start": 76,
+          "line_end": 78,
+          "desc": "safeApprove(token, address(swapRouter), amount) uses `amount` not `_safeAmount`; no zero-reset before approve"
+        }
+      ],
+      "impact": "Permanent denial of service for swapIn on affected token. Once the first swapIn creates a residual approval, all subsequent swapIn calls for that token through the aggregator will revert. The only remediation is redeploying the aggregator contract. This blocks the cross-chain swap-in functionality for the affected token pair. The owner's rescueFunds function cannot fix the approval issue as it only handles token/ETH transfers, not approval resets.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Router _routerDeposit safeApprove Incompatible with USDT Approve Race Protection",
+      "severity": "high",
+      "summary": "The _routerDeposit function calls safeApprove(asset, router, amount) without first resetting the approval to 0. USDT's approve() function requires the current allowance to be 0 before setting a new non-zero value. If any stale allowance exists (from a partially failed previous migration or deliberate griefing), USDT migration via _routerDeposit will permanently revert, blocking vault churn for USDT.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Missing approve(0) before approve(amount) for USDT compatibility"
+        }
+      ],
+      "impact": "The impact is a denial-of-service for USDT vault migration via _routerDeposit. If any stale allowance exists from router to new router for USDT, all subsequent migration attempts for USDT will fail permanently. This could strand USDT funds in the old router during vault churn, requiring deployment of a new migration mechanism. The severity is HIGH for USDT specifically, as vault churn is a critical protocol operation. The defect is also present in AvaxRouter.sol for any AVAX-chain tokens with the same approve pattern.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Permissionless Event Spoofing via Dust Deposits Tricks Bifrost Observation",
+      "severity": "high",
+      "summary": "Any address can call depositWithExpiry to emit Deposit events with arbitrary vault addresses and memos for minimal cost. For ETH deposits, sending 1 wei emits a legitimate Deposit event. For ERC20 deposits, any token with approval emits the event. If Bifrost's log parser doesn't strictly validate minimum thresholds, vault whitelist, and memo semantics, crafted events could trigger unintended cross-chain actions or create noise disrupting observation.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Permissionless event emission with arbitrary parameters"
+        }
+      ],
+      "impact": "The on-chain code defect is the complete absence of input validation on deposit parameters. Impact depends on Bifrost's off-chain filtering: (1) If Bifrost has robust minimum thresholds per asset, the spoofed events are filtered - but the code still wastes Bifrost parsing resources. (2) If Bifrost lacks adequate filtering, spoofed events could trigger unintended cross-chain state transitions. (3) Log flooding could hit max_contract_tx_logs limits, causing legitimate deposits in the same block to be missed. The code-level defect is confirmed regardless of off-chain mitigation effectiveness.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Outbound Queue Blocking via Reverting Fallback in transferOut",
+      "severity": "high",
+      "summary": "In transferOut for ETH/AVAX, if the send to the recipient fails, the router bounces funds back to the vault using .transfer(). If the vault is a smart contract that consumes >2300 gas on receive(), the bounce-back reverts, causing the entire transaction to revert and blocking the outbound queue.",
+      "description": [
+        {
+          "file": "AvaxRouter.sol",
+          "line_start": 122,
+          "line_end": 140,
+          "desc": "payable(address(msg.sender)).transfer(safeAmount) used for fallback"
+        }
+      ],
+      "impact": "No impact. The outbound queue cannot be blocked by this mechanism. The code correctly handles the case where the recipient cannot receive ETH by bouncing funds back to the vault (EOA). The transaction succeeds and the outbound is marked as processed.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Fee-on-Transfer Tokens Cause Accounting Discrepancy in Outbound Transfers",
+      "severity": "high",
+      "summary": "When transferOutV5 is called for a fee-on-transfer token, the router transfers 'amount' to the recipient, who receives 'amount - fee'. However, the TransferOut event emits the full 'amount'. Bifrost observes this event and records that the full amount was delivered, creating an accounting discrepancy.",
+      "description": [
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 142,
+          "line_end": 168,
+          "desc": "Emits TransferOut with transferOutPayload.amount instead of actual transferred amount"
+        }
+      ],
+      "impact": "MEDIUM severity. The code contains a real defect in asymmetric fee-on-transfer handling between inbound (correct) and outbound (incorrect) paths. Impact materializes when fee-on-transfer tokens are used. The vault's allowance is decremented by the full amount, meaning the router's actual token balance decreases by the full amount (sent) minus only what the fee-on-transfer mechanism retains in the router (which is 0 - the fee goes to the token owner). This means allowance and actual balance stay in sync at the router level, but the event emitted misrepresents what the user received, causing Bifrost to record incorrect delivery amounts.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Router-to-router migration can be hijacked by malicious external router via approval + depositWithExpiry call chain",
+      "severity": "high",
+      "summary": "THORChain_Router.transferAllowance/returnVaultAssets allow forwarding assets to an arbitrary `router` address (when router != address(this)) by calling safeApprove(asset, router, amount) and then calling iROUTER(router).depositWithExpiry(...). If the destination `router` is malicious (or not the intended upgraded router), it can use the approval to pull tokens directly and miscredit/never credit the intended vault allowance on the new router, causing permanent loss or mis-accounting.",
+      "description": [
+        {
+          "file": "ethereum/contracts/THORChain_Router.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "safeApprove(_asset, _router, _amount); iROUTER(_router).depositWithExpiry(...) with untrusted _router"
+        },
+        {
+          "file": "THORChain_Router.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: transferAllowance"
+        }
+      ],
+      "impact": "If a vault operator is tricked or misconfigured to use a malicious router address during migration, all ERC20 tokens being migrated can be stolen. The vault allowance is properly decremented (so no double-spend within the old router), but the tokens go to the attacker. Impact is HIGH because it affects all tokens being migrated and recovery is impossible once tokens are transferred to the attacker. However, the attack requires operational error or social engineering of vault operators.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Aggregator swapOut (V4) uses fixed max deadline enabling execution far after intended timing (slippage protections become stale)",
+      "severity": "high",
+      "summary": "THORChain_Aggregator.swapOut sets deadline to type(uint).max when calling swapRouter.swapExactETHForTokens, meaning the trade can execute regardless of time. This undermines the operational intent of expiring orders and may increase harm from delayed execution (even without public mempool).",
+      "description": [
+        {
+          "file": "ethereum/contracts/THORChain_Aggregator.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "swapExactETHForTokens{value: msg.value}(..., type(uint).max)"
+        },
+        {
+          "file": "THORChain_Aggregator.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: swapOut"
+        }
+      ],
+      "impact": "The practical impact is negligible. amountOutMin provides the primary protection against unfavorable execution. The deadline is a secondary protection that prevents execution of stale transactions, but in the THORChain outbound flow, the nodes control transaction submission timing. If a transaction gets stuck, it would need to meet the amountOutMin requirement regardless of when it executes, providing adequate protection.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

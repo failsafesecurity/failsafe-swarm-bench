@@ -1,0 +1,242 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T21:36:06.852Z",
+    "duration_ms": 211180
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Tokenomics Admin",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "changeTokenomicsParameters",
+          "changeIncentiveFractions",
+          "changeStakingParams",
+          "changeTokenomicsImplementation"
+        ],
+        "failure_modes": [
+          "Admin sets extreme tokenomics parameters causing inflation overflow or zero emissions"
+        ],
+        "attack_vectors": [
+          "Compromised admin key could redirect emissions or halt tokenomics"
+        ]
+      },
+      {
+        "boundary": "Cross-Chain Bridge Relayers",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "receiveMessage",
+          "receiveWormholeMessages",
+          "onTokenBridged"
+        ],
+        "failure_modes": [
+          "Bridge failure or censorship preventing L2 from receiving emissions",
+          "Bridge compromise allowing forged messages to mint/distribute unbacked tokens"
+        ],
+        "attack_vectors": [
+          "Spoofing message sender if bridge validation is bypassed"
+        ]
+      },
+      {
+        "boundary": "Service Staking Activity Checker",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "checkpoint",
+          "stake"
+        ],
+        "failure_modes": [
+          "Activity checker returns false data, causing active services to be evicted or inactive services to receive rewards"
+        ],
+        "attack_vectors": [
+          "Service operators artificially inflating multisig nonces to game the liveness ratio without performing useful work"
+        ]
+      },
+      {
+        "boundary": "veOLAS Voters",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "voteForNomineeWeights",
+          "voteForNomineeWeightsBatch"
+        ],
+        "failure_modes": [
+          "Voters collude to direct all emissions to a single malicious staking contract"
+        ],
+        "attack_vectors": [
+          "Flash loan attacks on veOLAS (mitigated by lock times and WEIGHT_VOTE_DELAY)"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Epoch N",
+        "to_state": "Epoch N+1",
+        "trigger": "Tokenomics.checkpoint()",
+        "conditions": [
+          "Time passed since last epoch end >= epochLen",
+          "Not called in the same block as a service donation"
+        ],
+        "invariants": [
+          "epochCounter strictly increases",
+          "effectiveBond correctly accumulates leftovers"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Service Staked",
+        "to_state": "Service Evicted",
+        "trigger": "StakingBase.checkpoint()",
+        "conditions": [
+          "Service inactivity > maxInactivityDuration"
+        ],
+        "invariants": [
+          "Service is removed from setServiceIds",
+          "ServiceInfo retains reward balance for future unstake"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Nominee Active",
+        "to_state": "Nominee Removed",
+        "trigger": "VoteWeighting.removeNominee()",
+        "conditions": [
+          "Caller is owner",
+          "Nominee exists"
+        ],
+        "invariants": [
+          "Nominee weight is set to 0",
+          "Total pointsSum is reduced by nominee weight"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Invariant Broken",
+        "locations": [
+          "VoteWeighting.sol: removeNominee(bytes32,uint256)"
+        ],
+        "severity": "critical",
+        "evidence": "In `removeNominee`, `pointsSum[nextTime].bias` is updated to `newSum`, but `pointsSum[nextTime].slope` is not updated to remove the slope of the removed nominee. If `pointsSum[nextTime]` was uninitialized by `_getSum()`, its slope becomes 0, wiping out the slope of all other active nominees. If it was initialized, it retains the removed nominee's slope, causing `pointsSum` to decay faster than the actual sum of weights.",
+        "exploitation_method": "When an admin calls `removeNominee` to remove a deprecated staking target, it inadvertently corrupts the global `pointsSum` slope. As a result, the total weight sum will either stop decaying or decay too fast, breaking the relative weight calculations (`nomineeRelativeWeight`) for all other active nominees and disrupting the entire emission distribution system.",
+        "affected_assets": [
+          "OLAS emissions",
+          "Voting Power allocations"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (DoS)",
+        "locations": [
+          "Tokenomics.sol: checkpoint()"
+        ],
+        "severity": "low",
+        "evidence": "The `checkpoint()` function contains the condition `if (diffNumSeconds < curEpochLen || diffNumSeconds > MAX_EPOCH_LENGTH) { return false; }`. If `checkpoint()` is not called for a duration exceeding `MAX_EPOCH_LENGTH` (364 days), it will permanently return false.",
+        "exploitation_method": "If the protocol is abandoned or transactions are censored for over a year, the tokenomics contract becomes permanently bricked as epochs can no longer be advanced. While highly unlikely under normal operation, it represents a strict state transition failure mode.",
+        "affected_assets": [
+          "Protocol Tokenomics",
+          "Future Epoch Emissions"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Tokenomics.sol",
+          "function": "changeTokenomicsParameters(uint256,uint256,uint256,uint256,uint256)",
+          "guards": [
+            "OwnerOnly"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes take effect in the next epoch"
+        },
+        {
+          "contract": "Tokenomics.sol",
+          "function": "changeIncentiveFractions(uint256,uint256,uint256,uint256,uint256,uint256)",
+          "guards": [
+            "OwnerOnly"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes take effect in the next epoch"
+        },
+        {
+          "contract": "Dispenser.sol",
+          "function": "setDepositProcessorChainIds(address[],uint256[])",
+          "guards": [
+            "OwnerOnly"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "VoteWeighting.sol",
+          "function": "removeNominee(bytes32,uint256)",
+          "guards": [
+            "OwnerOnly"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Contains critical logic bug affecting pointsSum slope"
+        },
+        {
+          "contract": "DefaultTargetDispenserL2.sol",
+          "function": "migrate(address)",
+          "guards": [
+            "OwnerOnly"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Permanently locks the contract and transfers all OLAS"
+        },
+        {
+          "contract": "StakingVerifier.sol",
+          "function": "setImplementationsStatuses(address[],bool[],bool)",
+          "guards": [
+            "OwnerOnly"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_zero",
+          "call_sites": [
+            {
+              "file": "StakingActivityChecker.sol",
+              "lines": "38-41",
+              "function": "getMultisigNonces"
+            }
+          ],
+          "compositional_usage": [
+            "Liveness Ratio Calculation"
+          ]
+        }
+      ]
+    }
+  }
+}

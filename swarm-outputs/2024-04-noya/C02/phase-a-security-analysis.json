@@ -1,0 +1,315 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T04:50:33.817Z",
+    "duration_ms": 121003
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin/Maintainer Roles",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "addVault",
+          "changeVaultAddresses",
+          "addConnector",
+          "updateConnectorTrustedTokens",
+          "addTrustedPosition",
+          "removeTrustedPosition",
+          "updateMinimumHealthFactor",
+          "addRoutes"
+        ],
+        "failure_modes": [
+          "Compromised admin key could add malicious connectors or routes",
+          "Incorrect configuration could lock vault funds"
+        ],
+        "attack_vectors": [
+          "Privilege escalation",
+          "Governance takeover"
+        ]
+      },
+      {
+        "boundary": "Keeper/Manager Multisig",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "execute",
+          "swapHoldings",
+          "transferPositionToAnotherConnector",
+          "openPosition",
+          "decreasePosition",
+          "borrow",
+          "repay"
+        ],
+        "failure_modes": [
+          "Keeper executes unprofitable trades",
+          "Keeper interacts with unverified external contracts via flashloans"
+        ],
+        "attack_vectors": [
+          "Multisig compromise",
+          "Replay attacks (mitigated by nonce/EIP712)"
+        ]
+      },
+      {
+        "boundary": "External DeFi Protocols & Oracles",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "_getPositionTVL",
+          "getTVL"
+        ],
+        "failure_modes": [
+          "Spot price manipulation inflates/deflates TVL",
+          "External protocol insolvency causes underflow in TVL calculation"
+        ],
+        "attack_vectors": [
+          "Flash loan price manipulation",
+          "Read-only reentrancy"
+        ]
+      },
+      {
+        "boundary": "Cross-chain Messaging (LayerZero)",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "_lzReceive",
+          "updateTVL"
+        ],
+        "failure_modes": [
+          "Stale TVL updates due to relayer delays",
+          "Message spoofing if endpoint validation is bypassed"
+        ],
+        "attack_vectors": [
+          "Cross-chain replay attacks",
+          "Exploiting TVL desync between chains"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Uninitialized Position",
+        "to_state": "Active Holding Position",
+        "trigger": "updateHoldingPosition (index == 0)",
+        "conditions": [
+          "Position must be trusted",
+          "Max holding positions limit not reached"
+        ],
+        "invariants": [
+          "isPositionUsed maps to correct holdingPositions index",
+          "Index 0 is reserved for dummy position"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Active Holding Position",
+        "to_state": "Removed Position",
+        "trigger": "updateHoldingPosition (removePosition == true)",
+        "conditions": [
+          "Position balance must be zero or dust level"
+        ],
+        "invariants": [
+          "Array length decreases by 1",
+          "Swapped element's index is updated in isPositionUsed mapping"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Pending Bridge Transaction",
+        "to_state": "Executed Bridge Transaction",
+        "trigger": "startBridgeTransaction",
+        "conditions": [
+          "Transaction must be approved",
+          "BRIDGE_TXN_WAITING_TIME must have passed"
+        ],
+        "invariants": [
+          "Approval mapping is cleared after execution"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Arithmetic Underflow in TVL Calculation (DoS)",
+        "locations": [
+          "AaveConnector.sol:_getPositionTVL",
+          "CompoundConnector.sol:_getPositionTVL",
+          "PrismaConnector.sol:_getPositionTVL",
+          "Dolomite.sol:_getPositionTVL",
+          "SiloConnector.sol:_getPositionTVL"
+        ],
+        "severity": "high",
+        "evidence": "Connectors calculate TVL by subtracting debt from collateral (e.g., `return totalCollateral - totalDebt;`). If debt exceeds collateral due to interest accrual or price drops, the subtraction underflows, reverting the transaction.",
+        "exploitation_method": "An underwater position will cause `TVLHelper.getTVL()` to revert entirely, freezing all vault deposits, withdrawals, and management fee calculations.",
+        "affected_assets": [
+          "All vault assets (Systemic DoS)"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Stuck Native ETH / Missing Payable Forwarding",
+        "locations": [
+          "GenericSwapAndBridgeHandler.sol:executeSwap",
+          "GenericSwapAndBridgeHandler.sol:executeBridge"
+        ],
+        "severity": "high",
+        "evidence": "The functions are marked `payable` but make external calls to `performSwapAction` and `performBridgeAction` without forwarding `msg.value` (e.g., missing `{value: msg.value}`).",
+        "exploitation_method": "When native ETH is sent to execute a swap or bridge, it remains stuck in the `GenericSwapAndBridgeHandler` contract because the external call forwards 0 ETH. There is no mechanism to rescue these stuck native funds.",
+        "affected_assets": [
+          "Native ETH used for swaps/bridges"
+        ]
+      },
+      {
+        "swc_id": "SWC-111",
+        "pattern": "Oracle Manipulation via Spot Price / Reserves",
+        "locations": [
+          "UNIv3Connector.sol:_getPositionTVL",
+          "CamelotConnector.sol:_getPositionTVL",
+          "PancakeswapConnector.sol"
+        ],
+        "severity": "high",
+        "evidence": "`UNIv3Connector` uses `pool.slot0()` (spot price) to calculate liquidity amounts. `CamelotConnector` uses `getReserves()` to calculate LP token value.",
+        "exploitation_method": "An attacker can use a flash loan to heavily skew the Uniswap V3 or Camelot pool. This artificially inflates the reported TVL of the LP position. The attacker can then mint vault shares at an inflated TVL or withdraw at a manipulated share price.",
+        "affected_assets": [
+          "Vault Base Tokens",
+          "LP Positions"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Empty Implementation / Missing Logic",
+        "locations": [
+          "Watchers.sol:verifyRemoveLiquidity"
+        ],
+        "severity": "medium",
+        "evidence": "The `verifyRemoveLiquidity` function is completely empty. It is called by `BaseConnector.sendTokensToTrustedAddress` to verify withdrawals.",
+        "exploitation_method": "The Watcher mechanism is intended to monitor and revert suspicious liquidity removals. Because it is empty, any liquidity removal requested by the accounting manager automatically succeeds, bypassing the intended security guardrail.",
+        "affected_assets": [
+          "Vault Liquidity"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Registry.sol",
+          "function": "addVault(uint256,address,address,address,address,address,address,address,address,address[])",
+          "guards": [
+            "onlyRole(MAINTAINER_ROLE)"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Maintainer role is intended to be a timelock"
+        },
+        {
+          "contract": "Registry.sol",
+          "function": "addTrustedPosition(uint256,uint256,address,bool,bool,bytes,bytes)",
+          "guards": [
+            "onlyVaultMaintainerWithoutTimeLock"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        },
+        {
+          "contract": "GenericSwapAndBridgeHandler.sol",
+          "function": "addRoutes(RouteData[])",
+          "guards": [
+            "onlyMaintainer"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Adds allowed swap/bridge routes"
+        },
+        {
+          "contract": "BaseConnector.sol",
+          "function": "updateMinimumHealthFactor(uint256)",
+          "guards": [
+            "onlyMaintainer"
+          ],
+          "has_timelock": true,
+          "cancel_window_sec": 0,
+          "notes": "Updates safety margin for borrowing"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "UNIv3Connector.sol",
+              "lines": "130-135",
+              "function": "_getPositionTVL"
+            }
+          ],
+          "compositional_usage": [
+            "Spot Price (slot0)"
+          ]
+        },
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "CamelotConnector.sol",
+              "lines": "70-75",
+              "function": "_getPositionTVL"
+            }
+          ],
+          "compositional_usage": [
+            "Spot Reserves (getReserves)"
+          ]
+        },
+        {
+          "source": "Chainlink",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "CompoundConnector.sol",
+              "lines": "80-90",
+              "function": "getCollBlanace"
+            }
+          ],
+          "compositional_usage": [
+            "comet.getPrice"
+          ]
+        },
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "BaseConnector.sol",
+              "lines": "200-210",
+              "function": "_getValue"
+            }
+          ],
+          "compositional_usage": [
+            "INoyaValueOracle"
+          ]
+        }
+      ]
+    }
+  }
+}

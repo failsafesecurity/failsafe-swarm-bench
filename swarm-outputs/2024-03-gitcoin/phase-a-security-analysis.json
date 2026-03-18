@@ -1,0 +1,289 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T00:17:20.808Z",
+    "duration_ms": 115760
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin/Upgrade",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "initialize",
+          "_authorizeUpgrade"
+        ],
+        "failure_modes": [
+          "Malicious contract upgrade",
+          "Incorrect role assignment"
+        ],
+        "attack_vectors": [
+          "Compromised admin key leading to complete protocol takeover"
+        ]
+      },
+      {
+        "boundary": "Slasher Operations",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "slash"
+        ],
+        "failure_modes": [
+          "Slashing innocent users",
+          "Incorrect slash percentage",
+          "Indefinite delay of burn via repeated slashing"
+        ],
+        "attack_vectors": [
+          "Compromised slasher key",
+          "Griefing users by slashing 100% of their stakes"
+        ]
+      },
+      {
+        "boundary": "Releaser Operations",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "release"
+        ],
+        "failure_modes": [
+          "Releasing funds to the wrong user",
+          "Releasing funds from the wrong round"
+        ],
+        "attack_vectors": [
+          "Compromised releaser key restoring funds to malicious actors"
+        ]
+      },
+      {
+        "boundary": "User Staking",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "selfStake",
+          "extendSelfStake",
+          "withdrawSelfStake",
+          "communityStake",
+          "extendCommunityStake",
+          "withdrawCommunityStake",
+          "lockAndBurn"
+        ],
+        "failure_modes": [
+          "Underflow on withdrawal due to state inconsistency",
+          "Front-running slashes"
+        ],
+        "attack_vectors": [
+          "Front-running slash transactions to withdraw unlocked funds before they are slashed"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unstaked",
+        "to_state": "Staked",
+        "trigger": "selfStake / communityStake",
+        "conditions": [
+          "amount > 0",
+          "duration between 12 and 104 weeks",
+          "unlockTime >= existing unlockTime",
+          "contract not paused"
+        ],
+        "invariants": [
+          "userTotalStaked increases by amount",
+          "contract token balance increases by amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Staked",
+        "to_state": "Withdrawn",
+        "trigger": "withdrawSelfStake / withdrawCommunityStake",
+        "conditions": [
+          "block.timestamp >= unlockTime",
+          "amount <= staked amount",
+          "contract not paused"
+        ],
+        "invariants": [
+          "userTotalStaked decreases by amount",
+          "contract token balance decreases by amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Staked",
+        "to_state": "Slashed",
+        "trigger": "slash",
+        "conditions": [
+          "caller has SLASHER_ROLE",
+          "percent between 1 and 100",
+          "contract not paused"
+        ],
+        "invariants": [
+          "stake amount decreases",
+          "slashedAmount increases",
+          "userTotalStaked decreases",
+          "totalSlashed for round increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Slashed",
+        "to_state": "Released",
+        "trigger": "release",
+        "conditions": [
+          "caller has RELEASER_ROLE",
+          "slashRound >= currentSlashRound - 1",
+          "amountToRelease <= slashedAmount",
+          "contract not paused"
+        ],
+        "invariants": [
+          "slashedAmount decreases",
+          "stake amount increases",
+          "totalSlashed for round decreases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Round N",
+        "to_state": "Round N+1",
+        "trigger": "lockAndBurn",
+        "conditions": [
+          "block.timestamp - lastBurnTimestamp >= burnRoundMinimumDuration",
+          "contract not paused"
+        ],
+        "invariants": [
+          "currentSlashRound increments",
+          "lastBurnTimestamp updates",
+          "totalSlashed[currentSlashRound - 1] transferred to burnAddress"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-131",
+        "pattern": "State Inconsistency / Integer Underflow",
+        "locations": [
+          "IdentityStaking.sol: release()",
+          "IdentityStaking.sol: withdrawSelfStake()",
+          "IdentityStaking.sol: withdrawCommunityStake()"
+        ],
+        "severity": "critical",
+        "evidence": "In the `release` function, `amount` is restored but `userTotalStaked` is not updated. When the user later calls `withdrawSelfStake` or `withdrawCommunityStake`, the line `userTotalStaked[msg.sender] -= amount` will underflow and revert, permanently locking the released funds in the contract.",
+        "exploitation_method": "A user who has been slashed and subsequently released will be unable to withdraw their funds once the lock period expires, as the withdrawal transaction will revert due to an arithmetic underflow.",
+        "affected_assets": [
+          "User staked GTC tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Transaction Order Dependence (Front-Running)",
+        "locations": [
+          "IdentityStaking.sol: slash()",
+          "IdentityStaking.sol: withdrawSelfStake()",
+          "IdentityStaking.sol: withdrawCommunityStake()"
+        ],
+        "severity": "medium",
+        "evidence": "Unlocked stakes are still subject to slashing. However, there is no mechanism to prevent a user from withdrawing their unlocked stake when they see a pending `slash` transaction in the mempool.",
+        "exploitation_method": "A malicious user monitors the mempool for `slash` transactions targeting their address. If their stake is unlocked, they front-run the `slash` with a `withdraw` transaction, successfully escaping the penalty.",
+        "affected_assets": [
+          "Protocol slashing mechanism / GTC tokens meant to be slashed"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / State Manipulation",
+        "locations": [
+          "IdentityStaking.sol: slash()"
+        ],
+        "severity": "low",
+        "evidence": "In `slash()`, if `sStake.slashedInRound == currentSlashRound - 1`, the previous slash amount is moved to `currentSlashRound`. This allows a slasher to indefinitely delay the burning of a user's slashed funds by repeatedly slashing them in subsequent rounds.",
+        "exploitation_method": "A slasher can call `slash` on a user who already has a pending slash from the previous round. Even if the user's remaining balance is 0, the slash will roll over the pending `slashedAmount` to the new round, resetting the appeal/burn timer.",
+        "affected_assets": [
+          "Slashed GTC tokens pending burn"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "IdentityStaking.sol",
+          "function": "initialize(address,address,address,address[],address[])",
+          "guards": [
+            "initializer"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets initial roles and parameters"
+        },
+        {
+          "contract": "IdentityStaking.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyRole(PAUSER_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Pauses contract operations"
+        },
+        {
+          "contract": "IdentityStaking.sol",
+          "function": "unpause()",
+          "guards": [
+            "onlyRole(PAUSER_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Unpauses contract operations"
+        },
+        {
+          "contract": "IdentityStaking.sol",
+          "function": "_authorizeUpgrade(address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Authorizes UUPS proxy upgrade"
+        },
+        {
+          "contract": "IdentityStaking.sol",
+          "function": "slash(address[],address[],address[],uint88)",
+          "guards": [
+            "onlyRole(SLASHER_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Slashes user stakes"
+        },
+        {
+          "contract": "IdentityStaking.sol",
+          "function": "release(address,address,uint88,uint16)",
+          "guards": [
+            "onlyRole(RELEASER_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Releases slashed funds back to users"
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

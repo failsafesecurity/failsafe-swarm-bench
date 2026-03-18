@@ -1,0 +1,458 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T03:18:41.954Z",
+    "duration_ms": 201062
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-APPLICATION-LIFECYCLE",
+        "source": "User (proposeAgent caller)",
+        "path": [
+          "User approves assetToken to Factory",
+          "proposeAgent transfers applicationThreshold from user",
+          "Application stored in _applications mapping",
+          "executeApplication or withdraw called",
+          "On execute: tokens deployed, LP created, NFT minted, TBA created",
+          "On withdraw: assetToken returned to proposer"
+        ],
+        "transformations": [
+          "applicationThreshold stored as withdrawableAmount",
+          "withdrawableAmount used as initial LP liquidity"
+        ],
+        "sinks": [
+          "AgentToken contract (initial liquidity)",
+          "Proposer address (on withdraw)",
+          "Uniswap LP pool"
+        ],
+        "trust_changes": "User funds held by factory with no timelock; proposer or WITHDRAW_ROLE can execute/withdraw",
+        "validation_points": [
+          "Balance/allowance check in proposeAgent",
+          "Status == Active check in execute/withdraw"
+        ],
+        "exposure_risks": [
+          "WITHDRAW_ROLE can execute or withdraw any application regardless of proposer intent"
+        ],
+        "manipulation_risks": [
+          "WITHDRAW_ROLE holder can front-run proposer's withdraw with executeApplication, converting their deposit into LP without consent"
+        ]
+      },
+      {
+        "flow_id": "DF-002-TAX-AUTOSWAP",
+        "source": "Uniswap buy/sell transaction",
+        "path": [
+          "transfer/transferFrom called with LP address involvement",
+          "_transfer detects applyTax = true",
+          "_taxProcessing computes tax and accumulates to contract balance + projectTaxPendingSwap",
+          "_autoSwap checks threshold and swaps accumulated tax tokens to pairToken via Uniswap",
+          "Swap proceeds sent directly to projectTaxRecipient"
+        ],
+        "transformations": [
+          "sentAmount * taxBasisPoints / 10000 = tax",
+          "tax cast to uint128 and added to projectTaxPendingSwap",
+          "swapBalance capped at swapThreshold * MAX_SWAP_THRESHOLD_MULTIPLE"
+        ],
+        "sinks": [
+          "projectTaxRecipient receives swapped pairToken"
+        ],
+        "trust_changes": "Tax recipient set by owner/factory; no validation of recipient address",
+        "validation_points": [
+          "_eligibleForSwap checks threshold, no autoswap in progress, not from LP/router"
+        ],
+        "exposure_risks": [
+          "amountOutMin = 0 in swap allows full sandwich attack extraction",
+          "Failed swap silently caught, tax tokens accumulate indefinitely"
+        ],
+        "manipulation_risks": [
+          "MEV bots can sandwich the autoswap getting 100% of swap value as slippage",
+          "Owner can change projectTaxRecipient to divert accumulated tax tokens",
+          "Owner can set tax rates arbitrarily high with no maximum check in setProjectTaxRates"
+        ]
+      },
+      {
+        "flow_id": "DF-003-TOKEN-MINT-SUPPLY",
+        "source": "AgentToken.initialize via Factory",
+        "path": [
+          "supplyParams decoded (maxSupply, lpSupply, vaultSupply)",
+          "_processSupplyParams validates maxSupply == lpSupply + vaultSupply",
+          "_mintBalances mints lpSupply to address(this), vaultSupply to vault",
+          "_mint casts amount to uint128 for _totalSupply"
+        ],
+        "transformations": [
+          "lpSupply * 10**18 = lpMint_",
+          "vaultSupply * 10**18 = vaultMint_",
+          "_totalSupply += uint128(amount)"
+        ],
+        "sinks": [
+          "AgentToken contract balance (LP tokens)",
+          "vault address (vault tokens)"
+        ],
+        "trust_changes": "Factory is trusted to provide correct supply params",
+        "validation_points": [
+          "maxSupply <= type(uint128).max check",
+          "maxSupply == lpSupply + vaultSupply check"
+        ],
+        "exposure_risks": [
+          "uint128 truncation in _mint if amount exceeds uint128 despite check"
+        ],
+        "manipulation_risks": [
+          "Admin controls _tokenSupplyParams and can set arbitrary values for new tokens"
+        ]
+      },
+      {
+        "flow_id": "DF-004-VESTAKING-DELEGATION",
+        "source": "User calling AgentVeToken.stake",
+        "path": [
+          "User approves assetToken (LP token) to VeToken",
+          "stake transfers LP from sender to VeToken contract",
+          "_mint creates veToken for receiver",
+          "_delegate sets receiver's delegate to delegatee",
+          "_balanceCheckpoints updated",
+          "addValidator called on AgentNft for delegatee"
+        ],
+        "transformations": [
+          "LP tokens 1:1 minted as veTokens",
+          "Delegation overrides any previous delegation entirely"
+        ],
+        "sinks": [
+          "VeToken contract holds LP tokens",
+          "Receiver gets veTokens (non-transferable)",
+          "Delegatee gets voting power"
+        ],
+        "trust_changes": "Anyone can register as validator via public addValidator on AgentNftV2",
+        "validation_points": [
+          "canStake || totalSupply() == 0",
+          "!isBlacklisted check",
+          "balance/allowance checks"
+        ],
+        "exposure_risks": [
+          "Re-staking overrides delegation for ENTIRE balance, not just new amount",
+          "Public addValidator allows anyone to become validator"
+        ],
+        "manipulation_risks": [
+          "Attacker can call addValidator on AgentNftV2 to register as validator without staking",
+          "First staker's initialLock locks founder's tokens until maturity"
+        ]
+      },
+      {
+        "flow_id": "DF-005-CUSTOM-TOKEN-APPLICATION-V4",
+        "source": "User calling initFromToken on AgentFactoryV4",
+        "path": [
+          "User provides external ERC20 token address and initialLP amount",
+          "Factory checks _tokenApplication[tokenAddr] == 0 (sentinel value check)",
+          "Transfers initialLP of custom token and applicationThreshold of assetToken",
+          "On execute: creates Uniswap pair, adds liquidity with both tokens",
+          "On withdraw: returns assetToken and ALL of that custom token balance in factory"
+        ],
+        "transformations": [
+          "_tokenApplication[tokenAddr] = id maps token to application ID",
+          "Custom token liquidity paired with assetToken on Uniswap"
+        ],
+        "sinks": [
+          "Uniswap pair (LP)",
+          "Proposer (on withdraw)"
+        ],
+        "trust_changes": "isCompatibleToken only checks basic ERC20 interface, not behavior",
+        "validation_points": [
+          "_tokenApplication[tokenAddr] == 0",
+          "isCompatibleToken basic interface check"
+        ],
+        "exposure_risks": [
+          "Sentinel value 0 collision with potential application ID 0",
+          "withdraw sends entire factory balance of custom token, not just deposited amount"
+        ],
+        "manipulation_risks": [
+          "Malicious token with hooks could reenter during safeTransferFrom",
+          "If _nextId starts at 0, first application ID is 0, making _tokenApplication mapping check unreliable"
+        ]
+      },
+      {
+        "flow_id": "DF-006-AGENT-MIGRATION",
+        "source": "Founder calling AgentMigrator.migrateAgent",
+        "path": [
+          "Founder transfers initialAmount of assetToken to new token contract",
+          "New AgentToken, VeToken, and DAO deployed",
+          "AgentNft.migrateVirtual updates on-chain records",
+          "LP tokens staked via VeToken"
+        ],
+        "transformations": [
+          "Old DAO voting params copied to new DAO",
+          "New token/LP/veToken addresses set"
+        ],
+        "sinks": [
+          "New AgentToken (LP liquidity)",
+          "New VeToken (staked LP)",
+          "AgentNft (updated records)"
+        ],
+        "trust_changes": "migrateVirtual requires ADMIN_ROLE on AgentNft; AgentMigrator must have this role",
+        "validation_points": [
+          "founder == _msgSender()",
+          "!migratedAgents[id]"
+        ],
+        "exposure_risks": [
+          "Uses raw transferFrom instead of safeTransferFrom for assetToken",
+          "Owner can reset migration flag and re-migrate"
+        ],
+        "manipulation_risks": [
+          "Owner can call reset() to allow re-migration, potentially creating duplicate agent infrastructure"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Applications require applicationThreshold deposit of assetToken",
+        "Applications can be executed (creating agent infrastructure) or withdrawn (returning deposit)",
+        "AgentTokens have buy/sell tax collected and auto-swapped via Uniswap",
+        "VeTokens are non-transferable and represent staked LP positions with delegation",
+        "Founder's initial stake is locked until maturity (matureAt timestamp)",
+        "Each agent has NFT, DAO, Token, VeToken, TBA, and LP pool",
+        "Validators are registered per-virtualId with ELO-based scoring"
+      ],
+      "economic_incentives": [
+        "Application threshold acts as spam prevention and provides initial liquidity",
+        "Tax on buy/sell funds the project tax recipient (treasury/creator/TBA)",
+        "Staking LP tokens gives governance power through VeToken delegation",
+        "Validators earn score based on DAO participation (proposal voting)"
+      ],
+      "governance_mechanisms": [
+        "Agent DAO governs agent metadata and core types",
+        "VeToken holders delegate to validators who vote on proposals",
+        "DAO can set new DAO address via setDAO",
+        "Validator scores combine base score (from initial registration) + DAO participation score"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "AgentToken tax processing uses unchecked block with uint128 cast for projectTaxPendingSwap",
+          "expected_behavior": "Tax amounts should accurately accumulate",
+          "actual_behavior": "If projectTax exceeds uint128.max (practically unlikely but theoretically possible with high supply and high tax), silent truncation occurs. More realistically, accumulated projectTaxPendingSwap can overflow uint128 over many transactions in the unchecked block",
+          "risk_level": "medium",
+          "exploitation_potential": "With very high volume and tax rates, projectTaxPendingSwap could silently wrap around uint128, causing accounting desync between actual contract balance and tracked pending swap amount"
+        },
+        {
+          "scenario": "AgentNftV2.addValidator has no access control",
+          "expected_behavior": "Only stakers who delegate to a validator should register them",
+          "actual_behavior": "Anyone can call addValidator(virtualId, anyAddress) to register any address as a validator for any agent",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker registers many addresses as validators, diluting validator scores and manipulating totalUptimeScore. Since _initValidatorScore grants base score equal to totalProposals at registration time, registering after many proposals gives free score"
+        },
+        {
+          "scenario": "AgentToken.setProjectTaxRates has no maximum or monotonicity enforcement",
+          "expected_behavior": "Comment says 'subject to only ever decreasing' - tax rates should only decrease",
+          "actual_behavior": "Owner or factory can set any uint16 value including increasing rates up to 65535 basis points (655%)",
+          "risk_level": "high",
+          "exploitation_potential": "Owner/factory can set sell tax to 100% (10000 BP) or higher, effectively stealing all tokens from sellers. Tax above 100% would cause underflow in unchecked block"
+        },
+        {
+          "scenario": "AgentFactoryV4 sentinel value collision for _tokenApplication mapping",
+          "expected_behavior": "_tokenApplication[addr] == 0 should reliably indicate no application exists",
+          "actual_behavior": "If _nextId is initialized to 0, the first application gets ID 0, making _tokenApplication[tokenAddr] = 0 indistinguishable from 'no application'",
+          "risk_level": "medium",
+          "exploitation_potential": "Could allow the same token to be registered twice if first application has ID 0, or prevent proper cleanup on withdrawal"
+        },
+        {
+          "scenario": "AgentToken autoswap with amountOutMin = 0",
+          "expected_behavior": "Tax swaps should receive fair market value",
+          "actual_behavior": "swapExactTokensForTokensSupportingFeeOnTransferTokens called with amountOutMin=0, accepting any output amount",
+          "risk_level": "high",
+          "exploitation_potential": "MEV bots can sandwich every autoswap transaction, front-running to manipulate price, then back-running to capture the price difference. All accumulated tax value can be extracted"
+        },
+        {
+          "scenario": "AgentFactoryV2 uses IERC20.transfer instead of SafeERC20.safeTransfer",
+          "expected_behavior": "Transfer should be verified for success",
+          "actual_behavior": "IERC20(assetToken).transfer(token, initialAmount) does not use SafeERC20 wrapper",
+          "risk_level": "medium",
+          "exploitation_potential": "If assetToken is a non-standard ERC20 that returns false instead of reverting on failure, the transfer would silently fail and executeApplication would proceed with no initial liquidity"
+        },
+        {
+          "scenario": "AgentFactoryV4.withdraw transfers entire factory balance of custom token",
+          "expected_behavior": "Should return only the amount deposited by the withdrawer",
+          "actual_behavior": "IERC20(customToken).safeTransfer(application.proposer, IERC20(customToken).balanceOf(address(this))) sends ALL tokens of that type held by the factory",
+          "risk_level": "medium",
+          "exploitation_potential": "If custom tokens arrive at the factory through other means (airdrops, direct transfers, dust), the withdrawer receives all of them. Also, if factory holds other legitimate custom token balances for other operations, they would be drained"
+        },
+        {
+          "scenario": "AgentVeToken.stake delegation overrides entire balance delegation",
+          "expected_behavior": "Additional stakes should allow split delegation or additive behavior",
+          "actual_behavior": "_delegate(receiver, delegatee) replaces delegation for the ENTIRE receiver balance, not just the newly staked amount",
+          "risk_level": "medium",
+          "exploitation_potential": "A user who has staked and delegated to validator A, then stakes 1 wei and delegates to validator B, moves their entire voting power from A to B instantly"
+        },
+        {
+          "scenario": "AgentNftV2.setDAO can set DAO to address(0)",
+          "expected_behavior": "DAO should always be a valid governance contract",
+          "actual_behavior": "No validation on newDAO address; setting to address(0) permanently locks governance since onlyVirtualDAO modifier would require msg.sender == address(0)",
+          "risk_level": "medium",
+          "exploitation_potential": "Malicious DAO proposal could set DAO to address(0), permanently disabling governance for that agent"
+        },
+        {
+          "scenario": "AgentToken.distributeTaxTokens callable by anyone",
+          "expected_behavior": "Controlled distribution of tax tokens",
+          "actual_behavior": "Any address can call distributeTaxTokens to force direct transfer of pending tax tokens instead of swap",
+          "risk_level": "low",
+          "exploitation_potential": "Could be used to avoid the Uniswap swap step, sending raw agent tokens to projectTaxRecipient instead of converted pairToken. May disrupt expected revenue flow"
+        },
+        {
+          "scenario": "botProtectionDurationInSeconds is stored but never enforced",
+          "expected_behavior": "Bot protection should restrict early trading after funding",
+          "actual_behavior": "The variable is set in initialize but never referenced in transfer logic or any other function",
+          "risk_level": "medium",
+          "exploitation_potential": "Bots can freely trade immediately after initial liquidity is added, sniping the launch with no protection"
+        },
+        {
+          "scenario": "Tax rate can exceed BP_DENOM (10000) causing underflow in unchecked block",
+          "expected_behavior": "Tax should be a fraction of the transaction amount",
+          "actual_behavior": "If projectSellTaxBasisPoints is set > 10000, tax = (sentAmount_ * projectSellTaxBasisPoints) / BP_DENOM would exceed sentAmount_. In the unchecked block, amountLessTax_ -= tax would underflow to a huge number",
+          "risk_level": "high",
+          "exploitation_potential": "Owner sets tax > 100%, sells trigger underflow making amountLessTax_ extremely large, potentially draining the contract or causing massive token inflation to receiver"
+        },
+        {
+          "scenario": "ValidatorRegistry.totalUptimeScore has unbounded loop",
+          "expected_behavior": "Should return sum of all validator scores",
+          "actual_behavior": "Iterates over all validators for a virtualId; with many validators (from public addValidator) this can exceed block gas limit",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker registers thousands of validators via public addValidator, making totalUptimeScore and any functions depending on it revert due to gas limits"
+        }
+      ],
+      "assumption_violations": [
+        "Tax rates assumed to be <= BP_DENOM (10000) but not enforced in setProjectTaxRates",
+        "Application IDs assumed to be non-zero for sentinel value checks in V4 but _nextId can start at 0",
+        "addValidator in AgentNftV2 assumed to only be called by staking flow but is public with no access control",
+        "botProtectionDurationInSeconds assumed to provide protection but is never used",
+        "AssetToken assumed to be standard ERC20 but V2 factory uses raw transfer instead of SafeERC20",
+        "_totalSupply assumed to fit uint128 but _balances are uint256, creating potential accounting mismatch",
+        "Autoswap assumes fair market execution but uses 0 slippage protection"
+      ],
+      "game_theory_risks": [
+        "MEV extraction on every tax autoswap due to zero slippage protection - systematic value extraction from all token holders",
+        "Owner/factory can change tax rates and recipient at any time, effectively a centralized rug-pull vector",
+        "Anyone can grief totalUptimeScore by registering thousands of dummy validators via public addValidator",
+        "WITHDRAW_ROLE can execute applications without proposer consent, forcing proposer's funds into LP",
+        "Validator score gaming: register as validator after many proposals to get high base score for free",
+        "Delegation override on re-stake allows instant voting power reallocation without unstaking",
+        "distributeTaxTokens can be called by anyone to bypass Uniswap swap, sending raw tokens to tax recipient"
+      ],
+      "integration_risks": [
+        "Uniswap V2 router interaction in autoswap has no slippage protection (amountOutMin = 0)",
+        "ERC6551 TBA creation depends on external registry; if implementation is malicious, TBA could be compromised",
+        "Clone-based deployment (Clones.clone) creates minimal proxies that cannot be upgraded individually",
+        "Uniswap pair creation in _createPair checks getPair == address(0) but race condition possible if pair created externally between check and create",
+        "AgentToken approves Uniswap router for type(uint256).max - infinite approval persists even if router is compromised",
+        "Fee-on-transfer tokens used as pairToken would cause addLiquidity accounting discrepancies"
+      ],
+      "calculation_errors": [
+        "AgentToken._mint: _totalSupply += uint128(amount) silently truncates amounts exceeding uint128, while _balances[account] += amount uses full uint256",
+        "AgentToken._burn: _totalSupply -= uint128(amount) could underflow differently than expected if balance tracking diverged from supply",
+        "AgentToken._taxProcessing: entire block is unchecked; amountLessTax_ -= tax can underflow if tax > sentAmount_ (possible with tax BP > 10000)",
+        "AgentToken._swapTax: proportional reduction formula projectTaxPendingSwap -= uint128((projectTaxPendingSwap * swapBalance_) / contractBalance_) may lose precision and leave dust in projectTaxPendingSwap",
+        "_initValidatorScore sets base score to totalProposals at registration time, giving late-registering validators an unfair advantage equal to all past proposals"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "AgentToken",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted",
+            "pausable:false"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "fee",
+          "accounting_model": "balanceOf",
+          "notes": "Custom ERC20 with buy/sell tax via liquidity pool detection. Tax tokens auto-swapped to pairToken. Unchecked arithmetic in tax processing. _totalSupply uses uint128 but _balances use uint256. botProtectionDurationInSeconds set but never enforced."
+        },
+        {
+          "address_or_symbol": "AgentVeToken",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "non_transferable",
+            "snapshot"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "Non-transferable vote-escrowed token. transfer/transferFrom/approve all revert. 1:1 minting from LP staking. Delegation checkpointed via AddressCheckpoints. Founder has initialLock until maturity."
+        },
+        {
+          "address_or_symbol": "VIRTUAL (assetToken)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "External base currency token used for application deposits and LP pairing. V2 factory uses raw IERC20.transfer (unsafe). V3/V4 use SafeERC20."
+        },
+        {
+          "address_or_symbol": "UniswapV2Pair (LP)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true"
+          ],
+          "decimals": 18,
+          "notes": "Standard Uniswap V2 LP token. Used as staking asset for AgentVeToken. Raw IERC20.transfer used in _addInitialLiquidity."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation_agent_token",
+          "state_vars": [
+            "_totalSupply (uint128)",
+            "sum(_balances) (uint256)"
+          ],
+          "notes": "BROKEN: _totalSupply uses uint128 cast while _balances use uint256. If minted amounts are large, totalSupply could be truncated while balances are accurate, breaking conservation."
+        },
+        {
+          "name": "application_status_finality",
+          "state_vars": [
+            "application.status"
+          ],
+          "notes": "Application should transition Active -> Executed or Active -> Withdrawn exactly once. Enforced by status check."
+        },
+        {
+          "name": "tax_accounting",
+          "state_vars": [
+            "projectTaxPendingSwap",
+            "balanceOf(address(this))"
+          ],
+          "notes": "projectTaxPendingSwap should be <= balanceOf(address(this)). Possible desync due to uint128 truncation in accumulation and precision loss in proportional reduction during partial swaps."
+        },
+        {
+          "name": "ve_token_supply_backing",
+          "state_vars": [
+            "AgentVeToken.totalSupply()",
+            "IERC20(assetToken).balanceOf(veToken)"
+          ],
+          "notes": "VeToken total supply should equal LP tokens held by contract. Maintained by 1:1 mint on stake and burn on withdraw."
+        },
+        {
+          "name": "validator_uniqueness",
+          "state_vars": [
+            "_validatorsMap",
+            "_validators array"
+          ],
+          "notes": "Public addValidator checks isValidator before adding. But internal _addValidator (called in mint) doesn't check, allowing potential duplicate in array though map stays correct."
+        },
+        {
+          "name": "token_application_mapping_consistency",
+          "state_vars": [
+            "_tokenApplication",
+            "_applicationToken"
+          ],
+          "notes": "V4: bidirectional mapping uses 0 as sentinel. If application ID 0 exists, mapping breaks. Cleared on withdraw but not on execute."
+        }
+      ]
+    }
+  }
+}

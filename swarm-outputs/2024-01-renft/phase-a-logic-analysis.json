@@ -1,0 +1,451 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T00:52:14.263Z",
+    "duration_ms": 415985
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "Seaport order fulfillment (zoneParams calldata from Seaport)",
+        "path": [
+          "Seaport calls Create.validateOrder()",
+          "Decode RentPayload and signature from zoneParams.extraData",
+          "Construct SeaportPayload from zoneParams",
+          "Validate protocol signature expiration, fulfiller, and signer role",
+          "_rentFromZone processes the payload",
+          "_isValidOrderMetadata verifies metadata hash against zoneHash",
+          "_isValidSafeOwner verifies fulfiller owns the safe",
+          "_executionInvariantChecks verifies assets went to correct destinations",
+          "_convertToItems creates Item[] from offers and considerations",
+          "For BASE/PAY: accumulate rentalAssetUpdates, build RentalOrder, derive orderHash",
+          "STORE.addRentals stores order hash and rental asset IDs",
+          "ESCRW.increaseDeposit records ERC20 deposits",
+          "_addHooks calls external hooks"
+        ],
+        "transformations": [
+          "SpentItem[] -> Item[] (with itemType and settleTo assignment)",
+          "Item[] -> RentalId[] (via toRentalId with recipient wallet)",
+          "RentalOrder -> bytes32 orderHash (via _deriveRentalOrderHash)",
+          "Intermediary bytes -> RentalAssetUpdate[] (via _convertToStatic)"
+        ],
+        "sinks": [
+          "Storage.orders[orderHash] = true",
+          "Storage.rentedAssets[rentalId] += amount",
+          "PaymentEscrow.balanceOf[token] += amount",
+          "Hook.onStart() external call"
+        ],
+        "trust_changes": "Untrusted Seaport calldata transitions to trusted after protocol signer signature verification and invariant checks; hook calls re-enter untrusted external code",
+        "validation_points": [
+          "_validateProtocolSignatureExpiration",
+          "_validateFulfiller matches intendedFulfiller",
+          "_recoverSignerFromPayload + hasRole('CREATE_SIGNER')",
+          "_isValidOrderMetadata checks rentDuration != 0 and metadata hash == zoneHash",
+          "_isValidSafeOwner checks protocol-deployed safe and owner",
+          "_executionInvariantChecks ensures correct recipients",
+          "_convertToItems enforces item type rules per orderType"
+        ],
+        "exposure_risks": [
+          "RentPayload metadata.orderType is NOT included in the metadata hash, so fulfiller can alter it",
+          "RentPayload metadata.emittedExtraData is NOT included in the metadata hash, so fulfiller can inject arbitrary event data",
+          "Hook.onStart() receives rental data to potentially malicious contract"
+        ],
+        "manipulation_risks": [
+          "Fulfiller can change orderType without invalidating zoneHash (orderType missing from _deriveOrderMetadataHash)",
+          "rentalWallet is missing from _deriveRentalOrderHash, enabling potential hash collisions across different wallets",
+          "Hook contracts receive extraData and can perform arbitrary logic"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "User calls Stop.stopRent(order) with full RentalOrder struct",
+        "path": [
+          "Validate rental can be stopped based on orderType, expiry, and sender",
+          "Build rentalAssetUpdates from order items",
+          "_removeHooks calls external hooks (onStop)",
+          "_reclaimRentedItems: Safe.execTransactionFromModule -> delegatecall Reclaimer.reclaimRentalOrder",
+          "Reclaimer transfers ERC721/ERC1155 from safe to lender",
+          "ESCRW.settlePayment calculates and distributes ERC20 payments",
+          "STORE.removeRentals deletes order hash and decrements rental asset counts"
+        ],
+        "transformations": [
+          "RentalOrder -> bytes32 orderHash (via _deriveRentalOrderHash)",
+          "Item[] -> RentalAssetUpdate[] (rental items with rental IDs)",
+          "Payment amount -> paymentAmount - fee (if fee active)",
+          "Pro-rata: amount split by elapsed/total time ratio"
+        ],
+        "sinks": [
+          "ERC721/ERC1155 transferred from rental wallet to lender",
+          "ERC20 transferred from escrow to lender and/or renter",
+          "Storage.orders[orderHash] deleted",
+          "Storage.rentedAssets[rentalId] decremented",
+          "PaymentEscrow.balanceOf[token] decremented"
+        ],
+        "trust_changes": "User-supplied RentalOrder is trusted only after its hash matches storage; external calls to hooks and NFT receivers introduce untrusted execution before state updates",
+        "validation_points": [
+          "_validateRentalCanBeStoped checks orderType-specific stop conditions",
+          "STORE.removeRentals requires orders[orderHash] == true",
+          "Reclaimer checks address(this) != original and address(this) == rentalWallet"
+        ],
+        "exposure_risks": [
+          "rentalWallet not in orderHash allows supplying different wallet with matching hash",
+          "External calls (hooks, NFT transfers) occur before storage removal (CEI violation)",
+          "Lender receives callback during NFT transfer before order is removed from storage"
+        ],
+        "manipulation_risks": [
+          "Potential reentrancy through ERC721/ERC1155 receiver callbacks on lender address before STORE.removeRentals",
+          "Order with manipulated rentalWallet could pass hash check if rentalWallet omission is exploited",
+          "stopRentBatch processes all reclaims before all payments, amplifying reentrancy window"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Safe transaction initiated by rental wallet owner",
+        "path": [
+          "Safe calls Guard.checkTransaction before execution",
+          "Guard loads function selector from calldata",
+          "Guard checks if hook exists for target address",
+          "If hook active: forward to hook.onTransaction (bypasses _checkTransaction)",
+          "If no hook: _checkTransaction inspects selector against blocklist",
+          "For NFT transfer selectors: load tokenId from calldata and check isRentedOut",
+          "For module enable/disable: check whitelist",
+          "Guard.checkAfterExecution is called but does nothing"
+        ],
+        "transformations": [
+          "Raw calldata -> function selector (assembly mload)",
+          "Raw calldata -> tokenId at known offset (assembly mload)",
+          "Raw calldata -> extension address at known offset"
+        ],
+        "sinks": [
+          "Transaction allowed to proceed or reverted",
+          "Hook.onTransaction receives full transaction details"
+        ],
+        "trust_changes": "Safe owner's transaction is untrusted; validated by guard logic or delegated to hook",
+        "validation_points": [
+          "Delegate call restriction (only whitelisted delegates)",
+          "Minimum 4-byte calldata required",
+          "Selector-based checks for known dangerous functions",
+          "isRentedOut check for NFT operations"
+        ],
+        "exposure_risks": [
+          "When hook is active, _checkTransaction is completely bypassed",
+          "Unknown selectors (not in the if/else chain) are allowed by default",
+          "ERC20 token transfers are not blocked (design choice but exposure risk)"
+        ],
+        "manipulation_risks": [
+          "A malicious/buggy hook could approve dangerous operations that _checkTransaction would block",
+          "Non-standard NFT contracts with different transfer function signatures bypass guard checks",
+          "The guard doesn't prevent setting approvals on non-rented NFTs, which could set up future exploits"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "PaymentEscrow._settlePayment called during rental stop",
+        "path": [
+          "Calculate elapsedTime and totalTime from rental timestamps",
+          "Loop through items, filter ERC20 payments",
+          "Calculate fee if active, deduct from paymentAmount",
+          "Decrease deposit (balanceOf[token] -= item.amount pre-fee)",
+          "If PAY order and not expired: pro-rata split between lender and renter",
+          "If PAY order and expired, or BASE order: full payment to settleTo recipient"
+        ],
+        "transformations": [
+          "item.amount -> paymentAmount (after fee deduction)",
+          "Pro-rata: (amount * elapsedTime * 1000 / totalTime + 500) / 1000 -> renterAmount",
+          "lenderAmount = amount - renterAmount"
+        ],
+        "sinks": [
+          "ERC20 transfer to lender address",
+          "ERC20 transfer to renter address",
+          "balanceOf[token] decreased by full amount (pre-fee)"
+        ],
+        "trust_changes": "Order data trusted by permissioned modifier; ERC20 transfer target addresses from order struct",
+        "validation_points": [
+          "permissioned modifier ensures caller is authorized policy",
+          "onlyByProxy ensures proxy context"
+        ],
+        "exposure_risks": [
+          "Fee remains in escrow as trapped balance, only recoverable via skim()",
+          "If ERC20 is fee-on-transfer, actual received amount < recorded amount, creating accounting mismatch"
+        ],
+        "manipulation_risks": [
+          "Fee-on-transfer tokens would cause balanceOf to be inflated relative to actual token balance",
+          "Rebasing tokens could cause escrow balance to diverge from tracked balanceOf",
+          "Pro-rata rounding always favors lender (renter gets bumped up by 500, but lender gets remainder)"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Kernel.executeAction called by executor",
+        "path": [
+          "Executor selects action and target",
+          "Based on action type: install/upgrade module, activate/deactivate policy, migrate kernel, change executor/admin",
+          "Module install: verify contract, validate keycode, store mappings, call INIT",
+          "Module upgrade: swap addresses, call INIT, reconfigure dependent policies",
+          "Policy activate: grant permissions, add to active list, configure dependencies",
+          "Policy deactivate: revoke permissions, remove from active list, prune dependents"
+        ],
+        "transformations": [
+          "Module address -> Keycode mapping (bidirectional)",
+          "Policy -> Permissions[] -> modulePermissions mapping",
+          "Policy -> Keycode[] dependencies -> moduleDependents mapping"
+        ],
+        "sinks": [
+          "getModuleForKeycode, getKeycodeForModule mappings",
+          "modulePermissions mapping",
+          "activePolicies array",
+          "moduleDependents mapping"
+        ],
+        "trust_changes": "Only executor can perform actions; no timelock or multi-sig requirement at kernel level",
+        "validation_points": [
+          "onlyExecutor modifier",
+          "ensureContract validates target is contract",
+          "ensureValidKeycode validates keycode format"
+        ],
+        "exposure_risks": [
+          "Single executor address has full control over protocol configuration",
+          "ChangeExecutor and ChangeAdmin do not require target to be a contract"
+        ],
+        "manipulation_risks": [
+          "Executor can install malicious modules or policies",
+          "Module upgrade reconfigures policies which calls external configureDependencies()",
+          "Kernel migration disables all policies without re-enabling them on new kernel"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Only protocol-deployed rental safes can be used for renting",
+        "BASE orders: lender offers NFTs, renter pays ERC20; renter gets nothing back on expiry unless PAY",
+        "PAY orders: lender offers NFTs + ERC20 payment; renter receives pro-rata payment if stopped early",
+        "PAYEE orders: mirror of PAY orders, processed without storage footprint",
+        "Rental assets cannot be transferred from safe while rental is active (guard enforced)",
+        "Only the Stop policy module can reclaim assets from rental safes",
+        "Delegate calls from rental safes restricted to whitelisted addresses",
+        "Protocol signer must authorize all rental creation payloads"
+      ],
+      "economic_incentives": [
+        "Protocol takes a fee (0-100%) on all rental payments during settlement",
+        "Fees accumulate in escrow as delta between tracked and actual balance, withdrawn via skim()",
+        "PAY order pro-rata split incentivizes renters to use full rental duration",
+        "Lenders in PAY orders can stop early, receiving unused payment back",
+        "BASE order payments always go fully to lender upon expiry"
+      ],
+      "governance_mechanisms": [
+        "Kernel executor controls module installation, upgrades, policy activation/deactivation",
+        "Kernel admin controls role granting and revoking",
+        "ADMIN_ADMIN role manages whitelists, fees, and proxy upgrades",
+        "GUARD_ADMIN role manages hook paths and statuses",
+        "CREATE_SIGNER role authorizes rental creation payloads",
+        "No timelock on any governance action"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "orderType field is NOT included in _deriveOrderMetadataHash despite being in the EIP-712 type string",
+          "expected_behavior": "orderType should be committed in the zoneHash so the lender's signed order type cannot be changed",
+          "actual_behavior": "The fulfiller can supply any orderType value in OrderMetadata without invalidating the zoneHash check, because only rentDuration and hooks are hashed",
+          "risk_level": "high",
+          "exploitation_potential": "While item type enforcement in _convertToItems limits cross-type manipulation, the missing commitment violates the security model. If new order types are added or item validation changes, this becomes directly exploitable. Currently emittedExtraData is also uncommitted, allowing injection of arbitrary event data."
+        },
+        {
+          "scenario": "rentalWallet is missing from _deriveRentalOrderHash encoding despite being in the EIP-712 type string",
+          "expected_behavior": "Each rental order hash should uniquely identify the order including which wallet holds the rented assets",
+          "actual_behavior": "Two orders identical in all fields except rentalWallet produce the same hash. The type hash includes 'address rentalWallet' but the abi.encode call skips it, going directly from order.renter to order.startTimestamp",
+          "risk_level": "high",
+          "exploitation_potential": "During stopRent, an attacker can supply a RentalOrder with a different rentalWallet that matches the stored hash. This could cause assets to be reclaimed from the wrong wallet and payments settled to wrong parties. While Storage.removeRentals would likely revert due to rentalId mismatch, ERC1155 tokens rented to multiple wallets could create matching rentalId counts enabling exploitation."
+        },
+        {
+          "scenario": "Check-Effects-Interactions violation in stopRent: external calls before storage removal",
+          "expected_behavior": "Storage should be updated before external calls to prevent reentrancy",
+          "actual_behavior": "stopRent calls _removeHooks (external), _reclaimRentedItems (external NFT transfers with callbacks), ESCRW.settlePayment (external ERC20 transfers) all before STORE.removeRentals",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious lender contract receiving ERC721/ERC1155 via onERC721Received/onERC1155Received callback could re-enter stopRent while the order is still in storage. While same-order reentrancy would likely fail (NFTs already transferred) or cause the original tx to revert, edge cases with ERC1155 amounts > 1 or cross-order interactions in stopRentBatch could be problematic."
+        },
+        {
+          "scenario": "Hook active for target address bypasses all Guard._checkTransaction protections",
+          "expected_behavior": "Guard should enforce base security checks even when hooks are active",
+          "actual_behavior": "When a hook is registered and active for a target, _checkTransaction is NOT called. The hook's onTransaction is solely responsible for security. If the hook doesn't replicate guard checks, setGuard/enableModule/disableModule/transfer operations could be permitted.",
+          "risk_level": "medium",
+          "exploitation_potential": "A GUARD_ADMIN could set a hook for an address that doesn't enforce module/guard protection checks, allowing the safe owner to remove the guard or disable the stop policy module, then freely transfer rented assets."
+        },
+        {
+          "scenario": "Fee-on-transfer ERC20 tokens used as rental payment",
+          "expected_behavior": "Escrow tracked balance should match actual received amount",
+          "actual_behavior": "ESCRW.increaseDeposit records the nominal amount from the Seaport order, but if the token charges a transfer fee, the actual received amount is less. This inflates balanceOf relative to true balance, and settlement will fail when insufficient actual tokens exist.",
+          "risk_level": "high",
+          "exploitation_potential": "An attacker can create a rental with a fee-on-transfer token. The escrow tracks full amount but holds less. During settlement, if multiple orders use the same token, later settlements fail due to insufficient balance. The skim function would also underflow (trueBalance < syncedBalance)."
+        },
+        {
+          "scenario": "EIP-712 _deriveHookHash does not keccak256 the bytes extraData field",
+          "expected_behavior": "Per EIP-712 spec, dynamic bytes should be hashed with keccak256 before encoding",
+          "actual_behavior": "_deriveHookHash passes hook.extraData directly to abi.encode, which encodes it as a dynamic type with offset/length/data instead of its keccak256 hash",
+          "risk_level": "low",
+          "exploitation_potential": "Internal consistency means this doesn't create an on-chain exploit, but off-chain tools using standard EIP-712 encoding would produce different hashes, potentially causing integration issues."
+        },
+        {
+          "scenario": "rentalOrderTypeHash computed with abi.encode instead of abi.encodePacked for nested type strings",
+          "expected_behavior": "EIP-712 type hash = keccak256(concatenation of type strings)",
+          "actual_behavior": "_deriveRentalTypehashes uses abi.encode(rentalOrderTypeString, hookTypeString, itemTypeString) which adds ABI encoding padding, while rentPayloadTypeHash correctly uses abi.encodePacked",
+          "risk_level": "low",
+          "exploitation_potential": "Internal consistency prevents on-chain exploit, but the inconsistency between rentalOrderTypeHash (abi.encode) and rentPayloadTypeHash (abi.encodePacked) indicates a code quality issue. Off-chain verification tools would need custom handling."
+        },
+        {
+          "scenario": "Domain separator is immutable, does not handle chain forks",
+          "expected_behavior": "Domain separator should be recomputed if chain ID changes (fork scenario)",
+          "actual_behavior": "_DOMAIN_SEPARATOR is computed once at deployment and stored as immutable. _CHAIN_ID is stored but never checked against block.chainid at runtime. After a chain fork, signatures are replayable on both chains.",
+          "risk_level": "medium",
+          "exploitation_potential": "After a chain fork, rental creation signatures can be replayed on the forked chain, potentially creating unwanted rentals. The protocol signer's authorization is valid on both chains."
+        },
+        {
+          "scenario": "stopRentBatch settles all payments after all reclaims, widening reentrancy window",
+          "expected_behavior": "Each order's payments should be settled atomically with its reclaim",
+          "actual_behavior": "All _reclaimRentedItems calls happen in a loop, then ESCRW.settlePaymentBatch is called for all orders at once, then STORE.removeRentalsBatch removes all. A callback during any reclaim occurs before ANY payment is settled and before ANY order is removed from storage.",
+          "risk_level": "medium",
+          "exploitation_potential": "During reclaim of order[0], a callback could call stopRent for order[1] (not yet processed in batch), fully settling and removing it. The batch would then fail when processing order[1] reclaim. While the batch reverts, it creates a griefing vector."
+        },
+        {
+          "scenario": "Guard allows pure ETH transfers to be blocked",
+          "expected_behavior": "Rental safes should be able to receive and send ETH",
+          "actual_behavior": "Guard.checkTransaction reverts if data.length < 4, blocking pure ETH transfers (empty calldata). Rental safe owners cannot send ETH without at least 4 bytes of calldata.",
+          "risk_level": "low",
+          "exploitation_potential": "Not directly exploitable but limits legitimate safe functionality. ETH sent to the safe may become trapped if there's no way to send it out."
+        },
+        {
+          "scenario": "Create2Deployer marks address as deployed before successful deployment",
+          "expected_behavior": "deployed mapping should only be set after successful creation",
+          "actual_behavior": "deployed[targetDeploymentAddress] = true is set before the assembly create2 call. If create2 fails, the subsequent address check reverts, but the deployed mapping is already set in the transaction's state changes. Since the entire tx reverts, this is actually safe in normal cases.",
+          "risk_level": "low",
+          "exploitation_potential": "Not exploitable because the revert undoes the mapping change. But if the check were removed or bypassed, it would permanently prevent redeployment."
+        },
+        {
+          "scenario": "PAYEE orders have no storage footprint and cannot be independently stopped",
+          "expected_behavior": "All rental orders should be trackable and stoppable",
+          "actual_behavior": "PAYEE orders skip the if block in _rentFromZone that adds rentals to storage, increases deposits, and processes hooks. They have no order hash in storage and no rental asset tracking.",
+          "risk_level": "medium",
+          "exploitation_potential": "PAYEE orders cannot be stopped via stopRent since there's no order hash in storage. If the PAY counterpart is stopped but the PAYEE items were already transferred, there's no mechanism to reclaim PAYEE-side assets independently."
+        },
+        {
+          "scenario": "Pro-rata calculation overflow with large amounts and timestamps",
+          "expected_behavior": "Calculation should handle large values safely",
+          "actual_behavior": "(amount * elapsedTime) * 1000 could overflow for large amounts and durations. Solidity 0.8.x checked arithmetic would revert, making settlement impossible.",
+          "risk_level": "low",
+          "exploitation_potential": "An attacker could create a rental with a very large ERC20 amount and long duration such that the pro-rata calculation overflows, preventing early settlement of PAY orders. The lender would need to wait for full expiry to settle."
+        }
+      ],
+      "assumption_violations": [
+        "Assumes all ERC20 tokens transfer the exact amount specified (violated by fee-on-transfer tokens)",
+        "Assumes all ERC20 tokens have standard return values (partially handled by _safeTransfer)",
+        "Assumes ERC721/ERC1155 safeTransferFrom callbacks don't perform malicious reentrancy",
+        "Assumes hooks approved by GUARD_ADMIN are not malicious or buggy",
+        "Assumes the protocol signer's private key is not compromised",
+        "Assumes Seaport correctly enforces order matching and prevents double-fulfillment",
+        "Assumes rental wallet owners cannot bypass the guard through unknown function selectors",
+        "Assumes the chain ID never changes (no fork handling for domain separator)",
+        "Assumes lender and renter addresses are not contracts that could exploit callbacks"
+      ],
+      "game_theory_risks": [
+        "Lender can stop PAY orders early to limit renter's payment, especially if renter usage increases asset value",
+        "Renter in BASE order has no incentive to return assets early since they paid full upfront",
+        "Protocol signer is a centralized point of trust; compromise allows unauthorized rental creation",
+        "Hooks add middleware that could censor or manipulate rental lifecycle events",
+        "An attacker could create many small rentals to grief the guard's isRentedOut checks with many storage reads"
+      ],
+      "integration_risks": [
+        "Seaport order types and zone callback interface could change in future versions",
+        "Gnosis Safe module/guard interface changes could break Stop/Guard policies",
+        "ERC20 tokens with non-standard behavior (rebasing, pausable, blacklistable) can break escrow accounting",
+        "Hook contracts are external dependencies that can revert and block rental start/stop",
+        "If Seaport processes multiple orders atomically and one fails, all fail, which could be used to grief"
+      ],
+      "calculation_errors": [
+        "OrderMetadata hash computation omits orderType and emittedExtraData fields despite them being in the type string, creating a 3-slot encoding where a 5-slot encoding is specified",
+        "RentalOrder hash computation omits rentalWallet field despite it being in the type string, creating an 8-field encoding where 9 fields are specified",
+        "rentalOrderTypeHash uses abi.encode instead of abi.encodePacked for concatenating type strings, producing a different hash than EIP-712 specification",
+        "Hook hash uses raw bytes encoding of extraData instead of keccak256(extraData) as required by EIP-712 for dynamic bytes types"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "ERC20_PAYMENT",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:unsupported",
+            "permit:unknown"
+          ],
+          "decimals": 18,
+          "notes": "Protocol uses custom _safeTransfer handling bool/void returns. Fee-on-transfer tokens will cause balanceOf accounting mismatch in PaymentEscrow. Rebasing tokens will cause skim() underflow. No SafeERC20 wrapper used.",
+          "approval_model": "unknown",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "ERC721_RENTAL",
+          "behaviors": [
+            "callback_onTransfer",
+            "permit:unknown"
+          ],
+          "decimals": 0,
+          "notes": "Transferred to rental safe during creation and reclaimed to lender on stop. safeTransferFrom triggers onERC721Received callback on recipient, which is a reentrancy vector when lender is a contract."
+        },
+        {
+          "address_or_symbol": "ERC1155_RENTAL",
+          "behaviors": [
+            "callback_onTransfer",
+            "permit:unknown"
+          ],
+          "decimals": 0,
+          "notes": "Amount tracked in rentedAssets mapping. safeTransferFrom triggers onERC1155Received callback. Batch transfers completely blocked by guard. Multiple concurrent rentals of same token+id across wallets possible, interacting with rentalWallet hash omission."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "order_hash_uniqueness",
+          "state_vars": [
+            "Storage.orders[orderHash]"
+          ],
+          "notes": "VIOLATED: rentalWallet is omitted from _deriveRentalOrderHash, so orders differing only in rentalWallet share the same hash. orders[hash] = true can only represent one order."
+        },
+        {
+          "name": "escrow_balance_conservation",
+          "state_vars": [
+            "PaymentEscrow.balanceOf[token]",
+            "IERC20.balanceOf(escrow)"
+          ],
+          "notes": "balanceOf[token] tracks deposits and is decremented on settlement. Fees accumulate as delta between tracked and actual balance. Fee-on-transfer tokens break this: actual < tracked. skim() would underflow."
+        },
+        {
+          "name": "rental_asset_tracking",
+          "state_vars": [
+            "Storage.rentedAssets[rentalId]"
+          ],
+          "notes": "Incremented on rental creation, decremented on stop. RentalId = keccak256(wallet, token, tokenId). If rentalWallet is altered during stopRent via hash collision, wrong rentalId would be decremented."
+        },
+        {
+          "name": "guard_transfer_prevention",
+          "state_vars": [
+            "Storage.rentedAssets[rentalId]",
+            "Guard selector checks"
+          ],
+          "notes": "Guard blocks known transfer selectors for rented assets. Bypassed when hook is active for target. Non-standard transfer functions and ERC20 transfers are not blocked."
+        },
+        {
+          "name": "metadata_hash_completeness",
+          "state_vars": [
+            "OrderMetadata.orderType",
+            "OrderMetadata.emittedExtraData"
+          ],
+          "notes": "VIOLATED: orderType and emittedExtraData are NOT included in _deriveOrderMetadataHash despite being in the EIP-712 type string. Fulfiller can alter these without invalidating zoneHash."
+        }
+      ]
+    }
+  }
+}

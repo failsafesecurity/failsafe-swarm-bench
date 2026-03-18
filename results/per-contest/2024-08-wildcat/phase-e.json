@@ -1,0 +1,116 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "FixedTermLoanHooks.onQueueWithdrawal unconditionally blocks nukeFromOrbit before term end, preventing sanctioned account quarantine",
+      "severity": "high",
+      "summary": "In FixedTermLoanHooks, the onQueueWithdrawal hook performs an absolute check: 'if (market.fixedTermEndTime > block.timestamp) revert WithdrawBeforeTermEnd()'. This check has no exception for sanctioned-account quarantining via nukeFromOrbit. The nukeFromOrbit flow is: nukeFromOrbit -> onNukeFromOrbit (no-op, line 948-952) -> _blockAccount -> _queueWithdrawal -> hooks.onQueueWithdrawal -> revert.\n\nOn fixed-term markets using FixedTermLoanHooks, if a lender becomes sanctioned before the fixed term",
+      "description": [
+        {
+          "file": "src/access/FixedTermLoanHooks.sol",
+          "line_start": 854,
+          "line_end": 859,
+          "desc": "onQueueWithdrawal unconditionally reverts with WithdrawBeforeTermEnd() if market.fixedTermEndTime > block.timestamp, with no exception for forced withdrawals from nukeFromOrbit. When nukeFromOrbit calls _blockAccount which calls _queueWithdrawal, the hook rejects the withdrawal."
+        }
+      ],
+      "impact": "Sanctioned accounts cannot be quarantined on fixed-term markets before the term ends. Their tokens continue accruing interest, and all market participants are exposed to regulatory risk. The protocol's sanctions compliance mechanism is completely broken for fixed-term markets.",
+      "proof_of_concept": "1. Borrower creates a fixed-term market with FixedTermLoanHooks, 1-year term\n2. Lender deposits 1,000,000 USDC worth of assets, receives market tokens\n3. After 1 month, lender is sanctioned by OFAC (appears on Chainalysis list)\n4. Anyone calls nukeFromOrbit(lender) to quarantine the sanctioned account\n5. The call reverts: nukeFromOrbit -> onNukeFromOrbit (noop) -> _blockAccount -> _queueWithdrawal -> hooks.onQueueWithdrawal -> WithdrawBeforeTermEnd()\n6. Sanctioned lender's tokens remain earning interest for 11 more months\n7. All market participants are forced to share a market with a sanctioned entity",
+      "remediation": "Add an exception in FixedTermLoanHooks.onQueueWithdrawal for forced withdrawals. The onNukeFromOrbit hook could set a transient storage flag that onQueueWithdrawal checks to bypass the fixed-term restriction."
+    },
+    {
+      "title": "repayAndProcessUnpaidWithdrawalBatches reverts on underfunded markets due to raw subtraction in availableLiquidity calculation",
+      "severity": "high",
+      "summary": "In repayAndProcessUnpaidWithdrawalBatches, after the repayment transfer and state update, available liquidity is calculated as totalAssets() - (state.normalizedUnclaimedWithdrawals + state.accruedProtocolFees). This raw subtraction underflows when the market's actual token balance is less than the sum of reserved withdrawals and accrued fees.\n\nThis is particularly problematic because this function is specifically designed to handle underfunded markets — it allows anyone to repay on behalf of the",
+      "description": [
+        {
+          "file": "src/market/WildcatMarketWithdrawals.sol",
+          "line_start": 302,
+          "line_end": 303,
+          "desc": "The function computes availableLiquidity = totalAssets() - (state.normalizedUnclaimedWithdrawals + state.accruedProtocolFees) using unchecked subtraction. When totalAssets < normalizedUnclaimedWithdrawals + accruedProtocolFees, this reverts with arithmetic underflow."
+        }
+      ],
+      "impact": "Partial repayments combined with batch processing fail atomically when the market is underfunded. This prevents incremental debt recovery during borrower distress, delaying lender access to their funds.",
+      "proof_of_concept": "1. Market state: normalizedUnclaimedWithdrawals = 100e18, accruedProtocolFees = 5e18\n2. totalAssets() = 80e18 (borrower partially defaulted)\n3. Unpaid withdrawal batches exist worth 50e18\n4. Third party calls repayAndProcessUnpaidWithdrawalBatches(10e18, 5)\n5. After transfer: totalAssets() = 90e18\n6. Calculation: 90e18 - (100e18 + 5e18) underflows\n7. Transaction reverts, 10e18 repayment is rolled back\n8. Must repay at least 25e18 in a single call to avoid the underflow",
+      "remediation": "Replace the raw subtraction with saturating subtraction: uint256 availableLiquidity = totalAssets().satSub(state.normalizedUnclaimedWithdrawals + state.accruedProtocolFees);"
+    },
+    {
+      "title": "closeMarket uses raw subtraction for availableLiquidity tracking which can revert on rounding edge cases, blocking market closure",
+      "severity": "high",
+      "summary": "In closeMarket(), available liquidity is tracked using raw subtraction at three points:\n\n1. Line 253-254: Initial calculation\n2. Line 268: After pending batch payment\n3. Line 278: In unpaid batch loop\n\nAll three use raw subtraction, unlike repayAndProcessUnpaidWithdrawalBatches which uses satSub on line 314.\n\nAfter _repay brings in remaining debts, currentlyHeld equals totalDebts(). But totalDebts() uses normalizeAmount (rayMul, rounds half-up) while normalizedUnclaimedWithdrawals was accumulate",
+      "description": [
+        {
+          "file": "src/market/WildcatMarket.sol",
+          "line_start": 253,
+          "line_end": 278,
+          "desc": "closeMarket computes availableLiquidity = currentlyHeld - (state.normalizedUnclaimedWithdrawals + state.accruedProtocolFees) and decrements it with raw subtraction in a loop. The corresponding repayAndProcessUnpaidWithdrawalBatches function correctly uses satSub for the same loop operation."
+        }
+      ],
+      "impact": "Market closure can be blocked by arithmetic underflow edge cases. Borrower must manually diagnose and send extra dust to work around the issue.",
+      "proof_of_concept": "1. Market has several withdrawal batches processed over time with different rounding\n2. Borrower calls closeMarket()\n3. Borrower pays totalDebts() worth of remaining debt\n4. currentlyHeld should cover all obligations but due to rounding (rayMul vs mulDiv), currentlyHeld - (normalizedUnclaimedWithdrawals + accruedProtocolFees) underflows by a few wei\n5. closeMarket() reverts with arithmetic underflow\n6. Borrower must detect this and send extra dust tokens to the market before retrying",
+      "remediation": "Use saturating subtraction: currentlyHeld.satSub(state.normalizedUnclaimedWithdrawals + state.accruedProtocolFees) and availableLiquidity.satSub(normalizedAmountPaid) on lines 268 and 278."
+    },
+    {
+      "title": "collectFees and withdrawableProtocolFees revert via underflow when market is underfunded, blocking fee collection and breaking view functions",
+      "severity": "high",
+      "summary": "The withdrawableProtocolFees function in MarketState.sol (line 109) performs uint256 totalAvailableAssets = totalAssets - state.normalizedUnclaimedWithdrawals without underflow protection.\n\nThis function is called by:\n1. collectFees() in WildcatMarket.sol (line 129) — state-changing\n2. withdrawableProtocolFees() in WildcatMarketBase.sol (line 382-387) — external view\n\nWhen a market becomes underfunded (totalAssets < normalizedUnclaimedWithdrawals), both revert. This is a common state: when the b",
+      "description": [
+        {
+          "file": "src/libraries/MarketState.sol",
+          "line_start": 105,
+          "line_end": 111,
+          "desc": "withdrawableProtocolFees computes totalAssets - state.normalizedUnclaimedWithdrawals using raw subtraction. When totalAssets < normalizedUnclaimedWithdrawals, both the internal function and the external view function revert."
+        }
+      ],
+      "impact": "Protocol fee collection DoS and view function breakage whenever totalAssets < normalizedUnclaimedWithdrawals. Fees accrue but cannot be collected.",
+      "proof_of_concept": "1. Market: 1M USDC deposits, 800K borrowed\n2. 300K USDC in withdrawals queued and partially processed\n3. normalizedUnclaimedWithdrawals reaches 205K while totalAssets = 200K\n4. collectFees() reverts — fees locked\n5. withdrawableProtocolFees() view also reverts — UI breaks",
+      "remediation": "Use saturating subtraction: uint256 totalAvailableAssets = totalAssets.satSub(state.normalizedUnclaimedWithdrawals);"
+    },
+    {
+      "title": "nukeFromOrbit fails for non-depositing token holders when withdrawalRequiresAccess is true due to empty hooksData",
+      "severity": "high",
+      "summary": "When nukeFromOrbit(accountAddress) is called, _blockAccount calls _queueWithdrawal with baseCalldataSize = msg.data.length. This causes extraCalldataBytes = calldatasize() - msg.data.length = 0 in the hook dispatch, meaning EMPTY hooksData is forwarded.\n\nIn AccessControlHooks.onQueueWithdrawal, when withdrawalRequiresAccess is true, the check is:\nif (!isKnownLenderOnMarket[lender][msg.sender] && !_tryValidateAccess(status, lender, hooksData)) revert NotApprovedLender()\n\nFor a lender who received",
+      "description": [
+        {
+          "file": "src/market/WildcatMarket.sol",
+          "line_start": 299,
+          "line_end": 305,
+          "desc": "_blockAccount passes msg.data.length as baseCalldataSize to _queueWithdrawal, causing zero-length hooksData to be forwarded. For lenders who received tokens via transfer and have expired credentials, the access validation fails and nukeFromOrbit reverts."
+        }
+      ],
+      "impact": "Sanctioned accounts that received tokens via transfer and have expired credentials cannot be quarantined when withdrawal access control is enabled. Their tokens continue earning interest.",
+      "proof_of_concept": "1. Market with withdrawalRequiresAccess = true\n2. Lender A deposits, becomes known lender\n3. Lender A transfers tokens to Lender B (who has credential but never deposited)\n4. Lender B's credential expires\n5. Lender B gets sanctioned\n6. Anyone calls nukeFromOrbit(lenderB)\n7. Hook check: isKnownLenderOnMarket[B] = false, empty hooksData, expired credential\n8. Reverts with NotApprovedLender\n9. Sanctioned lender B cannot be quarantined",
+      "remediation": "The onQueueWithdrawal hook should bypass access checks for nukeFromOrbit-initiated withdrawals. The onNukeFromOrbit hook can set a transient flag. Alternatively, _blockAccount should signal a forced withdrawal."
+    },
+    {
+      "title": "FixedTermLoanHooks.onCloseMarket is empty, allowing borrower to close fixed-term market early and zero APR without temporary reserve ratio protection",
+      "severity": "high",
+      "summary": "In FixedTermLoanHooks, onCloseMarket (line 943-946) is empty. When a borrower calls closeMarket(), there is no check on whether the fixed term has ended.\n\ncloseMarket() in WildcatMarket.sol directly sets state.annualInterestBips = 0 (line 245), bypassing the onSetAnnualInterestAndReserveRatioBips hook that normally enforces temporary reserve ratio protection when APR is reduced. The closure drops APR from whatever it was to 0% in one step.\n\nWhile market closure sets reserveRatioBips to 10000 (10",
+      "description": [
+        {
+          "file": "src/access/FixedTermLoanHooks.sol",
+          "line_start": 943,
+          "line_end": 946,
+          "desc": "The onCloseMarket hook is a no-op. It does not check whether the fixed term has ended. closeMarket() sets APR to 0% directly (bypassing onSetAnnualInterestAndReserveRatioBips), so no temporary reserve ratio protection is triggered."
+        }
+      ],
+      "impact": "Borrower can terminate a fixed-term market before the term ends, zeroing APR without the temporary reserve ratio warning period. Lenders lose expected interest income with no advance warning.",
+      "proof_of_concept": "1. Borrower creates fixed-term market: 10% APR, 1-year term\n2. Lenders deposit 10M USDC expecting ~1M interest over the year\n3. After 1 month, borrower calls closeMarket()\n4. onCloseMarket() is empty — no fixed term check\n5. APR immediately set to 0%, reserveRatio to 100%\n6. Lenders can withdraw principal but lose 11 months of expected interest\n7. The temporary reserve ratio mechanism was completely bypassed",
+      "remediation": "Implement FixedTermLoanHooks.onCloseMarket to revert if fixedTermEndTime > block.timestamp, or at minimum trigger the temporary reserve ratio protection."
+    },
+    {
+      "title": "setFixedTermEndTime allows borrower to set term to zero or past timestamp, instantly voiding fixed-term guarantee without any lender protection",
+      "severity": "high",
+      "summary": "The setFixedTermEndTime function allows the borrower to reduce the fixed term end time to any value, including 0. The only check (line 239) ensures the new time is not greater: 'if (newFixedTermEndTime > hookedMarket.fixedTermEndTime) revert IncreaseFixedTerm()'.\n\nThis allows: (1) Set fixedTermEndTime to 0, immediately allowing all withdrawals. (2) Then reduce APR, triggering only a standard 2-week temporary reserve ratio, not the full term protection.\n\nThe lack of any notification mechanism mea",
+      "description": [
+        {
+          "file": "src/access/FixedTermLoanHooks.sol",
+          "line_start": 236,
+          "line_end": 242,
+          "desc": "setFixedTermEndTime only checks that newFixedTermEndTime is not GREATER than current end time. A borrower can set it to 0 or any past timestamp, immediately enabling withdrawals and allowing subsequent APR reduction to near-zero."
+        }
+      ],
+      "impact": "Borrower can unilaterally void the fixed-term guarantee at any time without triggering protective mechanisms for lenders.",
+      "proof_of_concept": "1. Borrower creates market with 1-year fixed term at 10% APR\n2. Lenders deposit expecting 1-year lockup\n3. After 6 months: borrower calls setFixedTermEndTime(market, 0)\n4. fixedTermEndTime is now 0 — withdrawals allowed immediately\n5. Borrower calls setAnnualInterestAndReserveRatioBips(100, 1000) — reduces APR to 1%\n6. Only 2-week temporary reserve ratio, not 6-month remaining term protection\n7. Lenders who expected 1-year 10% APR are surprised",
+      "remediation": "Either prevent reducing the fixed term below block.timestamp, or trigger temporary reserve ratio protection when the term is reduced."
+    }
+  ]
+}

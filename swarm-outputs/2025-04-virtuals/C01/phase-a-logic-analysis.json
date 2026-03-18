@@ -1,0 +1,536 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T03:21:34.126Z",
+    "duration_ms": 374378
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-GENESIS-PARTICIPATE",
+        "source": "User (msg.sender)",
+        "path": [
+          "User calls Genesis.participate(pointAmt, virtualsAmt)",
+          "Balance and allowance checks on virtualTokenAddress",
+          "mapAddrToVirtuals[msg.sender] += virtualsAmt, participants.push if first time",
+          "safeTransferFrom(msg.sender, address(this), virtualsAmt)"
+        ],
+        "transformations": [
+          "cumulative addition to mapping"
+        ],
+        "sinks": [
+          "Genesis contract balance (VIRTUAL tokens)",
+          "on-chain mapping mapAddrToVirtuals"
+        ],
+        "trust_changes": "User funds move to contract custody; off-chain system controls pointAmt interpretation",
+        "validation_points": [
+          "pointAmt > 0",
+          "virtualsAmt > 0",
+          "virtualsAmt <= maxContributionVirtualAmount",
+          "balance check",
+          "allowance check"
+        ],
+        "exposure_risks": [
+          "pointAmt is only emitted, not stored — off-chain system fully controls points allocation"
+        ],
+        "manipulation_risks": [
+          "No per-user cumulative cap — a single user can call participate() many times bypassing maxContributionVirtualAmount",
+          "Off-chain point system can be manipulated since on-chain has no point validation"
+        ]
+      },
+      {
+        "flow_id": "DF-002-GENESIS-SUCCESS",
+        "source": "FACTORY_ROLE (FGenesis OPERATION_ROLE)",
+        "path": [
+          "FGenesis.onGenesisSuccess calls Genesis.onGenesisSuccess with operator-supplied arrays",
+          "Validates refund amounts against mapAddrToVirtuals",
+          "If first launch: approves agentFactory, calls initFromBondingCurve + executeBondingCurveApplication",
+          "Refunds VIRTUAL tokens to specified addresses",
+          "Sets claimableAgentTokens mapping for distribution addresses"
+        ],
+        "transformations": [
+          "VIRTUAL tokens → AgentFactory → Agent Token + DAO + NFT",
+          "Partial refunds",
+          "Agent token allocation stored"
+        ],
+        "sinks": [
+          "agentTokenAddress stored",
+          "claimableAgentTokens mapping",
+          "refunded VIRTUAL tokens to users"
+        ],
+        "trust_changes": "FACTORY_ROLE fully controls refund and distribution amounts — no on-chain validation of fairness",
+        "validation_points": [
+          "refundUserCountForFailed == 0",
+          "array length match",
+          "per-user refund <= committed",
+          "contract balance >= totalRefund + reserveAmount"
+        ],
+        "exposure_risks": [
+          "claimableAgentTokens uses assignment (=) not addition (+=) — repeated calls overwrite unclaimed allocations",
+          "Admin can call withdrawLeftAssetsAfterFinalized to drain unclaimed agent tokens"
+        ],
+        "manipulation_risks": [
+          "Operator can distribute agent tokens unfairly since distribution amounts are not validated against contributions",
+          "Multiple calls overwrite prior claimableAgentTokens entries, stealing from users who haven't claimed",
+          "No on-chain check that total distributed agent tokens proportionally match virtual contributions"
+        ]
+      },
+      {
+        "flow_id": "DF-003-BONDING-LAUNCH",
+        "source": "Any user via launchFor() (launch() is broken)",
+        "path": [
+          "User calls launchFor with purchaseAmount",
+          "Fee deducted and sent to _feeTo",
+          "Remaining transferred to Bonding contract",
+          "FERC20 token created with initialSupply",
+          "Pair created via factory, initial liquidity added to pair",
+          "Initial purchase executed via router.buy",
+          "FERC20 tokens transferred to msg.sender"
+        ],
+        "transformations": [
+          "Asset tokens → fee + initial liquidity (virtual)",
+          "FERC20 minted with full supply to Bonding",
+          "Router adds virtual liquidity",
+          "Initial buy swaps asset for FERC20"
+        ],
+        "sinks": [
+          "_feeTo receives fee",
+          "FPair holds FERC20 tokens",
+          "msg.sender receives purchased FERC20"
+        ],
+        "trust_changes": "creator parameter is user-controlled in launchFor — any address can be attributed as creator",
+        "validation_points": [
+          "purchaseAmount > fee",
+          "balance check"
+        ],
+        "exposure_risks": [
+          "launchFor() is public — anyone can attribute any address as token creator affecting downstream rewards",
+          "launch() function is broken due to double nonReentrant modifier — always reverts"
+        ],
+        "manipulation_risks": [
+          "Creator attribution manipulation — attacker sets victim as creator, or sets themselves as creator of popular token",
+          "Since launch() always fails, only launchFor() works, and caller != creator is possible"
+        ]
+      },
+      {
+        "flow_id": "DF-004-BONDING-GRADUATION",
+        "source": "Triggered automatically during buy() when reserveA <= gradThreshold",
+        "path": [
+          "buy() detects graduation threshold reached",
+          "_openTradingOnUniswap called",
+          "Bonding curve trading disabled",
+          "Asset tokens transferred from pair to Bonding",
+          "Bonding approves agentFactory for asset balance",
+          "initFromBondingCurve + executeBondingCurveApplication called",
+          "Agent token created, pair approved for agent token transfers",
+          "FERC20 tokens burned from pair (but totalSupply NOT decremented)"
+        ],
+        "transformations": [
+          "FERC20 pair liquidity → Agent token creation via AgentFactory",
+          "FERC20 burned (balance only, totalSupply unchanged)"
+        ],
+        "sinks": [
+          "Agent tokens held by pairAddress (vault)",
+          "FERC20 balances zeroed but totalSupply unchanged"
+        ],
+        "trust_changes": "Automated — no human in the loop for graduation decision",
+        "validation_points": [
+          "_token.trading && !_token.tradingOnUniswap"
+        ],
+        "exposure_risks": [
+          "FERC20.burnFrom does NOT decrement totalSupply — phantom supply remains",
+          "Stored _token.data.supply used in executeBondingCurveApplication may be stale"
+        ],
+        "manipulation_risks": [
+          "Graduation can be front-run — MEV bots can sandwich the graduation transaction",
+          "Exact gradThreshold boundary can be gamed — buy exactly enough to trigger"
+        ]
+      },
+      {
+        "flow_id": "DF-005-TAX-COLLECTION-DISTRIBUTION",
+        "source": "EXECUTOR_ROLE calls AgentTax.handleAgentTaxes",
+        "path": [
+          "EXECUTOR records txhashes and amounts",
+          "Accumulated tax tracked in agentTaxAmounts",
+          "_swapForAsset swaps taxToken to assetToken via router",
+          "creatorFee (99% default) sent to creator address",
+          "feeAmount (1% default) sent to treasury",
+          "Optional tbaBonus.distributeBonus called"
+        ],
+        "transformations": [
+          "taxToken → assetToken via AMM swap",
+          "Split: creator (100-feeRate)% + treasury (feeRate)%"
+        ],
+        "sinks": [
+          "Creator address",
+          "Treasury",
+          "TBABonus (optional bonus)"
+        ],
+        "trust_changes": "EXECUTOR_ROLE provides minOutput — could set to 0 enabling sandwich attacks",
+        "validation_points": [
+          "txhash uniqueness check (agentId > 0)",
+          "balance >= amountToSwap",
+          "TBA exists"
+        ],
+        "exposure_risks": [
+          "MEV/sandwich attacks if minOutput is set too low by executor",
+          "Cached TBA/creator in _agentRecipients can become stale if NFT ownership changes"
+        ],
+        "manipulation_risks": [
+          "Creator address can be changed by current creator via updateCreator — tax revenue can be redirected",
+          "dcaSell uses input-amount-based slippage calculation which is mathematically incorrect"
+        ]
+      },
+      {
+        "flow_id": "DF-006-UNWRAP-TOKEN",
+        "source": "Anyone (no access control on unwrapToken)",
+        "path": [
+          "Caller provides srcTokenAddress and list of accounts",
+          "For each account: check FERC20 balance",
+          "Burn FERC20 from account (owner-only burnFrom, Bonding is owner)",
+          "TransferFrom agent tokens from pairAddress to account"
+        ],
+        "transformations": [
+          "1:1 FERC20 → agent token swap"
+        ],
+        "sinks": [
+          "FERC20 burned (balance only)",
+          "Agent tokens transferred to user accounts"
+        ],
+        "trust_changes": "No access control — anyone can force-unwrap any user's tokens",
+        "validation_points": [
+          "tradingOnUniswap must be true",
+          "balance > 0"
+        ],
+        "exposure_risks": [
+          "Users have no choice in unwrapping — anyone can force-convert their FERC20 to agent tokens",
+          "burnFrom doesn't reduce totalSupply — accounting mismatch"
+        ],
+        "manipulation_risks": [
+          "Forced unwrapping without user consent",
+          "If agent token has different value/decimals than assumed, 1:1 exchange rate is incorrect"
+        ]
+      },
+      {
+        "flow_id": "DF-007-DAO-VOTING-AUTO-EXECUTE",
+        "source": "Voter calls AgentDAO.castVote",
+        "path": [
+          "_castVote records vote",
+          "Score incremented for voter",
+          "If support==1 (For) and params provided, _updateMaturity called for ELO scoring",
+          "If support==1, _tryAutoExecute checks if forVotes == totalSupply",
+          "If condition met, execute(proposalId) called inline"
+        ],
+        "transformations": [
+          "Vote weight → proposal vote tally",
+          "ELO calculation for maturity scoring",
+          "Auto-execution on unanimous vote"
+        ],
+        "sinks": [
+          "Proposal state change",
+          "Score checkpoints",
+          "Maturity scoring"
+        ],
+        "trust_changes": "Voting power snapshot taken at proposal creation — no flash loan protection beyond that",
+        "validation_points": [
+          "Voter hasn't voted before",
+          "Proposal is Active"
+        ],
+        "exposure_risks": [
+          "getMaturity divides by forVotes — division by zero if forVotes is 0",
+          "Auto-execute happens during castVote — complex execution during vote can have unexpected side effects"
+        ],
+        "manipulation_risks": [
+          "If totalSupply is 0 or very small, a single voter can auto-execute any proposal",
+          "ELO params (uint8[] votes) are voter-provided and could be crafted to game maturity scores"
+        ]
+      },
+      {
+        "flow_id": "DF-008-AIRDROP",
+        "source": "Caller provides token, recipients, amounts, total",
+        "path": [
+          "Assembly transferFrom pulls _total from caller to Airdrop contract",
+          "Loop transfers amounts[i] to recipients[i]"
+        ],
+        "transformations": [
+          "Bulk token distribution"
+        ],
+        "sinks": [
+          "Individual recipient addresses"
+        ],
+        "trust_changes": "No validation on array lengths or sum(amounts) vs _total",
+        "validation_points": [
+          "Only ERC20 return value checks"
+        ],
+        "exposure_risks": [
+          "No check that _recipients.length == _amounts.length — mismatched arrays read garbage calldata",
+          "No check that sum(amounts) == _total — excess tokens stuck in contract permanently"
+        ],
+        "manipulation_risks": [
+          "If _recipients shorter than _amounts, tokens sent to garbage addresses derived from calldata"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Genesis lifecycle: Not Started → Active → Ended → (Success | Failed | Cancelled)",
+        "Bonding curve: constant product k=xy with virtual liquidity (no real asset tokens in pair initially)",
+        "Graduation: automatic when token reserve <= gradThreshold during buy",
+        "Tax distribution: taxToken swapped to assetToken, split between creator and treasury",
+        "DAO proposals can be auto-executed when 100% for-votes (unanimous)",
+        "FERC20 tokens are intermediary — unwrapped to agent tokens post-graduation",
+        "VirtualGenesisDAO supports early execution when quorum + vote success conditions met"
+      ],
+      "economic_incentives": [
+        "Bonding curve fee: split between buy/sell taxes sent to taxVault",
+        "AgentTax: 99% to creator, 1% to treasury (default feeRate=100/10000)",
+        "TBABonus: additional 35% bonus from separate allowance pool",
+        "Genesis participation: contribute VIRTUAL tokens for agent token allocation (determined off-chain)",
+        "Validator scoring: ELO-based system rewards accurate model evaluation"
+      ],
+      "governance_mechanisms": [
+        "AgentDAO: quorum fraction 51%, auto-execute on 100% for-votes",
+        "VirtualGenesisDAO: configurable quorum (default 10000e18), early execution via EXECUTOR_ROLE",
+        "VirtualProtocolDAO: standard quorum fraction governance",
+        "ContributionNft: proposal-proposer-only minting, admin bypass for proposal threshold"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Bonding.launch() always reverts due to double nonReentrant modifier",
+          "expected_behavior": "launch() should create token and return pair address",
+          "actual_behavior": "launch() calls launchFor() which also has nonReentrant — internal call re-enters guard and reverts",
+          "risk_level": "high",
+          "exploitation_potential": "launch() is permanently broken; only launchFor() works, which allows any caller to set arbitrary creator address, affecting who receives graduation rewards and AgentTax creator fees"
+        },
+        {
+          "scenario": "FERC20.burnFrom and _burn do not decrement _totalSupply",
+          "expected_behavior": "Burning tokens should reduce totalSupply to maintain supply conservation invariant",
+          "actual_behavior": "Only _balances[user] is decremented; _totalSupply remains at initial value creating phantom supply",
+          "risk_level": "high",
+          "exploitation_potential": "After graduation, FERC20 totalSupply is inflated. Any code relying on totalSupply (maxTx calculation, external integrations) uses wrong values. Supply passed to executeBondingCurveApplication uses stored data.supply which may diverge from actual circulating supply"
+        },
+        {
+          "scenario": "Genesis.onGenesisSuccess called multiple times overwrites claimableAgentTokens",
+          "expected_behavior": "Agent token allocations should be final and immutable once set",
+          "actual_behavior": "claimableAgentTokens uses = assignment not +=. Second call overwrites unclaimed allocations",
+          "risk_level": "high",
+          "exploitation_potential": "Malicious or compromised OPERATION_ROLE can call onGenesisSuccess again with different distribution amounts, reducing or zeroing out unclaimed user allocations"
+        },
+        {
+          "scenario": "Genesis.withdrawLeftAssetsAfterFinalized drains unclaimed agent tokens",
+          "expected_behavior": "Only truly leftover assets should be withdrawable",
+          "actual_behavior": "Admin can withdraw ANY token including agent tokens that users haven't claimed yet",
+          "risk_level": "high",
+          "exploitation_potential": "Admin calls withdrawLeftAssetsAfterFinalized for agentTokenAddress, stealing tokens that users are entitled to claim via claimAgentToken"
+        },
+        {
+          "scenario": "AgentTax.dcaSell uses incorrect slippage calculation",
+          "expected_behavior": "Slippage should be calculated based on expected output from AMM",
+          "actual_behavior": "minOutput = (amountToSwap * (DENOM - slippage)) / DENOM — uses input amount as basis, not expected output",
+          "risk_level": "medium",
+          "exploitation_potential": "If taxToken and assetToken have very different values, minOutput is either way too high (always reverting) or way too low (no slippage protection, enabling sandwich attacks)"
+        },
+        {
+          "scenario": "AgentDAO.getMaturity division by zero when forVotes is 0",
+          "expected_behavior": "Should handle zero forVotes gracefully",
+          "actual_behavior": "_proposalMaturities[proposalId] / forVotes reverts with division by zero",
+          "risk_level": "medium",
+          "exploitation_potential": "Calling getMaturity on a proposal with zero for-votes causes revert, potentially breaking integrations that call this view function"
+        },
+        {
+          "scenario": "Airdrop contract has no array length validation",
+          "expected_behavior": "Should require _recipients.length == _amounts.length",
+          "actual_behavior": "Uses _amounts.length as loop bound; reads _recipients from raw calldata offset — mismatched arrays read garbage data",
+          "risk_level": "medium",
+          "exploitation_potential": "If arrays mismatch, tokens sent to unintended addresses derived from adjacent calldata. Also sum(amounts) vs _total not validated — excess tokens permanently stuck in contract"
+        },
+        {
+          "scenario": "ContributionNft.mint doesn't verify proposal is accepted",
+          "expected_behavior": "Only accepted/succeeded proposals should have contribution NFTs minted",
+          "actual_behavior": "Only checks msg.sender == proposalProposer — no state check on proposal",
+          "risk_level": "medium",
+          "exploitation_potential": "Proposer can mint ContributionNft before proposal voting completes or even for rejected proposals, polluting the contribution history"
+        },
+        {
+          "scenario": "Genesis.participate has no per-user cumulative contribution cap",
+          "expected_behavior": "Users should have reasonable contribution limits",
+          "actual_behavior": "maxContributionVirtualAmount is per-transaction, not per-user. Users can call participate() unlimited times",
+          "risk_level": "low",
+          "exploitation_potential": "Whale can dominate genesis participation by making many transactions, each under the per-tx limit"
+        },
+        {
+          "scenario": "Bonding.sell() and buy() lack nonReentrant modifier",
+          "expected_behavior": "Functions modifying state after external calls should have reentrancy protection",
+          "actual_behavior": "tokenInfo data updates happen after router calls which involve external token transfers",
+          "risk_level": "medium",
+          "exploitation_potential": "If traded token has callbacks (ERC777-like), attacker could re-enter sell/buy to manipulate tokenInfo state before it's updated"
+        },
+        {
+          "scenario": "FPair.swap does not verify k-constant invariant",
+          "expected_behavior": "After swap, newReserve0 * newReserve1 should equal k",
+          "actual_behavior": "Reserves updated blindly based on router-provided amounts; k stored but never verified",
+          "risk_level": "low",
+          "exploitation_potential": "Router bugs could violate constant product invariant without detection, leading to economic exploitation of the pair"
+        },
+        {
+          "scenario": "Bonding price calculation integer division precision loss",
+          "expected_behavior": "Price should be calculated with adequate precision",
+          "actual_behavior": "price = newReserveA / newReserveB — pure integer division loses all fractional precision",
+          "risk_level": "low",
+          "exploitation_potential": "Price tracking is inaccurate, though only used for informational purposes in tokenInfo storage"
+        },
+        {
+          "scenario": "AgentInference.promptMulti first element agentId could match uninitialized prevAgentId",
+          "expected_behavior": "TBA should always be looked up correctly",
+          "actual_behavior": "prevAgentId initialized to 0; if first agentIds[0] is 0, TBA lookup is skipped, agentTba stays address(0)",
+          "risk_level": "low",
+          "exploitation_potential": "Edge case with agentId 0 would cause safeTransferFrom to address(0) to revert, but agentId 0 is unlikely valid in the system"
+        }
+      ],
+      "assumption_violations": [
+        "FERC20 assumes burnFrom correctly updates supply — it does NOT, violating ERC20 supply conservation",
+        "Bonding assumes launch() wrapper works — it DOES NOT due to double nonReentrant, forcing direct launchFor usage",
+        "Genesis assumes onGenesisSuccess is called once per genesis — nothing prevents multiple calls after first launch",
+        "AgentTax dcaSell assumes input and output tokens have comparable value for slippage calculation — this is generally false",
+        "FPair assumes router always provides correct swap amounts maintaining k — no on-chain verification",
+        "ContributionNft.ownerOf returns address(0) for non-existent tokens instead of reverting, violating ERC721 spec",
+        "FGenesis.createGenesis uses raw transferFrom instead of SafeERC20, assuming VIRTUAL token returns bool"
+      ],
+      "game_theory_risks": [
+        "Genesis participation: whale can dominate allocation by splitting contributions across many transactions under maxContributionVirtualAmount",
+        "Bonding curve graduation can be front-run: MEV bot buys just before graduation to profit from price discontinuity",
+        "AgentTax creator update: current creator can transfer creator rights to another address, redirecting all future tax revenue",
+        "DAO auto-execution on 100% for-votes creates race condition: last voter triggers execution, potentially with different gas conditions",
+        "launchFor() creator attribution: anyone can launch a token attributing it to a popular address, potentially confusing users or gaming creator rewards",
+        "Validator ELO scoring: voters provide their own battle results (uint8[] votes param) — if not validated off-chain, scores can be gamed"
+      ],
+      "integration_risks": [
+        "Genesis → AgentFactoryV3: initFromBondingCurve and executeBondingCurveApplication are called sequentially — if factory state changes between calls, inconsistency possible",
+        "Bonding → AgentFactoryV3: graduation path depends on factory granting BONDING_ROLE and factory's executeBondingCurveApplication working correctly",
+        "AgentTax → IRouter: swap relies on external AMM — price manipulation or low liquidity causes failed or exploitable swaps",
+        "AeroAdaptor: hardcoded route (stable=false) — if pool params change, swaps may fail or route through suboptimal path",
+        "FGenesis grants BONDING_ROLE on AgentFactoryV3 to each new Genesis contract — requires FGenesis to have role admin on AgentFactoryV3",
+        "AgentDAO → ServiceNft.mint: triggered via proposal execution — relies on contribution and service NFT contracts being correctly configured"
+      ],
+      "calculation_errors": [
+        "FERC20._burn/burnFrom: totalSupply not decremented (accounting error)",
+        "Bonding.sell/buy: price = reserveA / reserveB uses integer division losing all precision for values < 1",
+        "Bonding liquidity calculation: liquidity = (((K * 10000) / assetRate) * 10000 ether / supply) * 1 ether / 10000 — complex multiplication/division chain susceptible to precision loss and overflow",
+        "AgentTax dcaSell: minOutput = amountToSwap * (DENOM - slippage) / DENOM — calculates slippage on input amount instead of expected output amount",
+        "AgentDAO.getMaturity: _proposalMaturities[proposalId] / forVotes — division by zero when forVotes is 0",
+        "FRouter buy tax: txFee = (fee * amountIn) / 100 — fee is from factory (e.g., 1 for 1%), but if fee > 100, tax exceeds 100%"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "VIRTUAL",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "ERC20Capped with owner-only mint. Standard transfer. Used as base currency throughout protocol."
+        },
+        {
+          "address_or_symbol": "FERC20",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "blacklist",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "CRITICAL: burnFrom/burn do NOT decrement totalSupply. Has maxTx limit on non-excluded addresses. Owner can burn anyone's tokens without approval. Intermediary bonding curve token."
+        },
+        {
+          "address_or_symbol": "veVIRTUAL",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "snapshot",
+            "non_standard_return"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "Non-transferable voting token. approve/transfer/transferFrom all revert. Only owner can update balances via oracleTransfer. ERC20Votes for governance snapshots."
+        },
+        {
+          "address_or_symbol": "AgentToken (from AgentFactory)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Created via AgentFactoryV3.executeBondingCurveApplication. Exact implementation not provided but assumed standard ERC20. Used as final agent token post-graduation."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "ferc20_supply_conservation_BROKEN",
+          "state_vars": [
+            "_totalSupply",
+            "sum(_balances)"
+          ],
+          "notes": "VIOLATED: _totalSupply is never decremented by burn/burnFrom. After any burn, sum(_balances) < _totalSupply."
+        },
+        {
+          "name": "genesis_virtual_conservation",
+          "state_vars": [
+            "sum(mapAddrToVirtuals)",
+            "IERC20(virtualTokenAddress).balanceOf(genesis)"
+          ],
+          "notes": "Should hold that contract balance >= sum of all unreturned mapAddrToVirtuals entries. Maintained by participate/refund/fail logic."
+        },
+        {
+          "name": "fpair_constant_product",
+          "state_vars": [
+            "_pool.reserve0",
+            "_pool.reserve1",
+            "_pool.k"
+          ],
+          "notes": "k set at mint time. swap() does NOT verify reserve0*reserve1 == k after update. Router is trusted to provide correct amounts."
+        },
+        {
+          "name": "agent_tax_swap_tracking",
+          "state_vars": [
+            "agentTaxAmounts.amountCollected",
+            "agentTaxAmounts.amountSwapped"
+          ],
+          "notes": "amountSwapped should never exceed amountCollected. The difference represents pending swap amount."
+        },
+        {
+          "name": "genesis_claimable_token_integrity",
+          "state_vars": [
+            "claimableAgentTokens[user]",
+            "IERC20(agentToken).balanceOf(genesis)"
+          ],
+          "notes": "VULNERABLE: onGenesisSuccess can be called multiple times overwriting allocations. withdrawLeftAssetsAfterFinalized can drain tokens backing claims."
+        },
+        {
+          "name": "tba_bonus_allowance",
+          "state_vars": [
+            "_agentAllowances[agentId]",
+            "_agentPaidAmounts[agentId]"
+          ],
+          "notes": "_agentPaidAmounts should never exceed _agentAllowances. Enforced by setAllowances check and bonus capping logic."
+        }
+      ]
+    }
+  }
+}

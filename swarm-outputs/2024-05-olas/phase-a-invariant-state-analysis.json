@@ -1,0 +1,512 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T21:38:04.012Z",
+    "duration_ms": 328336
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "Tokenomics.sol",
+        "description": "Epoch counter must strictly increase by exactly 1 on each successful checkpoint. If it could be incremented multiple times or skipped, the entire epoch-based accounting (rewards, top-ups, staking incentives, bonds) breaks.",
+        "attack_scenario": "If epochCounter can be incremented without proper settlement (e.g., via reentrancy through treasury.rebalanceTreasury external call), tokenomics points would have missing data, leading to incorrect reward distributions and inflation schedules.",
+        "invariant_logic": "checkpoint() returns true => epochCounter_new == epochCounter_old + 1; checkpoint() returns false => epochCounter_new == epochCounter_old",
+        "solidity_property": "function invariant_epochCounterMonotonicity(uint256 oldCounter) public view { assert(epochCounter >= oldCounter && epochCounter <= oldCounter + 1); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "checkpoint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Tokenomics.sol",
+        "description": "Unit incentive reward and topUp fields are cast to uint96 after accumulation in _finalizeIncentivesForUnitId. If accumulated values exceed uint96 max (~7.9e28), silent truncation causes permanent loss of rewards for component/agent owners.",
+        "attack_scenario": "A highly-used component/agent accumulates rewards across many epochs without claiming. The reward or topUp field overflows uint96 during finalization, and the owner permanently loses the difference. An attacker could deliberately avoid claiming to set up conditions where truncation benefits them after re-accumulation.",
+        "invariant_logic": "totalIncentives (reward accumulation) <= type(uint96).max before cast; totalIncentives (topUp accumulation) <= type(uint96).max before cast",
+        "solidity_property": "function invariant_noUint96Overflow(uint256 unitType, uint256 unitId) public view { uint256 reward = mapUnitIncentives[unitType][unitId].reward; uint256 topUp = mapUnitIncentives[unitType][unitId].topUp; assert(reward <= type(uint96).max && topUp <= type(uint96).max); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "_finalizeIncentivesForUnitId"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "Tokenomics.sol",
+        "description": "Donation and checkpoint must not occur in the same block to prevent flash loan attacks where an attacker inflates donation amounts, triggers checkpoint to lock in favorable IDF/rewards, and reverts the donation in the same block.",
+        "attack_scenario": "Attacker flash-loans ETH, donates to services via treasury in block N to inflate totalDonationsETH, then calls checkpoint() in the same block to settle the epoch with manipulated IDF. The lastDonationBlockNumber check prevents this.",
+        "invariant_logic": "checkpoint() callable => lastDonationBlockNumber != block.number",
+        "solidity_property": "function invariant_noSameBlockDonationCheckpoint() public view { /* at entry of checkpoint */ assert(lastDonationBlockNumber != block.number); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "checkpoint"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "trackServiceDonations"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Tokenomics.sol",
+        "description": "Reward fractions (rewardComponentFraction + rewardAgentFraction + rewardTreasuryFraction) must always sum to exactly 100 for every epoch. Top-up fractions (maxBondFraction + topUpComponentFraction + topUpAgentFraction + stakingFraction) must sum to at most 100. Violation would create tokens from nothing or destroy allocation.",
+        "attack_scenario": "If fraction constraints are violated through changeIncentiveFractions, more than 100% of donations/inflation could be distributed, or some fraction would silently receive zero allocation, causing protocol insolvency.",
+        "invariant_logic": "forall epoch e: unitPoints[0].rewardUnitFraction + unitPoints[1].rewardUnitFraction + epochPoint.rewardTreasuryFraction == 100 AND maxBondFraction + unitPoints[0].topUpUnitFraction + unitPoints[1].topUpUnitFraction + stakingFraction <= 100",
+        "solidity_property": "function invariant_fractionSums(uint256 epoch) public view { TokenomicsPoint storage tp = mapEpochTokenomics[epoch]; assert(tp.unitPoints[0].rewardUnitFraction + tp.unitPoints[1].rewardUnitFraction + tp.epochPoint.rewardTreasuryFraction == 100); assert(tp.epochPoint.maxBondFraction + tp.unitPoints[0].topUpUnitFraction + tp.unitPoints[1].topUpUnitFraction + mapEpochStakingPoints[epoch].stakingFraction <= 100); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "changeIncentiveFractions"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "checkpoint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Dispenser.sol",
+        "description": "mapLastClaimedStakingEpochs for a nominee must only advance forward and must never allow re-claiming of already-claimed epochs. Double-claiming would mint excess OLAS from inflation.",
+        "attack_scenario": "If mapLastClaimedStakingEpochs could be reset or decreased, an attacker could re-claim staking incentives for already-processed epochs, draining the inflation pool and minting unbacked OLAS.",
+        "invariant_logic": "forall nomineeHash: mapLastClaimedStakingEpochs[nomineeHash]_new >= mapLastClaimedStakingEpochs[nomineeHash]_old",
+        "solidity_property": "function invariant_claimedEpochMonotonicity(bytes32 nomineeHash, uint256 oldValue) public view { assert(mapLastClaimedStakingEpochs[nomineeHash] >= oldValue); }",
+        "inventory_refs": [
+          {
+            "file": "Dispenser.sol",
+            "function": "claimStakingIncentives"
+          },
+          {
+            "file": "Dispenser.sol",
+            "function": "_calculateStakingIncentivesBatch"
+          },
+          {
+            "file": "Dispenser.sol",
+            "function": "retain"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "StakingBase.sol",
+        "description": "A service can only transition: Unstaked->Staked (via stake()), Staked->Evicted (via checkpoint eviction), Staked->Unstaked (via unstake()), Evicted->Unstaked (via unstake()). Re-staking requires full unstake first. Skipping states would corrupt the staking set and reward accounting.",
+        "attack_scenario": "If a service could re-stake while still staked or evicted (tsStart > 0), it would duplicate its entry in setServiceIds, earning double rewards and corrupting the eviction/unstake index logic.",
+        "invariant_logic": "stake(serviceId) requires mapServiceInfo[serviceId].tsStart == 0; unstake(serviceId) requires mapServiceInfo[serviceId].owner == msg.sender AND tsStart > 0",
+        "solidity_property": "function invariant_serviceStateTransition(uint256 serviceId) public view { ServiceInfo memory sInfo = mapServiceInfo[serviceId]; if (sInfo.tsStart > 0) { /* staked or evicted - cannot stake again */ } }",
+        "inventory_refs": [
+          {
+            "file": "StakingBase.sol",
+            "function": "stake"
+          },
+          {
+            "file": "StakingBase.sol",
+            "function": "unstake"
+          },
+          {
+            "file": "StakingBase.sol",
+            "function": "checkpoint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "StakingBase.sol",
+        "description": "A service must have been staked for at least minStakingDuration before unstaking (unless availableRewards == 0). This prevents rapid stake/unstake attacks that occupy slots without meaningful activity. The constraint minNumStakingPeriods >= maxNumInactivityPeriods ensures this duration always exceeds eviction threshold.",
+        "attack_scenario": "Without minimum staking duration, an attacker could rapidly stake and unstake services to monopolize staking slots, blocking legitimate services from earning rewards while extracting any brief-window rewards for themselves.",
+        "invariant_logic": "unstake(serviceId) requires (block.timestamp - tsStart > minStakingDuration) OR (availableRewards == 0)",
+        "solidity_property": "function invariant_minStakingDuration(uint256 serviceId) public view { ServiceInfo memory sInfo = mapServiceInfo[serviceId]; if (sInfo.tsStart > 0 && availableRewards > 0) { assert(minStakingDuration <= maxInactivityDuration || minStakingDuration >= maxInactivityDuration); } }",
+        "inventory_refs": [
+          {
+            "file": "StakingBase.sol",
+            "function": "unstake"
+          },
+          {
+            "file": "StakingBase.sol",
+            "function": "_initialize"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "DefaultTargetDispenserL2.sol",
+        "description": "L2 target dispenser must only process data from authenticated sources: the L2 message relayer AND the L1 deposit processor. If either check fails, arbitrary actors could inject fake staking deposits or drain tokens.",
+        "attack_scenario": "An attacker sends a crafted message directly to the L2 dispenser pretending to be from the L1 deposit processor. Without proper relayer and source checks, they could trigger deposit of withheld OLAS to attacker-controlled staking contracts.",
+        "invariant_logic": "_receiveMessage requires messageRelayer == l2MessageRelayer AND sourceProcessor == l1DepositProcessor",
+        "solidity_property": "function invariant_authenticatedMessage(address relayer, address source) public view { assert(relayer == l2MessageRelayer && source == l1DepositProcessor); }",
+        "inventory_refs": [
+          {
+            "file": "DefaultTargetDispenserL2.sol",
+            "function": "_receiveMessage"
+          },
+          {
+            "file": "ArbitrumTargetDispenserL2.sol",
+            "function": "receiveMessage"
+          },
+          {
+            "file": "OptimismTargetDispenserL2.sol",
+            "function": "receiveMessage"
+          },
+          {
+            "file": "GnosisTargetDispenserL2.sol",
+            "function": "receiveMessage"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "DefaultTargetDispenserL2.sol",
+        "description": "After migrate() is called, the contract becomes permanently inoperable: owner is zeroed, _locked is set to 2 permanently, paused is 2. No further write operations should be possible. This is irreversible by design.",
+        "attack_scenario": "If migration could be reversed or if any write function remained callable post-migration, an attacker could use the abandoned contract (which may still hold withheld OLAS or queued nonces) to redirect funds.",
+        "invariant_logic": "post migrate(): owner == address(0) AND _locked == 2 AND paused == 2; no function with reentrancy guard or owner check can execute",
+        "solidity_property": "function invariant_postMigration() public view { if (owner == address(0)) { assert(_locked == 2); } }",
+        "inventory_refs": [
+          {
+            "file": "DefaultTargetDispenserL2.sol",
+            "function": "migrate"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "DefaultTargetDispenserL2.sol",
+        "description": "stakingBatchNonce must strictly increase with each batch processed in _processData. This nonce is used as part of the queue hash for failed deposits. If the nonce could be replayed or reset, queued redemptions could collide or be replayed.",
+        "attack_scenario": "If stakingBatchNonce were decremented or not incremented, two different batches could produce the same queueHash for different target/amount combinations, allowing one redemption to satisfy a different queued request.",
+        "invariant_logic": "after _processData: stakingBatchNonce_new == stakingBatchNonce_old + 1",
+        "solidity_property": "function invariant_batchNonceMonotonicity(uint256 oldNonce) public view { assert(stakingBatchNonce >= oldNonce); }",
+        "inventory_refs": [
+          {
+            "file": "DefaultTargetDispenserL2.sol",
+            "function": "_processData"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VoteWeighting.sol",
+        "description": "A removed nominee (mapRemovedNominees[hash] > 0) can never be re-added. Once removed, the nominee is permanently deactivated. mapNomineeIds[hash] is set to 0 on removal and _addNominee checks both maps before allowing addition.",
+        "attack_scenario": "If a removed nominee could be re-added, the old voting slopes and scheduled weight changes would conflict with new ones, corrupting the global weight sum and allowing double-allocation of voting power.",
+        "invariant_logic": "forall nomineeHash: mapRemovedNominees[nomineeHash] > 0 => mapNomineeIds[nomineeHash] == 0 (forever after removal)",
+        "solidity_property": "function invariant_removedNomineeNeverReAdded(bytes32 nomineeHash) public view { if (mapRemovedNominees[nomineeHash] > 0) { assert(mapNomineeIds[nomineeHash] == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "VoteWeighting.sol",
+            "function": "removeNominee"
+          },
+          {
+            "file": "VoteWeighting.sol",
+            "function": "_addNominee"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "VoteWeighting.sol",
+        "description": "A user's total allocated voting power (voteUserPower) must never exceed MAX_WEIGHT (10000 bps = 100%). This ensures the gauge weight system remains zero-sum across all nominees per user.",
+        "attack_scenario": "If a user could exceed MAX_WEIGHT, they could allocate more than 100% of their veOLAS power, inflating the weights of chosen nominees and disproportionately directing staking incentives to colluding targets.",
+        "invariant_logic": "forall user: voteUserPower[user] <= MAX_WEIGHT (10000)",
+        "solidity_property": "function invariant_votePowerCapped(address user) public view { assert(voteUserPower[user] <= MAX_WEIGHT); }",
+        "inventory_refs": [
+          {
+            "file": "VoteWeighting.sol",
+            "function": "voteForNomineeWeights"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "VoteWeighting.sol",
+        "description": "Users cannot change votes for the same nominee more often than WEIGHT_VOTE_DELAY (10 days). This prevents vote manipulation attacks where a user rapidly shifts weight to exploit short-term incentive calculations.",
+        "attack_scenario": "Without the delay, an attacker with veOLAS could rapidly shift all weight to a target right before an epoch checkpoint, claim disproportionate staking incentives, then shift weight elsewhere. The 10-day delay prevents this temporal gaming.",
+        "invariant_logic": "voteForNomineeWeights requires block.timestamp >= lastUserVote[msg.sender][nomineeHash] + WEIGHT_VOTE_DELAY",
+        "solidity_property": "function invariant_voteDelay(address user, bytes32 nomineeHash) public view { assert(block.timestamp >= lastUserVote[user][nomineeHash] + WEIGHT_VOTE_DELAY || lastUserVote[user][nomineeHash] == 0); }",
+        "inventory_refs": [
+          {
+            "file": "VoteWeighting.sol",
+            "function": "voteForNomineeWeights"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "Dispenser.sol",
+        "description": "Nominees can only be removed (in Dispenser context) when there is more than 1 week remaining before the current epoch ends. This prevents last-minute removals that could cause accounting issues with in-progress epoch incentive calculations.",
+        "attack_scenario": "If a nominee is removed right before an epoch ends, users who already voted for it would have their staking incentive calculations disrupted, and the one-epoch grace period for claiming post-removal incentives could be circumvented.",
+        "invariant_logic": "removeNominee requires block.timestamp < (prevEpochEndTime + epochLen - 1 weeks)",
+        "solidity_property": "function invariant_removalTiming() public view { /* checked in removeNominee */ }",
+        "inventory_refs": [
+          {
+            "file": "Dispenser.sol",
+            "function": "removeNominee"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-015",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Dispenser.sol",
+        "description": "The withheld amount accounting must be consistent: amounts withheld on L2 are synced to L1 via bridge messages and credited against future transfers. The deduction logic (withheldAmount >= transferAmount reduces transfer to 0, otherwise reduces withheld) must never allow double-spending of withheld amounts.",
+        "attack_scenario": "If withheld amounts are not properly decremented when applied against transfers, the same withheld amount could offset multiple transfer batches, causing the protocol to distribute more OLAS than intended without actual tokens backing the deposits.",
+        "invariant_logic": "mapChainIdWithheldAmounts[chainId] after claim = max(0, oldWithheld - transferAmount); transferAmount after = max(0, oldTransfer - oldWithheld)",
+        "solidity_property": "function invariant_withheldConsistency(uint256 chainId, uint256 oldWithheld, uint256 oldTransfer) public view { uint256 newWithheld = mapChainIdWithheldAmounts[chainId]; if (oldWithheld >= oldTransfer) { assert(newWithheld == oldWithheld - oldTransfer); } else { assert(newWithheld == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "Dispenser.sol",
+            "function": "claimStakingIncentives"
+          },
+          {
+            "file": "Dispenser.sol",
+            "function": "_calculateStakingIncentivesBatch"
+          },
+          {
+            "file": "Dispenser.sol",
+            "function": "syncWithheldAmount"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-016",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "EthereumDepositProcessor.sol",
+        "description": "On L1 Ethereum chain, if ANY single staking target in a batch has zero emissions limit from verifyInstanceAndGetEmissionsAmount, the entire batch transaction reverts (hard revert). This differs from L2 behavior (soft withholding) and can block all L1 staking targets on a chain if one becomes invalid.",
+        "attack_scenario": "An attacker deploys a staking instance, gets it voted for, then disables it (via setInstanceStatus). When anyone tries to claim a batch that includes this target on L1, the entire batch fails, blocking all other valid targets in that batch from receiving incentives.",
+        "invariant_logic": "EthereumDepositProcessor._deposit: forall target in batch: verifyInstanceAndGetEmissionsAmount(target) > 0, else entire tx reverts",
+        "solidity_property": "function invariant_l1AllTargetsMustBeValid(address[] memory targets) public view { for (uint256 i = 0; i < targets.length; i++) { assert(IStakingFactory(stakingFactory).verifyInstanceAndGetEmissionsAmount(targets[i]) > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "EthereumDepositProcessor.sol",
+            "function": "_deposit"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-017",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "Tokenomics.sol",
+        "description": "Tokenomics checkpoint can only succeed if the epoch duration is between epochLen and MAX_EPOCH_LENGTH (~364 days). If no checkpoint is called for more than MAX_EPOCH_LENGTH, the checkpoint function permanently returns false, freezing the tokenomics system.",
+        "attack_scenario": "If all parties fail to call checkpoint for over 364 days (e.g., contract becomes inaccessible, or gas griefing), the tokenomics system becomes permanently frozen: no new epochs, no reward distributions, no bond programs. This is a liveness failure.",
+        "invariant_logic": "checkpoint returns true requires: epochLen <= (block.timestamp - prevEpochEndTime) <= MAX_EPOCH_LENGTH",
+        "solidity_property": "function invariant_epochTimeBounds() public view { uint256 prevEnd = mapEpochTokenomics[epochCounter - 1].epochPoint.endTime; uint256 diff = block.timestamp - prevEnd; assert(diff <= MAX_EPOCH_LENGTH); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "checkpoint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-018",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Tokenomics.sol",
+        "description": "Tokenomics can only be initialized once (owner == address(0) before init). The proxy-based upgrade pattern means the implementation can be changed, but storage initialization must happen exactly once to prevent re-initialization attacks that reset all tokenomics state.",
+        "attack_scenario": "If initializeTokenomics could be called again on the proxy, all tokenomics parameters, epoch counters, inflation rates, and accumulated data would be reset. This would destroy all pending rewards, bonds, and staking incentives.",
+        "invariant_logic": "initializeTokenomics callable only when owner == address(0); after init: owner != address(0)",
+        "solidity_property": "function invariant_initOnce() public view { assert(owner != address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "initializeTokenomics"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-019",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "DefaultTargetDispenserL2.sol",
+        "description": "The redeem function for queued staking deposits does NOT re-verify the staking target's validity or emissions limit. A target that was valid when queued but later became invalid (disabled, or exceeded emissions) can still receive full queued amount.",
+        "attack_scenario": "A staking target passes verification during _processData but is then disabled by its deployer. The queued deposit remains redeemable at the original amount, bypassing the emissions limit that would now return 0. The target receives OLAS it should not.",
+        "invariant_logic": "redeem(target, amount, batchNonce) does NOT check verifyInstanceAndGetEmissionsAmount(target); only checks stakingQueueingNonces[hash]",
+        "solidity_property": "function invariant_redeemNoReverify(address target, uint256 amount, uint256 batchNonce) public view { bytes32 queueHash = keccak256(abi.encode(target, amount, batchNonce)); assert(stakingQueueingNonces[queueHash]); /* no emissions check */ }",
+        "inventory_refs": [
+          {
+            "file": "DefaultTargetDispenserL2.sol",
+            "function": "redeem"
+          },
+          {
+            "file": "DefaultTargetDispenserL2.sol",
+            "function": "_processData"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-020",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "StakingBase.sol",
+        "description": "availableRewards must always be less than or equal to balance. If more rewards are distributed than tokens held, the contract becomes insolvent and withdrawals fail.",
+        "attack_scenario": "If reward accounting diverges from actual token balance (e.g., through rounding in proportional distribution when totalRewards > lastAvailableRewards), the accumulated mapServiceInfo[id].reward values could exceed the contract's actual token balance, causing late-claiming services to fail on withdrawal.",
+        "invariant_logic": "availableRewards <= balance AND sum(mapServiceInfo[id].reward for all staked services) <= balance - availableRewards... approximately",
+        "solidity_property": "function invariant_solvency() public view { assert(availableRewards <= balance); }",
+        "inventory_refs": [
+          {
+            "file": "StakingBase.sol",
+            "function": "checkpoint"
+          },
+          {
+            "file": "StakingBase.sol",
+            "function": "_withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-021",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "WormholeDepositProcessorL1.sol",
+        "description": "Wormhole delivery hash must be unique and recorded to prevent replay attacks. Each cross-chain message has a unique deliveryHash, and mapDeliveryHashes prevents processing the same message twice.",
+        "attack_scenario": "Without delivery hash uniqueness check, a Wormhole relayer or attacker could replay a legitimate L2-to-L1 withheld amount sync message, causing the withheld amount to be credited multiple times on L1, allowing excess OLAS to be claimed without actual tokens backing it.",
+        "invariant_logic": "receiveWormholeMessages: mapDeliveryHashes[deliveryHash] must be false before processing; set to true after",
+        "solidity_property": "function invariant_deliveryHashUnique(bytes32 hash) public view { /* once set to true, cannot process again */ }",
+        "inventory_refs": [
+          {
+            "file": "WormholeDepositProcessorL1.sol",
+            "function": "receiveWormholeMessages"
+          },
+          {
+            "file": "WormholeTargetDispenserL2.sol",
+            "function": "receivePayloadAndTokens"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-022",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "StakingFactory.sol",
+        "description": "Only the original deployer of a staking proxy instance can toggle its enabled/disabled status via setInstanceStatus. If this check is bypassed, anyone could disable legitimate staking contracts, causing their emissions amount to return 0 and blocking reward distribution.",
+        "attack_scenario": "If setInstanceStatus had no deployer check, a griefer could disable all staking instances, causing verifyInstance to return false for all targets. This would cause all staking incentives to be withheld on L2 or reverted on L1.",
+        "invariant_logic": "setInstanceStatus(instance, isEnabled) requires msg.sender == mapInstanceParams[instance].deployer",
+        "solidity_property": "function invariant_onlyDeployerToggles(address instance) public view { assert(mapInstanceParams[instance].deployer != address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "StakingFactory.sol",
+            "function": "setInstanceStatus"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-023",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Tokenomics.sol",
+        "description": "Tokenomics parameters (devsPerCapital, codePerDev, epsilonRate, epochLen, veOLASThreshold) and incentive fractions are only applied at the next epoch boundary via checkpoint(), not immediately. The tokenomicsParametersUpdated flag (bitmask) coordinates this deferred application.",
+        "attack_scenario": "If parameters were applied immediately, the owner could manipulate mid-epoch calculations. By deferring to next checkpoint, the current epoch's calculations remain consistent. If the flag bits are mismanaged, parameters could be applied to wrong epochs or not applied at all.",
+        "invariant_logic": "changeTokenomicsParameters sets bit 0x01; changeIncentiveFractions sets bit 0x02; changeStakingParams sets bit 0x08; checkpoint reads and resets all bits to 0",
+        "solidity_property": "function invariant_paramUpdateFlag() public view { /* after checkpoint: tokenomicsParametersUpdated == 0 */ }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "changeTokenomicsParameters"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "changeIncentiveFractions"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "changeStakingParams"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "checkpoint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-024",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Dispenser.sol",
+        "description": "Staking incentives cannot be claimed when the contract is in StakingIncentivesPaused or AllPaused state, OR when the treasury is paused (paused == 2). Both conditions are checked conjunctively. Developer incentives have their own independent pause check (DevIncentivesPaused or AllPaused).",
+        "attack_scenario": "If pause states are not properly enforced, staking incentives could be claimed during emergency scenarios (e.g., discovered exploit in bridge), allowing attackers to drain funds before the vulnerability is addressed.",
+        "invariant_logic": "claimStakingIncentives requires: paused != StakingIncentivesPaused AND paused != AllPaused AND ITreasury(treasury).paused() != 2",
+        "solidity_property": "function invariant_pauseEnforced() public view { Pause p = paused; assert(p != Pause.StakingIncentivesPaused && p != Pause.AllPaused); }",
+        "inventory_refs": [
+          {
+            "file": "Dispenser.sol",
+            "function": "claimStakingIncentives"
+          },
+          {
+            "file": "Dispenser.sol",
+            "function": "claimStakingIncentivesBatch"
+          },
+          {
+            "file": "Dispenser.sol",
+            "function": "claimOwnerIncentives"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-025",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Tokenomics.sol",
+        "description": "effectiveBond must track the running total of maxBond allocations minus consumed bond program reservations plus refunds. If effectiveBond accounting drifts from actual available bond capacity, bond programs could be over- or under-allocated.",
+        "attack_scenario": "During checkpoint, effectiveBond is credited with the new epoch's maxBond and adjusted for the difference between actual epoch inflation and pre-estimated maxBond. If the year-change inflation recalculation is incorrect, effectiveBond could be inflated, allowing depository to create bond programs larger than the inflation supports.",
+        "invariant_logic": "effectiveBond_new = effectiveBond_old + newMaxBond + (actualMaxBond - oldMaxBond) where actualMaxBond >= oldMaxBond",
+        "solidity_property": "function invariant_effectiveBondConsistency() public view { assert(effectiveBond <= type(uint96).max); }",
+        "inventory_refs": [
+          {
+            "file": "Tokenomics.sol",
+            "function": "checkpoint"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "reserveAmountForBondProgram"
+          },
+          {
+            "file": "Tokenomics.sol",
+            "function": "refundFromBondProgram"
+          }
+        ]
+      }
+    ]
+  }
+}

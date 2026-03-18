@@ -1,0 +1,506 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "forceInclusion Missing Time-Based Delay Check Allows Premature Forced Message Inclusion",
+      "severity": "high",
+      "summary": "The forceInclusion function only enforces a block-number-based delay check (l1BlockAndTime[0] + delayBlocks_ >= block.number) but completely omits the time-based delay check. The error ForceIncludeTimeTooSoon is defined in Error.sol but never used anywhere in the codebase. The delaySeconds variable is stored and read in getTimeBounds/maxTimeVariationInternal but is not enforced during force inclusion. On chains where block production rate varies or accelerates, messages could be force-included b",
+      "description": [
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 242,
+          "line_end": 244,
+          "desc": "Only block-based check present: `if (l1BlockAndTime[0] + delayBlocks_ >= block.number) revert ForceIncludeBlockTooSoon()`. No timestamp check against delaySeconds. ForceIncludeTimeTooSoon error defined at Error.sol but never referenced."
+        },
+        {
+          "file": "Error.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: ForceIncludeTimeTooSoon"
+        }
+      ],
+      "impact": "The missing time-based check weakens censorship resistance guarantees by allowing premature force inclusion when block production rates diverge from expected timing. On L1 Ethereum, the practical window is small but non-zero. On L2 chains or chains with variable block times, the window could be significant. The defect reduces the dual-check safety margin that the protocol was designed with, as evidenced by the defined-but-unused error type and the stored-but-unchecked delaySeconds parameter.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "DelayBuffer Zero replenishRateInBasis Config Permanently Disables Buffer Recovery",
+      "severity": "high",
+      "summary": "isValidBufferConfig allows replenishRateInBasis to be 0 (it only checks <= BASIS, not > 0). If configured with zero replenishment rate, the buffer can deplete but never recover. After any transient sequencer outage that causes buffer depletion, the force inclusion window permanently shortens to threshold blocks. This is a one-way ratchet that can never be reversed without admin reconfiguration.",
+      "description": [
+        {
+          "file": "DelayBuffer.sol",
+          "line_start": 88,
+          "line_end": 93,
+          "desc": "isValidBufferConfig returns true for replenishRateInBasis == 0. calcBuffer line 46: `buffer += (elapsed * replenishRateInBasis) / BASIS` adds 0 replenishment when rate is 0."
+        },
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _setBufferConfig"
+        }
+      ],
+      "impact": "If configured with replenishRateInBasis=0 and buffer depletes, the force inclusion window permanently shortens to threshold blocks. This reduces censorship resistance as force inclusion becomes permanently cheaper. The impact is MEDIUM because: (1) it requires admin misconfiguration, (2) it's recoverable via admin reconfiguration, but (3) the missing validation is a genuine asymmetric oversight that could lead to an irreversible degradation of security properties if not caught.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "isSynced Check in DelayBuffer Can Cause Underflow Revert After Chain Fork",
+      "severity": "high",
+      "summary": "The isSynced function computes block.number - self.prevBlockNumber without safe subtraction. Under Solidity 0.8's checked arithmetic, if prevBlockNumber > block.number (possible after a chain fork where block numbers reset or if a forked chain has lower block numbers), this would revert with an underflow. Since isSynced is called by isDelayProofRequired (which gates batch posting) and isUpdatable (which gates buffer updates), an underflow would brick all batch posting functions that check delay ",
+      "description": [
+        {
+          "file": "DelayBuffer.sol",
+          "line_start": 97,
+          "line_end": 99,
+          "desc": "return block.number - self.prevBlockNumber <= self.threshold; — unchecked subtraction. removeDelayAfterFork at SequencerInbox.sol:196-200 resets delay params but NOT buffer.prevBlockNumber."
+        },
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: removeDelayAfterFork"
+        }
+      ],
+      "impact": "If triggered: all delay-bufferable batch posting functions revert (both regular and delay-proof variants). ForceInclusion still works. Admin can recover by calling setBufferConfig which resets prevBlockNumber via buffer.update(). Impact duration is from fork until admin intervention. The severity is MEDIUM because: (1) it requires an unusual fork scenario, (2) forceInclusion provides a fallback, (3) admin recovery is available.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Smart Contract Batch Posters Silently Denied L2 Gas Reimbursements",
+      "severity": "high",
+      "summary": "SequencerInbox intentionally skips calling submitBatchSpendingReport if the caller is a smart contract, causing multisig batch posters to silently lose all L2 gas reimbursements.",
+      "description": [
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 341,
+          "line_end": 343,
+          "desc": "isFromOrigin ? data.length : 0 and if (msg.sender == tx.origin && !isUsingFeeToken)"
+        }
+      ],
+      "impact": "MEDIUM severity. Smart contract batch posters lose 100% of their L2 gas reimbursements. For a production rollup, batch posting costs can be substantial (hundreds of ETH per month at high gas prices). The defect is particularly insidious because: (1) it's completely silent - no error, no event, no indication of the loss; (2) the protocol explicitly supports smart contract batch posters and is deprecating the EOA-only path; (3) EIP-3074 and EIP-4337 trends push toward more smart contract wallet usage for infrastructure operations.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "forceInclusion Uses Last Message Block Number Instead of First for Buffer Update",
+      "severity": "high",
+      "summary": "In forceInclusion, buffer.update(l1BlockAndTime[0]) is called with the block number of the LAST delayed message in the force-included range. In contrast, delayProofImpl processes the FIRST new delayed message's block number for buffer updates. When force-including a range of messages (from old to new), using the last message's (more recent) block number results in LESS buffer depletion than if the first (oldest) message's block were used. This asymmetry means forceInclusion systematically undere",
+      "description": [
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 245,
+          "line_end": 250,
+          "desc": "forceInclusion calls buffer.update(l1BlockAndTime[0]) where l1BlockAndTime[0] is the LAST message's block; delayProofImpl calls buffer.update(delayProof.delayedMessage.blockNumber) for the FIRST new message"
+        }
+      ],
+      "impact": "MEDIUM severity. The buffer tracks sequencer delay and determines force inclusion deadlines. When forceInclusion understates the delay:\n1. Force inclusion deadlines remain longer than they should be, making it harder for users to force-include subsequent messages\n2. The buffer doesn't accurately reflect the sequencer's actual delinquency\n3. The sequencer benefits from an artificially maintained delay window\n\nThe impact is bounded by the fact that force inclusion still works (just with slightly different timing guarantees), and the buffer has min/max bounds (threshold/max). The severity is MEDIUM because it doesn't break the mechanism entirely but introduces a systematic bias that undermines the delay buffer's purpose.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Staking Pool Free-Riding and Share Theft via Unadjusted Balances",
+      "severity": "high",
+      "summary": "The staking pools do not deduct user deposit balances when staking tokens into the rollup or challenge manager. This allows early depositors to withdraw their funds after the protocol move is made, forcing remaining depositors to bear 100% of the slashing risk, and enables stealing funds from new depositors if the pool is slashed.",
+      "description": [
+        {
+          "file": "AbsBoldStakingPool.sol",
+          "line_start": 41,
+          "line_end": 51,
+          "desc": "depositBalance[msg.sender] is only decreased during withdrawal, not when funds are sent to the protocol"
+        }
+      ],
+      "impact": "The severity is HIGH for the accounting defect itself. The first-come-first-served withdrawal issue after createAssertion is a clear design flaw that asymmetrically distributes slashing risk. The theft-from-new-deposits scenario, while less likely in practice (requires someone depositing into a stale/slashed pool), is also real. The total value at risk equals all tokens deposited into any slashed pool plus any new deposits made to those pools. The pools are permissionless to create and deposit into, meaning there's no off-chain coordination that could universally prevent exploitation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Token Breaks Staking Pool Accounting",
+      "severity": "high",
+      "summary": "If the configured `stakeToken` is a fee-on-transfer token, `AbsBoldStakingPool` credits the user's `depositBalance` with the full `amount` while receiving less. This prevents the pool from ever reaching the required balance to stake, or allows early withdrawers to drain funds deposited by others.",
+      "description": [
+        {
+          "file": "AbsBoldStakingPool.sol",
+          "line_start": 31,
+          "line_end": 32,
+          "desc": "depositBalance[msg.sender] += amount; IERC20(stakeToken).safeTransferFrom(msg.sender, address(this), amount);"
+        }
+      ],
+      "impact": "HIGH severity when the precondition is met. Two impacts: (1) Denial of service - the pool cannot accumulate enough actual tokens to create assertions/edges, completely preventing the pool from functioning. (2) Fund loss - if the pool does function, early withdrawers steal from later depositors by withdrawing more actual tokens than they deposited. The severity is mitigated by the config dependency - mainstream Arbitrum deployments use WETH (not fee-on-transfer), but the code is designed for arbitrary rollup deployments.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Blob Gas Cost Truncation Denies Batch Poster Reimbursement",
+      "severity": "high",
+      "summary": "In `SequencerInbox.formBlobDataHash`, the normalized blob gas cost is calculated as `blobCost / block.basefee`. If the L1 base fee spikes significantly higher than the blob base fee, this integer division can truncate to zero, denying the batch poster any L2 gas reimbursement for their blob data costs.",
+      "description": [
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 469,
+          "line_end": 474,
+          "desc": "block.basefee > 0 ? blobCost / block.basefee : 0"
+        }
+      ],
+      "impact": "The defect causes systematic truncation of blob cost reimbursement to zero under common market conditions. However, the economic impact is limited because truncation to zero only occurs when blob costs themselves are negligibly small (less than 1 gas unit worth of ETH). At blobBaseFee=1 wei with 6 blobs, the unreimbursed cost is ~786,432 wei (~$0.002 at $2500/ETH). Over thousands of batches this could accumulate to a few dollars. The risk is classified as MEDIUM because: (1) the code defect is real and occurs under common conditions, (2) batch posters consistently lose a small amount per batch, and (3) during extreme L1 congestion spikes where basefee increases dramatically while blob fees remain low, the gap widens but the absolute amounts lost remain small.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "RollupCreator.createRollup Sweeps Entire Contract ETH Balance to Caller",
+      "severity": "high",
+      "summary": "RollupCreator._deployFactories sends address(this).balance (the ENTIRE contract ETH balance) to msg.sender as a refund, not just the excess from the current deployment. Since RollupCreator has a receive() function accepting arbitrary ETH, any ETH accumulated from prior sends or accidental transfers would be swept by the next createRollup caller who deploys factories with ETH-based rollup.",
+      "description": [
+        {
+          "file": "RollupCreator.sol",
+          "line_start": 214,
+          "line_end": 224,
+          "desc": "msg.sender.call{value: address(this).balance} sends entire contract balance, not just excess from this deployment"
+        }
+      ],
+      "impact": "The impact is MEDIUM. While the code is clearly defective (sending more ETH than belongs to the caller), the practical accumulation of ETH in the RollupCreator depends on: (1) accidental ETH transfers to the contract, (2) edge cases in l2FactoriesDeployer.perform refund logic, or (3) deliberate griefing (sending ETH to be stolen later, which has no attacker benefit). In typical usage, createRollup is called infrequently and the contract balance is likely near zero between calls. However, the code is still wrong - it should track and refund only the caller's excess, not the entire balance.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cross-Claim Timer Inheritance via Missing claimId Validation in updateTimerCacheByClaim",
+      "severity": "high",
+      "summary": "The checkClaimIdLink function validates that claimingEdgeId.originId matches edgeId.mutualId() and that the level is correct, but it does NOT verify that claimingEdgeId.claimId == edgeId. Since rival edges share the same mutualId, a dishonest edge at level L can inherit timer from a claiming edge at level L+1 that actually claims the honest rival. This allows a dishonest bisection chain to steal accumulated unrivaled time from the honest chain's claiming edges, potentially enabling confirmation ",
+      "description": [
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "line_start": 383,
+          "line_end": 401,
+          "desc": "checkClaimIdLink checks originId==mutualId and level but omits claimId==edgeId check; natspec at EdgeChallengeManager.sol:101 says 'claimId equal to edgeId' but code doesn't enforce"
+        },
+        {
+          "file": "EdgeChallengeManager.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: updateTimerCacheByClaim"
+        }
+      ],
+      "impact": "CRITICAL. The vulnerability completely undermines the BoLD protocol's core security guarantee: that only the correct assertion can accumulate enough timer to be confirmed. By allowing cross-claim timer inheritance, the dishonest party can effectively copy the honest chain's accumulated timer (including one-step proof max timers), reducing the security game to a race based only on edge creation timing rather than correctness of state transitions. If exploited, a fraudulent assertion could be confirmed, potentially enabling theft of all bridged assets in the rollup.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Token Drains Challenge Manager",
+      "severity": "high",
+      "summary": "If a fee-on-transfer token is used as the stake token, the Challenge Manager will become insolvent because it refunds more tokens than it actually receives.",
+      "description": [
+        {
+          "file": "EdgeChallengeManager.sol",
+          "line_start": 216,
+          "line_end": 216,
+          "desc": "Transfers exact stakeAmounts[level] in and out without checking actual received balance"
+        },
+        {
+          "file": "ChallengeEdgeLib.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: setRefunded"
+        }
+      ],
+      "impact": "If a fee-on-transfer token is used as stakeToken: (1) Contract gradually becomes insolvent, (2) Later refundStake calls revert, locking honest validators' stakes permanently, (3) This constitutes both loss of funds and denial of service. The defect exists in the code regardless of current deployment choices - it is a missing safety check for a known class of ERC20 tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Validator Whitelist Permanently Removable During Extended Pause via removeWhitelistAfterValidatorAfk",
+      "severity": "high",
+      "summary": "The function removeWhitelistAfterValidatorAfk() has no whenNotPaused modifier. If the rollup admin pauses the contract for a legitimate operational reason (e.g., security incident, upgrade coordination) lasting longer than VALIDATOR_AFK_BLOCKS (201600 blocks, ~28 days at 12s), any address can call this function to permanently and irreversibly disable the validator whitelist. Once unpaused, all validator-gated functions become permissionless, allowing any entity to stake, create assertions, and p",
+      "description": [
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 73,
+          "line_end": 77,
+          "desc": "removeWhitelistAfterValidatorAfk() is external with no whenNotPaused modifier; block.number keeps incrementing during pause, making _validatorIsAfk() return true"
+        }
+      ],
+      "impact": "HIGH impact. The validator whitelist is a critical access control mechanism that restricts who can participate in the rollup validation. Its permanent removal during a pause means that upon unpausing, any entity can stake, create assertions, and participate in the challenge game without authorization. While creating invalid assertions still requires capital and will be challenged, the removal of the whitelist fundamentally changes the security model from permissioned to permissionless without admin intent.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "confirmEdgeByOneStepProof machineStep Overflow with High numBigStepLevel Configuration",
+      "severity": "high",
+      "summary": "In confirmEdgeByOneStepProof, the machineStep calculation iterates through BigStep levels, multiplying stepSize by bigStepHeight at each level: stepSize *= bigStepHeight. With numBigStepLevel > ~9 and bigStepHeight >= 2^26 (a power of 2), the intermediate value overflows uint256 (Solidity 0.8 checked arithmetic), causing the function to always revert. This permanently prevents one-step proof confirmation, making the challenge protocol unable to resolve disputes. The contract allows numBigStepLev",
+      "description": [
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "line_start": 464,
+          "line_end": 478,
+          "desc": "stepSize *= bigStepHeight in loop iterating through BigStep levels; exponential growth with no overflow guard"
+        }
+      ],
+      "impact": "If deployed with overflow-causing parameters: CRITICAL - complete inability to resolve disputes via one-step proofs. confirmEdgeByOneStepProof becomes permanently non-functional. Disputes reaching the SmallStep level cannot be resolved, which could block assertion confirmation for disputed assertions. Recovery requires redeployment of the EdgeChallengeManager with corrected parameters. For typical production configurations (numBigStepLevel = 1-3), this is not exploitable, but the code contains a genuine missing validation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unprivileged permanent validator whitelist removal on faster-than-12s block chains",
+      "severity": "high",
+      "summary": "The validator whitelist can be permanently disabled by any caller once `_validatorIsAfk()` becomes true. Because `VALIDATOR_AFK_BLOCKS` is hardcoded assuming ~12s blocks, deploying on a chain with materially faster block times shortens the wall-clock time to whitelist removal, allowing permissionless participation much earlier than intended.",
+      "description": [
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 43,
+          "line_end": 77,
+          "desc": "VALIDATOR_AFK_BLOCKS = 201600; _validatorIsAfk compares createdAtBlock/firstChildBlock + VALIDATOR_AFK_BLOCKS < block.number; removeWhitelistAfterValidatorAfk callable by anyone"
+        }
+      ],
+      "impact": "HIGH. The validator whitelist is a critical security control that gates who can participate in assertion creation and confirmation. Premature removal allows Sybil attacks on the validator set. The defect is especially severe because: (1) the state change is permanent with no re-enable mechanism, (2) it's callable by anyone, (3) the stated invariant (AFK time > max(2*confirmPeriod, 2*challengePeriod)) can be violated on fast-block chains, meaning the whitelist could be removed while challenges are still in progress, and (4) unlike confirmPeriodBlocks/challengePeriodBlocks which are configurable per-deployment, this constant cannot be adjusted.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Stuck Excess Stake on Losing Assertions",
+      "severity": "high",
+      "summary": "When a staker creates a non-first-child assertion, `requiredStake` is sent to `loserStakeEscrow`. However, if the staker had deposited more than `requiredStake` (e.g., to cover future assertions), the excess amount remains in their `amountStaked` balance. If this assertion loses the challenge, the staker can never become 'inactive' (because their assertion will never be confirmed and will never have a valid child), permanently locking their excess funds.",
+      "description": [
+        {
+          "file": "RollupCore.sol",
+          "line_start": 382,
+          "line_end": 386,
+          "desc": "requireInactiveStaker requires latestConfirmed or haveChild, which a losing leaf will never achieve"
+        },
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: stakeOnNewAssertion"
+        }
+      ],
+      "impact": "HIGH severity. Any validator who deposits more than exactly requiredStake and creates a non-first-child assertion (which is the expected behavior in disputes) risks permanently losing their excess funds if the assertion loses. This disincentivizes honest validators from participating in disputes or maintaining adequate stake for future operations. The developers acknowledged this issue in a code comment but did not implement a fix.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "`newStakeOnNewAssertion` Violates CEI and Temporarily Uses Other Users' Funds",
+      "severity": "high",
+      "summary": "`newStakeOnNewAssertion` calls `stakeOnNewAssertion` (which transfers `requiredStake` to the escrow) BEFORE calling `receiveTokens` to pull the user's deposit. This temporarily uses the contract's existing balance to cover the escrow transfer.",
+      "description": [
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 231,
+          "line_end": 233,
+          "desc": "stakeOnNewAssertion called before receiveTokens"
+        }
+      ],
+      "impact": "MEDIUM severity. The CEI violation creates a potential DoS vector where honest validators using newStakeOnNewAssertion to challenge invalid assertions may be blocked if the contract's existing token balance is insufficient. While workarounds exist (existing stakers can use stakeOnNewAssertion directly, or tokens can be pre-sent to the contract), the code is objectively incorrect in its ordering. In worst case, this could delay challenges against invalid assertions, though it cannot prevent them entirely since existing stakers with deposits already in the contract can still create competing assertions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Minimum Assertion Period Bypass via Intentional Overflow Assertions",
+      "severity": "high",
+      "summary": "The `minimumAssertionPeriod` rate limit is bypassed for `overflowAssertion`s. An attacker can intentionally craft valid but incomplete execution states to trigger this bypass, allowing them to generate an unbounded chain of child assertions in a single block.",
+      "description": [
+        {
+          "file": "RollupCore.sol",
+          "line_start": 300,
+          "line_end": 304,
+          "desc": "overflowAssertion bypasses minimumAssertionPeriod check"
+        },
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: stakeOnNewAssertion"
+        }
+      ],
+      "impact": "MEDIUM severity. The direct impact is state bloat: hundreds or thousands of AssertionNode entries created in _assertions mapping, plus events emitted, all within a single block. This degrades node sync performance and increases storage costs. If the overflow assertions contain invalid states (attacker can submit any FINISHED state), honest validators need to identify the root of the malicious chain and challenge it. While challenging the root suffices (children of an invalid assertion cannot be confirmed), the presence of many assertions complicates the validator's monitoring logic. The attacker's cost is gas for creating assertions plus their initial baseStake deposit.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "`fastConfirmNewAssertion` Drains Staker Funds When Creating Sibling Assertions",
+      "severity": "high",
+      "summary": "The `anyTrustFastConfirmer` can instantly create and confirm assertions. If it creates a sibling assertion, the contract transfers `requiredStake` to `loserStakeEscrow`. Because the fast confirmer does not deposit stake, this transfer drains the contract's balance.",
+      "description": [
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 203,
+          "line_end": 204,
+          "desc": "safeTransfer to loserStakeEscrow without prior deposit by fast confirmer"
+        }
+      ],
+      "impact": "The direct impact is violation of the solvency invariant (INV-ECON-001). Each time the fast confirmer creates a non-first-child assertion, requiredStake tokens are removed from the contract without replacement. This reduces the contract's ability to honor future withdrawals by honest stakers. If repeated or if requiredStake is large relative to the contract's balance, this can render the contract insolvent, preventing legitimate stakers from withdrawing. The severity is moderated by: (1) requiring a trusted role (anyTrustFastConfirmer), (2) the scenario requires someone else to have already created the first child, and (3) the lost tokens belong to the losing staker who would have lost them anyway in a normal dispute resolution.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "BOLDUpgradeAction Skips Stakers in Active Challenges Leading to Potential Fund Lockup",
+      "severity": "high",
+      "summary": "BOLDUpgradeAction.cleanupOldRollup iterates through stakers but only refunds those where staker.isStaked && staker.currentChallenge == 0. Stakers in active challenges at upgrade time are skipped. Additionally, iteration is capped at 50 stakers. Skipped stakers rely on IMPL_PATCHED_OLD_ROLLUP_USER to withdraw post-upgrade. If the patched implementation doesn't properly handle challenged stakers or stakers beyond index 50, their funds are permanently locked.",
+      "description": [
+        {
+          "file": "BOLDUpgradeAction.sol",
+          "line_start": 221,
+          "line_end": 240,
+          "desc": "for loop capped at 50; inner condition `if (staker.isStaked && staker.currentChallenge == 0)` skips challenged stakers; upgradeSecondaryTo(IMPL_PATCHED_OLD_ROLLUP_USER) is the only recovery path"
+        }
+      ],
+      "impact": "If IMPL_PATCHED_OLD_ROLLUP_USER does not properly handle all edge cases, the impact is: (1) Stakers in active challenges at upgrade time cannot recover their funds. (2) Stakers beyond index 50 cannot recover their funds. (3) Due to the iteration bug (list modification during iteration), additional eligible stakers within the first 50 may also be skipped. The financial impact is the permanent loss of staked funds for affected stakers. On production Arbitrum One, staker count is typically low (single digits), but the challenge filter remains relevant.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Upgrading Stake Amounts Causes EdgeChallengeManager Insolvency or User Loss",
+      "severity": "high",
+      "summary": "EdgeChallengeManager.refundStake uses the current stakeAmounts array rather than the historical amount paid. If an admin upgrades the contract to change stake amounts while challenges are active, it will refund incorrect amounts.",
+      "description": [
+        {
+          "file": "EdgeChallengeManager.sol",
+          "line_start": 348,
+          "line_end": 348,
+          "desc": "uint256 sa = stakeAmounts[edge.level]; used during refund instead of recorded amount"
+        }
+      ],
+      "impact": "If stakeAmounts is increased via upgrade: early refund claimants drain funds from the contract, leaving later claimants unable to be refunded (insolvency). If decreased: all edge creators receive less than their original stake. The severity depends on the magnitude of the change and the number of active edges. This directly violates INV-ECON-002 (EdgeChallengeManager solvency invariant).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "SequencerInbox updateRollupAddress owner-check uses current rollup.owner(): bridge-rollup desync can brick updates",
+      "severity": "high",
+      "summary": "SequencerInbox.updateRollupAddress requires msg.sender == rollup.owner() (where rollup is the cached rollup pointer). If the cached rollup pointer becomes stale or points to a rollup whose owner is not the intended governance entity (e.g., after migrations), then the legitimate operator of the bridge/rollup may be unable to call updateRollupAddress, leaving SequencerInbox wired to an outdated rollup and breaking admin workflows that depend on correct rollup ownership checks (onlyRollupOwner / on",
+      "description": [
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 120,
+          "line_end": 133,
+          "desc": "if (msg.sender != IOwnable(rollup).owner()) revert NotOwner(...); newRollup = bridge.rollup(); rollup = newRollup;"
+        }
+      ],
+      "impact": "No actual impact. The described scenario (permanent loss of admin control over SequencerInbox) cannot occur through the intended upgrade flow. The BOLDUpgradeAction handles the transition atomically. Even in a hypothetical desync scenario, the proxy admin can upgrade the SequencerInbox implementation to recover. The old rollup's owner() function remains callable indefinitely since the contract persists on-chain.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Delay Proof Validation Bypass when Buffer is Synced and Full",
+      "severity": "high",
+      "summary": "In `delayProofImpl`, if `buffer.isUpdatable()` returns false, the delay proof is completely ignored and not validated against the delayed accumulator.",
+      "description": [
+        {
+          "file": "SequencerInbox.sol",
+          "line_start": 416,
+          "line_end": 417,
+          "desc": "Validation logic wrapped in conditional that can be false"
+        }
+      ],
+      "impact": "No real impact. The behavior is by design. When the delay buffer is synced and full, the delay proof is irrelevant because the buffer cannot change. The batch poster could equivalently use the non-DelayProof variant. No state corruption, no consensus split, and no financial impact results from this behavior.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Staking Pools Rendered Inoperable by Validator Whitelist Enforcement",
+      "severity": "high",
+      "summary": "When the validator whitelist is enabled, EdgeChallengeManager enforces that msg.sender is a whitelisted validator. Because staking pools are deployed permissionlessly via CREATE2, they are not whitelisted by default, causing all pool-initiated edge creations to revert.",
+      "description": [
+        {
+          "file": "EdgeChallengeManager.sol",
+          "line_start": 133,
+          "line_end": 136,
+          "desc": "if (whitelistEnabled && !assertionChain.isValidator(msg.sender)) { revert NotValidator(msg.sender); }"
+        }
+      ],
+      "impact": "HIGH",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Protocol Insolvency via loserStakeEscrow Accounting Desync",
+      "severity": "high",
+      "summary": "Creating a sibling assertion transfers funds to the loser escrow without reducing the staker's accounted balance, allowing attackers to drain the contract.",
+      "description": [
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 201,
+          "line_end": 203,
+          "desc": "safeTransfer to loserStakeEscrow occurs without reducing _stakerMap[msg.sender].amountStaked"
+        },
+        {
+          "file": "RollupCore.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: deleteStaker"
+        }
+      ],
+      "impact": "CRITICAL. The vulnerability allows an attacker to drain honest validators' staked funds from the RollupUserLogic contract. Each attack cycle profits requiredStake (minus gas costs). The contract becomes insolvent — honest validators who later attempt to withdraw will find insufficient tokens in the contract. This directly violates INV-ECON-001 (solvency invariant). The totalWithdrawableFunds and sum of amountStaked will exceed the contract's actual token balance.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Pausable Time-Deadline Desync Allows Immediate Malicious Confirmation",
+      "severity": "high",
+      "summary": "`RollupUserLogic` can be paused by the admin, preventing honest validators from creating new assertions or responding to challenges. However, `EdgeChallengeManager` does not implement a pause mechanism, and its timers (`timeUnrivaled`) are based on L1 `block.number`. If the rollup is paused during a dispute, the attacker's edges continue to accumulate unrivaled time. Upon unpausing, the attacker's edges may have exceeded the `challengePeriodBlocks` threshold, allowing them to instantly confirm a",
+      "description": [
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "line_start": 310,
+          "line_end": 315,
+          "desc": "timeUnrivaled uses block.number without accounting for paused periods"
+        },
+        {
+          "file": "RollupUserLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: stakeOnNewAssertion"
+        }
+      ],
+      "impact": "No real impact. The timer behavior is technically as described (uses block.number without pause adjustment), but it cannot be exploited because: (1) honest validators can always create rival edges to stop the timer, (2) assertion confirmation is equally paused, and (3) the admin who controls the pause can take appropriate measures upon unpausing. This is an operational consideration, not a code defect.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Permissionless Edge Bisection Enables Gas Griefing of Honest Validators",
+      "severity": "high",
+      "summary": "bisectEdge in EdgeChallengeManager has no access control - any address can bisect any pending rivaled edge. While bisection heights are deterministic (mandatoryBisectionHeight), an adversary can front-run or preempt honest validators' bisection transactions, causing honest validators to waste gas on reverted transactions (due to ChildrenAlreadySet check). On L1 where this is deployed, the adversary can observe honest validators' submitted bisection transactions and submit their own first.",
+      "description": [
+        {
+          "file": "EdgeChallengeManager.sol",
+          "line_start": 227,
+          "line_end": 260,
+          "desc": "bisectEdge is external with no modifier or msg.sender check. Anyone can call it with any edgeId. ChallengeEdgeLib.setChildren reverts if children already set."
+        },
+        {
+          "file": "EdgeChallengeManagerLib.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: bisectEdge"
+        }
+      ],
+      "impact": "Minimal. The honest validator wastes gas on reverted transactions, but the challenge game progresses correctly. The adversary spends gas to do honest work that benefits the honest party. Net economic impact is small gas costs for reverted txs, which is a standard concern for permissionless L1 functions, not a smart contract vulnerability.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

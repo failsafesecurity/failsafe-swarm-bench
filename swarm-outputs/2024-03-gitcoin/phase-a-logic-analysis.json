@@ -1,0 +1,431 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T00:19:51.518Z",
+    "duration_ms": 266467
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-SELF-STAKE",
+        "source": "User (msg.sender) providing GTC tokens and duration",
+        "path": [
+          "selfStake(amount, duration) called",
+          "Validate amount > 0",
+          "Compute unlockTime = duration + uint64(block.timestamp)",
+          "Validate unlockTime in [12w, 104w] range and >= existing unlockTime",
+          "Update selfStakes[msg.sender].amount += amount",
+          "Update selfStakes[msg.sender].unlockTime = unlockTime",
+          "Update userTotalStaked[msg.sender] += amount",
+          "Emit SelfStake event",
+          "token.transferFrom(msg.sender, address(this), amount)"
+        ],
+        "transformations": [
+          "uint88 amount added to existing stake",
+          "uint64 duration added to block.timestamp for unlockTime"
+        ],
+        "sinks": [
+          "selfStakes mapping",
+          "userTotalStaked mapping",
+          "contract token balance"
+        ],
+        "trust_changes": "User tokens move from user-controlled to contract-controlled with time lock",
+        "validation_points": [
+          "amount > 0 check",
+          "unlockTime range check [12w-104w]",
+          "unlockTime >= existing unlockTime",
+          "token.transferFrom return value"
+        ],
+        "exposure_risks": [
+          "Post-lock period: stake remains slashable until withdrawn"
+        ],
+        "manipulation_risks": [
+          "No protection against dust staking (very small amounts immune to slashing due to integer division)"
+        ]
+      },
+      {
+        "flow_id": "DF-002-COMMUNITY-STAKE",
+        "source": "User (msg.sender) staking on stakee address",
+        "path": [
+          "communityStake(stakee, amount, duration) called",
+          "Validate stakee != msg.sender, stakee != 0, amount > 0",
+          "Compute unlockTime and validate range",
+          "Update communityStakes[msg.sender][stakee]",
+          "Update userTotalStaked[msg.sender] += amount",
+          "Emit CommunityStake event",
+          "token.transferFrom(msg.sender, address(this), amount)"
+        ],
+        "transformations": [
+          "amount added to community stake struct",
+          "duration converted to absolute unlockTime"
+        ],
+        "sinks": [
+          "communityStakes mapping",
+          "userTotalStaked mapping",
+          "contract token balance"
+        ],
+        "trust_changes": "User tokens locked under both staker and stakee's reputation risk",
+        "validation_points": [
+          "stakee != self check",
+          "address(0) check",
+          "amount > 0",
+          "time range",
+          "transferFrom return"
+        ],
+        "exposure_risks": [
+          "Stakee misbehavior leads to staker losing funds through cascading slash"
+        ],
+        "manipulation_risks": [
+          "Staker cannot control when stakee misbehaves; post-lock slashing risk"
+        ]
+      },
+      {
+        "flow_id": "DF-003-SLASH",
+        "source": "SLASHER_ROLE authorized address submitting slash arrays and percent",
+        "path": [
+          "slash(selfStakers, communityStakers, communityStakees, percent) called",
+          "Validate percent in [1, 100]",
+          "Validate communityStakers.length == communityStakees.length",
+          "For each selfStaker: compute slashedAmount = (percent * stake.amount) / 100",
+          "Handle round transitions: move from round N-1 to N, or zero stale slashes",
+          "Update totalSlashed[currentSlashRound] += slashedAmount",
+          "Update stake.slashedAmount += slashedAmount, stake.amount -= slashedAmount",
+          "Update userTotalStaked[staker] -= slashedAmount",
+          "Same logic for community stakes"
+        ],
+        "transformations": [
+          "percent * amount / 100 truncating division",
+          "slashedAmount moved between rounds",
+          "stale slashes zeroed"
+        ],
+        "sinks": [
+          "selfStakes.slashedAmount",
+          "totalSlashed mapping",
+          "userTotalStaked mapping"
+        ],
+        "trust_changes": "Tokens move from active stake to slashed state; still in contract but pending burn",
+        "validation_points": [
+          "percent range [1,100]",
+          "array length match",
+          "onlyRole(SLASHER_ROLE)"
+        ],
+        "exposure_risks": [
+          "SLASHER_ROLE is fully trusted; can slash any stake at any percent",
+          "Duplicate addresses in arrays cause compounding slashes"
+        ],
+        "manipulation_risks": [
+          "Truncation to zero for small stakes: (1 * 99) / 100 = 0",
+          "Slashing zero-amount stakes still updates slashedInRound affecting future release logic"
+        ]
+      },
+      {
+        "flow_id": "DF-004-RELEASE",
+        "source": "RELEASER_ROLE restoring slashed funds after successful appeal",
+        "path": [
+          "release(staker, stakee, amountToRelease, slashRound) called",
+          "Validate slashRound >= currentSlashRound - 1 (not burned)",
+          "Validate staker and stakee addresses != 0",
+          "If staker == stakee: restore to selfStake, else communityStake",
+          "Decrease slashedAmount, increase amount",
+          "Decrease totalSlashed[slashRound]"
+        ],
+        "transformations": [
+          "slashedAmount decremented",
+          "amount incremented by same value"
+        ],
+        "sinks": [
+          "selfStakes or communityStakes mapping",
+          "totalSlashed mapping"
+        ],
+        "trust_changes": "Tokens return from slashed state to active stake",
+        "validation_points": [
+          "slashRound not burned check",
+          "slashedAmount >= amountToRelease",
+          "slashedInRound == slashRound",
+          "onlyRole(RELEASER_ROLE)"
+        ],
+        "exposure_risks": [
+          "CRITICAL: userTotalStaked is NOT updated on release - creates permanent accounting mismatch"
+        ],
+        "manipulation_risks": [
+          "Released funds become unwithdrawable because userTotalStaked underflows on withdraw"
+        ]
+      },
+      {
+        "flow_id": "DF-005-LOCK-AND-BURN",
+        "source": "Any caller (permissionless) triggering round progression and burn",
+        "path": [
+          "lockAndBurn() called",
+          "Check burnRoundMinimumDuration elapsed since lastBurnTimestamp",
+          "Compute roundToBurn = currentSlashRound - 1",
+          "Read amountToBurn = totalSlashed[roundToBurn]",
+          "Increment currentSlashRound",
+          "Update lastBurnTimestamp",
+          "Transfer amountToBurn to burnAddress",
+          "Emit Burn event"
+        ],
+        "transformations": [
+          "totalSlashed[roundToBurn] tokens removed from contract",
+          "currentSlashRound incremented"
+        ],
+        "sinks": [
+          "burnAddress receives tokens",
+          "currentSlashRound state",
+          "lastBurnTimestamp state"
+        ],
+        "trust_changes": "Slashed tokens become permanently burned; exit the system",
+        "validation_points": [
+          "burnRoundMinimumDuration check",
+          "whenNotPaused"
+        ],
+        "exposure_risks": [
+          "totalSlashed[roundToBurn] is NOT zeroed after burn, leaving stale data"
+        ],
+        "manipulation_risks": [
+          "Permissionless call: anyone can trigger burn as soon as minimum duration passes",
+          "If burnAddress is misconfigured, tokens could go to wrong destination"
+        ]
+      },
+      {
+        "flow_id": "DF-006-WITHDRAW",
+        "source": "User (msg.sender) withdrawing unlocked stakes",
+        "path": [
+          "withdrawSelfStake(amount) or withdrawCommunityStake(stakee, amount)",
+          "Check unlockTime <= block.timestamp",
+          "Check amount <= stake.amount",
+          "Decrease stake.amount",
+          "Decrease userTotalStaked[msg.sender]",
+          "Transfer tokens to msg.sender"
+        ],
+        "transformations": [
+          "stake.amount decremented",
+          "userTotalStaked decremented",
+          "tokens transferred out"
+        ],
+        "sinks": [
+          "User receives GTC tokens",
+          "Updated storage mappings"
+        ],
+        "trust_changes": "Tokens move from contract-controlled back to user-controlled",
+        "validation_points": [
+          "unlockTime check",
+          "amount <= stake.amount",
+          "transfer return value"
+        ],
+        "exposure_risks": [
+          "withdrawSelfStake allows amount=0 (no guard)"
+        ],
+        "manipulation_risks": [
+          "If userTotalStaked is desynchronized (from release bug), withdrawal reverts due to underflow"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Stakes are locked for 12-104 weeks and can only be extended, not shortened",
+        "Self-stakes represent personal reputation; community stakes vouch for others",
+        "All staked amounts (locked and unlocked-but-not-withdrawn) are slashable",
+        "Slashing is percentage-based (1-100%) and executed by SLASHER_ROLE",
+        "Appeal window is enforced by burnRoundMinimumDuration (90 days) between burns",
+        "RELEASER_ROLE can restore slashed amounts before burn occurs",
+        "lockAndBurn is permissionless but rate-limited by burnRoundMinimumDuration",
+        "userTotalStaked should equal sum of all stake.amounts for a user across self and community stakes"
+      ],
+      "economic_incentives": [
+        "Stakers are incentivized to stake on trustworthy identities to avoid slashing losses",
+        "Longer lock periods signal higher commitment (12-104 weeks)",
+        "Slashing creates economic penalty for Sybil or malicious behavior",
+        "Community staking creates skin-in-the-game for vouching",
+        "Post-lock vulnerability incentivizes prompt withdrawal of unlocked stakes"
+      ],
+      "governance_mechanisms": [
+        "DEFAULT_ADMIN_ROLE controls upgrade authority, role management, and can grant/revoke SLASHER/RELEASER/PAUSER roles",
+        "SLASHER_ROLE has unilateral power to slash any stake at any percentage - centralization risk",
+        "RELEASER_ROLE can restore slashed funds before burn - appeal mechanism",
+        "PAUSER_ROLE can halt all operations via pause/unpause",
+        "No timelock on admin actions (upgrades, role changes)",
+        "No on-chain governance or multisig requirement for slashing decisions"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Release function does not update userTotalStaked",
+          "expected_behavior": "After release, userTotalStaked should be incremented by amountToRelease to stay consistent with actual stake amounts",
+          "actual_behavior": "userTotalStaked remains at the post-slash reduced value while stake.amount is restored, creating a permanent desynchronization",
+          "risk_level": "high",
+          "exploitation_potential": "After a slash-then-release cycle, the user cannot withdraw the released amount because userTotalStaked -= amount in withdrawSelfStake/withdrawCommunityStake will underflow and revert. Funds are permanently locked in the contract. Example: stake 100, slash 50 (userTotalStaked=50), release 50 (userTotalStaked still 50, amount=100). Withdraw 100 fails because 50-100 underflows. User can only withdraw 50, losing 50 tokens permanently."
+        },
+        {
+          "scenario": "Slash produces zero slashedAmount due to integer truncation",
+          "expected_behavior": "Either skip the slash for that stake or ensure minimum 1 unit is slashed",
+          "actual_behavior": "slashedAmount = 0 but slashedInRound is still updated to currentSlashRound, and slashedAmount += 0. This corrupts the slash tracking metadata without actually slashing anything.",
+          "risk_level": "low",
+          "exploitation_potential": "A user with a tiny stake (e.g. 99 wei) cannot be effectively slashed at low percentages. The slashedInRound update could interfere with future legitimate slashes if the round changes (the stale slash handling may zero out a previous legitimate slashedAmount)."
+        },
+        {
+          "scenario": "Duplicate addresses in slash arrays",
+          "expected_behavior": "Each address slashed once at the specified percent",
+          "actual_behavior": "Each occurrence slashes the remaining amount again, compounding the effect. Two 50% slashes result in 75% total slash, not 50%.",
+          "risk_level": "medium",
+          "exploitation_potential": "Malicious or negligent SLASHER_ROLE could include duplicate addresses to slash more than intended percent"
+        },
+        {
+          "scenario": "lockAndBurn does not zero totalSlashed[roundToBurn]",
+          "expected_behavior": "totalSlashed mapping should be zeroed after burning to prevent stale data",
+          "actual_behavior": "Mapping retains stale value after tokens are transferred. While this doesn't cause direct financial loss (the stale value is never used for future operations), it creates inaccurate on-chain accounting data.",
+          "risk_level": "low",
+          "exploitation_potential": "Off-chain systems reading totalSlashed for burned rounds get incorrect data. No direct on-chain exploit."
+        },
+        {
+          "scenario": "withdrawSelfStake called with amount = 0",
+          "expected_behavior": "Should revert with AmountMustBeGreaterThanZero",
+          "actual_behavior": "Succeeds, emitting a SelfStakeWithdrawn event with amount 0 and executing a zero-value token transfer",
+          "risk_level": "low",
+          "exploitation_potential": "Gas griefing, misleading events. No financial impact."
+        },
+        {
+          "scenario": "Staker slashed in round N-2 or earlier, then slashed again - stale slash handling",
+          "expected_behavior": "Old slashedAmount from already-burned rounds should be properly handled",
+          "actual_behavior": "sStake.slashedAmount is set to 0 (correct, since those funds were burned). But the already-burned totalSlashed mapping for the old round still contains the stale value (not decremented). This is inconsistent but doesn't cause loss because the old round's totalSlashed is never used again.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit. The stale totalSlashed for old rounds is cosmetic."
+        },
+        {
+          "scenario": "currentSlashRound = 1 and release called with slashRound = 0",
+          "expected_behavior": "Should be rejected since round 0 is a non-standard round",
+          "actual_behavior": "Passes the RoundAlreadyBurned check (0 < 0 is false). Would then check slashedInRound == 0, which could match an unslashed stake. However, amountToRelease > slashedAmount (which would be 0 for unslashed) would catch any positive amount.",
+          "risk_level": "low",
+          "exploitation_potential": "A release(staker, staker, 0, 0) call on an unslashed stake would succeed as a no-op. No financial impact but could emit confusing events if events were emitted (they aren't in release)."
+        },
+        {
+          "scenario": "burnAddress set to address(0) or incorrect address during initialization",
+          "expected_behavior": "Burned tokens should be permanently removed from circulation",
+          "actual_behavior": "No validation of burnAddress in initialize. If set to address(0) and GTC reverts on zero-address transfers, lockAndBurn would permanently revert when there are slashed tokens, bricking the burn mechanism.",
+          "risk_level": "medium",
+          "exploitation_potential": "Misconfiguration could prevent burns, causing slashed funds to remain unreleased and new rounds unable to progress. The contract would need an upgrade to fix."
+        },
+        {
+          "scenario": "Slash called on a stake that was just released in the current round",
+          "expected_behavior": "Slash should apply to the restored amount",
+          "actual_behavior": "After release, stake.amount is restored and stake.slashedAmount is reduced. If slashed again in the same round, the round check passes (slashedInRound == currentSlashRound), and new slashedAmount is calculated on the full restored amount. However, the old remaining slashedAmount is preserved and the new slash is added on top. This is correct behavior.",
+          "risk_level": "low",
+          "exploitation_potential": "No exploit, but complex interactions between slash and release in the same round should be carefully managed by operators."
+        }
+      ],
+      "assumption_violations": [
+        "CRITICAL: The invariant 'userTotalStaked[addr] == sum of all stake.amounts for addr' is violated after any release operation",
+        "Assumption that totalSlashed accurately reflects contract's token obligations breaks after lockAndBurn (stale values remain)",
+        "Assumption that SLASHER_ROLE always provides deduplicated address arrays is not enforced on-chain",
+        "Assumption that GTC token behaves as standard ERC20 (returns bool, doesn't have fee-on-transfer) - not using SafeERC20",
+        "Assumption that burnAddress is valid and can receive tokens is not validated at initialization",
+        "Missing storage gap (__gap) for safe upgradability - new state variables in upgrades could collide with storage of child contracts"
+      ],
+      "game_theory_risks": [
+        "SLASHER_ROLE has unchecked unilateral power - no on-chain checks on slash correctness, no timelock, no multisig requirement",
+        "Post-lock period creates a race condition: users must withdraw immediately after unlock or risk being slashed on unlocked funds",
+        "Community stakers bear disproportionate risk - their funds can be slashed due to stakee misbehavior they cannot control or predict",
+        "Permissionless lockAndBurn allows any party to trigger burn as soon as minimum duration passes, potentially before off-chain appeal processes complete",
+        "No mechanism for partial appeal - RELEASER_ROLE must know exact slash amounts per stake to release correctly",
+        "Slashing at 100% combined with short appeal period (if burnRoundMinimumDuration is changed) could enable griefing"
+      ],
+      "integration_risks": [
+        "If GTC token is upgraded or replaced, the contract would need upgrade to update token reference",
+        "No SafeERC20 usage - tokens that don't return bool on transfer would cause issues",
+        "UUPS proxy pattern - if _authorizeUpgrade is compromised, entire contract including funds is at risk",
+        "Missing __UUPSUpgradeable_init() call in initializer (may be benign depending on OZ version)",
+        "No reentrancy guard - relies on checks-effects-interactions pattern which is correctly followed but fragile if modified in upgrade"
+      ],
+      "calculation_errors": [
+        "CRITICAL: release() fails to execute userTotalStaked[staker] += amountToRelease, causing permanent accounting desynchronization and fund lockup",
+        "Integer truncation in slash: (percent * amount) / 100 rounds down, allowing micro-stakes to avoid slashing entirely",
+        "No rounding compensation: repeated small percentage slashes compound truncation errors, resulting in slightly less total slashed than expected"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "GTC",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "fee_on_transfer:false",
+            "pausable:false",
+            "blacklist:false",
+            "non_standard_return:false",
+            "mint_burn_restricted:true"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Test GTC contract uses uint96 balances (max ~79 billion tokens w/ 18 decimals). Production GTC has standard ERC20 behavior. Contract uses IERC20 without SafeERC20 wrapper. transferFrom in test contract has no allowance check (test only). Cannot transfer to address(0).",
+          "evidence_refs": [
+            {
+              "file": "GTC.sol",
+              "lines": [
+                1,
+                350
+              ],
+              "function": "multiple"
+            }
+          ],
+          "confidence": "high"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "userTotalStaked_consistency",
+          "state_vars": [
+            "userTotalStaked[addr]",
+            "selfStakes[addr].amount",
+            "sum(communityStakes[addr][*].amount)"
+          ],
+          "description": "userTotalStaked[addr] should equal selfStakes[addr].amount + sum of all communityStakes[addr][stakee].amount for all stakees. VIOLATED after release() operations.",
+          "status": "BROKEN"
+        },
+        {
+          "name": "totalSlashed_token_balance_consistency",
+          "state_vars": [
+            "sum(totalSlashed[active_rounds])",
+            "contract_token_balance",
+            "sum(all_stake_amounts)"
+          ],
+          "description": "Contract token balance should equal sum of all stake.amount values plus sum of totalSlashed for unburned rounds. Partially violated because totalSlashed is not zeroed after burn.",
+          "status": "WEAKENED"
+        },
+        {
+          "name": "slash_round_monotonicity",
+          "state_vars": [
+            "currentSlashRound"
+          ],
+          "description": "currentSlashRound only increases (via lockAndBurn). Initialized at 1, incremented by 1 each burn cycle.",
+          "status": "MAINTAINED"
+        },
+        {
+          "name": "unlock_time_monotonicity",
+          "state_vars": [
+            "stake.unlockTime"
+          ],
+          "description": "Lock periods can only be extended, never shortened for a given stake.",
+          "status": "MAINTAINED"
+        },
+        {
+          "name": "stake_amount_conservation",
+          "state_vars": [
+            "stake.amount",
+            "stake.slashedAmount",
+            "totalSlashed"
+          ],
+          "description": "When slashing: stake.amount decreases by X, stake.slashedAmount increases by X, totalSlashed increases by X. When releasing: stake.slashedAmount decreases by X, stake.amount increases by X, totalSlashed decreases by X. Conservation should hold within active rounds.",
+          "status": "MAINTAINED"
+        }
+      ]
+    }
+  }
+}

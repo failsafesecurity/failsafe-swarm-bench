@@ -1,0 +1,491 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T17:15:15.750Z",
+    "duration_ms": 213815
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-DEPOSIT",
+        "source": "User (msg.sender with ERC20 approval or ETH value)",
+        "path": [
+          "depositWithExpiry (expiration check)",
+          "_deposit (nonReentrant)",
+          "ETH: vault.send(msg.value)",
+          "ERC20: safeTransferFrom (balance-diff check) -> _vaultAllowance[vault][asset] += safeAmount"
+        ],
+        "transformations": [
+          "safeTransferFrom measures actual received amount via balance delta for fee-on-transfer tokens"
+        ],
+        "sinks": [
+          "ETH -> vault address directly",
+          "ERC20 -> Router contract balance, _vaultAllowance ledger"
+        ],
+        "trust_changes": "User input becomes trusted vault allowance entry; Bifrost observes Deposit event",
+        "validation_points": [
+          "block.timestamp < expiration",
+          "msg.value == 0 for ERC20",
+          "safeTransferFrom success check"
+        ],
+        "exposure_risks": [
+          "Any address can call depositWithExpiry emitting Deposit events with arbitrary memo to trick Bifrost",
+          "Deposit event amount is based on actual received amount (correct)"
+        ],
+        "manipulation_risks": [
+          "Log spoofing: anyone can emit Deposit events with crafted memos to any vault address for dust amounts",
+          "Bifrost must filter deposits below dust threshold and validate vault addresses"
+        ]
+      },
+      {
+        "flow_id": "DF-02-TRANSFER-OUT-V5",
+        "source": "Vault (msg.sender with _vaultAllowance)",
+        "path": [
+          "transferOutV5 / batchTransferOutV5 (nonReentrant)",
+          "_transferOutV5",
+          "ETH: to.send(amount) -> fallback: msg.sender.transfer(amount)",
+          "ERC20: _vaultAllowance[msg.sender][asset] -= amount -> asset.transfer(to, amount)"
+        ],
+        "transformations": [
+          "No fee-on-transfer accounting on outbound; emitted amount equals requested amount, not actual received"
+        ],
+        "sinks": [
+          "ETH -> recipient or bounced back to vault",
+          "ERC20 -> recipient address"
+        ],
+        "trust_changes": "Vault allowance (trusted) is decremented; tokens leave router custody",
+        "validation_points": [
+          "Solidity 0.8 underflow check on allowance subtraction",
+          "transfer success check"
+        ],
+        "exposure_risks": [
+          "For fee-on-transfer tokens, emitted TransferOut event amount differs from actual recipient amount, causing Bifrost accounting discrepancy"
+        ],
+        "manipulation_risks": [
+          "If vault has allowance, any EOA calling as that vault address can drain tokens - but vaults are THORChain-controlled multisig addresses"
+        ]
+      },
+      {
+        "flow_id": "DF-03-TRANSFER-OUT-AND-CALL-V5-ETH",
+        "source": "Vault (msg.sender with ETH msg.value)",
+        "path": [
+          "transferOutAndCallV5 / batchTransferOutAndCallV5 (nonReentrant)",
+          "_transferOutAndCallV5 (fromAsset == address(0))",
+          "target.call{value: msg.value}(swapOutV5(...))",
+          "FAIL: target.send(msg.value) -> FAIL: msg.sender.transfer(msg.value)"
+        ],
+        "transformations": [
+          "msg.value used directly, fromAmount parameter from struct is passed in call data but not used for value transfer"
+        ],
+        "sinks": [
+          "Success: aggregator performs swap, tokens to recipient",
+          "Fail: ETH to aggregator target (NOT recipient)",
+          "Fail2: ETH bounced back to vault"
+        ],
+        "trust_changes": "ETH transferred to untrusted aggregator; if swap fails, ETH sent to aggregator target, not intended recipient",
+        "validation_points": [
+          "No validation that msg.value == fromAmount",
+          "No validation on aggregator target"
+        ],
+        "exposure_risks": [
+          "Fallback sends ETH to aggregator target instead of recipient - user may lose funds if aggregator cannot return them",
+          "In batch mode, msg.value is reused for every ETH-based call"
+        ],
+        "manipulation_risks": [
+          "batchTransferOutAndCallV5 with multiple ETH items: each call sends full msg.value to aggregator, first call drains it, subsequent calls send 0 ETH (or revert on fallback)"
+        ]
+      },
+      {
+        "flow_id": "DF-04-TRANSFER-OUT-AND-CALL-V5-ERC20",
+        "source": "Vault (msg.sender with _vaultAllowance for fromAsset)",
+        "path": [
+          "_transferOutAndCallV5 (fromAsset != address(0))",
+          "_vaultAllowance[msg.sender][fromAsset] -= fromAmount",
+          "fromAsset.transfer(target, fromAmount)",
+          "target.call(swapOutV5(...))",
+          "No fallback if swapOutV5 fails"
+        ],
+        "transformations": [
+          "Allowance decremented, ERC20 transferred to aggregator, then aggregator called"
+        ],
+        "sinks": [
+          "Success: aggregator swaps tokens to recipient",
+          "Fail: ERC20 tokens remain stuck in aggregator contract"
+        ],
+        "trust_changes": "Router custody -> aggregator custody (no recovery mechanism if swap fails)",
+        "validation_points": [
+          "Underflow check on allowance",
+          "transfer success required",
+          "swapOutV5 failure is silently ignored"
+        ],
+        "exposure_risks": [
+          "If aggregator swap fails, ERC20 tokens are irrecoverably sent to aggregator with no fallback mechanism",
+          "Tokens stuck in aggregator depend on aggregator having rescue/recovery functions"
+        ],
+        "manipulation_risks": [
+          "Malicious or buggy aggregator could receive tokens, fail the swap intentionally, and keep the tokens via rescueFunds"
+        ]
+      },
+      {
+        "flow_id": "DF-05-TRANSFER-ALLOWANCE",
+        "source": "Vault (msg.sender)",
+        "path": [
+          "transferAllowance (nonReentrant)",
+          "Same router: _adjustAllowances(newVault, asset, amount)",
+          "Different router: _routerDeposit(router, newVault, asset, amount, memo)"
+        ],
+        "transformations": [
+          "Allowance moved between vaults in same router, or tokens approved and deposited into new router"
+        ],
+        "sinks": [
+          "Same router: _vaultAllowance ledger updated",
+          "Different router: tokens transferred via depositWithExpiry on new router"
+        ],
+        "trust_changes": "Vault A loses allowance, Vault B gains allowance; for cross-router: tokens leave current router",
+        "validation_points": [
+          "Underflow check on allowance",
+          "safeApprove does not reset to 0 first (USDT incompatibility)"
+        ],
+        "exposure_risks": [
+          "_routerDeposit calls safeApprove without resetting to 0 first, fails for USDT-like tokens with approve race protection"
+        ],
+        "manipulation_risks": [
+          "If _routerDeposit partially fails after approval but before depositWithExpiry, stale approval remains on new router"
+        ]
+      },
+      {
+        "flow_id": "DF-06-AGGREGATOR-SWAP-IN",
+        "source": "User (ERC20 token holder)",
+        "path": [
+          "swapIn (nonReentrant)",
+          "safeTransferFrom(token, amount) -> _safeAmount (balance-diff)",
+          "safeApprove(token, swapRouter, amount) // uses original amount, not _safeAmount",
+          "swapRouter.swapExactTokensForETH(_safeAmount, ...)",
+          "_safeAmount = address(this).balance",
+          "tcRouter.depositWithExpiry{value: _safeAmount}(...)"
+        ],
+        "transformations": [
+          "Token -> ETH via DEX swap -> deposit into THORChain router"
+        ],
+        "sinks": [
+          "ETH deposited to THORChain vault via router"
+        ],
+        "trust_changes": "User token -> aggregator -> DEX -> ETH -> THORChain router -> vault",
+        "validation_points": [
+          "safeTransferFrom balance-diff check",
+          "amountOutMin slippage protection"
+        ],
+        "exposure_risks": [
+          "safeApprove uses original amount not _safeAmount: over-approves for fee-on-transfer tokens",
+          "address(this).balance includes any pre-existing ETH in aggregator, not just swap output"
+        ],
+        "manipulation_risks": [
+          "An attacker can send dust ETH to aggregator to inflate the deposit amount observed by next swapIn caller",
+          "Sandwich attack on DEX swap"
+        ]
+      },
+      {
+        "flow_id": "DF-07-ETH-RUNE-TRANSFER-TO",
+        "source": "tx.origin (not msg.sender)",
+        "path": [
+          "transferTo(recipient, amount)",
+          "_transfer(tx.origin, recipient, amount)"
+        ],
+        "transformations": [
+          "Transfers from tx.origin balance, bypassing allowance system"
+        ],
+        "sinks": [
+          "Recipient receives RUNE tokens"
+        ],
+        "trust_changes": "Any contract in the call chain can transfer from the original transaction signer",
+        "validation_points": [
+          "Only balance check, no approval check"
+        ],
+        "exposure_risks": [
+          "Phishing attack: malicious contract can steal all ETH.RUNE from tx.origin by being called in any transaction"
+        ],
+        "manipulation_risks": [
+          "If user interacts with any malicious contract, that contract can call transferTo to drain user's ETH.RUNE balance"
+        ]
+      },
+      {
+        "flow_id": "DF-08-RETURN-VAULT-ASSETS",
+        "source": "Vault (msg.sender)",
+        "path": [
+          "returnVaultAssets (nonReentrant)",
+          "Same router: loop _adjustAllowances for each coin",
+          "Different router: loop _routerDeposit for each coin",
+          "asgard.send(msg.value) for ETH"
+        ],
+        "transformations": [
+          "Batch allowance transfer + ETH forwarding"
+        ],
+        "sinks": [
+          "Allowances moved to asgard vault, ETH sent to asgard"
+        ],
+        "trust_changes": "Old vault loses all allowances, new asgard gains them",
+        "validation_points": [
+          "asgard.send must succeed (require)",
+          "underflow checks on each allowance"
+        ],
+        "exposure_risks": [
+          "If asgard is a contract that rejects ETH, the entire returnVaultAssets call reverts, preventing vault migration"
+        ],
+        "manipulation_risks": [
+          "No validation that coins array matches actual vault holdings; vault must have sufficient allowance for each coin"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Vault allowance tracks ERC20 custody per vault; ETH is forwarded directly and not tracked in allowances",
+        "Only the vault address (msg.sender) can spend its allowance via transferOut/transferOutAndCall",
+        "Deposits are permissionless - anyone can deposit to any vault with any memo",
+        "Aggregator whitelist is enforced off-chain by Bifrost/THORNode, not on-chain by the router",
+        "NonReentrant modifier protects all state-changing functions",
+        "Fee-on-transfer tokens are handled on inbound (deposit) via balance-diff, but NOT on outbound (transferOut)"
+      ],
+      "economic_incentives": [
+        "Users deposit to initiate cross-chain swaps, incentivized by exchange rates",
+        "Vaults are incentivized to process outbound transfers to earn rewards from THORChain",
+        "Aggregators earn fees from DEX swaps on the final mile",
+        "No on-chain fees in the router itself - all fee logic is on THORChain L1"
+      ],
+      "governance_mechanisms": [
+        "Vault rotation (churn) managed by THORChain consensus, executed via transferAllowance",
+        "Aggregator whitelist managed off-chain by THORNode - fuzzy matching on last 3 hex digits",
+        "Router upgrades via returnVaultAssets + _routerDeposit to new router"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "batchTransferOutAndCallV5 with multiple ETH-based (fromAsset=address(0)) aggregation payloads",
+          "expected_behavior": "Each payload should use its own fromAmount of ETH for the aggregator swap",
+          "actual_behavior": "Each _transferOutAndCallV5 call uses msg.value (total ETH sent with batch tx), not aggregationPayload.fromAmount. First call forwards all ETH; subsequent calls forward msg.value again but the router may not have enough ETH, causing fallback cascades",
+          "risk_level": "high",
+          "exploitation_potential": "If THORChain nodes construct a batch with multiple ETH-based aggregation calls, the first call receives all ETH and subsequent calls fail. ETH may be stuck in aggregator or bounced back incorrectly. In practice, nodes likely only include one ETH call per batch, but the code is incorrect."
+        },
+        {
+          "scenario": "_transferOutAndCallV5 ETH path fallback sends to aggregator target instead of recipient",
+          "expected_behavior": "If aggregator swap fails, ETH should be sent to the intended recipient (like V4 transferOutAndCall does)",
+          "actual_behavior": "ETH is sent to aggregationPayload.target (the aggregator contract), not aggregationPayload.recipient",
+          "risk_level": "medium",
+          "exploitation_potential": "If the aggregator's swapOutV5 fails, ETH is sent to the aggregator contract. If aggregator has no withdrawal mechanism for arbitrary ETH, funds are stuck. Differs from V4 behavior where fallback sends to `to` (recipient)."
+        },
+        {
+          "scenario": "_transferOutAndCallV5 ERC20 path: aggregator swapOutV5 call fails",
+          "expected_behavior": "ERC20 tokens should be recoverable by the recipient or returned to the router",
+          "actual_behavior": "ERC20 tokens are already transferred to the aggregator. If swapOutV5 fails, tokens are stuck in the aggregator with no recovery mechanism in the router. The transaction still succeeds (by design).",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious or buggy aggregator could intentionally fail the swap and keep the tokens. Recovery depends on the aggregator having a rescueFunds function accessible to the owner."
+        },
+        {
+          "scenario": "USDT used in _routerDeposit (cross-router migration)",
+          "expected_behavior": "safeApprove should successfully approve the new router to spend USDT",
+          "actual_behavior": "USDT requires approve to be set to 0 before setting a non-zero value. safeApprove in _routerDeposit does not reset to 0 first, so if any stale allowance exists, the approve call will fail and revert the migration",
+          "risk_level": "medium",
+          "exploitation_potential": "Router migration for USDT could be blocked if there's any stale approval to the new router address. This could be triggered by a griefing attack where someone front-runs with a tiny approval."
+        },
+        {
+          "scenario": "Fee-on-transfer token outbound transfer via transferOut",
+          "expected_behavior": "Event should emit actual amount received by recipient, and allowance should be reduced by actual transfer cost",
+          "actual_behavior": "Allowance is reduced by full amount and event emits full amount, but recipient receives less due to transfer fee. Bifrost may record incorrect outbound amount.",
+          "risk_level": "low",
+          "exploitation_potential": "Accounting discrepancy between on-chain actual transfers and Bifrost-observed amounts for fee-on-transfer tokens. Could lead to THORChain L1 state inconsistency."
+        },
+        {
+          "scenario": "transferOut ETH to a contract that reverts on receive (RevertingContract)",
+          "expected_behavior": "ETH should be bounced back to the vault",
+          "actual_behavior": "to.send() returns false, then msg.sender.transfer(safeAmount) is called. ETH is returned to vault. Event emits the full amount with the recipient address, even though recipient never received funds.",
+          "risk_level": "low",
+          "exploitation_potential": "Bifrost observes TransferOut event with amount but recipient never received ETH. Could cause THORChain to mark outbound as complete when it wasn't delivered."
+        },
+        {
+          "scenario": "ETH_RUNE transferTo called by a malicious contract in any user transaction",
+          "expected_behavior": "Only msg.sender should be able to transfer their tokens",
+          "actual_behavior": "transferTo uses tx.origin, so any contract called by the user can drain their ETH.RUNE",
+          "risk_level": "high",
+          "exploitation_potential": "Phishing attack: deploy a contract that calls ETH_RUNE.transferTo(attacker, victim_balance) when any user interacts with it. All of the user's ETH.RUNE is stolen."
+        },
+        {
+          "scenario": "Aggregator swapIn with pre-existing ETH balance in aggregator",
+          "expected_behavior": "Only ETH from the current swap should be deposited to THORChain",
+          "actual_behavior": "address(this).balance is used after swap, which includes any pre-existing ETH in the aggregator (from previous failed swaps, direct sends, etc.)",
+          "risk_level": "low",
+          "exploitation_potential": "Attacker sends dust ETH to aggregator to inflate the deposit amount for the next swapIn caller, or steal pre-existing ETH by calling swapIn at the right time."
+        },
+        {
+          "scenario": "transferOut with amount=0 for ERC20",
+          "expected_behavior": "No-op or small gas cost",
+          "actual_behavior": "_vaultAllowance[msg.sender][asset] -= 0 succeeds, transfer(to, 0) succeeds, event emitted with amount=0",
+          "risk_level": "low",
+          "exploitation_potential": "Event spam: vault can emit many TransferOut events with 0 amount to create noise for Bifrost observers"
+        },
+        {
+          "scenario": "depositWithExpiry with vault = address(0) and asset = address(0)",
+          "expected_behavior": "Should fail or handle gracefully",
+          "actual_behavior": "vault.send(msg.value) with vault = address(0) will fail (send to zero address), require(success) reverts",
+          "risk_level": "low",
+          "exploitation_potential": "No exploitation, transaction simply reverts"
+        }
+      ],
+      "assumption_violations": [
+        "Assumption: msg.value equals fromAmount in _transferOutAndCallV5 ETH path - not enforced, breaks in batch mode",
+        "Assumption: aggregator will always forward or return tokens on failure - no guarantee, ERC20 can be stuck",
+        "Assumption: approve(spender, amount) works for all tokens - USDT requires reset to 0 first",
+        "Assumption: transfer() returns bool or nothing - correct for most tokens but StealToken shows side-effect risk during transfer callbacks",
+        "Assumption: vault addresses are valid THORChain vaults - not validated on-chain, any address accepted",
+        "Assumption: aggregator swap failure is recoverable for ETH - V5 sends to target not recipient, inconsistent with V4"
+      ],
+      "game_theory_risks": [
+        "Log spoofing: attacker deposits dust amounts with crafted memos to trick Bifrost into processing fake swaps",
+        "Aggregator front-running: aggregator or MEV bot can sandwich swap transactions for profit",
+        "Vault impersonation: if an attacker somehow obtains vault address's private key, they can drain all allowances",
+        "Griefing returnVaultAssets: if asgard address is a contract that conditionally reverts, vault migration is blocked"
+      ],
+      "integration_risks": [
+        "USDT approve race condition breaks _routerDeposit for router migration",
+        "Fee-on-transfer tokens cause accounting discrepancies between router events and actual transfers",
+        "Rebasing tokens (if used) would break the allowance accounting since balances change without transfers",
+        "Pausable tokens (like USDT) could block outbound transfers if paused, locking funds in router",
+        "Blacklistable tokens (like USDT/USDC) could blacklist the router address, locking all custodied tokens",
+        "Non-standard ERC20s that don't revert on failure but return false are handled correctly by the low-level call pattern",
+        "External router in _routerDeposit is an untrusted contract - could be malicious and steal approved tokens without completing deposit"
+      ],
+      "calculation_errors": [
+        "THORChain_Aggregator.swapIn: safeApprove(token, swapRouter, amount) approves original amount instead of _safeAmount for fee-on-transfer tokens - over-approval but not loss",
+        "_transferOutAndCallV5 ETH path: uses msg.value instead of aggregationPayload.fromAmount for value transfer - mismatch in batch operations",
+        "No calculation error in allowance arithmetic - all use Solidity 0.8 checked math"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "USDT (TetherToken)",
+          "behaviors": [
+            "fee_on_transfer",
+            "rebasing:false",
+            "permit:false",
+            "pausable",
+            "blacklist",
+            "non_standard_return"
+          ],
+          "decimals": 6,
+          "approval_model": "bounded",
+          "transfer_model": "fee",
+          "accounting_model": "balanceOf",
+          "notes": "approve() requires current allowance to be 0 before setting non-zero value. transfer/transferFrom do not return bool. Has basisPointsRate fee. Router safeTransferFrom handles correctly on inbound, but _routerDeposit safeApprove may fail due to approve race condition. Pausable and blacklistable can lock router funds."
+        },
+        {
+          "address_or_symbol": "ETH_RUNE",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Contains transferTo(recipient, amount) using tx.origin - critical phishing vulnerability. Owner can mint up to 500M maxSupply. Intended as transitionary asset."
+        },
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Standard WETH9 implementation. transferFrom allows infinite approval optimization."
+        },
+        {
+          "address_or_symbol": "ERC20Token (Token.sol)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Standard test ERC20 with burn. No special behaviors."
+        },
+        {
+          "address_or_symbol": "StealERC20Token",
+          "behaviors": [
+            "callback_onTransfer",
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "hooks",
+          "accounting_model": "balanceOf",
+          "notes": "Malicious test token: transfer() calls _steal() which attempts to transfer a target token. Attack vector: if router calls transfer on StealToken, the steal attempt calls target.transfer from StealToken (not router), so router funds are safe due to msg.sender being StealToken not Router."
+        },
+        {
+          "address_or_symbol": "EvilERC20Token",
+          "behaviors": [
+            "callback_onTransfer",
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "hooks",
+          "accounting_model": "balanceOf",
+          "notes": "Malicious test token: transferFrom() attempts reentrancy by calling iROUTER.deposit on first call. Router's nonReentrant modifier prevents this attack."
+        },
+        {
+          "address_or_symbol": "ETH/AVAX (native)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Native asset represented as address(0). Forwarded directly to vault on deposit, not tracked in allowance system. Sent via .send() with 2300 gas stipend."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "vault_allowance_conservation",
+          "state_vars": [
+            "_vaultAllowance[vault][asset]",
+            "Router ERC20 balance"
+          ],
+          "description": "Sum of all _vaultAllowance[*][asset] should equal Router's balanceOf(asset) for any given ERC20 asset. Violated if fee-on-transfer tokens are transferred out (allowance decremented by nominal amount, but actual balance reduced by nominal + fee)."
+        },
+        {
+          "name": "allowance_transfer_conservation",
+          "state_vars": [
+            "_vaultAllowance[oldVault][asset]",
+            "_vaultAllowance[newVault][asset]"
+          ],
+          "description": "In _adjustAllowances: decrease in old vault equals increase in new vault. Solidity 0.8 checked math prevents underflow."
+        },
+        {
+          "name": "eth_not_tracked_in_allowance",
+          "state_vars": [
+            "_vaultAllowance[vault][address(0)]"
+          ],
+          "description": "ETH (address(0)) is never tracked in vault allowance. All ETH deposits are forwarded directly to vault. _vaultAllowance[vault][address(0)] should always be 0."
+        },
+        {
+          "name": "reentrancy_guard",
+          "state_vars": [
+            "_status"
+          ],
+          "description": "All public state-changing functions protected by nonReentrant modifier. _status transitions: _NOT_ENTERED -> _ENTERED -> _NOT_ENTERED."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Cooperative close() Bypasses Active Grace Period, Nullifying Payee's Time-Locked Settlement Window",
+      "severity": "high",
+      "summary": "The protocol implements two closure paths: (1) unilateral via initiateClose() + grace period + finalize(), and (2) cooperative via close(). The grace period mechanism (GRACE_PERIOD = 1 hour) exists specifically to give the payee time to settle outstanding vouchers before the channel is finalized. However, close() has no awareness of the grace period state — it does not check whether gracePeriodEnd has been set or is currently active. This means that after anyone triggers initiateClose() (which i",
+      "description": [
+        {
+          "file": "contracts/TempoStreamChannel.sol",
+          "line_start": 386,
+          "line_end": 440,
+          "desc": "The close() function checks only channel.payer != address(0) and !channel.finalized, but does NOT check channel.gracePeriodEnd. After initiateClose() starts a grace period, the payer can immediately call close() to finalize the channel, completely bypassing the 1-hour settlement window the grace period was designed to provide."
+        }
+      ],
+      "impact": "Payee loses all unsettled voucher value whenever the payer controls the authorizedSigner. The 1-hour grace period is completely ineffective. In the worst case (settled=0), the payer recovers the entire deposit, and the payee receives nothing for services already rendered.",
+      "proof_of_concept": "1. Payer opens channel with deposit=10000, authorizedSigner=payer's hot wallet\n2. Payee provides services worth 8000 in signed vouchers (only 3000 settled so far via settle())\n3. Payer (or anyone per TECH-H003) calls initiateClose(channelId) — grace period begins\n4. Payee sees ChannelCloseInitiated event and begins preparing to settle remaining 5000 in vouchers\n5. Before payee's settle txs are mined, payer calls close() with cumulativeAmount=3000 (matching current settled)\n6. close() succeeds immediately: delta=0 (payee gets nothing extra), payerRefund=7000\n7. Channel finalized. Payee lost 5000 in unsettled voucher value despite grace period supposedly protecting them",
+      "remediation": "Add a check in close() that prevents cooperative close while a grace period is active: `if (channel.gracePeriodEnd != 0 && block.timestamp < channel.gracePeriodEnd) revert GracePeriodActive();`. Alternatively, require the payee's signature on cooperative close (not just the payer's), ensuring true bilateral consent."
+    },
+    {
+      "title": "Anyone Can Force-Settle Vouchers via settle(), Enabling Nonce-Poisoning Attacks That Permanently Invalidate Payee's Higher-Value Vouchers",
+      "severity": "high",
+      "summary": "The settle() function on line 293 can be called by ANY address, not just the channel's payee. While the token transfer always goes to channel.payee (preventing fund redirection), the nonce-consumption side-effect is critically exploitable. The settledNonces mapping is set to the voucher's nonce value (line 324), and the nonce check on lines 301-302 requires future vouchers to have a strictly higher nonce value. The nonce model allows arbitrary gaps — nonce can jump from 0 to any value. If the pa",
+      "description": [
+        {
+          "file": "contracts/TempoStreamChannel.sol",
+          "line_start": 293,
+          "line_end": 334,
+          "desc": "The settle() function has no access control — any address can call it. Combined with the non-sequential nonce model (nonce gaps are allowed, only strictly increasing required), a malicious payer who controls the authorizedSigner can sign a minimal-value voucher with an extremely high nonce and settle it to permanently invalidate all of the payee's outstanding vouchers with lower nonces."
+        }
+      ],
+      "impact": "Near-total loss of payee earnings. The payer can deny virtually all payments to the payee by poisoning the nonce with a minimal-value settlement. The payee has no on-chain recourse once the nonce is consumed. This works regardless of how many vouchers the payee holds or their total value.",
+      "proof_of_concept": "1. Payer opens channel: deposit=10000, authorizedSigner=payer's delegate wallet\n2. During normal service, payee receives vouchers:\n   - Voucher A: cumulativeAmount=3000, nonce=5\n   - Voucher B: cumulativeAmount=6000, nonce=10\n   - Voucher C: cumulativeAmount=9000, nonce=15\n3. Before payee settles any vouchers, payer signs a poison voucher: cumulativeAmount=1, nonce=1000000\n4. Payer calls settle(poisonVoucher, poisonSig) — succeeds because anyone can call settle()\n5. State: channel.settled=1, settledNonces[channelId]=1000000\n6. Payee tries settle(voucherA): nonce 5 <= 1000000 → NonceTooLow → REVERT\n7. Payee tries settle(voucherB): nonce 10 <= 1000000 → NonceTooLow → REVERT\n8. Payee tries settle(voucherC): nonce 15 <= 1000000 → NonceTooLow → REVERT\n9. All payee vouchers permanently invalidated. Payee received only 1 token.\n10. Payer calls initiateClose() → waits 1 hour → finalize() → recovers 9999 tokens\n11. Payee lost 8999 tokens (9000 owed - 1 received) for services already rendered",
+      "remediation": "Apply one or more of these mitigations:\n1. Restrict settle() to be callable only by channel.payee: `if (msg.sender != channel.payee) revert UnauthorizedCaller();`\n2. Enforce that cumulativeAmount must be monotonically non-decreasing with nonce: `if (voucher.cumulativeAmount < channel.settled) revert InvalidAmount();` (already implicitly enforced by underflow, but the nonce poisoning issue remains)\n3. Require sequential nonces (no gaps): `if (voucher.nonce != settledNonces[channelId] + 1) revert InvalidNonce();`\n4. Best: Combine options 1 and 3 to both restrict who can settle and enforce sequential nonce progression"
+    },
+    {
+      "title": "CEI Violations in openChannel() and addDeposit() Enable Reentrancy-Based Forced Channel Closure via ERC-777 Token Hooks",
+      "severity": "high",
+      "summary": "The openChannel() and addDeposit() functions violate the Checks-Effects-Interactions (CEI) pattern by performing external calls (safeTransferFrom) before completing state updates. In openChannel(), the token transfer on line 241 occurs before the channel struct is written on lines 243-252. In addDeposit(), the transfer on line 279 occurs before the deposit increment on line 280. While the nonReentrant modifier prevents re-entering most functions, initiateClose() on line 342 notably LACKS this mo",
+      "description": [
+        {
+          "file": "contracts/TempoStreamChannel.sol",
+          "line_start": 241,
+          "line_end": 280,
+          "desc": "Both openChannel() (line 241) and addDeposit() (line 279) perform external token transfers BEFORE writing state to storage (channel struct creation on line 243, deposit update on line 280). Combined with initiateClose() lacking the nonReentrant modifier, ERC-777 token callbacks during these transfers can re-enter initiateClose() to force-start the grace period."
+        }
+      ],
+      "impact": "Forced channel closure during a routine deposit operation. Payee loses unsettled voucher value if they don't settle within the 1-hour grace period that was unexpectedly started. The CEI violation makes this attack possible during what should be a safe operation (topping up deposits).",
+      "proof_of_concept": "1. Payer opens a channel using an ERC-777 compatible token (e.g., wrapped token with hooks)\n2. Channel is active: deposit=5000, settled=2000, contract holds 3000\n3. Payer calls addDeposit(channelId, 5000) to top up the channel\n4. Token's safeTransferFrom triggers the ERC-777 tokensToSend hook\n5. An attacker contract (registered as ERC-777 operator) calls initiateClose(channelId) in the callback\n6. initiateClose succeeds: no nonReentrant block, channel exists, not finalized, gracePeriodEnd==0\n7. gracePeriodEnd = block.timestamp + 1 hour\n8. Callback returns, addDeposit completes: deposit becomes 10000\n9. Payee has 10000 deposit available but grace period is already ticking\n10. If payee doesn't settle all vouchers within 1 hour, payer recovers unsettled funds via finalize()",
+      "remediation": "1. Add nonReentrant modifier to initiateClose(): `function initiateClose(bytes32 channelId) external nonReentrant`\n2. Fix CEI in addDeposit: perform state update before transfer: `channel.deposit += amount; channel.token.safeTransferFrom(msg.sender, address(this), amount);`\n3. Fix CEI in openChannel: write channel struct before transfer (requires computing channelId first, which is already done)"
+    }
+  ]
+}

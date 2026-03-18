@@ -1,0 +1,265 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T00:21:32.851Z",
+    "duration_ms": 533667
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "Emergency mode fails to enable ETH withdrawal after convertAllETH. The UseClaimInstead check at line `if (block.timestamp >= startClaimDate) revert UseClaimInstead()` executes OUTSIDE the emergency mode conditional, permanently blocking ETH withdrawals after conversion. If lpETH is malicious/broken and claim() also fails, ETH depositors have zero recovery path since recoverERC20 also blocks lpETH.",
+        "attack_scenario": "1) Owner calls setLoopAddresses with a buggy lpETH. 2) TIMELOCK passes, owner calls convertAllETH converting all ETH to lpETH. 3) lpETH is discovered to be broken (e.g., safeTransfer reverts). 4) Owner enables emergencyMode. 5) ETH depositors call withdraw(ETH) -> reverts UseClaimInstead regardless of emergencyMode. 6) ETH depositors call claim() -> reverts because lpETH.safeTransfer fails. 7) Owner tries recoverERC20(lpETH) -> reverts NotValidToken. Funds permanently locked.",
+        "invariant_logic": "emergencyMode == true => forall token, user: withdraw(token) MUST succeed if balances[user][token] > 0 AND contract holds sufficient assets",
+        "solidity_property": "function invariant_emergencyWithdrawETH() public view { if (emergencyMode && block.timestamp >= startClaimDate) { /* ETH depositors should have a withdrawal path but currently do not */ assert(false); } }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "convertAllETH"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "recoverERC20"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "Non-ETH token claim uses `address(this).balance` (absolute contract balance) instead of the delta from the swap. Any ETH present in the contract from external sources (receive(), selfdestruct, coinbase) is credited to the current LRT claimer as bonus lpETH. Combined with _percentage=0 exploit (INV-STATE-003), this allows repeated draining.",
+        "attack_scenario": "1) After convertAllETH, contract should have 0 ETH. 2) Someone accidentally sends 5 ETH via receive(). 3) Attacker with any LRT balance calls claim(LRT, 100, UniswapV3, data) where swap returns 1 ETH. 4) claimedAmount = address(this).balance = 6 ETH. 5) Attacker receives 6 ETH worth of lpETH instead of 1 ETH. The 5 extra ETH is stolen from the accidental sender.",
+        "invariant_logic": "In _claim for non-ETH tokens: claimedAmount MUST equal (address(this).balance_after_swap - address(this).balance_before_swap), NOT address(this).balance",
+        "solidity_property": "function invariant_claimDelta() internal { uint256 pre = address(this).balance; _fillQuote(token, amount, data); uint256 post = address(this).balance; assert(claimedAmount == post - pre); }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_claim"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_fillQuote"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "The _percentage parameter for non-ETH claims is not validated to be in range [1, 100]. A _percentage of 0 creates a zero-amount swap that likely succeeds, leaves the user's balance unchanged (userStake - 0 = userStake), but captures any residual ETH via address(this).balance. This can be called repeatedly.",
+        "attack_scenario": "1) After convertAllETH, 2 ETH sits in contract from receive(). 2) Attacker has 1 unit of allowed LRT token locked. 3) Attacker calls claim(LRT, 0, UniswapV3, validDataFor0Amount). 4) Swap of 0 tokens succeeds trivially. 5) claimedAmount = address(this).balance = 2 ETH. 6) Attacker receives 2 ETH as lpETH. 7) balances[attacker][LRT] remains 1 (unchanged). 8) Repeat whenever ETH accumulates.",
+        "invariant_logic": "_percentage >= 1 AND _percentage <= 100 when _token != ETH in _claim",
+        "solidity_property": "function invariant_percentageRange(uint8 _percentage) public pure { assert(_percentage >= 1 && _percentage <= 100); }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_claim"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "claim"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "claimAndStake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "_decodeUniswapV3Data reads the encodedPath from hardcoded calldata offsets assuming standard ABI encoding (bytes offset = 0x80). An attacker can craft calldata with a non-standard offset for the bytes parameter, placing fake path data at the standard position (passing validation) while the real path data at the actual offset is used by the exchange proxy. inputToken and outputToken validation can be bypassed.",
+        "attack_scenario": "1) Attacker crafts UniswapV3 calldata where: offset to encodedPath = 0x100 (non-standard). 2) At standard position (offset 0x80), places fake path: [LRT_addr][fee][WETH_addr] with fake length. 3) At actual position (offset 0x100), places real path with different intermediate tokens or manipulated routes. 4) _validateData reads fake path: inputToken=LRT, outputToken=WETH -> passes all checks. 5) exchangeProxy reads actual offset, uses real path for execution. 6) Swap executes through attacker-manipulated pools.",
+        "invariant_logic": "Decoded inputToken and outputToken from _decodeUniswapV3Data MUST match the actual tokens the exchange proxy will use in execution",
+        "solidity_property": "function invariant_pathConsistency(bytes calldata _data) internal pure { (address in1, address out1,,,) = _decodeUniswapV3Data(_data); /* The exchange proxy reads offset from _data[4:36] and follows it to get the real path */ /* in1 and out1 must match the real path's first and last tokens */ }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_decodeUniswapV3Data"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_validateData"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_fillQuote"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "The lifecycle must follow: DEPOSIT -> GRACE_PERIOD -> CONVERSION -> CLAIM. The startClaimDate is initialized to max uint32, and convertAllETH sets it to block.timestamp, making claims possible. However, setLoopAddresses resets loopActivation to block.timestamp which immediately closes deposits AND starts the grace period. Between setLoopAddresses and convertAllETH, a withdrawal window exists. If during this window a user withdraws ETH (reducing totalSupply) but then sends ETH back via receive(), the contract balance > totalSupply, inflating totalLpETH/totalSupply ratio for remaining users.",
+        "attack_scenario": "1) 10 users deposit 10 ETH each. totalSupply=100. 2) Owner calls setLoopAddresses. 3) Grace period: attacker withdraws 10 ETH (totalSupply=90). 4) Attacker sends 10 ETH back via receive(). Contract balance=100. 5) Owner calls convertAllETH. totalBalance=100, totalLpETH=100_lpETH. 6) Remaining 9 users each claim: 10*100/90 = 11.11 lpETH each. Total: 99.99 lpETH. 7) Extra ~0.01 lpETH stays in contract. 8) Attacker lost their tracked balance but donated ETH that inflates others' claims. More critically: attacker re-deposits via a different address before setLoopAddresses closes deposits - but deposits are already closed.",
+        "invariant_logic": "After convertAllETH: totalLpETH/totalSupply should represent fair 1:1 conversion ratio. Formally: address(this).balance_at_conversion == totalSupply (no extra untracked ETH)",
+        "solidity_property": "function invariant_conversionFairness() internal view { /* At convertAllETH call time */ assert(address(this).balance == totalSupply); }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "convertAllETH"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "receive"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "startClaimDate transition must be one-way: from max_uint32 to a real timestamp, and only via convertAllETH. Once set, it can never be reset. This is correctly enforced by onlyBeforeDate(startClaimDate) on convertAllETH. However, the lack of any mechanism to reset startClaimDate means that if convertAllETH sets it prematurely or with incorrect totalLpETH (e.g., lpETH.deposit returns fewer tokens than expected), the damage is irreversible.",
+        "invariant_logic": "startClaimDate is modified exactly once: from UINT32_MAX to block.timestamp, exclusively in convertAllETH. old(startClaimDate) == UINT32_MAX => new(startClaimDate) == block.timestamp. Once set != UINT32_MAX, it never changes.",
+        "solidity_property": "function invariant_startClaimDateOneWay(uint32 old_val, uint32 new_val) public pure { if (old_val != type(uint32).max) { assert(new_val == old_val); } }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "convertAllETH"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "The _fillQuote function approves exchangeProxy for _amount of tokens but never resets the approval to 0 after the swap. If the exchange proxy doesn't consume the full allowance (e.g., partial fill), the residual approval persists. Any subsequent interaction with the exchange proxy (from any user's claim) could inadvertently or maliciously consume leftover approvals from a different user's tokens.",
+        "invariant_logic": "After _fillQuote completes: IERC20(token).allowance(address(this), exchangeProxy) == 0",
+        "solidity_property": "function invariant_noResidualApproval(address token) public view { assert(IERC20(token).allowance(address(this), exchangeProxy) == 0); }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_fillQuote"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "setLoopAddresses has no null-address check and can set lpETH/lpETHVault to address(0) or arbitrary contracts. While onlyAuthorized restricts to owner, the 7-day TIMELOCK before convertAllETH is the only user protection. The loopActivation reset to block.timestamp prevents re-calling setLoopAddresses, making the addresses permanent. If set incorrectly, there is no correction mechanism.",
+        "invariant_logic": "After setLoopAddresses: address(lpETH) != address(0) AND address(lpETHVault) != address(0). setLoopAddresses can only be called once (loopActivation monotonically decreases to current timestamp).",
+        "solidity_property": "function invariant_loopAddressesSet() public view { if (loopActivation < block.timestamp + 120 days) { assert(address(lpETH) != address(0)); assert(address(lpETHVault) != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "setLoopAddresses"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "convertAllETH"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "TransformERC20 swap validation does not check recipient/destination of output tokens. While the 0x TransformERC20 function sends output to msg.sender by default, the unchecked transformations array can contain arbitrary external calls. A crafted transformation could redirect intermediate or final funds to an attacker-controlled address before the output is settled to the contract.",
+        "invariant_logic": "For all exchange types: all swap output MUST arrive at address(this). TransformERC20 should validate that no transformation redirects funds.",
+        "solidity_property": "function invariant_swapRecipient(Exchange _exchange, bytes calldata _data) internal view { if (_exchange == Exchange.TransformERC20) { /* transformations array is unchecked - should verify no redirects */ assert(false); /* Cannot verify without parsing transformations */ } }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_validateData"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_decodeTransformERC20Data"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "The withdraw function clears balances[msg.sender][_token] = 0 BEFORE performing the ETH-specific startClaimDate check. While Solidity revert restores state, this pattern is error-prone. More critically, for LRT tokens after startClaimDate in emergency mode, users CAN withdraw LRT tokens that may have already been partially claimed. No cross-check exists between partial claims (_percentage < 100) and withdrawal eligibility, potentially allowing double-spend across claim and withdraw paths.",
+        "invariant_logic": "For any user and token: the sum of (claimed via _claim) + (withdrawn via withdraw) MUST NOT exceed original deposit. Equivalently: balances[user][token] must accurately reflect remaining unclaimed balance at all times.",
+        "solidity_property": "function invariant_noDoubleSpend(address user, address token, uint256 totalDeposited, uint256 totalClaimed, uint256 totalWithdrawn) public pure { assert(totalClaimed + totalWithdrawn <= totalDeposited); }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "The receive() function accepts ETH from any sender with no restrictions. After convertAllETH, any ETH sent to the contract has no accounting and becomes claimable by the next LRT token claimer via the address(this).balance capture in _claim. This creates a permanent unprotected ETH sink that benefits random future claimers rather than the original senders.",
+        "invariant_logic": "After convertAllETH: address(this).balance SHOULD be 0 at all times except transiently during _fillQuote execution. Any non-zero balance outside _fillQuote represents unaccounted funds.",
+        "solidity_property": "function invariant_noResidualETH() public view { if (startClaimDate < type(uint32).max && startClaimDate <= block.timestamp) { assert(address(this).balance == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "receive"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "PrelaunchPoints.sol",
+        "description": "lockFor and lockETHFor allow any caller to lock tokens on behalf of another address (_for). While this enables legitimate use cases, it also means an attacker can force-lock dust amounts for a victim's address in specific LRT tokens, potentially affecting the victim's claim path or withdrawal options. The victim cannot prevent receiving forced deposits.",
+        "invariant_logic": "For lockFor/lockETHFor: _for should only receive deposits they consent to, OR the deposit should never harm _for's existing positions",
+        "solidity_property": "function invariant_noForcedDeposit() public view { /* lockFor can be called by anyone for any _for address */ /* Verify that dust deposits cannot grief victim's claim flow */ }",
+        "inventory_refs": [
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "lockFor"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "lockETHFor"
+          },
+          {
+            "file": "PrelaunchPoints.sol",
+            "function": "_processLock"
+          }
+        ]
+      }
+    ]
+  }
+}

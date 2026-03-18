@@ -1,0 +1,258 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T21:39:09.125Z",
+    "duration_ms": 172123
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin Configuration",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "configureLockdrop",
+          "configureToken",
+          "setUSDThresholds"
+        ],
+        "failure_modes": [
+          "Admin sets invalid lockdrop dates",
+          "Admin configures malicious or fee-on-transfer tokens",
+          "Admin sets unreachable USD thresholds"
+        ],
+        "attack_vectors": [
+          "Compromised admin key can halt deposits or manipulate token configurations to drain funds"
+        ]
+      },
+      {
+        "boundary": "Price Feed Multi-Sig",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "proposeUSDPrice",
+          "approveUSDPrice",
+          "disapproveUSDPrice"
+        ],
+        "failure_modes": [
+          "Operators collude to set incorrect USD price",
+          "Operators fail to update price, leading to stale values"
+        ],
+        "attack_vectors": [
+          "Compromised operator keys can manipulate weighted value calculations for rewards"
+        ]
+      },
+      {
+        "boundary": "User Deposits and Withdrawals",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "lock",
+          "lockOnBehalf",
+          "unlock",
+          "setLockDuration"
+        ],
+        "failure_modes": [
+          "User bypasses lock duration due to flawed math",
+          "User griefs another user's lock time by depositing on their behalf",
+          "User loses remainder due to state overwrite logic flaw"
+        ],
+        "attack_vectors": [
+          "Exploiting lock duration math to withdraw early",
+          "Calling lockOnBehalf to indefinitely freeze victim funds"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unlocked or partially locked",
+        "to_state": "Locked with updated quantity and unlock time",
+        "trigger": "lock / lockOnBehalf",
+        "conditions": [
+          "Token is configured and active",
+          "Sufficient allowance or msg.value",
+          "Valid lock duration"
+        ],
+        "invariants": [
+          "Total locked quantity increases by deposited amount",
+          "Unlock time is set to current time + lock duration"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Locked and unlock time passed",
+        "to_state": "Unlocked and tokens transferred",
+        "trigger": "unlock",
+        "conditions": [
+          "Requested quantity <= locked quantity",
+          "Current time >= unlock time"
+        ],
+        "invariants": [
+          "Locked quantity decreases by withdrawn amount",
+          "User receives exact requested amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Existing lock duration",
+        "to_state": "Updated lock duration and unlock time",
+        "trigger": "setLockDuration",
+        "conditions": [
+          "Duration <= max lock duration",
+          "New unlock time >= old unlock time (flawed check)"
+        ],
+        "invariants": [
+          "Unlock time should not be reduced"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Proposed USD Price",
+        "to_state": "Approved USD Price applied to tokens",
+        "trigger": "approveUSDPrice",
+        "conditions": [
+          "Approvals count >= APPROVE_THRESHOLD"
+        ],
+        "invariants": [
+          "Only configured tokens are updated",
+          "Proposal is deleted after execution"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-110",
+        "pattern": "Logic Flaw / Lock Duration Bypass",
+        "locations": [
+          "LockManager.sol: setLockDuration"
+        ],
+        "severity": "critical",
+        "evidence": "The check `uint32(block.timestamp) + uint32(_duration) < lockedTokens[msg.sender][tokenContract].unlockTime` compares the new duration added to the current time against the old unlock time. However, the new unlock time is calculated as `lastLockTime + uint32(_duration)`. A user can set `_duration` such that the check passes, but the new unlock time is in the past or exactly at `block.timestamp`, allowing immediate withdrawal.",
+        "exploitation_method": "A user calls `setLockDuration` with a `_duration` equal to `old_unlockTime - block.timestamp`. The check passes, and the new unlock time becomes `lastLockTime + old_unlockTime - block.timestamp`, which is less than or equal to the current time, allowing immediate unlocking.",
+        "affected_assets": [
+          "All locked tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-110",
+        "pattern": "Denial of Service / Griefing",
+        "locations": [
+          "LockManager.sol: lockOnBehalf",
+          "LockManager.sol: _lock"
+        ],
+        "severity": "high",
+        "evidence": "The `_lock` function unconditionally updates `lockedToken.unlockTime = uint32(block.timestamp) + uint32(_lockDuration)` for the `_lockRecipient`. Any user can call `lockOnBehalf` with a minimal amount (e.g., 1 wei) for another user, resetting their lock timer to the full duration from the current timestamp.",
+        "exploitation_method": "An attacker monitors for users whose lock durations are about to expire. The attacker calls `lockOnBehalf` with 1 wei of the locked token for the victim, resetting their `unlockTime` and preventing them from withdrawing their funds indefinitely.",
+        "affected_assets": [
+          "Victim's locked tokens (time-locked indefinitely)"
+        ]
+      },
+      {
+        "swc_id": "SWC-104",
+        "pattern": "Unchecked Call Return Value / Missing SafeERC20",
+        "locations": [
+          "LockManager.sol: _lock",
+          "LockManager.sol: unlock"
+        ],
+        "severity": "medium",
+        "evidence": "The contract uses `token.transferFrom` and `token.transfer` directly without `SafeERC20`. Tokens that do not return a boolean value (like USDT) will cause these calls to revert due to ABI decoding failures.",
+        "exploitation_method": "If the admin configures a non-standard token like USDT, users will not be able to lock or unlock it, effectively freezing funds in the contract.",
+        "affected_assets": [
+          "Non-standard ERC20 tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-110",
+        "pattern": "Logic Flaw / State Overwrite",
+        "locations": [
+          "LockManager.sol: _lock"
+        ],
+        "severity": "medium",
+        "evidence": "In `_lock`, the `remainder` variable is initialized to 0. If `lockdrop` is not active, the `if` block calculating the new remainder is skipped. At the end of the function, `lockedToken.remainder = remainder;` overwrites the user's existing remainder with 0.",
+        "exploitation_method": "A user who accumulated a remainder during a lockdrop makes another deposit after the lockdrop ends. Their previously accumulated remainder is permanently deleted, causing a loss of potential future NFT mints.",
+        "affected_assets": [
+          "User's NFT remainder value"
+        ]
+      },
+      {
+        "swc_id": "SWC-110",
+        "pattern": "Accounting Logic Flaw / Fee-on-Transfer Support",
+        "locations": [
+          "LockManager.sol: _lock"
+        ],
+        "severity": "low",
+        "evidence": "The contract increments `lockedToken.quantity += _quantity` without verifying the actual amount of tokens received from `transferFrom`. If a fee-on-transfer token is used, the contract will credit the user with more tokens than it received.",
+        "exploitation_method": "If a fee-on-transfer token is configured, an attacker can lock and unlock repeatedly to drain the contract's balance of that token, as they are credited for the pre-fee amount but withdraw the full amount.",
+        "affected_assets": [
+          "Fee-on-transfer ERC20 tokens"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "LockManager.sol",
+          "function": "configureLockdrop(Lockdrop)",
+          "guards": [
+            "onlyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Configures lockdrop start/end and min duration"
+        },
+        {
+          "contract": "LockManager.sol",
+          "function": "configureToken(address,ConfiguredToken)",
+          "guards": [
+            "onlyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds or updates token configuration"
+        },
+        {
+          "contract": "LockManager.sol",
+          "function": "setUSDThresholds(uint8,uint8)",
+          "guards": [
+            "onlyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets thresholds for USD price multi-sig"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "LockManager.sol",
+              "lines": "384-386",
+              "function": "getLockedWeightedValue"
+            }
+          ],
+          "compositional_usage": [
+            "Weighted locked value calculation"
+          ]
+        }
+      ]
+    }
+  }
+}

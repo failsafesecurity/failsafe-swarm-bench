@@ -1,0 +1,408 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T00:22:02.033Z",
+    "duration_ms": 169753
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Security.sol",
+        "description": "onlyOwner and onlyManager modifiers are no-ops. They evaluate boolean expressions (msg.sender == owner, managers[msg.sender] == true) without require/if-revert, so they never revert and provide zero access control.",
+        "attack_scenario": "Any external account can call setManager, transferOwnership, setFeeRedistributor, setMaxFeePercent, setProtocolFeePercent, setExternalFeePercent, setERC20Factory, addFees, and onBalanceChange. An attacker takes ownership, changes fee destinations to drain protocol fees, or changes the ERC20 factory to deploy malicious tokens.",
+        "invariant_logic": "For every function modified by onlyOwner: tx must revert if msg.sender != owner. For every function modified by onlyManager: tx must revert if managers[msg.sender] != true.",
+        "solidity_property": "function invariant_onlyOwnerReverts() public { uint256 snap = gasleft(); try this.transferOwnership(address(0x1)) {} catch { return; } assert(msg.sender == owner); }",
+        "inventory_refs": [
+          {
+            "file": "Security.sol",
+            "function": "onlyOwner"
+          },
+          {
+            "file": "Security.sol",
+            "function": "onlyManager"
+          },
+          {
+            "file": "Security.sol",
+            "function": "setManager"
+          },
+          {
+            "file": "Security.sol",
+            "function": "transferOwnership"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "FeeSplitter.sol",
+        "description": "setCurves() has no access control modifier at all. Anyone can replace the curves reference, enabling the attacker to point it to a malicious contract that returns fabricated balances and supplies.",
+        "attack_scenario": "Attacker deploys a malicious contract returning inflated balanceOf values for the attacker's address, calls setCurves() to set it, then claims all fees from the FeeSplitter by having fabricated balances used in fee calculations.",
+        "invariant_logic": "setCurves() must only be callable by owner or a designated admin. After deployment, curves address should only change via authorized call.",
+        "solidity_property": "function invariant_setCurvesRestricted() public view { assert(address(curves) != address(0)); /* setCurves must revert for non-owner */ }",
+        "inventory_refs": [
+          {
+            "file": "FeeSplitter.sol",
+            "function": "setCurves"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "FeeSplitter.sol",
+        "description": "onBalanceChange sets userFeeOffset to current cumulativeFeePerToken without first crediting accrued fees via updateFeeCredit. This permanently destroys unclaimed fee entitlements whenever a user's balance changes (buy/sell/transfer).",
+        "attack_scenario": "User A holds tokens and accrues significant holder fees. When User A buys more tokens, _transferFees calls onBalanceChange which resets their fee offset without recording accrued fees. All previously accumulated fees are permanently lost. Additionally, since onlyManager is broken, anyone can call onBalanceChange for any user to wipe their accrued fees.",
+        "invariant_logic": "Before any modification to userFeeOffset[account], unclaimedFees[account] must be updated to include all owed fees: unclaimedFees[account] += (cumulativeFeePerToken - userFeeOffset[account]) * balanceOf(token, account) / PRECISION",
+        "solidity_property": "function invariant_noFeesLostOnBalanceChange(address token, address user) public view { TokenData storage d = tokensData[token]; uint256 balance = balanceOf(token, user); uint256 owed = (d.cumulativeFeePerToken - d.userFeeOffset[user]) * balance / PRECISION; assert(getClaimableFees(token, user) >= d.unclaimedFees[user] + owed); }",
+        "inventory_refs": [
+          {
+            "file": "FeeSplitter.sol",
+            "function": "onBalanceChange"
+          },
+          {
+            "file": "FeeSplitter.sol",
+            "function": "updateFeeCredit"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "_transferFees"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Curves.sol",
+        "description": "Excess ETH sent during buyCurvesToken is permanently locked in the contract. _buyCurvesToken checks msg.value >= price + totalFee but never refunds the difference.",
+        "attack_scenario": "User sends 1 ETH for a purchase that costs 0.5 ETH + fees. The extra ~0.5 ETH remains in the Curves contract with no withdrawal mechanism, permanently lost to the user.",
+        "invariant_logic": "After _buyCurvesToken completes, the contract's ETH balance increase should equal exactly the holderFee amount (all other fees are forwarded). Any excess msg.value should be returned to sender.",
+        "solidity_property": "function invariant_noExcessEthLocked(uint256 price, uint256 totalFee) public payable { uint256 before = address(this).balance; _buyCurvesToken(subject, 1); assert(msg.value == price + totalFee || /* refund was sent */); }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "_buyCurvesToken"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "buyCurvesToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Curves.sol",
+        "description": "When selling tokens and no referral fee destination is defined, the referralFee ETH amount is subtracted from the seller's payout but never sent to anyone, permanently locking it in the contract.",
+        "attack_scenario": "Token subject never sets a referral destination. On every sell, the seller receives (price - protocolFee - subjectFee - referralFee - holderFee) while referralFee ETH stays trapped. Over many trades, significant ETH accumulates in the contract with no recovery path.",
+        "invariant_logic": "For sells: if referralFeeDestination == address(0), then referralFee must either be added to seller payout or redirected to protocol. sum(all_transfers_out) == price for every sell.",
+        "solidity_property": "function invariant_sellFeeAccounting(address subject) public view { /* For each sell: sellValue + protocolFee + subjectFee + referralFee(if defined) + holderFee == price */ }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "_transferFees"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "sellCurvesToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Curves.sol",
+        "description": "withdraw() calls _deployERC20 directly without the onlyTokenSubject modifier, allowing any token holder to deploy the ERC20 representation and choose the default name/symbol, bypassing the subject's intent for naming set via setNameAndSymbol.",
+        "attack_scenario": "Subject sets a custom name/symbol via setNameAndSymbol. Before the subject calls mint(), another token holder calls withdraw() which triggers _deployERC20 with the subject's set name. However, if subject hasn't set name/symbol, withdraw() deploys with DEFAULT_NAME/DEFAULT_SYMBOL, and the subject can never change it since ERC20TokenAlreadyMinted would revert.",
+        "invariant_logic": "ERC20 deployment for a curvesTokenSubject should only occur via explicit subject action (mint) or with subject's pre-approved metadata. _deployERC20 should not be triggerable by arbitrary holders.",
+        "solidity_property": "function invariant_deployOnlyBySubject(address subject) public view { if (externalCurvesTokens[subject].token != address(0)) { /* deployment was authorized by subject */ } }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "_deployERC20"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "_mint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "Curves.sol",
+        "description": "The ERC20 token supply invariant: the total ERC20 minted supply must always equal curvesTokenBalance[subject][address(curves)] * 1 ether. Violations mean tokens are unbacked or locked.",
+        "attack_scenario": "If ERC20 tokens can be minted without corresponding internal balance transfer (e.g., by replacing curvesERC20Factory with a malicious one—possible since onlyOwner is broken), the 1:1 backing invariant breaks, allowing unbacked ERC20 tokens.",
+        "invariant_logic": "For all subjects s: CurvesERC20(externalCurvesTokens[s].token).totalSupply() == curvesTokenBalance[s][address(this)] * 1 ether",
+        "solidity_property": "function invariant_erc20Backing(address subject) public view { address token = externalCurvesTokens[subject].token; if (token != address(0)) { assert(CurvesERC20(token).totalSupply() == curvesTokenBalance[subject][address(this)] * 1 ether); } }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "deposit"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Curves.sol",
+        "description": "getPrice reverts due to arithmetic underflow when supply=0 and amount>1, because (supply - 1 + amount) evaluates supply-1 first which underflows. This prevents subjects from buying more than 1 token in their initial purchase.",
+        "attack_scenario": "A subject calls buyCurvesTokenWithName or buyCurvesTokenForPresale with amount=5 to bootstrap their curve. The transaction reverts with arithmetic underflow. The subject must buy exactly 1 token, then buy more in a subsequent transaction, exposing them to frontrunning on the second buy.",
+        "invariant_logic": "getPrice(0, amount) must return a valid price for any amount >= 1. The quadratic sum formula must handle supply=0 correctly.",
+        "solidity_property": "function invariant_getPriceNeverRevertsForValidInputs(uint256 supply, uint256 amount) public pure { require(amount >= 1); getPrice(supply, amount); /* must not revert */ }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "getPrice"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "_buyCurvesToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Curves.sol",
+        "description": "Because Security.sol onlyOwner/onlyManager never revert, any address can call setProtocolFeePercent to redirect protocol fees to their own address, setFeeRedistributor to a malicious contract, or setERC20Factory to deploy backdoored ERC20 tokens.",
+        "attack_scenario": "Attacker calls setProtocolFeePercent(1 ether, attackerAddress) setting 100% protocol fee. All subsequent buy/sell trades route nearly all ETH to the attacker. Alternatively, attacker calls setERC20Factory with a malicious factory that deploys ERC20 tokens with backdoor mint functions.",
+        "invariant_logic": "setProtocolFeePercent, setFeeRedistributor, setERC20Factory must revert when msg.sender is not the authorized owner.",
+        "solidity_property": "function invariant_feeSettingsProtected() public view { assert(feesEconomics.protocolFeeDestination == EXPECTED_DESTINATION); }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "setProtocolFeePercent"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "setFeeRedistributor"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "setERC20Factory"
+          },
+          {
+            "file": "Security.sol",
+            "function": "onlyOwner"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Curves.sol",
+        "description": "Supply conservation invariant: for each curvesTokenSubject, the sum of all curvesTokenBalance[subject][holder] across all holders must equal curvesTokenSupply[subject]. Violation means tokens are created or destroyed outside the bonding curve.",
+        "invariant_logic": "For all subjects s: sum(curvesTokenBalance[s][h] for all h) == curvesTokenSupply[s]",
+        "solidity_property": "function invariant_supplyConservation(address subject, address[] memory holders) public view { uint256 total = 0; for (uint256 i = 0; i < holders.length; i++) { total += curvesTokenBalance[subject][holders[i]]; } assert(total == curvesTokenSupply[subject]); }",
+        "attack_scenario": "A bug in _transfer or _buyCurvesToken causes balance to be credited without incrementing supply, or supply to change without corresponding balance updates, allowing unbacked selling.",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "_buyCurvesToken"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "sellCurvesToken"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "_transfer"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "Curves.sol",
+        "description": "The first token of any subject's curve can never be sold (supply must stay > 0 after sells). This ensures the bonding curve always has a base and the subject cannot abandon the curve after extracting value. curvesTokenSupply[subject] >= 1 once initialized.",
+        "invariant_logic": "For all subjects s where curvesTokenSupply[s] > 0: after any sellCurvesToken call, curvesTokenSupply[s] >= 1",
+        "solidity_property": "function invariant_lastTokenProtection(address subject) public view { if (curvesTokenSupply[subject] > 0) { assert(curvesTokenSupply[subject] >= 1); } }",
+        "attack_scenario": "If the last token could be sold, the bonding curve would reach supply=0, allowing a new user to re-initialize the curve as a different subject, stealing the curve's identity and accumulated fees.",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "sellCurvesToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "FeeSplitter.sol",
+        "description": "The userTokens array for each user can accumulate duplicate entries because onBalanceChange pushes the token every time balance changes without checking for duplicates. This causes batchClaiming to double-count fees.",
+        "attack_scenario": "Attacker buys and sells the same token repeatedly. Each buy triggers onBalanceChange which pushes the token again. When batchClaiming iterates userTokens, the same token appears multiple times. updateFeeCredit is called multiple times per token in a single batch—after the first call zeros the offset, subsequent calls with stale offset may miscalculate or the user extracts fees from duplicate entries.",
+        "invariant_logic": "For all users u: userTokens[u] must contain no duplicate entries. Each token address appears at most once.",
+        "solidity_property": "function invariant_noDuplicateUserTokens(address user) public view { address[] memory tokens = userTokens[user]; for (uint i = 0; i < tokens.length; i++) { for (uint j = i+1; j < tokens.length; j++) { assert(tokens[i] != tokens[j]); } } }",
+        "inventory_refs": [
+          {
+            "file": "FeeSplitter.sol",
+            "function": "onBalanceChange"
+          },
+          {
+            "file": "FeeSplitter.sol",
+            "function": "batchClaiming"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "FeeSplitter.sol",
+        "description": "Since onlyManager is a no-op, anyone can call addFees() with zero msg.value or onBalanceChange() for any user. An attacker can call onBalanceChange(token, victim) to reset victim's fee offset, permanently destroying their unclaimed fees.",
+        "attack_scenario": "Attacker monitors the mempool. When a user accumulates significant fees, attacker calls onBalanceChange(token, victim) to reset the victim's userFeeOffset to cumulativeFeePerToken without crediting accrued fees. The victim's unclaimed fees are permanently wiped.",
+        "invariant_logic": "onBalanceChange(token, account) must revert unless msg.sender is the authorized Curves contract. addFees(token) must revert unless msg.sender is the authorized Curves contract.",
+        "solidity_property": "function invariant_onBalanceChangeRestricted() public { /* onBalanceChange must revert for unauthorized callers */ }",
+        "inventory_refs": [
+          {
+            "file": "FeeSplitter.sol",
+            "function": "onBalanceChange"
+          },
+          {
+            "file": "FeeSplitter.sol",
+            "function": "addFees"
+          },
+          {
+            "file": "Security.sol",
+            "function": "onlyManager"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "Curves.sol",
+        "description": "Presale timing logic has an inconsistency: buyCurvesToken opens after startTime (startTime >= block.timestamp reverts), but buyCurvesTokenWhitelisted is available only when startTime > 0 AND startTime > block.timestamp. There's a gap—when startTime exactly equals block.timestamp, neither function works.",
+        "invariant_logic": "Presale phase (whitelisted buying) must be active when 0 < block.timestamp < startTime. Public buying must be active when block.timestamp > startTime. At block.timestamp == startTime, exactly one path should be available.",
+        "solidity_property": "function invariant_presaleTimingComplete(address subject) public view { uint256 st = presalesMeta[subject].startTime; if (st > 0) { assert(block.timestamp < st || block.timestamp > st); /* no dead zone */ } }",
+        "attack_scenario": "At the exact block where timestamp equals startTime, neither the presale whitelist purchase nor the public purchase can execute—creating a denial of service window that miners/validators could exploit for MEV.",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "buyCurvesToken"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "buyCurvesTokenWhitelisted"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "FeeSplitter.sol",
+        "description": "cumulativeFeePerToken must be monotonically non-decreasing for correct fee distribution. If it could decrease, users could claim more fees than deposited.",
+        "invariant_logic": "For all tokens t: tokensData[t].cumulativeFeePerToken can only increase or stay the same over time.",
+        "solidity_property": "function invariant_cumulativeFeeMonotonic(address token) public view { /* cumulativeFeePerToken_new >= cumulativeFeePerToken_old after any state change */ }",
+        "attack_scenario": "Since addFees is unprotected (broken onlyManager), an attacker cannot decrease the cumulative value through addFees (it only adds). However, replacing the curves contract via setCurves could manipulate totalSupply to be extremely small, causing a massive jump in cumulativeFeePerToken with tiny ETH amounts, and the attacker claims disproportionate fees.",
+        "inventory_refs": [
+          {
+            "file": "FeeSplitter.sol",
+            "function": "addFees"
+          },
+          {
+            "file": "FeeSplitter.sol",
+            "function": "setCurves"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Curves.sol",
+        "description": "The _transfer function does not call feeRedistributor.onBalanceChange for the recipient, only the sender gets onBalanceChange called during _transferFees on buy/sell. Direct transfers (transferCurvesToken, transferAllCurvesTokens) never notify the FeeSplitter at all, causing incorrect fee distribution for both sender and receiver.",
+        "attack_scenario": "User A holds 10 tokens and has accrued fees. User A transfers all 10 tokens to User B via transferCurvesToken. The FeeSplitter is never notified: User A's offset is stale (they can still claim fees as if they hold tokens after the next fee deposit), and User B's offset is stale (they may claim retroactive fees they didn't earn or miss fees if offset is too low).",
+        "invariant_logic": "Every change to curvesTokenBalance[subject][account] must be preceded by a call to feeRedistributor.onBalanceChange(subject, account) for correct fee accounting.",
+        "solidity_property": "function invariant_feeSplitterNotifiedOnTransfer(address subject, address from, address to) public { /* onBalanceChange must be called for both from and to before balance changes */ }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "_transfer"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "transferCurvesToken"
+          },
+          {
+            "file": "Curves.sol",
+            "function": "transferAllCurvesTokens"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "Curves.sol",
+        "description": "setWhitelist allows anyone with supply <= 1 (including supply == 0, meaning curve not yet created) to set a merkle root for their own address. A non-subject griefing attack: anyone can set their own merkle root before ever creating a curve.",
+        "attack_scenario": "Attacker sets a merkle root for their address before actually buying any tokens. Later when they create the curve with buyCurvesTokenForPresale, the previously set merkle root may conflict or create unexpected presale conditions. Additionally, if supply == 1, the subject can freely reset the whitelist even after presale participants have already bought.",
+        "invariant_logic": "Whitelist modification should only be allowed during the setup phase (supply == 0 or supply == 1 and before presale starts). Once the presale is active, the whitelist should be immutable.",
+        "solidity_property": "function invariant_whitelistImmutableDuringPresale(address subject) public view { if (presalesMeta[subject].startTime > 0 && block.timestamp < presalesMeta[subject].startTime) { /* merkle root should not change during active presale */ } }",
+        "inventory_refs": [
+          {
+            "file": "Curves.sol",
+            "function": "setWhitelist"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "FeeSplitter.sol",
+        "description": "FeeSplitter.claimFees calls updateFeeCredit then getClaimableFees, but after updateFeeCredit the owed portion is already in unclaimedFees and offset is reset—so getClaimableFees correctly returns unclaimedFees. However, claimFees only zeroes unclaimedFees but doesn't reset userFeeOffset, which is fine. The real issue is the double precision scaling: balanceOf returns balance * PRECISION, then updateFeeCredit computes (cumulativeFeePerToken - offset) * balance and divides by PRECISION. But cumulativeFeePerToken was computed with PRECISION already embedded via addFees ((msg.value * PRECISION) / totalSupply), and totalSupply already includes PRECISION scaling. This creates a precision mismatch.",
+        "attack_scenario": "The double-PRECISION scaling in balanceOf (which multiplies by 1e18) interacts with addFees (which also uses PRECISION). In addFees: cumulativeFeePerToken += (msg.value * 1e18) / (supply * 1e18) = msg.value / supply. In updateFeeCredit: owed = (cumFeePerToken - offset) * (balance * 1e18) / 1e18 = (cumFeePerToken - offset) * balance. This means the precision cancels correctly for balanceOf but totalSupply is also scaled by PRECISION in addFees, making cumFeePerToken = msg.value / supply (without PRECISION). Then owed = (msg.value/supply) * balance * PRECISION / PRECISION = msg.value * balance / supply. This seems correct but rounding can cause the contract to owe more than it holds.",
+        "invariant_logic": "sum(getClaimableFees(token, user) for all users) <= address(feeSplitter).balance for all tokens",
+        "solidity_property": "function invariant_feeSolvency(address token, address[] memory users) public view { uint256 totalOwed = 0; for (uint i = 0; i < users.length; i++) { totalOwed += getClaimableFees(token, users[i]); } assert(totalOwed <= address(this).balance); }",
+        "inventory_refs": [
+          {
+            "file": "FeeSplitter.sol",
+            "function": "addFees"
+          },
+          {
+            "file": "FeeSplitter.sol",
+            "function": "updateFeeCredit"
+          },
+          {
+            "file": "FeeSplitter.sol",
+            "function": "claimFees"
+          }
+        ]
+      }
+    ]
+  }
+}

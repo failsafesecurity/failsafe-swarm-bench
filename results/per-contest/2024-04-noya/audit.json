@@ -1,0 +1,1063 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "MorphoBlueConnector._getPositionTVL Adds Borrow Amount Instead of Subtracting, Inflating Vault TVL",
+      "severity": "high",
+      "summary": "MorphoBlueConnector._getPositionTVL computes TVL as `supplyAmount + borrowAmount + collateralInLoanToken`. The borrowAmount should be SUBTRACTED, not added. Additionally, when `borrow()` is called, borrowed tokens are sent to the connector and registered as held tokens via `_updateTokenInRegistry`. TVLHelper then counts: (1) the borrowed tokens as a held token balance, AND (2) the Morpho position TVL which erroneously adds borrowAmount. This results in TVL inflation of approximately 2x the borro",
+      "description": [
+        {
+          "file": "MorphoBlueConnector.sol",
+          "line_start": 112,
+          "line_end": 120,
+          "desc": "tvl = _getValue(params.loanToken, base, supplyAmount + borrowAmount + convertCToL(...))"
+        },
+        {
+          "file": "TVLHelper.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: getTVL(uint256,PositionRegistry,address)"
+        }
+      ],
+      "impact": "CRITICAL: TVL inflated by 2x borrow amount. This directly affects: (1) Share pricing via ERC4626 totalAssets() → TVL(), causing unfair deposit/withdrawal pricing for all users; (2) Performance fee extraction via recordProfitForFee() calculating phantom profits; (3) Deposit limits via TVL() check in deposit(), potentially blocking legitimate deposits; (4) All users of the vault are affected whenever Morpho borrowing is used.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Registry onlyVaultMaintainer Modifier Uses OR Instead of AND, Requiring Both Maintainer AND Emergency Roles",
+      "severity": "high",
+      "summary": "The `onlyVaultMaintainer` modifier in Registry.sol uses `||` in its revert condition: `if (msg.sender != vaults[_vaultId].maintainer || hasRole(EMERGENCY_ROLE, msg.sender) == false)`. By De Morgan's law, this passes ONLY when the caller is BOTH the vault maintainer AND holds the global EMERGENCY_ROLE. All other vault modifiers (onlyVaultGoverner, onlyVaultMaintainerWithoutTimeLock) correctly use `&&`, passing when EITHER condition is met. This locks `addConnector`, `updateConnectorTrustedTokens`",
+      "description": [
+        {
+          "file": "Registry.sol",
+          "line_start": 26,
+          "line_end": 30,
+          "desc": "if (msg.sender != vaults[_vaultId].maintainer || hasRole(EMERGENCY_ROLE, msg.sender) == false) — uses || where && is intended, compare with onlyVaultGoverner at lines 38-41 which uses &&"
+        }
+      ],
+      "impact": "CRITICAL severity. Three essential vault administration functions (addConnector, updateConnectorTrustedTokens, removeTrustedPosition) are inaccessible to the vault maintainer unless they also hold the global EMERGENCY_ROLE. In production deployments with proper role separation, this renders vault maintenance impossible without workarounds. The deployment script's use of the same address for all roles masks the bug but represents a centralization risk rather than a fix.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Registry Swap-and-Pop Position Removal Corrupts isPositionUsed Mapping via Wrong Key Computation",
+      "severity": "high",
+      "summary": "When removing a holding position via `updateHoldingPosition`, the swap-and-pop logic recomputes the key for the swapped element using `vault.holdingPositions[positionIndex].calculatorConnector`. However, the original key was computed as `keccak256(abi.encode(msg.sender, _positionId, _data))` where `msg.sender` is the connector that created the position. For token positions (positionTypeId=0), `calculatorConnector` is the AccountingManager but the creating connector is a BaseConnector derivative.",
+      "description": [
+        {
+          "file": "Registry.sol",
+          "line_start": 199,
+          "line_end": 207,
+          "desc": "Swap-and-pop recomputes key using vault.holdingPositions[positionIndex].calculatorConnector but original key used msg.sender; these differ for token positions where calculatorConnector=accountingManager and creator=connector"
+        },
+        {
+          "file": "BaseConnector.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _updateTokenInRegistry(address,bool)"
+        }
+      ],
+      "impact": "HIGH impact. The corrupted isPositionUsed mapping means: (1) Positions that were swapped become 'invisible' to their owning connector, preventing removal. (2) The connector may inadvertently create duplicate positions. (3) TVL calculations via TVLHelper iterate over holdingPositions array (which is still correct) but position management becomes broken. (4) The holdingPositions array can grow without proper cleanup, eventually hitting maxNumHoldingPositions and blocking new position creation. (5) The stale mapping entry could cause a different position to be incorrectly identified during lookups. This affects all vault depositors through incorrect position management.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "resetMiddle for Withdraw Queue Does Not Reset totalCBAmount, Enabling Double-Counting on Re-Calculation",
+      "severity": "high",
+      "summary": "When resetMiddle is called for the withdraw queue, it moves withdrawQueue.middle backwards to allow re-calculation of withdrawal shares. However, calculateWithdrawShares accumulates assets into currentWithdrawGroup.totalCBAmount additively. Since totalCBAmount is NOT reset by resetMiddle, re-processing the same requests doubles the totalCBAmount. This leads to incorrect neededAssetsForWithdraw, potentially blocking fulfillment or causing wrong pro-rata distribution in executeWithdraw.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 271,
+          "line_end": 287,
+          "desc": "resetMiddle sets withdrawQueue.middle = newMiddle without resetting currentWithdrawGroup.totalCBAmount; calculateWithdrawShares at line 219 uses currentWithdrawGroup.totalCBAmount += assetsNeededForWithdraw"
+        }
+      ],
+      "impact": "HIGH severity. The defect causes: (1) Withdrawing users receive approximately 50% of their entitled amounts per double-count; (2) neededAssetsForWithdraw demands inflated amounts from connectors, potentially over-withdrawing from strategy positions; (3) Excess tokens remain trapped in the accounting manager, creating accounting discrepancies. Recovery requires manual intervention. While resetMiddle requires onlyManager access, it is a designed operational tool, not an obscure edge case.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "calculateWithdrawShares Callable During Fulfilled-But-Not-Executed State, Orphaning Calculated Amounts",
+      "severity": "high",
+      "summary": "The withdraw group state machine allows calculateWithdrawShares to execute when currentWithdrawGroup.isStarted==true AND isFullfilled==true (the fulfilled-but-not-fully-executed state). The guard only blocks when isFullfilled==false AND isStarted==true. New calculations during this window add to totalCBAmount, but when executeWithdraw completes and deletes the withdraw group struct, these accumulated amounts are destroyed. The next withdraw group starts with totalCBAmount=0, missing the calculat",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 198,
+          "line_end": 223,
+          "desc": "Guard at line 206-208 only blocks (isStarted=true, isFullfilled=false); allows (true,true); delete at line 267 destroys orphaned totalCBAmount"
+        }
+      ],
+      "impact": "The impact is significant: (1) Orphaned requests are included in the next group but their amounts are not in totalCBAmountFullfilled, causing the pro-rata ratio to be incorrect. If the ratio exceeds 1 (because totalCBAmountFullfilled is too small relative to individual amounts), users may receive more than their fair share but the contract may revert due to insufficient balance. (2) The retrieveTokensForWithdraw function only retrieves based on totalCBAmount, which doesn't include the orphaned amounts, so the contract likely won't have enough tokens to fulfill all withdrawals. (3) Users whose requests were orphaned may end up in a broken state. The resetMiddle function can be used as a manual recovery mechanism if the manager is aware of the issue, but there's no automatic safeguard.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "UNIv3Connector._getPositionTVL Uses Aggregate Pool Position Key, Potentially Overstating TVL",
+      "severity": "high",
+      "summary": "UNIv3Connector._getPositionTVL computes the Uniswap V3 pool position key as `keccak256(abi.encodePacked(positionManager, tL, tU))`. In Uniswap V3, the pool tracks positions by `keccak256(abi.encodePacked(owner, tickLower, tickUpper))` where `owner` is the NFT position manager. This key returns the AGGREGATE liquidity of ALL positions managed by the NFT position manager at those tick ranges, not just the connector's specific NFT position. If other users have positions through the same NFT manager",
+      "description": [
+        {
+          "file": "UNIv3Connector.sol",
+          "line_start": 94,
+          "line_end": 107,
+          "desc": "bytes32 key = keccak256(abi.encodePacked(positionManager, tL, tU)); pool.positions(key) returns aggregate liquidity for ALL positions at those ticks"
+        }
+      ],
+      "impact": "HIGH impact. The vault TVL can be significantly overstated depending on how much external liquidity exists at the same tick ranges. This directly affects: (1) Share price calculations via totalAssets()/TVL(), causing depositors to receive fewer shares and withdrawers to receive more base tokens than warranted. (2) Performance fee calculations, since inflated TVL creates phantom profit. (3) Deposit limit checks, since TVL() > depositLimitTotalAmount may incorrectly prevent deposits. The magnitude depends on external positions at same ticks - popular ranges like full-range or common price brackets could have substantial external liquidity.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "collectManagementFees Underflows When preformanceFeeSharesWaitingForDistribution Exceeds totalSupply Minus Fee Receiver Balances",
+      "severity": "high",
+      "summary": "collectManagementFees computes `currentFeeShares = balanceOf(managementFeeReceiver) + balanceOf(performanceFeeReceiver) + preformanceFeeSharesWaitingForDistribution`, then subtracts this from `totalShares` to compute the fee base. However, `preformanceFeeSharesWaitingForDistribution` represents unminted shares (not yet in totalSupply). If this value is large enough, `totalShares - currentFeeShares` underflows in Solidity 0.8.20's checked arithmetic, causing a revert that blocks management fee co",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 309,
+          "line_end": 321,
+          "desc": "(totalShares - currentFeeShares) where currentFeeShares includes unminted preformanceFeeSharesWaitingForDistribution; checked arithmetic reverts on underflow"
+        }
+      ],
+      "impact": "The impact is a Denial of Service on management fee collection. When the underflow occurs, collectManagementFees always reverts until either: (a) collectPerformanceFees is called (minting the shares and resetting preformanceFeeSharesWaitingForDistribution to 0), or (b) checkIfTVLHasDroped resets the value to 0 if profit has dropped. If neither can be called (e.g., timing window issue with collectPerformanceFees requiring 12-48h), management fees are blocked indefinitely. This is a code defect regardless of whether an attacker can profit from it.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "UniswapValueOracle Silently Truncates Amount to uint128, Causing Severe Price Underreporting",
+      "severity": "high",
+      "summary": "UniswapValueOracle.getValue performs `uint128 amountIn128 = uint128(amount)` which silently truncates any amount exceeding uint128.max (~3.4e38). For tokens with very large total supplies or for high-precision internal calculations, this truncation returns an incorrect lower value. The truncated result is used in TVL calculations, understating the vault's total value and deflating share prices.",
+      "description": [
+        {
+          "file": "UniswapValueOracle.sol",
+          "line_start": 54,
+          "line_end": 55,
+          "desc": "uint128 amountIn128 = uint128(amount); — silent truncation of uint256 to uint128"
+        }
+      ],
+      "impact": "The defect is a missing bounds check that causes silent data corruption for large inputs. Impact: (1) TVL calculations via AccountingManager._getValue -> NoyaValueOracle -> UniswapValueOracle return incorrect values, (2) Share price calculations based on totalAssets() are wrong, (3) Swap slippage checks in SwapAndBridgeHandler compute incorrect minAmount. While the practical reachability depends on token characteristics, the code is objectively defective — it should either revert or handle the case correctly. The missing `require(amount <= type(uint128).max)` is a clear safeguard gap.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Active connector can drain arbitrary tokens from AccountingManager via unprotected sendTokensToTrustedAddress()",
+      "severity": "high",
+      "summary": "AccountingManager.sendTokensToTrustedAddress() transfers any ERC20 token to msg.sender if msg.sender is an active connector, with no binding to a specific operation (deposit execution, withdrawal retrieval) and no cap based on pending deposits/withdraw needs. If an attacker can become an enabled connector (or compromise an enabled connector), they can pull baseToken and other assets from the AccountingManager, potentially stealing user funds and breaking deposit-queue conservation.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 88,
+          "line_end": 101,
+          "desc": "if (registry.isAnActiveConnector(vaultId, msg.sender)) IERC20(token).safeTransfer(msg.sender, amount)"
+        }
+      ],
+      "impact": "If exploited: all baseToken held in AccountingManager (including funds reserved for pending deposits via totalAWFDeposit) can be drained. This breaks deposit execution for all queued users. The function also allows pulling non-baseToken assets that may be held by AccountingManager. Financial impact is up to 100% of AccountingManager token holdings. Recovery requires emergency pause and manual intervention. The code defect exists independently of exploitation feasibility.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "NoyaValueOracle multi-hop routing uses wrong variable in loop, potentially mispricing routes longer than 1 hop",
+      "severity": "high",
+      "summary": "In NoyaValueOracle._getValue(asset, baseToken, amount, sources), the loop sets `initialValue = _getValue(asset, sources[i], initialValue); quotingToken = sources[i];`. It appears to always quote from the original `asset` each hop rather than from the current `quotingToken`, which likely breaks multi-hop conversion logic (asset->token1->token2->base). This can yield incorrect pricing for any configured route with length > 1, impacting TVL and slippage checks.",
+      "description": [
+        {
+          "file": "NoyaValueOracle.sol",
+          "line_start": 63,
+          "line_end": 77,
+          "desc": "loop calls _getValue(asset, sources[i], initialValue) instead of _getValue(quotingToken, sources[i], initialValue)"
+        }
+      ],
+      "impact": "The defect is dormant if all routes have length 0 or 1, but becomes active the moment any maintainer configures a multi-hop route. Impact includes: (1) incorrect TVL leading to mispriced shares, (2) incorrect swap minAmount calculations in SwapAndBridgeHandler.executeSwap, (3) incorrect performance fee calculations based on wrong profit figures. The severity depends on the magnitude of mispricing and the assets involved.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ChainlinkOracleConnector Missing Feed Decimals Normalization Causes Systematic Price Misquoting",
+      "severity": "high",
+      "summary": "ChainlinkOracleConnector.getValueFromChainlinkFeed uses `sourceTokenUnit = 10^(token.decimals())` but does NOT normalize for the Chainlink feed's own decimal precision (typically 8 via `source.decimals()`). For token pairs where the feed decimals differ from base token decimals, the result is systematically wrong. Example: WETH(18 dec) → USDC(6 dec) with 8-decimal feed returns value scaled to 10^8 instead of 10^6, a 100x overvaluation.",
+      "description": [
+        {
+          "file": "ChainlinkOracleConnector.sol",
+          "line_start": 85,
+          "line_end": 103,
+          "desc": "Non-inverse: (amountIn * uintprice) / sourceTokenUnit — sourceTokenUnit uses token.decimals() not feed.decimals(); result has feed decimal precision, not base token decimal precision"
+        }
+      ],
+      "impact": "CRITICAL. If Chainlink is used as the oracle for any token pair with mismatched feed/base decimals (extremely common: 8-decimal USD feeds + 6-decimal USDC), the vault's TVL is systematically overvalued by 100x. New depositors receive 100x fewer shares. Existing holders can withdraw 100x more value. Performance fees are collected on phantom 100x profits. The entire vault's economic model is broken.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AerodromeConnector TVL Ignores Gauge-Staked LP Tokens, Causing Systematic TVL Underreporting",
+      "severity": "high",
+      "summary": "_getPositionTVL only counts `IERC20(pool).balanceOf(address(this))` but after calling stake(), LP tokens are transferred to the gauge and become invisible to TVL. This causes TVL to drop by the staked amount, deflating share price. New depositors buy shares cheaply; when LP is unstaked, TVL jumps and they profit at existing holders' expense.",
+      "description": [
+        {
+          "file": "AerodromeConnector.sol",
+          "line_start": 97,
+          "line_end": 106,
+          "desc": "uint256 balance = IERC20(pool).balanceOf(address(this)); — only counts unstaked LP, missing IGauge(gauge).balanceOf(address(this)) for staked LP"
+        }
+      ],
+      "impact": "HIGH. Once LP tokens are staked in the Aerodrome gauge (which is the standard operation for earning yield on Aerodrome), the entire staked amount becomes invisible to TVL. This systematically underreports vault TVL, leading to: (1) incorrect share pricing for all deposits and withdrawals, (2) potential extraction of value by informed parties who deposit when TVL is understated, (3) incorrect performance fee calculations, (4) the entire Aerodrome strategy's value is misrepresented. Compare with CurveConnector which correctly includes gauge balance via balanceOfRewardPool().",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Flash Loan Address Grants Global Manager Access Across All Vaults and Connectors",
+      "severity": "high",
+      "summary": "The onlyManager modifier in NoyaGovernanceBase allows `registry.flashLoan()` to call ANY manager-restricted function across ALL vaults and ALL connectors. If set to a generic flash loan provider (e.g., Balancer Vault) that allows arbitrary callbacks, any flash loan user becomes msg.sender = flashLoan address, gaining full manager access to execute deposits, withdrawals, fee collection, swaps, and position management across every vault.",
+      "description": [
+        {
+          "file": "NoyaGovernanceBase.sol",
+          "line_start": 28,
+          "line_end": 33,
+          "desc": "if (!(msg.sender == keeperContract || msg.sender == emergencyManager || msg.sender == registry.flashLoan())) revert; — flashLoan gets same access as keeper and emergency across all vaults"
+        },
+        {
+          "file": "Registry.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: setFlashLoanAddress"
+        }
+      ],
+      "impact": "If the flashLoan address is set to a contract that allows external calls (which many contracts do), the impact is CRITICAL: full manager access to all vaults including deposit/withdraw queue manipulation, fee extraction, arbitrary swaps, position management, and fund movements. The code defect violates the principle of least privilege by granting global manager access when only limited token-transfer access is needed.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Withdraw Queue Permanent DoS via Division by Zero",
+      "severity": "high",
+      "summary": "An attacker can queue a withdrawal for a tiny share amount that evaluates to 0 assets, causing the withdraw group's total amount to be 0 and permanently bricking the queue via division by zero.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 375,
+          "line_end": 376,
+          "desc": "Division by currentWithdrawGroup.totalCBAmountFullfilled without zero-check"
+        }
+      ],
+      "impact": "CRITICAL - Permanent denial of service for ALL vault withdrawals. Once the withdraw queue is bricked, no user can withdraw their funds. The emergency rescue function can only transfer tokens but cannot fix the withdraw queue state. The only recovery would require a contract upgrade, but the system has no upgrade mechanism (no proxy pattern). Total vault TVL is at risk of being permanently locked.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Withdraw Group Permanent DoS via Accumulator Overflow",
+      "severity": "high",
+      "summary": "The `retrieveTokensForWithdraw` function accumulates `amountAskedForWithdraw` without checking the total against `neededAssets`, allowing the accumulator to exceed the required amount and permanently bricking the withdraw group.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 270,
+          "line_end": 272,
+          "desc": "Validation checks local temp variable instead of global accumulator against neededAssets"
+        }
+      ],
+      "impact": "LOW-MEDIUM. The code has a real validation defect (checking local variable instead of global accumulator against totalCBAmount), violating INV-ECON-003. This could cause the accumulator to track incorrect values and emit misleading events. However, the permanent DoS claim is invalid - the AND condition in fulfillCurrentWithdrawGroup ensures that whenever sufficient assets are available (neededAssets==0), the inflated accumulator does not block fulfillment. The accumulator is reset to 0 upon successful fulfillment.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Public TVL Drop Check Allows Performance Fee Griefing",
+      "severity": "high",
+      "summary": "The public `checkIfTVLHasDroped` function allows anyone to permanently destroy pending performance fees during temporary market dips.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 377,
+          "line_end": 384,
+          "desc": "Public function allows resetting state variables based on manipulable spot TVL"
+        }
+      ],
+      "impact": "MEDIUM severity. The attack is a denial-of-service/griefing vector against protocol performance fee collection. Direct financial impact is limited to lost protocol revenue (performance fees), not user fund theft. However, the attack cost can be extremely low (just gas costs for calling checkIfTVLHasDroped during natural volatility, or flash loan fees for oracle manipulation) while the griefed amount can be significant. This could undermine the economic viability of managing strategies on the protocol.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "TVL calculation can be bricked by a single reverting position, halting deposits/withdrawals and fee workflows",
+      "severity": "high",
+      "summary": "TVLHelper.getTVL iterates all holding positions and calls connector.getPositionTVL; any revert bubbles up and reverts TVL(), which is used in previewDeposit/previewRedeem and thus in calculateDepositShares/calculateWithdrawShares/recordProfitForFee/deposit limit checks. A single position tied to a protocol outage, misconfigured oracle route, or a connector reverting for malformed state can halt core operations.",
+      "description": [
+        {
+          "file": "TVLHelper.sol",
+          "line_start": 10,
+          "line_end": 33,
+          "desc": "for each position: IConnector(...).getPositionTVL(...); no try/catch; revert propagates"
+        },
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: deposit(address,uint256,address)"
+        }
+      ],
+      "impact": "HIGH severity. When triggered, this bricks all core vault operations: no new deposits can be processed (deposit() reverts on TVL limit check), no deposit share calculations can occur (calculateDepositShares reverts on previewDeposit), no withdrawal share calculations can occur (calculateWithdrawShares reverts on previewRedeem), no performance fee recording can occur (recordProfitForFee reverts on getProfit), and no TVL drop checking can occur (checkIfTVLHasDroped reverts on getProfit). User funds are not directly stolen but are locked — users cannot deposit or withdraw. The emergency pause mechanism (emergencyStop) still works since it doesn't depend on TVL, but unpause doesn't resolve the underlying issue.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Pro-Rata Withdrawals Burn Full Share Amount for Partial Payment",
+      "severity": "high",
+      "summary": "In `AccountingManager.executeWithdraw`, if the vault lacks sufficient base tokens to fulfill the entire withdrawal group (`totalABAmount < totalCBAmountFullfilled`), users receive a pro-rata fraction of their requested base tokens. However, the contract burns the FULL amount of their requested shares, permanently destroying the unfulfilled value.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 326,
+          "line_end": 330,
+          "desc": "baseTokenAmount is scaled down, but _burn uses full shares"
+        }
+      ],
+      "impact": "CRITICAL: Direct, irrecoverable loss of user funds during any liquidity shortage event. The magnitude of loss is proportional to the liquidity shortfall (up to 100% of withdrawal value in extreme cases where totalABAmount approaches 0). All users in the affected withdrawal group suffer losses, with no possibility of recovery since shares are permanently burned. Remaining shareholders are unjustly enriched.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Connector Token Drain via Empty Watcher Verification",
+      "severity": "high",
+      "summary": "The `BaseConnector.sendTokensToTrustedAddress` function relies on `Watchers.verifyRemoveLiquidity` to validate withdrawal amounts. However, the Watcher function is completely empty. A compromised or malicious manager can drain arbitrary amounts of tokens from any connector to the AccountingManager.",
+      "description": [
+        {
+          "file": "Watchers.sol",
+          "line_start": 8,
+          "line_end": 8,
+          "desc": "function verifyRemoveLiquidity(...) external view { } is empty"
+        },
+        {
+          "file": "BaseConnector.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: sendTokensToTrustedAddress"
+        }
+      ],
+      "impact": "HIGH severity. The empty Watcher function eliminates an intended security layer for validating token withdrawals from connectors. Combined with the amount tracking mismatch in retrieveTokensForWithdraw, a compromised manager can drain connector funds to the AccountingManager. While this requires a compromised privileged account, the code explicitly relies on the Watcher as a defense-in-depth mechanism, and that mechanism is completely absent. The potential loss is the total TVL held across all connectors for the affected vault.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "BalancerConnector harvestAuraRewards Missing BAL Token Registry Update Causes TVL Underreporting",
+      "severity": "high",
+      "summary": "harvestAuraRewards only calls _updateTokenInRegistry(AURA) but not _updateTokenInRegistry(BAL). Aura reward pools distribute both AURA and BAL tokens upon getReward(). The BAL tokens received are not registered in the position tracking system, making them invisible to TVL calculations. This systematically underreports vault TVL by the value of all accumulated BAL rewards.",
+      "description": [
+        {
+          "file": "BalancerConnector.sol",
+          "line_start": 44,
+          "line_end": 49,
+          "desc": "Only _updateTokenInRegistry(address(AURA)) called; BAL not updated despite IRewardPool.getReward() distributing both"
+        }
+      ],
+      "impact": "MEDIUM severity. The BAL rewards from Aura pools represent a real but bounded portion of TVL. The impact scales with: (1) the BAL reward rate from Aura pools, (2) the frequency of harvestAuraRewards calls vs decreasePosition calls, and (3) the time gap between harvesting and the next operation that registers BAL. During this gap, share pricing is incorrect, creating unfair entry/exit prices for depositors and withdrawers.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "NoyaFeeReceiver.withdrawShares Creates Permanent Share Lock Without Cancellation Path",
+      "severity": "high",
+      "summary": "NoyaFeeReceiver.withdrawShares calls AccountingManager.withdraw(amount, receiver) which queues a withdrawal and increments withdrawRequestsByAddress[NoyaFeeReceiver] to lock shares. There is no mechanism to cancel a queued withdrawal. If the manager never processes the withdrawal (or it gets stuck in an incomplete group), the shares are permanently locked, preventing the fee receiver from transferring or burning them. The _update override enforces this lock on all transfers.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 193,
+          "line_end": 208,
+          "desc": "withdraw() increments withdrawRequestsByAddress with no corresponding cancellation function; _update at line 151 enforces balanceOf >= amount + withdrawRequestsByAddress"
+        },
+        {
+          "file": "NoyaFeeReceiver.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: withdrawShares"
+        }
+      ],
+      "impact": "MEDIUM severity. The NoyaFeeReceiver contract specifically uses both withdrawShares() and burnShares(). Once withdrawShares() is called, the locked shares cannot be burned until the full withdrawal pipeline completes. This creates an operational dependency where fee collection (via withdrawal to base tokens) blocks fee burning (share supply reduction). For regular users, the same issue applies - queued withdrawals cannot be cancelled, and shares are locked until the manager processes them. The impact is amplified if the contract is paused or the manager is unresponsive.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AccountingManager executeDeposit Unconditional Revert When No Deposits Are Ready",
+      "severity": "high",
+      "summary": "In executeDeposit, if no deposits pass the waiting time check (processedBaseTokenAmount remains 0), the function reaches the connector validation branch where the condition `processedBaseTokenAmount > 0` is false, causing it to fall to the else branch which always reverts with NoyaAccounting_INVALID_CONNECTOR. This wastes gas and provides no useful information. More critically, the connector address is validated ONLY in conjunction with processedBaseTokenAmount > 0, meaning if the connector is i",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 196,
+          "line_end": 213,
+          "desc": "if (isAnActiveConnector && processedBaseTokenAmount > 0) {...} else { revert INVALID_CONNECTOR } - revert triggered even when connector is valid but no deposits are ready"
+        }
+      ],
+      "impact": "Low severity code defect. No funds at risk. Impact is limited to: (1) wasted keeper gas on mistimed calls, (2) misleading error messages complicating debugging, (3) unreachable code (depositQueue.first update) in the zero-deposit path. The defect does not enable fund extraction or manipulation, but it represents incorrect logic that conflates two distinct error conditions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Oracle Manipulation via Spot Balances and Prices",
+      "severity": "high",
+      "summary": "Multiple connectors (UNIv3, Aerodrome, Balancer, Curve) calculate TVL using spot balances (e.g., `getReserves`, `_tokenBalances`) or spot prices (e.g., `slot0`). These are highly susceptible to single-block flash loan manipulation. An attacker can use a flash loan to imbalance a pool, drastically inflating or deflating the vault's TVL during the block where `calculateWithdrawShares` or `calculateDepositShares` is executed.",
+      "description": [
+        {
+          "file": "AerodromeConnector.sol",
+          "line_start": 114,
+          "line_end": 114,
+          "desc": "(uint256 reserve0, uint256 reserve1,) = IPool(pool).getReserves();"
+        }
+      ],
+      "impact": "Critical. The spot data manipulation affects the core share pricing mechanism. An attacker can inflate TVL to extract excess value during withdrawals, or deflate TVL to acquire cheap shares during deposits. The impact scales with the size of positions in manipulable pools relative to total vault TVL. All four connector types are affected independently, meaning any vault with positions in Aerodrome, Uniswap V3, Balancer, or Curve pools is vulnerable.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Registry onlyVaultMaintainer Modifier Uses Wrong Boolean Logic, Bricking Vault Administration",
+      "severity": "high",
+      "summary": "The onlyVaultMaintainer modifier uses OR (||) in the revert condition: `if (msg.sender != vaults[_vaultId].maintainer || hasRole(EMERGENCY_ROLE, msg.sender) == false)`. This means it only passes when the caller is BOTH the vault maintainer AND holds the EMERGENCY_ROLE. In contrast, the onlyVaultGoverner modifier correctly uses AND (&&). The same bug exists in onlyVaultMaintainerWithoutTimeLock. Functions gated by these modifiers (addConnector, removeTrustedPosition, updateConnectorTrustedTokens,",
+      "description": [
+        {
+          "file": "Registry.sol",
+          "line_start": 34,
+          "line_end": 38,
+          "desc": "if (msg.sender != vaults[_vaultId].maintainer || hasRole(EMERGENCY_ROLE, msg.sender) == false) - uses || instead of &&; compare to onlyVaultGoverner at lines 47-50 which correctly uses &&"
+        }
+      ],
+      "impact": "CRITICAL severity for any deployment with role separation. The vault maintainer (intended to be a timelock) cannot: (1) add or enable connectors via addConnector, (2) remove trusted positions via removeTrustedPosition, (3) update connector trusted tokens via updateConnectorTrustedTokens. The only workaround is granting EMERGENCY_ROLE to the maintainer address, which defeats the purpose of role separation. Note: addTrustedPosition uses onlyVaultMaintainerWithoutTimeLock which is NOT affected by this bug.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Holding Position Index Corruption via Swap-and-Pop Key Mismatch Between msg.sender and calculatorConnector",
+      "severity": "high",
+      "summary": "When a holding position is removed via swap-and-pop in updateHoldingPosition, the moved element's isPositionUsed key is recalculated using `calculatorConnector` (field from the struct). However, when positions are created, the key uses `msg.sender` (the calling connector). For token positions (type 0), calculatorConnector is the accountingManager while msg.sender is the connector—these differ. This creates orphaned entries in the isPositionUsed mapping, corrupting the position tracking system.",
+      "description": [
+        {
+          "file": "Registry.sol",
+          "line_start": 221,
+          "line_end": 232,
+          "desc": "Creation uses keccak256(abi.encode(msg.sender, _positionId, _data)) but swap-and-pop at lines 221-228 recalculates key using keccak256(abi.encode(holdingPositions[positionIndex].calculatorConnector, positionId, data))"
+        }
+      ],
+      "impact": "Critical. Any vault with multiple token positions from different connectors will experience position mapping corruption when any non-last position is removed. This leads to: (1) inability to remove/update the moved position through normal means (stale index causes out-of-bounds or wrong position access), (2) potential duplicate position creation (getHoldingPositionIndex returns 0 for the correct key if it was the last position, so a new position gets created), (3) gradual accumulation of phantom entries until maxNumHoldingPositions is reached, freezing the vault. This occurs during normal vault operations without any adversarial action required.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "TVL Calculation Underflow DoS in Multiple Connectors Freezes Entire Vault",
+      "severity": "high",
+      "summary": "Multiple connector _getPositionTVL functions perform unchecked subtraction of debt from collateral (e.g., `totalCollateral - totalDebt`). In Solidity 0.8.x, this reverts on underflow if debt exceeds collateral. Since TVLHelper.getTVL iterates ALL positions and calls each connector's getPositionTVL, a single underwater position reverts the entire TVL calculation, blocking all vault deposits, withdrawals, and fee calculations that depend on TVL.",
+      "description": [
+        {
+          "file": "SiloConnector.sol",
+          "line_start": 103,
+          "line_end": 103,
+          "desc": "tvl = totalDepositAmount - totalBAmount; unchecked subtraction reverts if totalBAmount > totalDepositAmount. Same pattern in PrismaConnector:160, CompoundConnector:108, Dolomite:91, AaveConnector:103"
+        },
+        {
+          "file": "PrismaConnector.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _getPositionTVL"
+        },
+        {
+          "file": "CompoundConnector.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _getPositionTVL"
+        },
+        {
+          "file": "Dolomite.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _getPositionTVL"
+        },
+        {
+          "file": "AaveConnector.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _getPositionTVL"
+        },
+        {
+          "file": "TVLHelper.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: getTVL"
+        }
+      ],
+      "impact": "CRITICAL - Complete vault operational freeze. All deposits and withdrawals are blocked when any single lending position becomes underwater. This affects all vault depositors simultaneously. The freeze persists until the position is manually brought above water (requiring external capital) or emergency governance action removes the problematic position. In severe market conditions, multiple positions could go underwater simultaneously, compounding the issue.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "SwapAndBridgeHandler onlyExistingRoute Modifier Allows Disabled Routes to Execute",
+      "severity": "high",
+      "summary": "The onlyExistingRoute modifier uses AND (&&) logic: `if (routes[_routeId].route == address(0) && !routes[_routeId].isEnabled) revert`. This only reverts when the route address is ZERO AND the route is disabled. A disabled route with a non-zero address passes the check. Since executeSwap and executeBridge never independently verify isEnabled, the emergency disable mechanism (setEnableRoute) is ineffective.",
+      "description": [
+        {
+          "file": "GenericSwapAndBridgeHandler.sol",
+          "line_start": 28,
+          "line_end": 30,
+          "desc": "if (routes[_routeId].route == address(0) && !routes[_routeId].isEnabled) revert RouteNotFound(); - uses && instead of ||, allowing disabled routes with non-zero addresses to pass"
+        }
+      ],
+      "impact": "HIGH severity. The emergency disable mechanism (setEnableRoute) is the primary safety control for compromised or deprecated routes. With this bug, once a route is added, it can only be truly disabled by also setting its address to address(0), which is not possible through the existing setEnableRoute function. This defeats a critical safety mechanism for the swap and bridge infrastructure. Any vault using the SwapAndBridgeHandler for swaps or bridges is affected. The impact extends to verifyRoute used by BaseConnector.sendTokensToTrustedAddress for token transfer validation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "DolomiteConnector.openBorrowPosition Passes removePosition=true Instead of false, Losing Position Tracking",
+      "severity": "high",
+      "summary": "DolomiteConnector.openBorrowPosition calls `registry.updateHoldingPosition(vaultId, ..., abi.encode(accountId), \"\", true)` with `removePosition=true`. This attempts to REMOVE a position when the intent is to ADD one. Since the position doesn't exist yet (first call returns positionIndex=0), the removal is a no-op (returns type(uint256).max). The borrow position is never tracked in the registry.",
+      "description": [
+        {
+          "file": "Dolomite.sol",
+          "line_start": 56,
+          "line_end": 60,
+          "desc": "registry.updateHoldingPosition(vaultId, registry.calculatePositionId(address(this), DOL_POSITION_ID, \"\"), abi.encode(accountId), \"\", true); - passes true (remove) instead of false (add)"
+        }
+      ],
+      "impact": "HIGH - Borrow positions opened through DolomiteConnector are invisible to the vault's TVL calculation. Debt from these positions is not subtracted from total TVL, leading to overstated vault value. This affects share price accuracy for all depositors. The closeBorrowPosition function also passes true (remove), meaning it tries to remove a position that was never added - also a no-op, so the position tracking is broken in both directions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "SNXv3Connector TVL Double-Counts Collateral by Adding totalDeposited and totalAssigned",
+      "severity": "high",
+      "summary": "SNXv3Connector._getPositionTVL calculates TVL as `_getValue(collateralType, base, totalDeposited + totalAssigned)`. In SNX V3, `getAccountCollateral` returns (totalDeposited, totalAssigned, totalLocked) where totalDeposited is the total collateral in the account and totalAssigned is the portion delegated to pools (a subset of totalDeposited). Adding them double-counts the delegated portion.",
+      "description": [
+        {
+          "file": "SNXConnector.sol",
+          "line_start": 89,
+          "line_end": 92,
+          "desc": "(uint256 totalDeposited, uint256 totalAssigned, uint256 totalLocked) = SNXCoreProxy.getAccountCollateral(accountId, collateralType); tvl = _getValue(collateralType, base, totalDeposited + totalAssigned);"
+        }
+      ],
+      "impact": "HIGH. The TVL inflation is proportional to the amount of delegated collateral (totalAssigned). In the worst case where all collateral is delegated (totalAssigned == totalDeposited), the TVL is approximately doubled. This directly affects the vault's share price calculation via TVLHelper.getTVL, enabling existing shareholders to extract excess value at the expense of new depositors, or allowing arbitrage between the inflated TVL and actual position value.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Watchers.verifyRemoveLiquidity Empty Implementation Provides Zero Withdrawal Verification",
+      "severity": "high",
+      "summary": "Watchers.verifyRemoveLiquidity is declared as `function verifyRemoveLiquidity(uint256 withdrawAmount, uint256 sentAmount, bytes memory data) external view { }` with an empty body. This function is called by BaseConnector.sendTokensToTrustedAddress when the accounting manager requests token transfers. The Watcher security layer, designed to validate withdrawal amounts and prevent unauthorized fund extraction, provides no actual verification.",
+      "description": [
+        {
+          "file": "Watchers.sol",
+          "line_start": 8,
+          "line_end": 8,
+          "desc": "function verifyRemoveLiquidity(uint256 withdrawAmount, uint256 sentAmount, bytes memory data) external view { } - empty function body"
+        },
+        {
+          "file": "BaseConnector.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: sendTokensToTrustedAddress"
+        }
+      ],
+      "impact": "The Watcher security layer for withdrawal verification is completely absent. Any withdrawal amount requested through the accountingManager path passes without scrutiny. This eliminates a documented defense-in-depth mechanism. The impact is that if the accounting manager is compromised, buggy, or misconfigured, there is no secondary check to prevent unauthorized fund extraction from connectors. This affects all depositors across all connectors in any vault that uses the provided Watchers contract.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "BaseConnector.transferPositionToAnotherConnector Silently Succeeds When Target Connector Is Inactive",
+      "severity": "high",
+      "summary": "transferPositionToAnotherConnector checks `if (registry.isAnActiveConnector(vaultId, connector))` but does nothing when the check fails—no revert, no error. The function silently succeeds, and the keeper believes the position was transferred successfully when in reality nothing happened. Token amounts are not moved, but the operation is considered complete.",
+      "description": [
+        {
+          "file": "BaseConnector.sol",
+          "line_start": 86,
+          "line_end": 93,
+          "desc": "if (registry.isAnActiveConnector(vaultId, connector)) { IConnector(connector).addLiquidity(tokens, amounts, data); } - no else branch or revert for inactive connector"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect causes silent operational failures in position management. While it does not directly enable fund theft, it leads to: (1) incorrect strategy state assumptions by the keeper, (2) potential double-counting or loss-of-tracking of positions, (3) misleading on-chain events that suggest operations succeeded when they did not, and (4) strategy inconsistencies that could cascade into incorrect risk management decisions. The impact is primarily operational/DoS rather than direct financial loss, but could lead to suboptimal capital allocation and stranded positions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "UNIv3 TVL Overcounting via Aggregate Pool Position Query Enables Share Price Inflation",
+      "severity": "high",
+      "summary": "UNIv3Connector._getPositionTVL queries pool.positions(key) using keccak256(positionManager, tickLower, tickUpper), which returns the AGGREGATE liquidity for ALL NonfungiblePositionManager NFTs at those ticks, not just the vault's specific tokenId. Any external user's liquidity at the same tick range through the same positionManager inflates the vault's reported TVL. An attacker can deposit into the vault, add external liquidity at the same tick range, inflate TVL, then withdraw vault shares at t",
+      "description": [
+        {
+          "file": "UNIv3Connector.sol",
+          "line_start": 120,
+          "line_end": 140,
+          "desc": "pool.positions(keccak256(positionManager, tL, tU)) returns aggregate liquidity, not per-tokenId liquidity"
+        }
+      ],
+      "impact": "CRITICAL. The defect causes the vault to report inflated TVL whenever external liquidity exists at the same tick range through the same NonfungiblePositionManager. This directly affects share pricing, enabling: (1) Existing depositors to withdraw more than their fair share, (2) Attackers to deliberately inflate TVL for profit extraction, (3) Incorrect management and performance fee calculations. All vault depositors are at risk of fund loss.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cross-Vault Privilege Escalation via Global FlashLoan Address Bypassing Per-Vault Access Control",
+      "severity": "high",
+      "summary": "The registry.flashLoan() address is global (not per-vault) and grants onlyManager access to ALL vaults' connectors via NoyaGovernanceBase.onlyManager. In BalancerFlashLoan.receiveFlashLoan, the destinationConnector[] calls are not validated against the specified vaultId. A keeper for vault A can flash loan and make arbitrary calls to vault B's connectors, since those connectors see msg.sender == registry.flashLoan() and pass the onlyManager check for any vault.",
+      "description": [
+        {
+          "file": "NoyaGovernanceBase.sol",
+          "line_start": 30,
+          "line_end": 35,
+          "desc": "msg.sender == registry.flashLoan() passes onlyManager for ANY vaultId; flashLoan is global not per-vault"
+        },
+        {
+          "file": "BalancerFlashLoan.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: receiveFlashLoan"
+        },
+        {
+          "file": "Registry.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: setFlashLoanAddress"
+        }
+      ],
+      "impact": "CRITICAL: A compromised keeper for ANY vault can execute manager-level operations on ALL other vaults' connectors. This breaks the fundamental trust isolation between vaults. The attacker can drain funds from all vaults by calling functions like swapHoldings (swap to worthless tokens), transferPositionToAnotherConnector (move to attacker connector), or protocol-specific withdraw functions. Total value at risk is the aggregate TVL across all vaults in the protocol.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cross-Chain TVL Update Lacks Timestamp Monotonicity Check Enabling Stale Data Injection",
+      "severity": "high",
+      "summary": "OmnichainManagerBaseChain.updateTVL accepts any updateTime without checking if it's newer than the existing positionTimestamp. If LayerZero delivers messages out of order, a stale TVL value can overwrite a more recent one. An attacker could exploit windows where stale (lower) TVL is recorded to deposit at cheap share prices, then trigger a fresh TVL update to profit from the correction.",
+      "description": [
+        {
+          "file": "OmnichainManagerBaseChain.sol",
+          "line_start": 35,
+          "line_end": 43,
+          "desc": "updateTVL accepts any updateTime; no check that updateTime > existing positionTimestamp"
+        },
+        {
+          "file": "LZHelperReceiver.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _lzReceive"
+        }
+      ],
+      "impact": "The impact is HIGH for multi-chain vault deployments. Stale TVL data directly affects share price calculations. If a stale lower TVL overwrites a fresh higher TVL, new depositors get shares at an unfairly cheap price, diluting existing shareholders. Conversely, a stale higher TVL could let withdrawers extract more value than entitled. The magnitude depends on TVL variance between updates and cross-chain TVL proportion of total vault TVL.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Camelot LP TVL Manipulation via Spot Reserves",
+      "severity": "high",
+      "summary": "CamelotConnector calculates LP token TVL using spot getReserves(). An attacker can flash loan and swap in the Camelot pool to heavily skew the reserves, artificially inflating the LP token's calculated value.",
+      "description": [
+        {
+          "file": "CamelotConnector.sol",
+          "line_start": 70,
+          "line_end": 75,
+          "desc": "ICamelotPair(pool).getReserves() used directly in TVL calculation"
+        }
+      ],
+      "impact": "CRITICAL. The LP token TVL calculation is directly manipulable via spot reserve skewing. This feeds into the vault's total TVL calculation via TVLHelper.getTVL(), which is used for share price computation. An attacker can inflate the vault's perceived value to extract funds from other depositors. The magnitude of inflation depends on pool liquidity depth and swap fees, but can be significant (the AM exceeds the GM by an unbounded factor as reserves become more skewed).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Prisma Troves Can Be Opened Below Minimum Health Factor",
+      "severity": "high",
+      "summary": "PrismaConnector.openTrove lacks the minimumHealthFactor validation present in adjustTrove. A keeper can open a trove that is dangerously close to liquidation, risking vault funds.",
+      "description": [
+        {
+          "file": "PrismaConnector.sol",
+          "line_start": 45,
+          "line_end": 55,
+          "desc": "openTrove does not call ITroveManager(tm).getNominalICR(address(this)) to check health factor"
+        }
+      ],
+      "impact": "Medium severity. The vault's collateral in the Prisma trove is at elevated liquidation risk. The minimumHealthFactor safety margin (defaulting to 150%) is specifically designed to prevent positions from being opened too close to liquidation thresholds. Bypassing this on trove creation exposes vault depositors to potential collateral loss through liquidation penalties. The impact is limited by the onlyManager access control (requires keeper multisig), but the whole point of minimumHealthFactor is to protect against operational errors and market volatility even when the keeper acts.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "SwapAndBridgeHandler Has No Function to Remove Eligible Users, Creating Irrevocable Access",
+      "severity": "high",
+      "summary": "The SwapAndBridgeHandler contract has addEligibleUser but no corresponding removeEligibleUser function. Once an address is granted swap/bridge execution rights via addEligibleUser, this access can never be revoked. If a connector is decommissioned or compromised, its swap/bridge privileges persist indefinitely.",
+      "description": [
+        {
+          "file": "GenericSwapAndBridgeHandler.sol",
+          "line_start": 65,
+          "line_end": 68,
+          "desc": "function addEligibleUser(address _user) external onlyMaintainerOrEmergency { isEligibleToUse[_user] = true; } — no corresponding remove function exists"
+        }
+      ],
+      "impact": "MEDIUM severity is appropriate. The defect means: (1) Admin cannot revoke swap/bridge execution rights from any address. (2) A compromised or decommissioned connector retains the ability to call executeSwap and executeBridge. (3) The only workaround is deploying a new SwapAndBridgeHandler contract and reconfiguring all connectors. This is inconsistent with the broader codebase pattern where similar boolean mappings support bidirectional updates (e.g., LifiImplementation.addHandler, Registry.addConnector).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "BalancerFlashLoan Allows Arbitrary External Calls via Unvalidated destinationConnector Array",
+      "severity": "high",
+      "summary": "In BalancerFlashLoan.receiveFlashLoan, the `destinationConnector` addresses decoded from userData are called with arbitrary calldata without validating them as active connectors. Only the `receiver` address (where tokens are sent) is validated. The keeper multi-sig can execute arbitrary calls to any contract (not just registered connectors) through the flash loan mechanism, bypassing connector-specific safety checks.",
+      "description": [
+        {
+          "file": "BalancerFlashLoan.sol",
+          "line_start": 64,
+          "line_end": 69,
+          "desc": "(bool success,) = destinationConnector[i].call{ value: 0, gas: gas[i] }(callingData[i]); — destinationConnector is not validated as active connector"
+        }
+      ],
+      "impact": "The code defect allows the keeper to bypass the connector trust boundary during flash loan execution. While the keeper already has broad authority via Keepers.execute, the flash loan context provides additional capabilities: (1) temporary access to flash-loaned capital, (2) ability to make calls alongside token movements in a single atomic transaction, and (3) the BalancerFlashLoan contract's special privilege as registry.flashLoan() which grants onlyManager access to all connectors. The inconsistent validation (checking receiver but not destinationConnector) is objectively a code defect regardless of exploitation difficulty.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Omnichain bridge transaction approvals never expire, allowing delayed execution under changed conditions",
+      "severity": "high",
+      "summary": "OmnichainLogic.updateBridgeTransactionApproval() records an approval timestamp, and startBridgeTransaction() only checks that the waiting time has passed; there is no upper bound expiry. If an approval is granted and later the environment changes (routes compromised, destination address rotated, market moves), the previously-approved bridgeRequest can still be executed at any point in the future as long as its hash matches. This increases operational risk and could be exploited if an attacker ca",
+      "description": [
+        {
+          "file": "OmnichainLogic.sol",
+          "line_start": 33,
+          "line_end": 83,
+          "desc": "if (approvedBridgeTXN[txn]==0 || approvedBridgeTXN[txn]+WAITING_TIME>block.timestamp) revert; // no max validity window"
+        }
+      ],
+      "impact": "MEDIUM severity. The missing expiry creates an indefinite window for execution of stale bridge approvals. Mitigating factors: (1) both approval and execution require onlyManager access, (2) destChainAddress validation partially protects against destination changes, (3) the toggle mechanism allows manual revocation. Aggravating factors: (1) cross-chain operations involve high-value asset movements, (2) recovery from incorrect cross-chain transactions is complex, (3) operational teams may not track all outstanding approvals.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "UNIv3 TVL Vulnerable to Spot Price Manipulation",
+      "severity": "high",
+      "summary": "UNIv3Connector uses the pool's current spot price (slot0) to calculate the underlying token amounts for its liquidity, which are then valued by the oracle.",
+      "description": [
+        {
+          "file": "UNIv3Connector.sol",
+          "line_start": 130,
+          "line_end": 135,
+          "desc": "pool.slot0() used in LiquidityAmounts.getAmountsForLiquidity"
+        }
+      ],
+      "impact": "CRITICAL. The vulnerability allows TVL manipulation of any vault holding Uniswap V3 positions. This directly affects share price calculations in the AccountingManager, enabling: (1) Inflated TVL -> deposits at inflated share price -> dilution of existing holders, (2) Deflated TVL -> withdrawals at deflated share price -> excess extraction. The attack is atomic (single block) and can be repeated. Combined with the separate aggregate liquidity bug (pool.positions returns ALL liquidity at that tick range), the impact is amplified.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Stuck Native ETH in SwapAndBridgeHandler",
+      "severity": "high",
+      "summary": "The executeSwap and executeBridge functions are payable but call their implementation contracts without forwarding msg.value, causing native ETH to be permanently stuck in the handler.",
+      "description": [
+        {
+          "file": "GenericSwapAndBridgeHandler.sol",
+          "line_start": 100,
+          "line_end": 110,
+          "desc": "ISwapAndBridgeImplementation(swapImplInfo.route).performSwapAction(msg.sender, _swapRequest); missing {value: msg.value}"
+        }
+      ],
+      "impact": "HIGH severity. Any native ETH sent to executeSwap or executeBridge is permanently lost. The payable modifier on both functions creates a reasonable expectation that ETH can be sent. The SwapAndBridgeHandler has no ETH rescue mechanism. While current internal callers (BaseConnector._executeSwap, OmnichainLogic.startBridgeTransaction) don't send ETH, the external payable interface allows it, and bridge operations typically require native ETH for cross-chain gas fees.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "SiloConnector.borrow Missing Health Factor Check Allows Unsafe Borrowing Leading to Liquidation",
+      "severity": "high",
+      "summary": "SiloConnector.borrow() does not check solvency/health factor after borrowing, unlike every other lending connector (Aave, Compound, Prisma) and unlike SiloConnector's own withdraw() and repay() functions. This allows the position to drop below minimumHealthFactor, making it eligible for external liquidation.",
+      "description": [
+        {
+          "file": "SiloConnector.sol",
+          "line_start": 72,
+          "line_end": 78,
+          "desc": "silo.borrow() called without subsequent SolvencyV2.isSolvent() check, unlike withdraw (line 95) and repay (line 104)"
+        }
+      ],
+      "impact": "HIGH. The missing health factor check in borrow() means there is no connector-level safety margin protecting against over-borrowing. While the Silo protocol itself may have internal checks at its own liquidation threshold, the connector's minimumHealthFactor (set to 5e17, i.e. 0.5) is designed to provide an additional safety buffer above the protocol's liquidation threshold. Without this check, the vault position can be pushed dangerously close to or past liquidation, resulting in direct loss of vault depositor funds through liquidation penalties.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "GearBoxV3._getPositionTVL Uses Magic address(840) for USD Pricing, Likely Causing TVL Revert and Vault DoS",
+      "severity": "high",
+      "summary": "GearBoxV3._getPositionTVL calls _getValue(address(840), base, amount) using address(840) (0x348) as a pseudo-token address for USD denomination. If the Noya Value Oracle has no price feed mapping for address(840) -> baseToken, the call reverts, causing TVLHelper.getTVL to revert and DoS-ing the entire vault.",
+      "description": [
+        {
+          "file": "GearBoxV3.sol",
+          "line_start": 78,
+          "line_end": 85,
+          "desc": "_getValue(address(840), base, ...) uses hardcoded magic address for USD denomination"
+        }
+      ],
+      "impact": "HIGH severity DoS. When triggered: (1) All vault deposits cannot be processed (TVL needed for share price). (2) All vault withdrawals are blocked (TVL needed for share calculation). (3) Management and performance fees cannot be calculated. (4) Cross-chain TVL updates fail. The entire vault is effectively frozen. Recovery requires either: (a) configuring the oracle with an address(840) price feed, (b) closing the Gearbox position via closeAccount (which doesn't require TVL calculation), or (c) updating the value oracle contract. During the DoS period, all depositor funds are locked.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "LifiImplementation._forward Leaves Residual ERC20 Allowance to LiFi Router After Swap",
+      "severity": "high",
+      "summary": "LifiImplementation._forward sets a token allowance to the LiFi router via forceApprove but never revokes it after the swap completes. If LiFi uses less than the approved amount (partial fill), or if the swap data is crafted to not consume the full amount, a residual allowance persists allowing the LiFi router to spend remaining tokens from the LifiImplementation contract.",
+      "description": [
+        {
+          "file": "LifiImplementation.sol",
+          "line_start": 126,
+          "line_end": 138,
+          "desc": "_setAllowance(token, lifi, amount) called before lifi.call but no forceApprove(lifi, 0) after"
+        }
+      ],
+      "impact": "MEDIUM impact. The defect leaves standing ERC20 allowances to the LiFi router after every non-native token swap or bridge. If any tokens accumulate in LifiImplementation (via partial fills, dust, or direct transfers), they are at risk. The impact is bounded by: (1) the amount of tokens that accumulate in LifiImplementation between transactions, (2) the trust relationship with the LiFi router - if the router is compromised or has undiscovered vulnerabilities, accumulated tokens could be drained. The risk compounds over time as multiple swaps leave residual allowances for different tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "StargateConnector.withdrawFromStargatePool Truncates poolId from uint256 to uint16, Potentially Targeting Wrong Pool",
+      "severity": "high",
+      "summary": "StargateConnector.withdrawFromStargatePool casts poolId from uint256 to uint16 when calling stargateRouter.instantRedeemLocal. For poolIds >= 65536, the truncation maps to a different pool, causing the withdrawal to interact with the wrong Stargate pool and potentially losing funds.",
+      "description": [
+        {
+          "file": "StargateConnector.sol",
+          "line_start": 71,
+          "line_end": 73,
+          "desc": "uint16(withdrawRequest.poolId) truncates uint256 to uint16 in instantRedeemLocal call"
+        }
+      ],
+      "impact": "LOW practical impact currently due to Stargate's small pool IDs, but the code contains a genuine unsafe narrowing cast defect. The asymmetry between deposit (uint256) and withdrawal (uint16 truncation) paths is a code quality issue that violates the principle of consistent type handling. If triggered, it could cause loss of funds by redeeming against the wrong Stargate pool.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AaveConnector.repayWithCollateral Missing nonReentrant Modifier Creates Reentrancy Surface",
+      "severity": "high",
+      "summary": "AaveConnector.repayWithCollateral lacks the nonReentrant modifier that every other state-changing function in the contract has. If Aave's repayWithATokens triggers a callback (e.g., through a token with transfer hooks), a reentrant call could manipulate the vault state before the original transaction completes.",
+      "description": [
+        {
+          "file": "AaveConnector.sol",
+          "line_start": 60,
+          "line_end": 63,
+          "desc": "repayWithCollateral has onlyManager but no nonReentrant, unlike supply (line 32), borrow (line 42), repay (line 53), withdrawCollateral (line 68)"
+        }
+      ],
+      "impact": "MEDIUM severity. The missing nonReentrant modifier is a definite code defect breaking the consistent reentrancy protection pattern across all AaveConnector functions. The practical exploitability depends on whether Aave V3's repayWithATokens can trigger callbacks through the tokens used, which is config-dependent. The onlyManager access control limits the attack surface to the keeper contract, emergency address, or flashLoan contract. However, the flashLoan contract (BalancerFlashLoan) accepts arbitrary destination calls from the keeper, creating a potential callback vector.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee-on-Transfer Tokens Permanently Brick Deposit Queue",
+      "severity": "high",
+      "summary": "If the vault uses a fee-on-transfer base token, the deposit queue accounting will desync from actual balances, causing deposit executions to revert.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 165,
+          "line_end": 176,
+          "desc": "Uses nominal amount for accounting instead of balance difference before/after transfer"
+        }
+      ],
+      "impact": "MEDIUM-HIGH severity. If a vault is configured with a fee-on-transfer base token: (1) The TVL() function underflows (balanceOf < totalAWFDeposit), reverting all deposit calculations, withdrawal calculations, and profit tracking. (2) executeDeposit reverts due to insufficient balance for transfer. (3) All deposited funds become locked in the contract. (4) The vault becomes completely non-functional. The severity depends on whether the protocol actually deploys with fee-on-transfer tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "CurveConnector Functions Missing Reentrancy Guard Enable Potential State Corruption",
+      "severity": "high",
+      "summary": "Multiple CurveConnector functions that make external calls to Convex/Curve/Prisma protocols lack the nonReentrant modifier: depositIntoConvexBooster, withdrawFromConvexBooster, withdrawFromConvexRewardPool, withdrawFromGauge, withdrawFromPrisma. If any of these external protocols have callback mechanisms (e.g., through token hooks), the connector could be re-entered during execution, potentially corrupting internal state or double-executing operations.",
+      "description": [
+        {
+          "file": "CurveConnector.sol",
+          "line_start": 103,
+          "line_end": 107,
+          "desc": "depositIntoConvexBooster has onlyManager but no nonReentrant; makes external call to convexBooster.deposit(pid, amount, stake)"
+        }
+      ],
+      "impact": "The direct impact is that cross-function reentrancy protection is broken for these five functions. If the flashLoan address is a contract that performs callbacks (e.g., Balancer Vault), an attacker could potentially: (1) double-deposit LP tokens into Convex during a single transaction, (2) re-enter harvest functions during a withdraw to claim rewards twice, (3) manipulate Registry holding positions during external protocol interactions. The impact is bounded by the onlyManager access control but amplified by the flashLoan bypass in onlyManager.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "PendleConnector Swap Functions Missing Reentrancy Guard",
+      "severity": "high",
+      "summary": "PendleConnector.swapYTForPT and swapYTForSY lack the nonReentrant modifier despite making external calls to the Pendle router which performs complex token operations involving multiple contracts. Other functions in the same connector (supply, depositIntoMarket, swapExactPTForSY, burnLP, decreasePosition) correctly use nonReentrant. Pendle's AMM involves token callbacks that could enable re-entry.",
+      "description": [
+        {
+          "file": "PendleConnector.sol",
+          "line_start": 122,
+          "line_end": 130,
+          "desc": "swapYTForPT has onlyManager but no nonReentrant; calls pendleRouter.swapExactYtForPt which involves complex multi-contract token operations"
+        }
+      ],
+      "impact": "The missing nonReentrant modifier on two swap functions represents a defensive coding gap. If exploitable, an attacker could execute multiple swaps in a single transaction, potentially depleting the connector's YT/PT/SY token balances beyond intended amounts. The impact is bounded by: (1) the onlyManager access control requirement, (2) the connector's token balances, and (3) the minAmount slippage parameters. The asymmetric application of nonReentrant is itself a quality/security defect even if not immediately exploitable.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "`TVLHelper.getLatestUpdateTime` Blocks All Calculations",
+      "severity": "high",
+      "summary": "`TVLHelper.getLatestUpdateTime` iterates through all holding positions and returns the oldest `positionTimestamp`. If a single position (e.g., on another chain) is not updated and becomes stale, `getLatestUpdateTime` will remain in the past. `calculateDepositShares` and `calculateWithdrawShares` require `recordTime <= oldestUpdateTime`. A single stale position will permanently block all deposits and withdrawals.",
+      "description": [
+        {
+          "file": "TVLHelper.sol",
+          "line_start": 39,
+          "line_end": 43,
+          "desc": "if (latestUpdateTime == 0 || positions[i].positionTimestamp < latestUpdateTime) { latestUpdateTime = positions[i].positionTimestamp; }"
+        }
+      ],
+      "impact": "HIGH - Complete denial of service for all vault deposit and withdrawal operations. All users are affected. Deposits remain in queue without shares being minted. Withdrawal requests remain unprocessed. The vault becomes non-functional until the stale position is manually resolved. This could cascade into liquidity crises if users cannot access their funds.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Performance Fee Window Expiration Causes Fee Loss",
+      "severity": "high",
+      "summary": "`collectPerformanceFees` requires that it be called between 12 and 48 hours after `recordProfitForFee`. If the manager bot fails to call this within the 36-hour window (e.g., due to network congestion or bot failure), the pending performance fee shares become permanently unclaimable.",
+      "description": [
+        {
+          "file": "AccountingManager.sol",
+          "line_start": 442,
+          "line_end": 446,
+          "desc": "if (... || block.timestamp - profitStoredTime > 48 hours) { return; }"
+        }
+      ],
+      "impact": "Medium severity. Direct impact: (1) Performance fee shares for a specific recording period are lost if the 36-hour collection window is missed. (2) Management fees are undercharged due to stale preformanceFeeSharesWaitingForDistribution being counted as if those shares exist. (3) Recovery requires a new recordProfitForFee call, but profit conditions may have changed. The defect is primarily operational (fee loss for protocol) rather than a user fund safety issue, but it represents real protocol revenue loss and incorrect fee accounting.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Direct theft of assets from connectors by abusing ConnectorMock2 as an enabled connector (if mistakenly deployed/allowed in prod)",
+      "severity": "high",
+      "summary": "ConnectorMock2 exposes sendTokensToTrustedAddress with no access control and can transfer arbitrary tokens to msg.sender. If this mock contract is ever enabled as a connector in a real vault (deployment/config mistake), an attacker can call it to pull any tokens it holds. Additionally, its addLiquidity and registry mutation helpers can corrupt holdings registry state if enabled.",
+      "description": [
+        {
+          "file": "ConnectorMock2.sol",
+          "line_start": 20,
+          "line_end": 40,
+          "desc": "external sendTokensToTrustedAddress transfers token to msg.sender with no auth"
+        }
+      ],
+      "impact": "If exploited: direct theft of all tokens held by ConnectorMock2. If registry mutation functions are abused: corruption of holding positions affecting TVL calculation, share pricing, deposit/withdrawal amounts, and fee calculations. The severity is CRITICAL if ConnectorMock2 is enabled and funded in production, but the probability depends on deployment practices which are not verifiable from the code alone.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "LZHelperSender.updateTVL uses entire contract ETH balance as LayerZero fee, enabling accidental or adversarial ETH burn/drain via donations",
+      "severity": "high",
+      "summary": "LZHelperSender.updateTVL sets MessagingFee(nativeFee=address(this).balance). Because the contract has a payable receive() function, anyone can donate ETH; the next updateTVL will spend the full balance as fees. This can either burn treasury ETH or cause unpredictable fee payment behavior and potential message failures (if the fee must match exact quoting behavior).",
+      "description": [
+        {
+          "file": "LZHelperSender.sol",
+          "line_start": 44,
+          "line_end": 86,
+          "desc": "_lzSend(..., MessagingFee(address(this).balance, 0), ...) uses entire ETH balance as fee; contract has `receive() external payable {}`."
+        }
+      ],
+      "impact": "The defect allows economic griefing against the protocol. An attacker can donate ETH to force overpayment of LayerZero fees. Even with refund mechanisms, this creates: (1) unnecessary gas costs for value transfer round-trips, (2) risk of permanent loss if endpoint refund fails, (3) operational uncertainty about fee budgeting, (4) no independent mechanism to recover donated ETH. The missing fee quoting means the protocol cannot predict or control messaging costs. This is a genuine code defect - the standard OApp pattern uses _quote() to determine exact fees, but this contract bypasses all such safeguards.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "PancakeswapConnector can orphan TVL tracking when NFT is transferred to MasterChef without corresponding registry holding position ownership update",
+      "severity": "high",
+      "summary": "PancakeswapConnector.sendPositionToMasterChef() transfers the Uniswap V3 position NFT from the connector to MasterChef. If UNIv3Connector-based TVL/accounting assumes the connector holds the NFT (e.g., for collect/burn operations or position lookups), transferring it away may break subsequent lifecycle management or registry position consistency (position remains recorded but asset is custodized elsewhere). This can cause incorrect TVL, inability to decrease/burn/collect, and operational stuck s",
+      "description": [
+        {
+          "file": "PancakeswapConnector.sol",
+          "line_start": 25,
+          "line_end": 44,
+          "desc": "IERC721(positionManager).safeTransferFrom(address(this), address(masterchef), tokenId); // no registry update or custody state recorded"
+        }
+      ],
+      "impact": "MEDIUM impact: (1) Operational disruption if manager calls lifecycle functions while NFT is staked - transactions revert wasting gas and blocking intended operations. (2) No explicit state tracking means there's no programmatic way to determine which positions are staked vs locally held. (3) If MasterChef withdraw fails (e.g., contract upgrade, paused state), the NFT could be permanently stuck with no fallback mechanism. (4) TVL continues reporting via pool.positions aggregated query, creating a mismatch between reported TVL and operational capability. The defect is missing state management for custody transfer, not a direct fund loss vector.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Cross-Chain TVL Staleness Checks Defeated by Default Timestamps",
+      "severity": "high",
+      "summary": "TVLHelper.getLatestUpdateTime returns type(uint256).max if positions are initialized with the default timestamp, defeating any staleness checks for cross-chain TVL data.",
+      "description": [
+        {
+          "file": "TVLHelper.sol",
+          "line_start": 40,
+          "line_end": 44,
+          "desc": "Minimum search over array containing type(uint256).max"
+        }
+      ],
+      "impact": "The defect allows stale cross-chain TVL data to bypass freshness validation. If an AccountingManager (not in scope but referenced in deployment scripts as a consumer of TVLHelper) uses getLatestUpdateTime to gate operations on TVL freshness, this check is rendered useless. Attackers could exploit windows where cross-chain TVL is stale to deposit at deflated share prices or withdraw at inflated share prices. The severity is HIGH because the invariant that getLatestUpdateTime(vaultId) <= block.timestamp is violated whenever the vault has any positions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "LidoConnector._getPositionTVL Uses Stale Cached stETH Amount, Diverging from Actual Rebased Value",
+      "severity": "high",
+      "summary": "LidoConnector stores the withdrawal request amount in additionalData at request time and uses this cached value for TVL calculation. Since stETH is a rebasing token that accrues staking rewards, the actual value of the pending withdrawal grows over time while the cached TVL value remains static, leading to systematic TVL undercounting.",
+      "description": [
+        {
+          "file": "LidoConnector.sol",
+          "line_start": 79,
+          "line_end": 82,
+          "desc": "abi.decode(p.additionalData, (uint256)) returns cached amount from request time, not current rebased value"
+        }
+      ],
+      "impact": "LOW to MEDIUM practical impact. The defect is real - the code uses a stale cached value instead of querying the actual withdrawal value. However, the magnitude is small: at 4% APY and a typical 1-5 day Lido withdrawal queue, the TVL undercounting is approximately 0.01-0.06% of the pending withdrawal amount. For a $10M pending withdrawal, this would be $1,000-$6,000 undercount. The systematic nature means it always undercounts, creating a persistent but small advantage for new depositors at the expense of existing ones.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Registry.addVault Missing Zero Address Check for Emergency and MaintainerWithoutTimelock Addresses",
+      "severity": "high",
+      "summary": "Registry.addVault requires non-zero addresses for governer, accountingManager, baseToken, maintainer, keeperContract, and watcher, but does NOT check _emergency and _maintainerWithoutTimelock. If either is set to address(0), the corresponding NoyaGovernanceBase modifiers (onlyEmergency, onlyVaultMaintainerWithoutTimeLock) become non-functional, locking out emergency operations and timelockless position management.",
+      "description": [
+        {
+          "file": "Registry.sol",
+          "line_start": 107,
+          "line_end": 114,
+          "desc": "require(_governer != address(0)); ... require(_watcher != address(0)); but no require for _emergency or _maintainerWithoutTimelock"
+        }
+      ],
+      "impact": "MEDIUM. The code has a clear input validation defect - inconsistent zero-address checks across governance address parameters. Current deployments are unaffected due to non-zero values being used. However, the missing checks create a latent risk: any future call to addVault or changeVaultAddresses could accidentally or maliciously set these to address(0), disabling emergency operations. The changeVaultAddresses function is particularly concerning since it can be called post-deployment by the vault governor.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

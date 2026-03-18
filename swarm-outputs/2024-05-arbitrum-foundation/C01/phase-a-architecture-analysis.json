@@ -1,0 +1,2229 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "architecture_entry_points",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.1 Asset Inventory - Financial assets, state assets, privilege assets, reputation assets",
+      "1.3 System Architecture Mapping - Contract hierarchies, dependencies, upgrade patterns, access control",
+      "2.1 Entry Point Enumeration - Public/external functions, callbacks, parameter analysis"
+    ],
+    "timestamp": "2026-03-08T21:47:59.963Z",
+    "duration_ms": 209726
+  },
+  "analysis": {
+    "asset_inventory": {
+      "financial_assets": [
+        "ETH held by RollupCreator (temporary; used to fund L2 factory deployment retryables; refundable remainder to caller)",
+        "ERC20 fee token transfers into Inbox during factory deployment (RollupCreator._deployFactories)",
+        "ERC20 stakeToken balances held by RollupCore/Rollup (validator deposits; withdrawable funds accounting)",
+        "ERC20 stakeToken balances held by EdgeChallengeManager (first stake per rival set kept for refund; excess stakes forwarded to excessStakeReceiver)",
+        "ERC20 stakeToken balances held by AbsBoldStakingPool / AssertionStakingPool / EdgeStakingPool (user pooled deposits)",
+        "Refund flows: EdgeChallengeManager.refundStake refunds stakeToken to edge.staker",
+        "Refund flows: RollupCore withdrawable funds (internal ledger) ultimately paid out via RollupUser.withdrawStakerFunds (not in provided code but referenced)",
+        "Gas refund mechanism hooks in SequencerInbox (GasRefundEnabled / IGasRefunder) affecting who receives L2 reimbursement credit",
+        "DAS keyset validity registry in SequencerInbox gating acceptance of DAS batches (indirectly impacts DA availability/fees)"
+      ],
+      "state_assets": [
+        "SequencerInbox.totalDelayedMessagesRead (critical ordering/censorship-resistance state)",
+        "SequencerInbox.bridge (IBridge pointer; controls enqueue and delayed accumulator reads)",
+        "SequencerInbox.rollup (IOwnable pointer; used for owner checks; can be updated)",
+        "SequencerInbox.isBatchPoster[address] (authorization set)",
+        "SequencerInbox.batchPosterManager (delegated authority over batch poster / sequencer allowlists)",
+        "SequencerInbox.isSequencer[address] (offchain feed signer allowlist state)",
+        "SequencerInbox.delayBlocks/futureBlocks/delaySeconds/futureSeconds (time bounds for batch headers and force inclusion rules)",
+        "SequencerInbox.dasKeySetInfo[bytes32] => {isValidKeyset, creationBlock} (DAS registry)",
+        "SequencerInbox.buffer (DelayBufferTypes.BufferData: bufferBlocks, max, threshold, prevBlockNumber, replenishRateInBasis, prevSequencedBlockNumber)",
+        "DelayBuffer library logic determining buffer depletion/replenishment and proof requirement state (buffer.isSynced/isUpdatable)",
+        "RollupCore assertion graph storage: _assertions[assertionHash] (AssertionNode), _latestConfirmed",
+        "RollupCore staking registry: _stakerList[], _stakerMap[address] => Staker, _withdrawableFunds[address], totalWithdrawableFunds",
+        "RollupCore config variables: chainId, confirmPeriodBlocks, baseStake, wasmModuleRoot, challengeManager, challengeGracePeriodBlocks, inbox, bridge, outbox, rollupEventInbox, loserStakeEscrow, stakeToken, minimumAssertionPeriod, validatorWhitelistDisabled, anyTrustFastConfirmer, isValidator[address]",
+        "EdgeChallengeManager edge store (EdgeStore internal store: edges, rival mappings, timer caches, confirmedRivals, firstRivals, hasMadeLayerZeroRival, etc. via library)",
+        "EdgeChallengeManager configuration: excessStakeReceiver, stakeToken, stakeAmounts[], challengePeriodBlocks, assertionChain, oneStepProofEntry, LAYERZERO_* heights, NUM_BIGSTEP_LEVEL",
+        "Staking pools: AbsBoldStakingPool.depositBalance[address] (user accounting); AssertionStakingPool.rollup/assertionHash; EdgeStakingPool.challengeManager/edgeId",
+        "Creators: BridgeCreator.ethBasedTemplates/erc20BasedTemplates; RollupCreator template pointers and validatorWalletCreator; BOLDUpgradeAction immutable deployment settings; StateHashPreImageLookup.preImages mapping"
+      ],
+      "privilege_assets": [
+        "Rollup ownership / admin (RollupProxy admin; RollupAdminLogic functions reachable only via proxy admin path)",
+        "SequencerInbox onlyRollupOwner authority (setMaxTimeVariation, setValidKeyset, invalidateKeysetHash, setBatchPosterManager, setBufferConfig)",
+        "SequencerInbox batchPosterManager authority (shared with rollup owner): setIsBatchPoster, setIsSequencer",
+        "Batch poster privilege (SequencerInbox.isBatchPoster): ability to append L2 batches via multiple methods (calldata/blob) and influence ordering",
+        "BridgeCreator owner (can update templates for bridge/sequencerInbox/inbox/outbox/rei)",
+        "RollupCreator owner (can setTemplates to change deployed rollup components)",
+        "ProxyAdmin ownership (controls upgrades for TransparentUpgradeableProxy instances for bridge stack; transferred to UpgradeExecutor during rollup creation)",
+        "UUPS-style upgrade authority in RollupAdminLogic via DoubleLogicUUPSUpgradeable (primary and secondary implementations)",
+        "BOLDUpgradeAction indirectly exercises upgrade power through provided ProxyAdmins and upgrade calls (intended to be executed by timelock/executor governance)",
+        "EdgeChallengeManager validator whitelist enforcement depends on assertionChain.validatorWhitelistDisabled() and assertionChain.isValidator(msg.sender) (privilege gating edge creation when whitelist enabled)"
+      ],
+      "reputation_assets": [
+        "Validator status/whitelist (RollupCore.isValidator; EdgeChallengeManager createLayerZeroEdge enforces when whitelist enabled)",
+        "Assertion confirmation state (_latestConfirmed, assertion statuses) impacting protocol correctness/finality reputation",
+        "DAS keyset registry validity (dasKeySetInfo) impacting data availability trust assumptions",
+        "Sequencer/batch poster authorization sets (isSequencer/isBatchPoster) impacting liveness/censorship perceptions",
+        "Staking pool depositor balances and successful refunds (AbsBoldStakingPool.depositBalance; pool/rollup interaction correctness)",
+        "Challenge outcome integrity (EdgeChallengeManager confirmed edges and timing cache correctness) impacting dispute resolution reputation"
+      ]
+    },
+    "system_architecture": {
+      "contracts_analyzed": [
+        "SequencerInbox.sol",
+        "DelayBuffer.sol",
+        "ISequencerInbox.sol",
+        "DelayBufferTypes.sol",
+        "RollupAdminLogic.sol",
+        "RollupCreator.sol",
+        "BOLDUpgradeAction.sol",
+        "BridgeCreator.sol",
+        "RollupProxy.sol",
+        "IRollupAdmin.sol",
+        "Error.sol",
+        "AbsBoldStakingPool.sol",
+        "AssertionStakingPool.sol",
+        "EdgeStakingPool.sol",
+        "AssertionStakingPoolCreator.sol",
+        "EdgeStakingPoolCreator.sol",
+        "StakingPoolCreatorUtils.sol",
+        "IAbsBoldStakingPool.sol",
+        "IAssertionStakingPool.sol",
+        "IEdgeStakingPool.sol",
+        "IAssertionStakingPoolCreator.sol",
+        "IEdgeStakingPoolCreator.sol",
+        "RollupCore.sol",
+        "Assertion.sol",
+        "AssertionState.sol",
+        "RollupLib.sol",
+        "IRollupCore.sol",
+        "IRollupLogic.sol",
+        "Config.sol",
+        "EdgeChallengeManager.sol"
+      ],
+      "inheritance_hierarchy": "SequencerInbox inherits DelegateCallAware and GasRefundEnabled and implements ISequencerInbox. RollupAdminLogic inherits RollupCore, implements IRollupAdmin, and inherits DoubleLogicUUPSUpgradeable (UUPS-like primary+secondary upgrade). RollupCore inherits PausableUpgradeable. RollupCreator and BridgeCreator inherit OZ Ownable. RollupProxy inherits AdminFallbackProxy (custom admin/secondary-impl proxy). AbsBoldStakingPool is abstract and implemented by AssertionStakingPool and EdgeStakingPool. EdgeChallengeManager inherits Initializable and implements IEdgeChallengeManager (with constructor disabling initializers).",
+      "external_dependencies": [
+        "OpenZeppelin: Ownable, Initializable, PausableUpgradeable, ProxyAdmin, TransparentUpgradeableProxy, UpgradeableBeacon (imported), Create2, Address, SafeERC20",
+        "Arbitrum precompiles: ArbGasInfo, ArbSys",
+        "OffchainLabs: DelegateCallAware, GasRefundEnabled, IGasRefunder, ArbitrumChecker, Messages, various bridge/rollup interfaces",
+        "EIP-4844 reader: IReader4844 (blob data hashes and blob base fee)"
+      ],
+      "upgrade_patterns": "Uses multiple upgrade patterns: (1) TransparentUpgradeableProxy for bridge stack components (Bridge, SequencerInbox, Inbox, Outbox, RollupEventInbox, ChallengeManager in creator/upgrade flows) governed by ProxyAdmin; (2) Custom RollupProxy (AdminFallbackProxy) with two logic implementations (admin/user) and initialization via initializeProxy; RollupAdminLogic uses DoubleLogicUUPSUpgradeable enabling upgrades of primary and secondary logic (UUPS-like) under proxy-admin routing; (3) BOLDUpgradeAction performs coordinated upgrades across proxies and migrates to a new RollupProxy via CREATE2.",
+      "access_control_structure": "SequencerInbox uses rollup.owner() as owner authority plus batchPosterManager shared authority. RollupAdminLogic comments indicate functions are only reachable by proxy admin (upgrade executor) so lacks explicit onlyOwner modifiers; pause/resume gated by PausableUpgradeable's internal state but externally callable via admin path. RollupCreator/BridgeCreator gated by Ownable. EdgeChallengeManager gates createLayerZeroEdge by Rollup validator whitelist when enabled, otherwise permissionless. Staking pools are permissionless for deposit/withdraw; pool 'protocol actions' (createAssertion/createEdge, makeStakeWithdrawable, withdrawStakeBackIntoPool) are permissionless as written.",
+      "access_control_notes_defects": [
+        "RollupAdminLogic: public/external admin functions (pause/resume/setOwner/etc.) rely on being reachable only through proxy-admin routing; if proxy wiring/admin separation is misconfigured, these become fully permissionless and catastrophic.",
+        "StateHashPreImageLookup.set() is permissionless and can be front-run; safety relies on BOLDUpgradeAction verifying hash correctness and timelock/executor sequencing."
+      ]
+    },
+    "entry_points": [
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "postUpgradeInit",
+        "visibility": "external",
+        "parameters": [
+          "BufferConfig bufferConfig_"
+        ],
+        "modifiers": [
+          "onlyDelegated",
+          "onlyProxyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "buffer.bufferBlocks",
+          "buffer.max",
+          "buffer.threshold",
+          "buffer.replenishRateInBasis",
+          "buffer.prevBlockNumber",
+          "buffer.prevSequencedBlockNumber"
+        ],
+        "external_calls": [
+          "DelayBuffer.isValidBufferConfig(bufferConfig_)",
+          "bridge.delayedMessageCount()"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "initialize",
+        "visibility": "external",
+        "parameters": [
+          "IBridge bridge_",
+          "ISequencerInbox.MaxTimeVariation maxTimeVariation_",
+          "BufferConfig bufferConfig_"
+        ],
+        "modifiers": [
+          "onlyDelegated"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "bridge",
+          "rollup",
+          "delayBlocks",
+          "futureBlocks",
+          "delaySeconds",
+          "futureSeconds",
+          "buffer (if delay bufferable)"
+        ],
+        "external_calls": [
+          "IERC20Bridge(address(bridge_)).nativeToken() (try/catch)",
+          "bridge_.rollup()"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "updateRollupAddress",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "rollup"
+        ],
+        "external_calls": [
+          "IOwnable(rollup).owner()",
+          "bridge.rollup()"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "removeDelayAfterFork",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "delayBlocks",
+          "futureBlocks",
+          "delaySeconds",
+          "futureSeconds"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "maxTimeVariation",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "forceInclusion",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _totalDelayedMessagesRead",
+          "uint8 kind",
+          "uint64[2] l1BlockAndTime",
+          "uint256 baseFeeL1",
+          "address sender",
+          "bytes32 messageDataHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "totalDelayedMessagesRead",
+          "buffer (via buffer.update if delay bufferable)"
+        ],
+        "external_calls": [
+          "Messages.messageHash(...)",
+          "bridge.delayedInboxAccs(...)",
+          "bridge.delayedMessageCount()",
+          "DelayBuffer.update(...)",
+          "bridge.enqueueSequencerMessage(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2BatchFromOrigin(uint256,bytes,uint256,IGasRefunder)",
+        "visibility": "external",
+        "parameters": [
+          "uint256",
+          "bytes data",
+          "uint256",
+          "IGasRefunder"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2BatchFromOrigin",
+        "visibility": "external",
+        "parameters": [
+          "uint256 sequenceNumber",
+          "bytes data",
+          "uint256 afterDelayedMessagesRead",
+          "IGasRefunder gasRefunder",
+          "uint256 prevMessageCount",
+          "uint256 newMessageCount"
+        ],
+        "modifiers": [
+          "refundsGas(gasRefunder, IReader4844(address(0)))"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "totalDelayedMessagesRead",
+          "buffer (indirectly via delayProof requirement gating; no update here unless delay bufferable proof path used elsewhere)",
+          "bridge state via enqueueSequencerMessage"
+        ],
+        "external_calls": [
+          "bridge.enqueueSequencerMessage(...)",
+          "bridge.delayedMessageCount()",
+          "submitBatchSpendingReport(...) -> bridge.submitBatchSpendingReport(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2BatchFromBlobs",
+        "visibility": "external",
+        "parameters": [
+          "uint256 sequenceNumber",
+          "uint256 afterDelayedMessagesRead",
+          "IGasRefunder gasRefunder",
+          "uint256 prevMessageCount",
+          "uint256 newMessageCount"
+        ],
+        "modifiers": [
+          "refundsGas(gasRefunder, reader4844)"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "totalDelayedMessagesRead",
+          "bridge state via enqueueSequencerMessage"
+        ],
+        "external_calls": [
+          "reader4844.getDataHashes()",
+          "reader4844.getBlobBaseFee()",
+          "bridge.enqueueSequencerMessage(...)",
+          "submitBatchSpendingReport(...) (conditional)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2BatchFromBlobsDelayProof",
+        "visibility": "external",
+        "parameters": [
+          "uint256 sequenceNumber",
+          "uint256 afterDelayedMessagesRead",
+          "IGasRefunder gasRefunder",
+          "uint256 prevMessageCount",
+          "uint256 newMessageCount",
+          "DelayProof delayProof"
+        ],
+        "modifiers": [
+          "refundsGas(gasRefunder, reader4844)"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "buffer (DelayBuffer.update)",
+          "totalDelayedMessagesRead",
+          "bridge state via enqueueSequencerMessage"
+        ],
+        "external_calls": [
+          "Messages.isValidDelayedAccPreimage(...)",
+          "bridge.delayedInboxAccs(...)",
+          "DelayBuffer.update(...)",
+          "reader4844.getDataHashes()",
+          "bridge.enqueueSequencerMessage(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2BatchFromOriginDelayProof",
+        "visibility": "external",
+        "parameters": [
+          "uint256 sequenceNumber",
+          "bytes data",
+          "uint256 afterDelayedMessagesRead",
+          "IGasRefunder gasRefunder",
+          "uint256 prevMessageCount",
+          "uint256 newMessageCount",
+          "DelayProof delayProof"
+        ],
+        "modifiers": [
+          "refundsGas(gasRefunder, IReader4844(address(0)))"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "buffer (DelayBuffer.update)",
+          "totalDelayedMessagesRead",
+          "bridge state via enqueueSequencerMessage"
+        ],
+        "external_calls": [
+          "Messages.isValidDelayedAccPreimage(...)",
+          "bridge.delayedInboxAccs(...)",
+          "DelayBuffer.update(...)",
+          "bridge.enqueueSequencerMessage(...)",
+          "submitBatchSpendingReport(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2Batch",
+        "visibility": "external",
+        "parameters": [
+          "uint256 sequenceNumber",
+          "bytes data",
+          "uint256 afterDelayedMessagesRead",
+          "IGasRefunder gasRefunder",
+          "uint256 prevMessageCount",
+          "uint256 newMessageCount"
+        ],
+        "modifiers": [
+          "refundsGas(gasRefunder, IReader4844(address(0)))"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "totalDelayedMessagesRead",
+          "bridge state via enqueueSequencerMessage"
+        ],
+        "external_calls": [
+          "bridge.enqueueSequencerMessage(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "addSequencerL2BatchDelayProof",
+        "visibility": "external",
+        "parameters": [
+          "uint256 sequenceNumber",
+          "bytes data",
+          "uint256 afterDelayedMessagesRead",
+          "IGasRefunder gasRefunder",
+          "uint256 prevMessageCount",
+          "uint256 newMessageCount",
+          "DelayProof delayProof"
+        ],
+        "modifiers": [
+          "refundsGas(gasRefunder, IReader4844(address(0)))"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "buffer (DelayBuffer.update)",
+          "totalDelayedMessagesRead",
+          "bridge state via enqueueSequencerMessage"
+        ],
+        "external_calls": [
+          "Messages.isValidDelayedAccPreimage(...)",
+          "DelayBuffer.update(...)",
+          "bridge.enqueueSequencerMessage(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "inboxAccs",
+        "visibility": "external",
+        "parameters": [
+          "uint256 index"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "bridge.sequencerInboxAccs(index)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "batchCount",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "bridge.sequencerMessageCount()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "forceInclusionDeadline",
+        "visibility": "external",
+        "parameters": [
+          "uint64 blockNumber"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "buffer.calcPendingBuffer(blockNumber)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "setMaxTimeVariation",
+        "visibility": "external",
+        "parameters": [
+          "ISequencerInbox.MaxTimeVariation maxTimeVariation_"
+        ],
+        "modifiers": [
+          "onlyRollupOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "delayBlocks",
+          "futureBlocks",
+          "delaySeconds",
+          "futureSeconds"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "setIsBatchPoster",
+        "visibility": "external",
+        "parameters": [
+          "address addr",
+          "bool isBatchPoster_"
+        ],
+        "modifiers": [
+          "onlyRollupOwnerOrBatchPosterManager"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "isBatchPoster[addr]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "setValidKeyset",
+        "visibility": "external",
+        "parameters": [
+          "bytes keysetBytes"
+        ],
+        "modifiers": [
+          "onlyRollupOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "dasKeySetInfo[ksHash].isValidKeyset",
+          "dasKeySetInfo[ksHash].creationBlock"
+        ],
+        "external_calls": [
+          "ArbSys.arbBlockNumber() (if host chain is Arbitrum)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "invalidateKeysetHash",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 ksHash"
+        ],
+        "modifiers": [
+          "onlyRollupOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "dasKeySetInfo[ksHash].isValidKeyset"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "setIsSequencer",
+        "visibility": "external",
+        "parameters": [
+          "address addr",
+          "bool isSequencer_"
+        ],
+        "modifiers": [
+          "onlyRollupOwnerOrBatchPosterManager"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "isSequencer[addr]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "setBatchPosterManager",
+        "visibility": "external",
+        "parameters": [
+          "address newBatchPosterManager"
+        ],
+        "modifiers": [
+          "onlyRollupOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "batchPosterManager"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "setBufferConfig",
+        "visibility": "external",
+        "parameters": [
+          "BufferConfig bufferConfig_"
+        ],
+        "modifiers": [
+          "onlyRollupOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "buffer.*"
+        ],
+        "external_calls": [
+          "DelayBuffer.isValidBufferConfig(bufferConfig_)",
+          "bridge.delayedMessageCount()",
+          "DelayBuffer.update(...) (conditional)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "isValidKeysetHash",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 ksHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "SequencerInbox.sol",
+        "function": "getKeysetCreationBlock",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 ksHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "initialize",
+        "visibility": "external",
+        "parameters": [
+          "Config config",
+          "ContractDependencies connectedContracts"
+        ],
+        "modifiers": [
+          "onlyProxy",
+          "initializer"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "rollupDeploymentBlock",
+          "bridge/inbox/outbox/rollupEventInbox/sequencerInbox (via bridge wiring)",
+          "validatorWalletCreator",
+          "challengeManager",
+          "confirmPeriodBlocks",
+          "chainId",
+          "baseStake",
+          "wasmModuleRoot",
+          "minimumAssertionPeriod",
+          "challengeGracePeriodBlocks",
+          "loserStakeEscrow",
+          "stakeToken",
+          "anyTrustFastConfirmer",
+          "_latestConfirmed",
+          "_assertions[genesisHash]",
+          "_assertionCreatedAtArbSysBlock[genesisHash] (if host arb)"
+        ],
+        "external_calls": [
+          "connectedContracts.bridge.setDelayedInbox(...)",
+          "connectedContracts.bridge.setSequencerInbox(...)",
+          "connectedContracts.bridge.setOutbox(...)",
+          "connectedContracts.rollupEventInbox.rollupInitialized(...) (conditional)",
+          "connectedContracts.sequencerInbox.totalDelayedMessagesRead()",
+          "connectedContracts.sequencerInbox.addSequencerL2Batch(...) (conditional bootstrap)",
+          "bridge.sequencerMessageCount()",
+          "ArbSys.arbBlockNumber() (if host arb)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setOutbox",
+        "visibility": "external",
+        "parameters": [
+          "IOutbox _outbox"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "outbox"
+        ],
+        "external_calls": [
+          "bridge.setOutbox(address(_outbox), true)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "removeOldOutbox",
+        "visibility": "external",
+        "parameters": [
+          "address _outbox"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [],
+        "external_calls": [
+          "bridge.setOutbox(_outbox, false)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setDelayedInbox",
+        "visibility": "external",
+        "parameters": [
+          "address _inbox",
+          "bool _enabled"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [],
+        "external_calls": [
+          "bridge.setDelayedInbox(_inbox, _enabled)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "pause",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "PausableUpgradeable._paused"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "resume",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "PausableUpgradeable._paused"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setValidator",
+        "visibility": "external",
+        "parameters": [
+          "address[] _validator",
+          "bool[] _val"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "isValidator[validator_i]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setOwner",
+        "visibility": "external",
+        "parameters": [
+          "address newOwner"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "proxy admin/owner (via _changeAdmin in DoubleLogicUUPSUpgradeable / proxy)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setMinimumAssertionPeriod",
+        "visibility": "external",
+        "parameters": [
+          "uint256 newPeriod"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "minimumAssertionPeriod"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setConfirmPeriodBlocks",
+        "visibility": "external",
+        "parameters": [
+          "uint64 newConfirmPeriod"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "confirmPeriodBlocks"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setBaseStake",
+        "visibility": "external",
+        "parameters": [
+          "uint256 newBaseStake"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "baseStake"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "forceRefundStaker",
+        "visibility": "external",
+        "parameters": [
+          "address[] staker"
+        ],
+        "modifiers": [
+          "whenPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_stakerMap[staker_i].amountStaked",
+          "_withdrawableFunds[withdrawalAddress]",
+          "totalWithdrawableFunds"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "forceCreateAssertion",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 prevAssertionHash",
+          "AssertionInputs assertion",
+          "bytes32 expectedAssertionHash"
+        ],
+        "modifiers": [
+          "whenPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_assertions[newAssertionHash]",
+          "_assertions[prevAssertionHash].firstChildBlock/secondChildBlock (via childCreated)",
+          "_assertionCreatedAtArbSysBlock[newAssertionHash] (if host arb)"
+        ],
+        "external_calls": [
+          "bridge.sequencerMessageCount()",
+          "bridge.sequencerInboxAccs(...)",
+          "ArbSys.arbBlockNumber() (if host arb)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "forceConfirmAssertion",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash",
+          "bytes32 parentAssertionHash",
+          "AssertionState confirmState",
+          "bytes32 inboxAcc"
+        ],
+        "modifiers": [
+          "whenPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "_latestConfirmed",
+          "_assertions[assertionHash].status"
+        ],
+        "external_calls": [
+          "outbox.updateSendRoot(sendRoot, blockHash)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setLoserStakeEscrow",
+        "visibility": "external",
+        "parameters": [
+          "address newLoserStakerEscrow"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "loserStakeEscrow"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setWasmModuleRoot",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 newWasmModuleRoot"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "wasmModuleRoot"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setSequencerInbox",
+        "visibility": "external",
+        "parameters": [
+          "address _sequencerInbox"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [],
+        "external_calls": [
+          "bridge.setSequencerInbox(_sequencerInbox)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setInbox",
+        "visibility": "external",
+        "parameters": [
+          "IInboxBase newInbox"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "inbox"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setValidatorWhitelistDisabled",
+        "visibility": "external",
+        "parameters": [
+          "bool _validatorWhitelistDisabled"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "validatorWhitelistDisabled"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setAnyTrustFastConfirmer",
+        "visibility": "external",
+        "parameters": [
+          "address _anyTrustFastConfirmer"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "anyTrustFastConfirmer"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "RollupAdminLogic.sol",
+        "function": "setChallengeManager",
+        "visibility": "external",
+        "parameters": [
+          "address _challengeManager"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "challengeManager"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupCreator.sol",
+        "function": "receive",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCreator.sol",
+        "function": "setTemplates",
+        "visibility": "external",
+        "parameters": [
+          "BridgeCreator _bridgeCreator",
+          "IOneStepProofEntry _osp",
+          "IEdgeChallengeManager _challengeManagerLogic",
+          "IRollupAdmin _rollupAdminLogic",
+          "IRollupUser _rollupUserLogic",
+          "IUpgradeExecutor _upgradeExecutorLogic",
+          "address _validatorWalletCreator",
+          "DeployHelper _l2FactoriesDeployer"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "bridgeCreator",
+          "osp",
+          "challengeManagerTemplate",
+          "rollupAdminLogic",
+          "rollupUserLogic",
+          "upgradeExecutorLogic",
+          "validatorWalletCreator",
+          "l2FactoriesDeployer"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupCreator.sol",
+        "function": "createRollup",
+        "visibility": "public",
+        "parameters": [
+          "RollupDeploymentParams deployParams"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "deployParams.config.owner (local mutation before initializeProxy)",
+          "deploys new ProxyAdmin",
+          "deploys new RollupProxy (CREATE2)",
+          "deploys new TransparentUpgradeableProxy instances via BridgeCreator",
+          "deploys new TransparentUpgradeableProxy for ChallengeManager",
+          "deploys new TransparentUpgradeableProxy for UpgradeExecutor",
+          "sets ProxyAdmin owner to UpgradeExecutor"
+        ],
+        "external_calls": [
+          "bridgeCreator.ethBasedTemplates()/erc20BasedTemplates()",
+          "bridgeCreator.createBridge(...)",
+          "IEdgeChallengeManager.initialize(...)",
+          "upgradeExecutor.initialize(...)",
+          "ProxyAdmin.transferOwnership(...)",
+          "RollupProxy.initializeProxy(...)",
+          "sequencerInbox.setIsBatchPoster(...)",
+          "sequencerInbox.setBatchPosterManager(...)",
+          "IRollupAdmin(rollup).setValidator(...)",
+          "IRollupAdmin(rollup).setOwner(...)",
+          "DeployHelper.getDeploymentTotalCost(...) and perform(...) (optional)",
+          "IERC20.safeTransferFrom(...) (optional)",
+          "ETH refund via msg.sender.call{value: balance} (optional)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "BOLDUpgradeAction.sol",
+        "function": "perform",
+        "visibility": "external",
+        "parameters": [
+          "address[] validators"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "Upgrades multiple proxies via ProxyAdmin (bridge/inbox/outbox/rei/seqInbox)",
+          "Deploys new ChallengeManager proxy",
+          "Deploys new RollupProxy via CREATE2",
+          "Pauses old rollup and force refunds some stakers (via old admin logic)",
+          "Upgrades old rollup secondary implementation to patched user logic",
+          "Sets validators and whitelist disabled flag on new rollup",
+          "Transfers new rollup ownership to actual owner"
+        ],
+        "external_calls": [
+          "IOldRollupAdmin.pause()/forceRefundStaker(...)",
+          "DoubleLogicUUPSUpgradeable(OLD_ROLLUP).upgradeSecondaryTo(...)",
+          "PREIMAGE_LOOKUP.get(...)",
+          "ProxyAdmin.upgrade / upgradeAndCall",
+          "IBridge.updateRollupAddress(...)",
+          "ISequencerInbox.updateRollupAddress()",
+          "IRollupEventInbox.updateRollupAddress()",
+          "IOutbox.updateRollupAddress()",
+          "IEdgeChallengeManager.initialize(...)",
+          "RollupProxy.initializeProxy(...)",
+          "IRollupAdmin.setValidator(...)",
+          "IRollupAdmin.setValidatorWhitelistDisabled(...)",
+          "IRollupAdmin.setOwner(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "StateHashPreImageLookup (BOLDUpgradeAction.sol)",
+        "function": "stateHash",
+        "visibility": "public",
+        "parameters": [
+          "ExecutionState executionState",
+          "uint256 inboxMaxCount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "StateHashPreImageLookup (BOLDUpgradeAction.sol)",
+        "function": "set",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 h",
+          "ExecutionState executionState",
+          "uint256 inboxMaxCount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "preImages[h]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "StateHashPreImageLookup (BOLDUpgradeAction.sol)",
+        "function": "get",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 h"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "wasmModuleRoot",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.wasmModuleRoot()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "latestConfirmed",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.latestConfirmed()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "getNode",
+        "visibility": "external",
+        "parameters": [
+          "uint64 nodeNum"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.getNode(nodeNum)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "getStakerAddress",
+        "visibility": "external",
+        "parameters": [
+          "uint64 stakerNum"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.getStakerAddress(stakerNum)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "stakerCount",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.stakerCount()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "getStaker",
+        "visibility": "external",
+        "parameters": [
+          "address staker"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.getStaker(staker)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "isValidator",
+        "visibility": "external",
+        "parameters": [
+          "address validator"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.isValidator(validator)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupReader (BOLDUpgradeAction.sol)",
+        "function": "validatorWalletCreator",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "OLD_ROLLUP.validatorWalletCreator()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "ConstantArrayStorage (BOLDUpgradeAction.sol)",
+        "function": "array",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "BridgeCreator.sol",
+        "function": "updateTemplates",
+        "visibility": "external",
+        "parameters": [
+          "BridgeTemplates _newTemplates"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "ethBasedTemplates"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "BridgeCreator.sol",
+        "function": "updateERC20Templates",
+        "visibility": "external",
+        "parameters": [
+          "BridgeTemplates _newTemplates"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "erc20BasedTemplates"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "BridgeCreator.sol",
+        "function": "createBridge",
+        "visibility": "external",
+        "parameters": [
+          "address adminProxy",
+          "address rollup",
+          "address nativeToken",
+          "ISequencerInbox.MaxTimeVariation maxTimeVariation",
+          "BufferConfig bufferConfig"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "deploys 5 TransparentUpgradeableProxy instances (bridge, sequencerInbox, inbox, rollupEventInbox, outbox)",
+          "initializes all deployed proxy instances"
+        ],
+        "external_calls": [
+          "IEthBridge.initialize(...) or IERC20Bridge.initialize(...)",
+          "sequencerInbox.initialize(...)",
+          "inbox.initialize(...)",
+          "rollupEventInbox.initialize(...)",
+          "outbox.initialize(...)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "RollupProxy.sol",
+        "function": "initializeProxy",
+        "visibility": "external",
+        "parameters": [
+          "Config config",
+          "ContractDependencies connectedContracts"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "Proxy admin/implementation/secondaryImplementation slots (via _initialize) if uninitialized"
+        ],
+        "external_calls": [
+          "IRollupAdmin.initialize(config, connectedContracts) via delegatecall through proxy init",
+          "IRollupUser.initialize(config.stakeToken) via secondary delegatecall init"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "AbsBoldStakingPool.sol",
+        "function": "depositIntoPool",
+        "visibility": "external",
+        "parameters": [
+          "uint256 amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "depositBalance[msg.sender]"
+        ],
+        "external_calls": [
+          "IERC20(stakeToken).safeTransferFrom(msg.sender, address(this), amount)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "AbsBoldStakingPool.sol",
+        "function": "withdrawFromPool(uint256)",
+        "visibility": "public",
+        "parameters": [
+          "uint256 amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "depositBalance[msg.sender]"
+        ],
+        "external_calls": [
+          "IERC20(stakeToken).safeTransfer(msg.sender, amount)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "AbsBoldStakingPool.sol",
+        "function": "withdrawFromPool()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "depositBalance[msg.sender]"
+        ],
+        "external_calls": [
+          "withdrawFromPool(depositBalance[msg.sender])",
+          "IERC20(stakeToken).safeTransfer(msg.sender, amount)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "AssertionStakingPool.sol",
+        "function": "createAssertion",
+        "visibility": "external",
+        "parameters": [
+          "AssertionInputs assertionInputs"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 allowance from pool to rollup (increase)"
+        ],
+        "external_calls": [
+          "IERC20(stakeToken).safeIncreaseAllowance(rollup, requiredStake)",
+          "IRollupUser(rollup).newStakeOnNewAssertion(requiredStake, assertionInputs, assertionHash, address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "AssertionStakingPool.sol",
+        "function": "makeStakeWithdrawable",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "IRollupUser(rollup).returnOldDeposit()"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "AssertionStakingPool.sol",
+        "function": "withdrawStakeBackIntoPool",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "IRollupUser(rollup).withdrawStakerFunds()"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "AssertionStakingPool.sol",
+        "function": "makeStakeWithdrawableAndWithdrawBackIntoPool",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "makeStakeWithdrawable()",
+          "withdrawStakeBackIntoPool()"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "EdgeStakingPool.sol",
+        "function": "createEdge",
+        "visibility": "external",
+        "parameters": [
+          "CreateEdgeArgs args"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 allowance from pool to challengeManager (increase)"
+        ],
+        "external_calls": [
+          "EdgeChallengeManager(challengeManager).stakeAmounts(args.level)",
+          "IERC20(stakeToken).safeIncreaseAllowance(challengeManager, requiredStake)",
+          "EdgeChallengeManager(challengeManager).createLayerZeroEdge(args)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "AssertionStakingPoolCreator.sol",
+        "function": "createPool",
+        "visibility": "external",
+        "parameters": [
+          "address _rollup",
+          "bytes32 _assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "deploys new AssertionStakingPool via CREATE2 with salt=0"
+        ],
+        "external_calls": [
+          "IRollupCore(_rollup).stakeToken() (in AssertionStakingPool constructor)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "AssertionStakingPoolCreator.sol",
+        "function": "getPool",
+        "visibility": "public",
+        "parameters": [
+          "address _rollup",
+          "bytes32 _assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "StakingPoolCreatorUtils.getPool(...)",
+          "Create2.computeAddress(...)",
+          "Address.isContract(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeStakingPoolCreator.sol",
+        "function": "createPool",
+        "visibility": "external",
+        "parameters": [
+          "address challengeManager",
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "deploys new EdgeStakingPool via CREATE2 with salt=0"
+        ],
+        "external_calls": [
+          "EdgeChallengeManager(challengeManager).stakeToken() (in EdgeStakingPool constructor)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "EdgeStakingPoolCreator.sol",
+        "function": "getPool",
+        "visibility": "public",
+        "parameters": [
+          "address challengeManager",
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "StakingPoolCreatorUtils.getPool(...)",
+          "Create2.computeAddress(...)",
+          "Address.isContract(...)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "initialize",
+        "visibility": "public",
+        "parameters": [
+          "IAssertionChain _assertionChain",
+          "uint64 _challengePeriodBlocks",
+          "IOneStepProofEntry _oneStepProofEntry",
+          "uint256 layerZeroBlockEdgeHeight",
+          "uint256 layerZeroBigStepEdgeHeight",
+          "uint256 layerZeroSmallStepEdgeHeight",
+          "IERC20 _stakeToken",
+          "address _excessStakeReceiver",
+          "uint8 _numBigStepLevel",
+          "uint256[] _stakeAmounts"
+        ],
+        "modifiers": [
+          "initializer"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "assertionChain",
+          "oneStepProofEntry",
+          "challengePeriodBlocks",
+          "stakeToken",
+          "excessStakeReceiver",
+          "LAYERZERO_BLOCKEDGE_HEIGHT",
+          "LAYERZERO_BIGSTEPEDGE_HEIGHT",
+          "LAYERZERO_SMALLSTEPEDGE_HEIGHT",
+          "NUM_BIGSTEP_LEVEL",
+          "stakeAmounts"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "createLayerZeroEdge",
+        "visibility": "external",
+        "parameters": [
+          "CreateEdgeArgs args"
+        ],
+        "modifiers": [],
+        "authentication_required": "conditional",
+        "state_changes": [
+          "store.edges[...] (new edge + metadata)",
+          "store.firstRivals / rival mappings (via library)",
+          "store.hasMadeLayerZeroRival[msg.sender][mutualId] (when whitelist enabled)",
+          "ERC20 transfers of stakeToken (to self or excessStakeReceiver)"
+        ],
+        "external_calls": [
+          "assertionChain.validatorWhitelistDisabled()",
+          "assertionChain.isValidator(msg.sender) (conditional)",
+          "assertionChain.validateAssertionHash(...) (block-edge path)",
+          "assertionChain.isPending(...) (block-edge path)",
+          "assertionChain.getSecondChildCreationBlock(...) (block-edge path)",
+          "IERC20(stakeToken).safeTransferFrom(msg.sender, receiver, stakeAmount)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "bisectEdge",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 edgeId",
+          "bytes32 bisectionHistoryRoot",
+          "bytes prefixProof"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.edges[...] (creates upper child, may create lower child)",
+          "store child links/timer cache fields (via library)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "multiUpdateTimeCacheByChildren",
+        "visibility": "public",
+        "parameters": [
+          "bytes32[] edgeIds"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.edges[edgeId].timerCache (via library)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "updateTimerCacheByChildren",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.edges[edgeId].timerCache (via library)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "updateTimerCacheByClaim",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId",
+          "bytes32 claimingEdgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.edges[edgeId].timerCache (via library)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "confirmEdgeByTime",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId",
+          "AssertionStateData claimStateData"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.confirmedRivals[mutualId] (via library)",
+          "store.edges[edgeId] confirmed flag/timer cache (via library)"
+        ],
+        "external_calls": [
+          "assertionChain.isFirstChild(...) (conditional)",
+          "assertionChain.validateAssertionHash(...) (conditional)",
+          "assertionChain.getSecondChildCreationBlock(...) (conditional)",
+          "assertionChain.getFirstChildCreationBlock(...) (conditional)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "confirmEdgeByOneStepProof",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId",
+          "OneStepData oneStepData",
+          "ConfigData prevConfig",
+          "bytes32[] beforeHistoryInclusionProof",
+          "bytes32[] afterHistoryInclusionProof"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.confirmedRivals[mutualId] and edge confirmed state (via library)"
+        ],
+        "external_calls": [
+          "assertionChain.validateConfig(prevAssertionHash, prevConfig)",
+          "assertionChain.bridge()",
+          "oneStepProofEntry (used inside library confirmEdgeByOneStepProof)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "refundStake",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "store.edges[edgeId].refunded flag (via library)"
+        ],
+        "external_calls": [
+          "IERC20(stakeToken).safeTransfer(edge.staker, stakeAmount)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "getLayerZeroEndHeight",
+        "visibility": "public",
+        "parameters": [
+          "EdgeType eType"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "calculateEdgeId",
+        "visibility": "public",
+        "parameters": [
+          "uint8 level",
+          "bytes32 originId",
+          "uint256 startHeight",
+          "bytes32 startHistoryRoot",
+          "uint256 endHeight",
+          "bytes32 endHistoryRoot"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "calculateMutualId",
+        "visibility": "public",
+        "parameters": [
+          "uint8 level",
+          "bytes32 originId",
+          "uint256 startHeight",
+          "bytes32 startHistoryRoot",
+          "uint256 endHeight"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "edgeExists",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "getEdge",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "edgeLength",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "hasRival",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "confirmedRival",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 mutualId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "hasLengthOneRival",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "timeUnrivaled",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "getPrevAssertionHash",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 edgeId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "firstRival",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 mutualId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "EdgeChallengeManager.sol",
+        "function": "hasMadeLayerZeroRival",
+        "visibility": "external",
+        "parameters": [
+          "address account",
+          "bytes32 mutualId"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "getAssertion",
+        "visibility": "public",
+        "parameters": [
+          "bytes32 assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "getAssertionCreationBlockForLogLookup",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "getStakerAddress",
+        "visibility": "external",
+        "parameters": [
+          "uint64 stakerNum"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "isStaked",
+        "visibility": "public",
+        "parameters": [
+          "address staker"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "latestStakedAssertion",
+        "visibility": "public",
+        "parameters": [
+          "address staker"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "amountStaked",
+        "visibility": "public",
+        "parameters": [
+          "address staker"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "getStaker",
+        "visibility": "external",
+        "parameters": [
+          "address staker"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "withdrawableFunds",
+        "visibility": "external",
+        "parameters": [
+          "address user"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "latestConfirmed",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "stakerCount",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "sequencerInbox",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "bridge.sequencerInbox()"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "genesisAssertionHash",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "getFirstChildCreationBlock",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "getSecondChildCreationBlock",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "validateAssertionHash",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash",
+          "AssertionState state",
+          "bytes32 prevAssertionHash",
+          "bytes32 inboxAcc"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "validateConfig",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash",
+          "ConfigData configData"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "isFirstChild",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "RollupCore.sol",
+        "function": "isPending",
+        "visibility": "external",
+        "parameters": [
+          "bytes32 assertionHash"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      }
+    ],
+    "inventories": {
+      "upgradeability_surface": [
+        {
+          "contract": "SequencerInbox.sol",
+          "pattern": "Transparent",
+          "initializer_guards": [
+            "onlyDelegated",
+            "AlreadyInit() check",
+            "postUpgradeInit: onlyDelegated + onlyProxyOwner + buffer.bufferBlocks==0 check"
+          ],
+          "storage_layout_file": "",
+          "collision_risk": "medium",
+          "notes": "Designed to be used behind a proxy (onlyDelegated). Uses immutables for reader4844/maxDataSize/deployTimeChainId/hostChainIsArbitrum/isUsingFeeToken/isDelayBufferable; upgrades must preserve constructor-immutables expectations (NativeTokenMismatch check in initialize).",
+          "shared_storage_slots": [],
+          "diamond_cut_access": ""
+        },
+        {
+          "contract": "RollupProxy.sol",
+          "pattern": "None",
+          "initializer_guards": [
+            "initializeProxy checks admin/implementation/secondaryImplementation slots are zero before _initialize"
+          ],
+          "storage_layout_file": "",
+          "collision_risk": "high",
+          "notes": "Custom AdminFallbackProxy with dual implementations. Misconfiguration of admin routing can expose RollupAdminLogic functions permissionlessly. Storage collision risk exists between primary/secondary logic implementations if not carefully managed."
+        },
+        {
+          "contract": "RollupAdminLogic.sol (via RollupProxy)",
+          "pattern": "UUPS",
+          "initializer_guards": [
+            "initializer",
+            "onlyProxy"
+          ],
+          "storage_layout_file": "",
+          "collision_risk": "high",
+          "notes": "Uses DoubleLogicUUPSUpgradeable allowing upgrades of primary and secondary logic. _authorizeUpgrade and _authorizeSecondaryUpgrade are empty (no checks) because access is assumed enforced by proxy admin separation; if that assumption fails, upgrades are catastrophic."
+        },
+        {
+          "contract": "BridgeCreator.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "storage_layout_file": "",
+          "collision_risk": "low",
+          "notes": "Factory deploying TransparentUpgradeableProxy instances; not itself upgradeable."
+        },
+        {
+          "contract": "RollupCreator.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "storage_layout_file": "",
+          "collision_risk": "low",
+          "notes": "Factory deploying RollupProxy and multiple TransparentUpgradeableProxy instances; not itself upgradeable."
+        },
+        {
+          "contract": "EdgeChallengeManager.sol",
+          "pattern": "Transparent",
+          "initializer_guards": [
+            "initializer",
+            "constructor _disableInitializers()"
+          ],
+          "storage_layout_file": "",
+          "collision_risk": "medium",
+          "notes": "Typically deployed behind TransparentUpgradeableProxy (as in RollupCreator/BOLDUpgradeAction). Initialization sets stake token/amounts and edge heights; upgrades must preserve EdgeStore layout."
+        },
+        {
+          "contract": "BOLDUpgradeAction.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "storage_layout_file": "",
+          "collision_risk": "low",
+          "notes": "Not upgradeable; orchestrates upgrades via external ProxyAdmin-controlled proxies."
+        },
+        {
+          "contract": "AssertionStakingPool.sol / EdgeStakingPool.sol / AbsBoldStakingPool.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "storage_layout_file": "",
+          "collision_risk": "low",
+          "notes": "Non-upgradeable staking pools deployed via CREATE2(salt=0) by creators; address determinism depends on creator address and bytecode."
+        }
+      ]
+    }
+  }
+}

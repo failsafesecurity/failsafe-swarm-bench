@@ -1,0 +1,986 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "Cred.sol",
+      "PhiFactory.sol",
+      "PhiNFT1155.sol",
+      "CuratorRewardsDistributor.sol",
+      "RewardControl.sol",
+      "PhiRewards.sol",
+      "BondingCurve.sol",
+      "Claimable.sol",
+      "CreatorRoyaltiesControl.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-05T00:28:03.619Z",
+    "duration_ms": 443901
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H001",
+      "title": "Public _addCredIdPerAddress/_removeCredIdPerAddress Allow Permanent DoS on Share Sales",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "_addCredIdPerAddress and _removeCredIdPerAddress are declared public despite underscore naming convention, allowing any external caller to corrupt per-address cred tracking data structures. An attacker can remove a victim's credId from the tracking array, causing subsequent sell operations to revert with WrongCredId, permanently locking the victim's shares and the ETH they represent on the bonding curve.",
+      "investigation_rationale": "These functions directly manage the internal bookkeeping arrays used by _updateCuratorShareBalance during sell operations. External manipulation desynchronizes _credIdsPerAddressCredIdIndex from _credIdsPerAddress without touching _credIdExistsPerAddress (only set in _updateCuratorShareBalance). When the victim sells their last share, _updateCuratorShareBalance calls _removeCredIdPerAddress which reads the deleted/stale index and reverts.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_addCredIdPerAddress",
+        "_removeCredIdPerAddress",
+        "_updateCuratorShareBalance",
+        "sellShareCred"
+      ],
+      "affected_contracts": [
+        "Cred.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Cred.sol",
+          "function": "_addCredIdPerAddress"
+        },
+        {
+          "file": "Cred.sol",
+          "function": "_removeCredIdPerAddress"
+        },
+        {
+          "file": "Cred.sol",
+          "function": "_updateCuratorShareBalance"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Cred.sol",
+        "lines": "449-453, 456-488",
+        "pattern": "Both functions declared 'public' with no access control modifier; any external caller can invoke them"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Victim holds shares in at least one credId",
+        "Victim has at least one other credId tracked in _credIdsPerAddress (so index 0 differs from target)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Cred.sol lines 449-488",
+        "vulnerable_pattern": "public visibility on internal bookkeeping functions",
+        "specific_concern": "_removeCredIdPerAddress deletes index mapping and modifies array; _credIdExistsPerAddress is NOT updated, causing _updateCuratorShareBalance to call _removeCredIdPerAddress again with stale index → WrongCredId revert",
+        "missing_safeguards": "No access control, should be internal"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can the attacker fully DoS a victim's ability to sell specific credId shares?",
+          "Can _addCredIdPerAddress be used to add duplicates that cause further corruption?",
+          "Is there any recovery path for the victim?"
+        ],
+        "validation_requirements": [
+          "Deploy Cred, have victim buy shares for credId 1 and 2, attacker calls _removeCredIdPerAddress(1, victim), victim tries to sell credId 1",
+          "Verify WrongCredId revert occurs",
+          "Verify shares remain locked permanently"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Victim holds shares in credId=1 and credId=2. 2. Attacker calls _removeCredIdPerAddress(1, victim). 3. Array removes credId=1, index mapping deleted. 4. Victim calls sellShareCred(1, amount, 0). 5. _updateCuratorShareBalance sees balance goes to 0, calls _removeCredIdPerAddress(1, victim). 6. Index lookup returns 0 (deleted). _credIdsPerAddress[victim][0] is credId=2 (swapped during step 2). 7. credId_ (1) != credIdToRemove (2) → revert WrongCredId. 8. Victim's shares are permanently locked.",
+      "prerequisites": [
+        "Any on-chain caller"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent lock of victim's shares which represent ETH value on the bonding curve. Could target any user.",
+        "affected_users": "Any share holder",
+        "recovery_possibility": "Only via UUPS upgrade to fix the function or manually reconstruct state"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No test for external calls to _addCredIdPerAddress/_removeCredIdPerAddress",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Minimal gas cost to attack",
+        "capital_requirements": "Zero capital needed",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Attack visible on-chain but damage is immediate and irreversible without upgrade"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H002",
+      "title": "Unsigned Quantity in signatureClaim/merkleClaim Allows Arbitrary NFT Minting",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The mintArgs_ parameter (containing quantity and imageURI) is not included in the signed encodeData_ for signatureClaim or in the Merkle leaf for merkleClaim. An attacker with a valid signature or Merkle proof intended for quantity=1 can modify the quantity to mint up to maxSupply NFTs in a single transaction.",
+      "investigation_rationale": "In signatureClaim, the signature covers (expiresIn_, minter_, ref_, verifier_, artId_, chainid, data_) but mintArgs_ is a separate unchecked parameter. In merkleClaim, the proof covers (minter_, leafPart_) but quantity is in mintArgs_. The _validateAndUpdateClaimState only checks numberMinted + quantity <= maxSupply.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "signatureClaim",
+        "merkleClaim",
+        "_validateAndUpdateClaimState"
+      ],
+      "affected_contracts": [
+        "PhiFactory.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PhiFactory.sol",
+          "function": "signatureClaim"
+        },
+        {
+          "file": "PhiFactory.sol",
+          "function": "merkleClaim"
+        },
+        {
+          "file": "PhiFactory.sol",
+          "function": "_validateAndUpdateClaimState"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PhiFactory.sol",
+        "lines": "327-340, 355-380",
+        "pattern": "Signature verification only covers encodeData_ which excludes mintArgs_ (quantity, imageURI); quantity is user-supplied without cryptographic binding"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker obtains a valid signature or Merkle proof for an art",
+        "Art's maxSupply > 1",
+        "Attacker pays getArtMintFee(artId, quantity) for the inflated quantity",
+        "Art is within its time window"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PhiFactory.sol lines 327-340",
+        "vulnerable_pattern": "signatureClaim verifies keccak256(encodeData_) against phiSignerAddress but mintArgs_ is a separate unverified calldata parameter",
+        "specific_concern": "quantity_ in mintArgs_ can be set to any value up to maxSupply",
+        "missing_safeguards": "No signature coverage over quantity or imageURI"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can an EOA directly call signatureClaim with modified mintArgs?",
+          "Does the TxOriginMismatch check prevent direct EOA calls?",
+          "What is the economic impact of minting maxSupply vs quantity=1?"
+        ],
+        "validation_requirements": [
+          "Obtain a valid signature for quantity=1, call signatureClaim with quantity=maxSupply",
+          "Verify minting succeeds for the inflated quantity",
+          "Confirm imageURI can also be arbitrarily set"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Attacker obtains valid signature for artId (intended for 1 mint). 2. Calls signatureClaim directly as EOA (passes tx.origin == _msgSender check). 3. Sets mintArgs_.quantity = maxSupply. 4. Pays getArtMintFee(artId, maxSupply). 5. Mints maxSupply NFTs, exhausting supply.",
+      "prerequisites": [
+        "Valid signature or Merkle proof",
+        "ETH to cover mint fees for inflated quantity"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete exhaustion of art supply; unauthorized minting of potentially valuable credential NFTs",
+        "affected_users": "All legitimate minters who can no longer claim; art creator loses scarcity guarantee",
+        "recovery_possibility": "Cannot unmint; art creator could increase maxSupply but damage to scarcity is permanent"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No test verifying quantity is bound by signature",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Gas scales linearly with quantity",
+        "capital_requirements": "Mint fee * quantity ETH needed",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Large mint events visible on-chain"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H003",
+      "title": "buyShareCredFor Enables Continuous Lock Period Griefing Against Any Curator",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "buyShareCredFor allows anyone to buy shares on behalf of another address, resetting the victim's lastTradeTimestamp and preventing them from selling for 10 minutes. An attacker can repeatedly call this function to continuously extend the lock period, effectively DoSing the victim's ability to sell shares.",
+      "investigation_rationale": "In _handleTrade for buy, lastTradeTimestamp[credId_][curator_] = block.timestamp is set for the curator_ (the victim), not msg.sender (the buyer). This means the attacker controls when the lock period starts for any address.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "buyShareCredFor",
+        "_handleTrade"
+      ],
+      "affected_contracts": [
+        "Cred.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Cred.sol",
+          "function": "buyShareCredFor"
+        },
+        {
+          "file": "Cred.sol",
+          "function": "_handleTrade"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Cred.sol",
+        "lines": "381-383, 363-365",
+        "pattern": "lastTradeTimestamp[credId_][curator_] = block.timestamp sets lock for curator_ parameter, not msg.sender"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Victim holds shares in a credId",
+        "Attacker has ETH to buy minimum 1 share at current price"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Cred.sol lines 363-365",
+        "vulnerable_pattern": "Lock period set for curator_ parameter instead of msg.sender in buy path",
+        "specific_concern": "Anyone can buy 1 share for a victim address to reset their lock timer",
+        "missing_safeguards": "No restriction on who can buy shares for whom; lock should only apply to the actual buyer"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the minimum cost to grief one lock period extension?",
+          "Can batchBuyShareCred be used to lock multiple creds simultaneously for a victim?",
+          "Is there an economic breaking point where griefing becomes unprofitable?"
+        ],
+        "validation_requirements": [
+          "Call buyShareCredFor(credId, 1, victim, 0) and verify victim cannot sell for 10 minutes",
+          "Repeat call every 9 minutes and verify victim is permanently locked"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Victim holds shares worth significant ETH. 2. Attacker monitors victim's sell attempts. 3. Every ~9 minutes, attacker calls buyShareCredFor(credId, 1, victim, 0) for the cost of 1 share. 4. Victim's lastTradeTimestamp is reset, preventing sell. 5. If bonding curve price is dropping, victim is forced to hold depreciating shares.",
+      "prerequisites": [
+        "ETH for minimum share purchase (price of 1 share at current supply)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Victim cannot sell during price drops; potential forced losses on bonding curve",
+        "affected_users": "Any curator targeted by attacker",
+        "recovery_possibility": "Victim must wait for attacker to stop; no on-chain mitigation"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for buyShareCredFor lock period impact on third parties",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~100K gas per grief transaction",
+        "capital_requirements": "Price of 1 share at current supply (could be very low)",
+        "execution_timing": "Every 9 minutes to maintain lock",
+        "detection_analysis": "On-chain pattern detectable but not preventable"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "Unbounded Loop in CuratorRewardsDistributor.distribute() Causes Permanent Fund Lock",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "distribute() fetches ALL curator addresses via getCuratorAddresses(credId, 0, 0) and iterates through them twice (once for share counting, once for reward calculation). For popular creds with many curators, this exceeds the block gas limit, permanently locking accumulated rewards.",
+      "investigation_rationale": "The function has two unbounded loops over all curators plus an external call to getShareNumber per curator. Each curator adds ~20K+ gas. At ~30M gas limit, approximately 1000-1500 curators would make distribution impossible. MAX_SUPPLY is 999, meaning up to 999 unique curators could exist.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "distribute"
+      ],
+      "affected_contracts": [
+        "CuratorRewardsDistributor.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "CuratorRewardsDistributor.sol",
+          "function": "distribute"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "CuratorRewardsDistributor.sol",
+        "lines": "77-118",
+        "pattern": "Two loops over distributeAddresses (unbounded array from getCuratorAddresses(credId,0,0)) with external call getShareNumber per iteration"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A cred accumulates many unique curators (up to 999 from MAX_SUPPLY)",
+        "Rewards are deposited via curatorRewardsDistributor.deposit()"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "CuratorRewardsDistributor.sol lines 77-118",
+        "vulnerable_pattern": "getCuratorAddresses(credId, 0, 0) fetches ALL addresses; two full iteration loops with external calls",
+        "specific_concern": "No pagination support in distribute(); balanceOf[credId] can never be zeroed if gas exceeds limit",
+        "missing_safeguards": "No maximum curator limit, no pagination, no batch distribution mechanism"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "At what curator count does distribute() exceed 30M gas?",
+          "Can an attacker deliberately inflate curator count by buying 1 share from many addresses?",
+          "Is there a fallback mechanism to recover locked rewards?"
+        ],
+        "validation_requirements": [
+          "Simulate distribute() with 500, 750, 999 curators and measure gas",
+          "Verify no alternative withdrawal path exists for locked balanceOf[credId]"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Attacker creates many wallets and buys 1 share each for a target credId (up to 999 unique addresses). 2. Rewards accumulate in CuratorRewardsDistributor for this credId. 3. distribute(credId) exceeds gas limit. 4. ETH is permanently locked in the contract.",
+      "prerequisites": [
+        "ETH to buy 1 share from many addresses (bonding curve price increases with supply)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "All accumulated curator rewards for affected credId are permanently locked",
+        "affected_users": "All curators of the affected credId",
+        "recovery_possibility": "No recovery mechanism exists; contract is not upgradeable"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No gas limit test for distribute() with many curators",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Critical - need exact gas per curator to determine threshold",
+        "capital_requirements": "Sum of bonding curve prices for N shares",
+        "execution_timing": "Setup requires multiple transactions; DoS is permanent",
+        "detection_analysis": "Curator count is publicly queryable"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H005",
+      "title": "withdrawFor Allows Unauthorized Forced Withdrawal of Any User's Reward Balance",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "RewardControl.withdrawFor(from, amount) has no access control. Any external caller can trigger withdrawal of another user's balance, sending it to the user's own address. With amount=0 (FULL_BALANCE sentinel), the entire balance is withdrawn without the user's consent.",
+      "investigation_rationale": "withdrawFor calls _withdraw(from, from, amount) which transfers ETH to 'from'. While funds aren't stolen, forced withdrawal disrupts composability, can force ETH onto contracts with expensive/reverting receive() functions, and removes user control over their withdrawal timing.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "withdrawFor",
+        "_withdraw"
+      ],
+      "affected_contracts": [
+        "RewardControl.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "RewardControl.sol",
+          "function": "withdrawFor"
+        },
+        {
+          "file": "RewardControl.sol",
+          "function": "_withdraw"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "RewardControl.sol",
+        "lines": "70-72",
+        "pattern": "No access control on withdrawFor; any caller can withdraw for any 'from' address"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Target address has a non-zero balance in RewardControl/PhiRewards"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "RewardControl.sol lines 70-72",
+        "vulnerable_pattern": "external function with no msg.sender validation against 'from' parameter",
+        "specific_concern": "Amount=0 triggers FULL_BALANCE sentinel, forcing complete withdrawal",
+        "missing_safeguards": "No require(msg.sender == from) or allowance mechanism"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can this cause a revert if 'from' is a contract that rejects ETH?",
+          "Can this be used to gas-grief contracts with expensive receive() functions?",
+          "Are there protocols composing with PhiRewards that depend on accumulated balances?"
+        ],
+        "validation_requirements": [
+          "Call withdrawFor(userAddress, 0) from unrelated account and verify full balance sent to user",
+          "Test with a contract address that reverts on receive()"
+        ]
+      },
+      "preliminary_attack_scenario": "1. User accumulates rewards in PhiRewards. 2. Attacker calls withdrawFor(user, 0). 3. User's entire balance is transferred to user without their consent. 4. If user is a contract with reverting receive(), the call reverts and user's balance is effectively locked (cannot be withdrawn by anyone).",
+      "prerequisites": [
+        "Target has balance in PhiRewards"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Forced withdrawal disrupts timing; if target cannot receive ETH, balance becomes locked",
+        "affected_users": "Any reward recipient, especially smart contract wallets",
+        "recovery_possibility": "Funds sent to user (not lost) unless receive reverts"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for unauthorized withdrawFor calls",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Minimal",
+        "capital_requirements": "Zero",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Withdraw events would show unexpected caller"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H006",
+      "title": "PhiFactory.claim() Traps Excess ETH With No User Refund Path",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "When users call PhiFactory.claim() with msg.value exceeding the actual mintFee, the function only forwards the exact mintFee via this.merkleClaim/this.signatureClaim internal self-call. Excess ETH remains trapped in the PhiFactory contract. The _processClaim refund logic targets _msgSender() which is address(this) in the self-call context, not the original user.",
+      "investigation_rationale": "claim() computes mintFee and calls this.merkleClaim{value:mintFee}. The original msg.value - mintFee stays in PhiFactory. Inside _processClaim, any refund goes to _msgSender() which resolves to address(this) (the factory calling itself). The owner can later call withdraw() to claim all stuck ETH.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "claim",
+        "_processClaim",
+        "withdraw"
+      ],
+      "affected_contracts": [
+        "PhiFactory.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PhiFactory.sol",
+          "function": "claim"
+        },
+        {
+          "file": "PhiFactory.sol",
+          "function": "_processClaim"
+        },
+        {
+          "file": "PhiFactory.sol",
+          "function": "withdraw"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PhiFactory.sol",
+        "lines": "274-305, 568-582",
+        "pattern": "claim() forwards exact mintFee via this.merkleClaim{value:mintFee}; no refund of msg.value - mintFee to original caller"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User calls claim() with msg.value > actual mintFee",
+        "This is a common UX pattern since users may not know exact fee"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PhiFactory.sol lines 274-305",
+        "vulnerable_pattern": "Self-call this.merkleClaim{value:mintFee} only forwards mintFee; no refund logic for excess in claim()",
+        "specific_concern": "_msgSender() inside _processClaim resolves to address(this), not the original user",
+        "missing_safeguards": "No excess refund to tx.origin or original msg.sender after self-call"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does batchClaim have the same issue?",
+          "How much ETH could accumulate from user overpayments?",
+          "Is the withdraw() function properly sending to protocolFeeDestination?"
+        ],
+        "validation_requirements": [
+          "Call claim() with 2x mintFee and verify excess stays in factory",
+          "Verify user has no way to recover the excess"
+        ]
+      },
+      "preliminary_attack_scenario": "1. User calls claim() with msg.value = 0.01 ETH, actual mintFee = 0.001 ETH. 2. Only 0.001 ETH forwarded to this.merkleClaim. 3. 0.009 ETH remains in PhiFactory. 4. Owner calls withdraw() to drain accumulated excess to protocolFeeDestination.",
+      "prerequisites": [
+        "User overpays for minting"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "User loses excess ETH; accumulated across many users could be significant",
+        "affected_users": "Any user calling claim() with excess ETH",
+        "recovery_possibility": "Only owner can recover via withdraw(); no user recovery path"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for claim() with excess ETH",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Any claim transaction",
+        "detection_analysis": "Factory balance increases observable on-chain"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "credMerkleRoot Overwrite When Creating New Art for Same CredId Invalidates Existing Claims",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "credMerkleRoot[credChainId][credId] is a single shared slot per (chainId, credId) pair. When _initializePhiArt is called for a new art on the same credId, it overwrites the existing merkle root. This invalidates all pending Merkle claims for previously created arts that relied on the old root.",
+      "investigation_rationale": "Multiple arts can share the same credId (they use the same NFT contract via credNFTContracts). Each call to createERC1155Internal triggers _initializePhiArt which unconditionally sets credMerkleRoot[credChainId][credId] = merkleRootHash. If the new art has a different merkle root, all merkleClaim calls for previous arts will fail proof verification.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_initializePhiArt",
+        "merkleClaim",
+        "createERC1155Internal"
+      ],
+      "affected_contracts": [
+        "PhiFactory.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PhiFactory.sol",
+          "function": "_initializePhiArt"
+        },
+        {
+          "file": "PhiFactory.sol",
+          "function": "merkleClaim"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PhiFactory.sol",
+        "lines": "494-496",
+        "pattern": "credMerkleRoot[credChainId][credId] = merkleRootHash unconditionally overwrites on each art creation"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Two or more arts created for the same credId with MERKLE verification",
+        "The new art has a different merkle root than the previous one",
+        "Users of the previous art have not yet claimed"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "PhiFactory.sol line 496",
+        "vulnerable_pattern": "credMerkleRoot is keyed only by (credChainId, credId), not by artId",
+        "specific_concern": "Overwrite invalidates proofs for existing arts; merkleClaim reads credMerkleRoot[art.credChainId][art.credId]",
+        "missing_safeguards": "No per-art merkle root storage; no check if root is already set"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How often do multiple arts share the same credId?",
+          "Can a malicious creator exploit this to selectively deny claims?",
+          "Can this be weaponized by anyone who can get a signature for art creation?"
+        ],
+        "validation_requirements": [
+          "Create artA with credId=1 and rootA, create artB with credId=1 and rootB",
+          "Verify merkleClaim for artA with proofs against rootA fails"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Art A created for credId=1 with merkle root R1. 2. Users prepare claims with proofs against R1. 3. Art B created for credId=1 with merkle root R2. 4. credMerkleRoot[chainId][1] = R2. 5. Users trying to claim Art A with proofs against R1 fail.",
+      "prerequisites": [
+        "Ability to create a new art for the same credId (requires signed data from phiSigner)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Legitimate users cannot claim their earned credential NFTs",
+        "affected_users": "All pending Merkle claimants for the overwritten credId",
+        "recovery_possibility": "Would require setting credMerkleRoot back; no user self-recovery"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for multiple arts with same credId",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "Art creation fee",
+        "execution_timing": "Between art creation and user claims",
+        "detection_analysis": "Merkle root change visible via credMerkleRoot public mapping"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H008",
+      "title": "Share Manipulation Before distribute() Extracts Disproportionate Curator Rewards",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "An attacker can buy large quantities of shares for a credId just before calling distribute(), receiving a disproportionate share of accumulated rewards. After the 10-minute lock period, they sell their shares. If the reward exceeds the bonding curve spread and fees, the attack is profitable.",
+      "investigation_rationale": "distribute() reads share balances at call time. Share data is fetched atomically from Cred contract. The attacker can observe accumulated balanceOf[credId] on-chain and time their buy → distribute → sell sequence. The 10-minute lock period is the only mitigation.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "distribute"
+      ],
+      "affected_contracts": [
+        "CuratorRewardsDistributor.sol",
+        "Cred.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "CuratorRewardsDistributor.sol",
+          "function": "distribute"
+        },
+        {
+          "file": "Cred.sol",
+          "function": "buyShareCred"
+        },
+        {
+          "file": "Cred.sol",
+          "function": "sellShareCred"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "CuratorRewardsDistributor.sol",
+        "lines": "77-118",
+        "pattern": "Reward distribution proportional to share count at call time; no time-weighted average or snapshot mechanism"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Significant rewards accumulated in balanceOf[credId]",
+        "Attacker has ETH to buy shares on bonding curve",
+        "Rewards exceed bonding curve spread + protocol fees + creator royalties for round-trip trade"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "CuratorRewardsDistributor.sol lines 89-106",
+        "vulnerable_pattern": "userRewards = (distributeAmount * userAmounts) / totalNum; snapshot at call time only",
+        "specific_concern": "No time-weighting means last-second buyers get same reward rate as long-term holders",
+        "missing_safeguards": "No snapshot, no time-weighted averaging, no minimum hold period for reward eligibility"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "At what reward balance does the attack become profitable?",
+          "What bonding curve spread exists at various supply levels?",
+          "Can the 10-minute lock period be bypassed via TECH-H003?"
+        ],
+        "validation_requirements": [
+          "Calculate break-even: rewards captured vs bonding curve spread + fees",
+          "Simulate: buy 100 shares, distribute, wait 10 min, sell 100 shares"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Observe balanceOf[credId] = 10 ETH. 2. Buy 500 shares (dominating total supply). 3. Wait 10 minutes (lock period). 4. Call distribute(credId) to receive ~proportional share of 10 ETH. 5. Sell 500 shares. 6. Profit if reward share > bonding curve price impact + fees.",
+      "prerequisites": [
+        "Large accumulated reward balance",
+        "Capital for share purchase"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Extraction of rewards meant for long-term curators",
+        "affected_users": "Legitimate long-term curators who receive diluted rewards",
+        "recovery_possibility": "No recovery; rewards are distributed"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No economic simulation of distribute manipulation",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard transaction costs",
+        "capital_requirements": "Depends on bonding curve price; potentially significant",
+        "execution_timing": "Multi-transaction: buy → wait 10 min → distribute → sell",
+        "detection_analysis": "Large share purchases followed by immediate distribution visible on-chain"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "BondingCurve._getCreatorFee Missing Return Statement Causes Incorrect Price Quotes",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "_getCreatorFee sets creatorFee=0 when supply_==0 but does not return, falling through to overwrite creatorFee with a non-zero royalty-based value. This causes getBuyPriceAfterFee and getSellPriceAfterFee to return inflated prices at supply=0, while getPriceData (used in actual trades) correctly returns 0.",
+      "investigation_rationale": "The if(supply_==0) block assigns creatorFee=0 but lacks a return statement. Execution continues to calculate creatorFee = (price_ * royaltyRate) / RATIO_BASE, overwriting the zero. This only affects view functions (getBuyPriceAfterFee, getSellPriceAfterFee) not the trade execution path (getPriceData has its own early return).",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_getCreatorFee",
+        "getBuyPriceAfterFee",
+        "getSellPriceAfterFee"
+      ],
+      "affected_contracts": [
+        "BondingCurve.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "BondingCurve.sol",
+          "function": "_getCreatorFee"
+        },
+        {
+          "file": "BondingCurve.sol",
+          "function": "getBuyPriceAfterFee"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "BondingCurve.sol",
+        "lines": "108-125",
+        "pattern": "if (supply_ == 0) { creatorFee = 0; } — no return; falls through to creatorFee = (price_ * royaltyRate) / RATIO_BASE"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Cred with supply == 0 (before first purchase or after all shares sold)",
+        "Non-zero buy/sell royalty configured"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "BondingCurve.sol lines 114-117",
+        "vulnerable_pattern": "Missing return after setting creatorFee = 0 for supply_ == 0",
+        "specific_concern": "creatorFee is overwritten to non-zero value; inconsistent with getPriceData",
+        "missing_safeguards": "Missing 'return' statement"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Are frontends using getBuyPriceAfterFee for price display?",
+          "Does the price discrepancy cause users to avoid purchasing?",
+          "Could the inconsistency cause issues in any state-changing function?"
+        ],
+        "validation_requirements": [
+          "Compare getBuyPriceAfterFee vs getPriceData at supply=0",
+          "Verify _getCreatorFee is not used in any state-changing path"
+        ]
+      },
+      "preliminary_attack_scenario": "Frontend displays inflated buy price from getBuyPriceAfterFee at supply=0 (includes phantom creator fee). Users see higher price than actual cost, deterring first-mover purchases. Actual trade via getPriceData charges no creator fee.",
+      "prerequisites": [
+        "Cred at supply 0"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Users may overpay if they set maxPrice based on getBuyPriceAfterFee, or avoid purchasing",
+        "affected_users": "Users viewing price quotes at supply=0",
+        "recovery_possibility": "No fund loss; UX and trust issue"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test comparing view price functions vs actual trade prices at supply=0",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "N/A",
+        "detection_analysis": "Comparison of return values at supply=0"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "createCred Signature Lacks Chain ID Allowing Cross-Chain Replay",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "The signedData_ in createCred encodes (expiresIn, sender, _, bondingCurve, credURL, credType, verificationType, merkleRoot) without block.chainid. A signature used on one chain can be replayed on another chain to create the same cred, potentially with mismatched bonding curve addresses.",
+      "investigation_rationale": "Unlike signatureClaim (which includes chainId in the signed data), createCred's signature does not bind to a specific chain. The protocol deploys on multiple chains (Base, Optimism, BeraChain), making cross-chain replay feasible.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "foundry.toml lists Base, Optimism, Arbitrum RPC endpoints; documentation states multi-chain deployment",
+      "affected_functions": [
+        "createCred"
+      ],
+      "affected_contracts": [
+        "Cred.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Cred.sol",
+          "function": "createCred"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Cred.sol",
+        "lines": "224-234",
+        "pattern": "abi.decode(signedData_, (uint256, address, uint256, address, string, string, string, bytes32)) — no chainId field"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Protocol deployed on multiple chains with same phiSignerAddress",
+        "Valid createCred signature obtained on chain A",
+        "bondingCurve address exists on chain B (or differs harmlessly)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Cred.sol lines 224-234",
+        "vulnerable_pattern": "Signed data decoded without chainId; no block.chainid check",
+        "specific_concern": "Same signature valid on any chain with matching phiSignerAddress",
+        "missing_safeguards": "No chain ID binding in signature data"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the third decoded uint256 (ignored via ',') serve as a chain ID?",
+          "Is phiSignerAddress the same across all chains?",
+          "Could replayed cred cause economic harm or just duplicate data?"
+        ],
+        "validation_requirements": [
+          "Decode the signed data format and verify no chainId field",
+          "Test replay of signature on different chain deployment"
+        ]
+      },
+      "preliminary_attack_scenario": "1. User creates cred on Base with valid signature. 2. Attacker captures signature and signedData. 3. Replays on Optimism, creating identical cred (if bonding curve address matches or is whitelisted). 4. Unauthorized cred creation on secondary chain.",
+      "prerequisites": [
+        "Multi-chain deployment with shared signer",
+        "Whitelisted bonding curve address on target chain"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Unauthorized cred creation; attacker pays for first share purchase. Duplicated credentials across chains.",
+        "affected_users": "Original cred creator; protocol integrity",
+        "recovery_possibility": "Cred can be created but has limited economic significance per documentation"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No cross-chain replay test for createCred",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "First share price on target chain",
+        "execution_timing": "After valid signature obtained on source chain",
+        "detection_analysis": "Duplicate creds detectable by off-chain indexing"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H011",
+      "title": "BondingCurve.setCredContract Not Called in Deployment Script Causes All Trades to Fail",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In Deploy.s.sol, bondingCurve.setCredContract(address(credProxy)) is commented out. Without this call, BondingCurve.credContract remains address(0), causing all calls to getPriceData to revert when accessing credContract.getCreatorRoyalty() and credContract.protocolFeePercent().",
+      "investigation_rationale": "BondingCurve._getProtocolFee calls credContract.protocolFeePercent(). If credContract is address(0), this is a call to the zero address which will revert. getPriceData is called by _handleTrade for every buy/sell, meaning ALL share trading is non-functional until setCredContract is called.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "setCredContract must be called post-deployment before any trade"
+      ],
+      "config_evidence": "Deploy.s.sol line: '// bondingCurve.setCredContract(address(credProxy));' is commented out",
+      "affected_functions": [
+        "getPriceData",
+        "_getProtocolFee",
+        "_getCreatorFee",
+        "setCredContract"
+      ],
+      "affected_contracts": [
+        "BondingCurve.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "BondingCurve.sol",
+          "function": "getPriceData"
+        },
+        {
+          "file": "BondingCurve.sol",
+          "function": "setCredContract"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "BondingCurve.sol",
+        "lines": "94-96, 102-104",
+        "pattern": "credContract.protocolFeePercent() and credContract.getCreatorRoyalty() called on potentially unset address"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "BondingCurve deployed without calling setCredContract",
+        "User attempts to create a cred or trade shares"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Deploy.s.sol lines with commented-out setCredContract",
+        "vulnerable_pattern": "Critical dependency not initialized in deployment script",
+        "specific_concern": "credContract = address(0) causes revert on any external call to it",
+        "missing_safeguards": "No check in constructor/initialize that credContract is set; no zero-address fallback"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Is setCredContract called in a separate post-deployment step?",
+          "Could Cred.createCred revert during the initial buyShareCred if bonding curve fails?",
+          "Is there a FixedPriceBondingCurve that doesn't need credContract?"
+        ],
+        "validation_requirements": [
+          "Deploy without calling setCredContract and attempt a trade",
+          "Verify revert occurs in getPriceData"
+        ]
+      },
+      "preliminary_attack_scenario": "Not an attack per se, but a deployment failure: all share trading is non-functional until owner calls setCredContract. Any cred creation attempt reverts because the initial buyShareCred call fails.",
+      "prerequisites": [
+        "Deployment follows the commented-out script exactly"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete protocol DoS until configuration fix",
+        "affected_users": "All users attempting to create creds or trade shares",
+        "recovery_possibility": "Owner calls setCredContract to fix"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No integration test with actual deployment script sequence",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Immediate post-deployment",
+        "detection_analysis": "First trade attempt would reveal the issue"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H012",
+      "title": "Unbounded protocolFeePercent Can Make Sells Impossible Due to Underflow",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Cred.setProtocolFeePercent has no upper bound validation. The owner can set protocolFeePercent to any value, including >10000 (>100%). When combined with creator royalties (up to 50%), the sell payout formula (price - protocolFee - creatorFee) underflows, causing all sell transactions to revert and permanently trapping curator funds.",
+      "investigation_rationale": "In _handleTrade for sells: curator_.safeTransferETH(price - protocolFee - creatorFee). If protocolFee + creatorFee > price, this underflows and reverts (Solidity 0.8 checked arithmetic). Unlike setProtocolFee in PhiFactory (which has a 10_000 cap), Cred.setProtocolFeePercent has no cap.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setProtocolFeePercent",
+        "_handleTrade"
+      ],
+      "affected_contracts": [
+        "Cred.sol",
+        "BondingCurve.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Cred.sol",
+          "function": "setProtocolFeePercent"
+        },
+        {
+          "file": "Cred.sol",
+          "function": "_handleTrade"
+        },
+        {
+          "file": "BondingCurve.sol",
+          "function": "_getProtocolFee"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Cred.sol",
+        "lines": "148-151",
+        "pattern": "setProtocolFeePercent(uint256 protocolFeePercent_) external onlyOwner — no upper bound check"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner sets protocolFeePercent to a value where protocolFee + creatorFee > price",
+        "Curators hold shares they want to sell"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Cred.sol lines 148-151",
+        "vulnerable_pattern": "No require(protocolFeePercent_ <= MAX_FEE) check",
+        "specific_concern": "Compare with PhiFactory.setProtocolFee which has 'if (protocolFee_ > 10_000) revert'",
+        "missing_safeguards": "No upper bound validation"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "At what protocolFeePercent value do sells start reverting?",
+          "Can curator still sell via batch functions to bypass?",
+          "Is the owner a multisig that mitigates this risk?"
+        ],
+        "validation_requirements": [
+          "Set protocolFeePercent to 5000, combined with 5000 sellShareRoyalty, attempt sell",
+          "Verify underflow revert"
+        ]
+      },
+      "preliminary_attack_scenario": "1. Owner (compromised or malicious) sets protocolFeePercent to 6000 (60%). 2. Cred with sellShareRoyalty = 5000 (50%). 3. Total fees = 110% of price. 4. All sell transactions revert due to underflow. 5. All curator shares permanently locked.",
+      "prerequisites": [
+        "Compromised or malicious owner"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "All curator funds locked across all creds using the affected bonding curve",
+        "affected_users": "All curators across all creds",
+        "recovery_possibility": "Owner must lower protocolFeePercent to restore sells"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for extreme protocolFeePercent values",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Immediate effect on all trades",
+        "detection_analysis": "protocolFeePercent is a public variable"
+      }
+    }
+  ]
+}

@@ -1,0 +1,288 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T03:23:11.639Z",
+    "duration_ms": 471889
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Genesis.sol",
+        "description": "onGenesisSuccess is not a one-shot transition. FACTORY_ROLE can call it multiple times after the agent token is launched, overwriting claimableAgentTokens mappings for users. The second call bypasses token creation (isFirstLaunch is false) but re-processes distributions, allowing the operator to zero out or redirect legitimate user claims.",
+        "attack_scenario": "OPERATION_ROLE calls onGenesisSuccess once with correct distributions. Users don't claim immediately. OPERATION_ROLE calls onGenesisSuccess again with different distributeAgentTokenUserAddresses/Amounts, overwriting (not adding to) claimableAgentTokens. Original beneficiaries lose their claims while attacker-controlled addresses receive the tokens.",
+        "invariant_logic": "Once agentTokenAddress != address(0) AND claimableAgentTokens has been populated, onGenesisSuccess MUST NOT be callable again, OR claimableAgentTokens[user] must only increase, never be overwritten to a lower value.",
+        "solidity_property": "function invariant_successIsOneShot() public view { if (agentTokenAddress != address(0)) { /* assert onGenesisSuccess cannot be called again */ } }",
+        "inventory_refs": [
+          {
+            "file": "Genesis.sol",
+            "function": "onGenesisSuccess"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "FERC20.sol",
+        "description": "burnFrom and _burn do not decrease _totalSupply. After token burns, totalSupply() returns a stale inflated value. This breaks the accounting invariant that totalSupply == sum of all balances. Graduation in Bonding.sol uses _token.data.supply (set from original totalSupply) to determine agent token supply parameters, creating mismatched supply ratios.",
+        "attack_scenario": "During graduation, _openTradingOnUniswap calls executeBondingCurveApplication with _token.data.supply / decimals as totalSupply and tokenBalance / decimals as lpSupply. After burnFrom(pairAddress, tokenBalance), totalSupply remains unchanged, but the actual circulating supply is reduced. The agent token is created with inflated supply parameters, causing 1:1 unwrap mapping to be incorrect—users holding FERC20 receive agent tokens but total agent supply exceeds actual FERC20 in circulation.",
+        "invariant_logic": "After burnFrom(user, amount): _totalSupply_new == _totalSupply_old - amount AND sum(balances) == _totalSupply_new",
+        "solidity_property": "function invariant_totalSupplyConsistency() public view { /* assert totalSupply() == sum of all _balances */ }",
+        "inventory_refs": [
+          {
+            "file": "FERC20.sol",
+            "function": "burnFrom"
+          },
+          {
+            "file": "FERC20.sol",
+            "function": "_burn"
+          },
+          {
+            "file": "Bonding.sol",
+            "function": "_openTradingOnUniswap"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Bonding.sol",
+        "description": "unwrapToken is a public function with no access control. Anyone can force-burn FERC20 tokens from arbitrary user accounts and transfer agent tokens to those users from the pair, without user consent. Since Bonding is the owner of FERC20 (deployed via new), burnFrom(onlyOwner) succeeds when called from unwrapToken.",
+        "attack_scenario": "After graduation, a griefer or MEV bot calls unwrapToken with all holder addresses. Users who intended to hold FERC20 for any reason (or who hadn't yet set up to receive agent tokens) have their tokens forcefully converted. Combined with the totalSupply bug in FERC20, the 1:1 mapping may also be incorrect, causing users to receive wrong amounts.",
+        "invariant_logic": "Token conversion (burn + transfer) MUST require the affected user's consent OR be restricted to an authorized role. unwrapToken SHOULD have access control (onlyOwner or role check) or require msg.sender == acc for each account.",
+        "solidity_property": "function invariant_unwrapRequiresConsent() public { /* assert msg.sender == account || hasRole(EXECUTOR, msg.sender) for each account in unwrapToken */ }",
+        "inventory_refs": [
+          {
+            "file": "Bonding.sol",
+            "function": "unwrapToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AgentDAO.sol",
+        "description": "The state() override returns ProposalState.Succeeded when forVotes == getPastTotalSupply(snapshot). If total supply at the snapshot block is 0 (e.g., no tokens delegated yet), then forVotes(0) == totalSupply(0) is trivially true. Any Active proposal auto-succeeds. Combined with _tryAutoExecute, the proposal is immediately executed when the first For vote is cast (or even without any votes if state is queried).",
+        "attack_scenario": "An agent token is created but no tokens are delegated at the snapshot block. An attacker (or the ContributionNft admin who bypasses threshold) creates a proposal targeting the DAO's assets. Since getPastTotalSupply at snapshot is 0 and forVotes is 0, state() returns Succeeded. The attacker calls execute() to drain the DAO.",
+        "invariant_logic": "state(proposalId) == Succeeded IMPLIES forVotes > 0 AND getPastTotalSupply(proposalSnapshot(proposalId)) > 0",
+        "solidity_property": "function invariant_noVacuousSuccess(uint256 proposalId) public view { if (state(proposalId) == ProposalState.Succeeded) { (, uint256 forVotes, ) = proposalVotes(proposalId); assert(forVotes > 0); assert(token().getPastTotalSupply(proposalSnapshot(proposalId)) > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "AgentDAO.sol",
+            "function": "state"
+          },
+          {
+            "file": "AgentDAO.sol",
+            "function": "_tryAutoExecute"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Genesis.sol",
+        "description": "withdrawLeftAssetsAfterFinalized allows DEFAULT_ADMIN_ROLE to withdraw ANY ERC20 token from the Genesis contract after finalization, including the agent token. Since claimableAgentTokens are stored in the Genesis contract and users must separately call claimAgentToken, the admin can drain all unclaimed agent tokens before users claim them.",
+        "attack_scenario": "After onGenesisSuccess distributes claimable amounts, some users don't claim immediately. The admin (FGenesis factory, controlled by its admin) calls withdrawLeftAssetsAfterFinalized with token=agentTokenAddress, draining all remaining agent tokens. Users who call claimAgentToken afterward get reverts due to insufficient balance.",
+        "invariant_logic": "withdrawLeftAssetsAfterFinalized(token=agentTokenAddress) MUST NOT withdraw more than (IERC20(agentTokenAddress).balanceOf(this) - sum(claimableAgentTokens[all users])). Unclaimed user tokens must be protected.",
+        "solidity_property": "function invariant_unclaimedProtected() public view { uint256 totalUnclaimed = /* sum of claimableAgentTokens */; assert(IERC20(agentTokenAddress).balanceOf(address(this)) >= totalUnclaimed); }",
+        "inventory_refs": [
+          {
+            "file": "Genesis.sol",
+            "function": "withdrawLeftAssetsAfterFinalized"
+          },
+          {
+            "file": "Genesis.sol",
+            "function": "claimAgentToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Genesis.sol",
+        "description": "maxContributionVirtualAmount only limits per-transaction amount, not cumulative per-user contribution. A user can call participate() repeatedly, each time contributing up to maxContributionVirtualAmount, bypassing the intended cap. The check `virtualsAmt <= maxContributionVirtualAmount` is per-call, not per-user.",
+        "attack_scenario": "maxContributionVirtualAmount is set to 1000 VIRTUAL to ensure fair distribution. A whale calls participate(1, 1000) ten times, contributing 10,000 VIRTUAL total. They dominate the genesis event and receive a disproportionate share of agent tokens during distribution, undermining the cap's purpose.",
+        "invariant_logic": "For all users u: mapAddrToVirtuals[u] <= maxContributionVirtualAmount (if the intent is per-user cap), OR the function should check mapAddrToVirtuals[msg.sender] + virtualsAmt <= maxContributionVirtualAmount",
+        "solidity_property": "function invariant_perUserCap() public view { for (uint i = 0; i < participants.length; i++) { assert(mapAddrToVirtuals[participants[i]] <= maxContributionVirtualAmount); } }",
+        "inventory_refs": [
+          {
+            "file": "Genesis.sol",
+            "function": "participate"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "FGenesis.sol",
+        "description": "createGenesis has no access control—any address that pays the fee can create a Genesis contract. Each created Genesis is automatically granted BONDING_ROLE on AgentFactoryV3. While the Genesis contract functions are FACTORY_ROLE-gated, the unlimited granting of BONDING_ROLE to new contracts expands the attack surface on AgentFactoryV3 and could exhaust role management or enable unintended access if AgentFactoryV3 has additional BONDING_ROLE-gated functions.",
+        "attack_scenario": "An attacker creates many Genesis contracts via createGenesis, each receiving BONDING_ROLE on AgentFactoryV3. If any vulnerability exists in the Genesis contract initialization or if AgentFactoryV3 has other BONDING_ROLE-gated operations beyond initFromBondingCurve/executeBondingCurveApplication, the attacker can exploit them through the Genesis contracts. Additionally, BONDING_ROLE cannot be easily revoked for all created contracts.",
+        "invariant_logic": "createGenesis SHOULD be restricted to OPERATION_ROLE or ADMIN_ROLE. Alternatively, BONDING_ROLE grants should be minimized and revocable.",
+        "solidity_property": "function invariant_genesisCreationRestricted() public view { /* assert only authorized roles can call createGenesis */ }",
+        "inventory_refs": [
+          {
+            "file": "FGenesis.sol",
+            "function": "createGenesis"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "AgentDAO.sol",
+        "description": "getMaturity divides _proposalMaturities[proposalId] by forVotes without a zero-check. If forVotes is 0, the function reverts with a division by zero. This function is called by ServiceNft.mint to set maturity for new service NFTs, causing the mint to revert and bricking the contribution workflow for that proposal.",
+        "attack_scenario": "A proposal reaches Succeeded state through the early-execution path or edge case with 0 totalSupply. ServiceNft.mint is called, which calls getMaturity. Since forVotes is 0, the call reverts. The service NFT cannot be minted, permanently blocking the contribution from being registered.",
+        "invariant_logic": "getMaturity(proposalId) MUST NOT revert for any valid proposalId. If forVotes == 0, it should return 0 or a default value.",
+        "solidity_property": "function invariant_getMaturitySafe(uint256 proposalId) public view { /* should never revert */ uint256 m = getMaturity(proposalId); }",
+        "inventory_refs": [
+          {
+            "file": "AgentDAO.sol",
+            "function": "getMaturity"
+          },
+          {
+            "file": "ServiceNft.sol",
+            "function": "mint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Bonding.sol",
+        "description": "buy() and sell() in Bonding.sol lack nonReentrant modifiers at the Bonding contract level. While the router functions they call have nonReentrant, the Bonding state updates (tokenInfo data: price, marketCap, liquidity, volume) occur AFTER the external call to router. If the asset token triggers a callback (e.g., ERC777) that re-enters unwrapToken or another Bonding function, stale state is read.",
+        "attack_scenario": "During a buy(), router.buy() transfers asset tokens. If the asset token has transfer hooks, a callback could call Bonding.unwrapToken() for the same token. unwrapToken reads tokenInfo which hasn't been updated yet by the buy(). While the immediate impact is limited (unwrapToken doesn't depend on price/volume data), future code additions or state dependencies could create exploitable inconsistencies.",
+        "invariant_logic": "Bonding.buy() and Bonding.sell() MUST have nonReentrant modifiers or MUST perform state updates before external calls (checks-effects-interactions pattern).",
+        "solidity_property": "function invariant_bondingNonReentrant() public { /* buy and sell should not be re-enterable */ }",
+        "inventory_refs": [
+          {
+            "file": "Bonding.sol",
+            "function": "buy"
+          },
+          {
+            "file": "Bonding.sol",
+            "function": "sell"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "AgentTax.sol",
+        "description": "dcaSell calculates minOutput as (amountToSwap * (DENOM - slippage)) / DENOM, which assumes a 1:1 exchange rate between taxToken and assetToken. If the actual exchange rate differs significantly, the slippage protection is either too strict (causing all swaps to fail) or too loose (offering no MEV protection). The minOutput should be based on the oracle/router price quote, not the input amount.",
+        "attack_scenario": "If taxToken trades at 0.001 assetToken, a 1% slippage minOutput of 0.99 * amountToSwap is far above the expected output of 0.001 * amountToSwap. All dcaSell calls revert, permanently locking tax revenue. Conversely, if taxToken trades at 1000 assetToken, the minOutput is near 0 relative to actual output, allowing sandwich attacks to extract nearly all value.",
+        "invariant_logic": "minOutput SHOULD be calculated as (expectedOutput * (DENOM - slippage)) / DENOM where expectedOutput = router.getAmountsOut(amountToSwap, path)[1]",
+        "solidity_property": "function invariant_dcaSlippage(uint256 amountToSwap, uint256 slippage) public view { address[] memory path = new address[](2); path[0] = taxToken; path[1] = assetToken; uint256[] memory expected = router.getAmountsOut(amountToSwap, path); uint256 correctMin = (expected[1] * (DENOM - slippage)) / DENOM; /* assert minOutput == correctMin */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentTax.sol",
+            "function": "dcaSell"
+          },
+          {
+            "file": "AgentTax.sol",
+            "function": "_swapForAsset"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "Genesis.sol",
+        "description": "The Genesis lifecycle lacks a terminal success state flag. isFailed and isCancelled are terminal flags, but success (agentTokenAddress != address(0)) is not enforced as terminal. onGenesisSuccess can be called again after initial success because there is no 'isSucceeded' flag or equivalent guard preventing re-entry into the success path. The mutual exclusion between success and failure paths depends only on refundUserCountForFailed == 0.",
+        "attack_scenario": "After a legitimate onGenesisSuccess call that distributes tokens fairly, the OPERATION_ROLE operator calls onGenesisSuccess again with a different distribution, redirecting remaining agent tokens in the contract (including unclaimed ones) to addresses they control. The second call passes all checks: whenNotCancelled (true), whenNotFailed (true), refundUserCountForFailed == 0 (true since no failure was triggered).",
+        "invariant_logic": "Genesis state transitions MUST be: {NotStarted} -> {Active} -> {Ended} -> EXACTLY ONE OF {Succeeded, Failed, Cancelled}. Once Succeeded, no further calls to onGenesisSuccess should be possible. Formally: if agentTokenAddress != address(0) AND claimableAgentTokens has been populated, onGenesisSuccess MUST revert.",
+        "solidity_property": "function invariant_successIsTerminal() public view { /* once agentTokenAddress != 0 and distributions set, onGenesisSuccess must not be callable */ }",
+        "inventory_refs": [
+          {
+            "file": "Genesis.sol",
+            "function": "onGenesisSuccess"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "GovernorCountingSimpleUpgradeable.sol",
+        "description": "The Deliberate vote type (support=3) returns from _countVote without setting hasVoted[account]=true. This means a user can cast a Deliberate vote (emitting VoteCast event with their weight) and then subsequently cast an actual vote (For/Against/Abstain). While the on-chain state is correct (only the real vote counts), the emitted VoteCast event for Deliberate misleads off-chain indexers into counting votes that didn't actually land, and the user's voting weight is revealed before their real vote.",
+        "attack_scenario": "In a contentious proposal, a large holder votes Deliberate to signal participation, then observes other votes before casting their real vote (strategic voting). Off-chain governance dashboards show double-counted events. Additionally, the Governor emits VoteCastWithParams for both calls, creating confusing audit trails.",
+        "invariant_logic": "For all proposals p and accounts a: if _countVote was called with Deliberate, hasVoted(p, a) MUST remain false AND no weight should be attributed to the voter in off-chain systems. Alternatively, Deliberate SHOULD set hasVoted to prevent subsequent re-voting.",
+        "solidity_property": "function invariant_deliberateNoReVote(uint256 proposalId, address account) public view { /* after any _castVote call, hasVoted should be true to prevent re-voting */ }",
+        "inventory_refs": [
+          {
+            "file": "GovernorCountingSimpleUpgradeable.sol",
+            "function": "_countVote"
+          },
+          {
+            "file": "GovernorCountingSimple.sol",
+            "function": "_countVote"
+          },
+          {
+            "file": "AgentDAO.sol",
+            "function": "_castVote"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Bonding.sol",
+        "description": "The bonding curve graduation in _openTradingOnUniswap is triggered inside buy() when newReserveA <= gradThreshold. The graduation process transfers all pair assets to agentFactory, creates an agent token, and burns FERC20 from the pair. But buy() updates tokenInfo.data (price, marketCap, etc.) AFTER the graduation call. The data written reflects pre-graduation reserves, creating permanently stale metadata for the graduated token.",
+        "attack_scenario": "A buy triggers graduation. The _openTradingOnUniswap function sets trading=false and tradingOnUniswap=true. Control returns to buy() which then writes stale price/marketCap/liquidity data over the token info. Any system reading tokenInfo after graduation gets incorrect data. While trading is disabled so no further trades occur, the metadata is permanently wrong.",
+        "invariant_logic": "If _openTradingOnUniswap is triggered during buy(), the post-graduation state updates in buy() SHOULD either be skipped or reflect post-graduation reality. tokenInfo[token].trading == false IMPLIES no further data updates should occur.",
+        "solidity_property": "function invariant_noStaleDataAfterGrad(address token) public view { if (tokenInfo[token].tradingOnUniswap) { /* data should reflect final state, not mid-buy state */ } }",
+        "inventory_refs": [
+          {
+            "file": "Bonding.sol",
+            "function": "buy"
+          },
+          {
+            "file": "Bonding.sol",
+            "function": "_openTradingOnUniswap"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "ContributionNft.sol",
+        "description": "ContributionNft.mint only checks that msg.sender == personaDAO.proposalProposer(proposalId). It does NOT verify the proposal has succeeded or is in any particular state. A proposer can mint a ContributionNft for their proposal regardless of whether it passed, failed, or is still active. The isAccepted() view function exists but is not enforced in mint().",
+        "attack_scenario": "A contributor proposes a malicious model update. The proposal is voted down (Defeated). The proposer still calls mint() to create a ContributionNft, since only proposalProposer is checked. While ServiceNft.mint requires DAO execution, the ContributionNft itself exists on-chain representing a rejected contribution, polluting the contribution tree and parent-child relationships.",
+        "invariant_logic": "ContributionNft.mint(proposalId) MUST require isAccepted(proposalId) == true, i.e., the proposal must have succeeded before a contribution NFT can be minted.",
+        "solidity_property": "function invariant_onlyAcceptedContributions(uint256 proposalId) public view { if (_ownerOf(proposalId) != address(0)) { assert(isAccepted(proposalId)); } }",
+        "inventory_refs": [
+          {
+            "file": "ContributionNft.sol",
+            "function": "mint"
+          },
+          {
+            "file": "ContributionNft.sol",
+            "function": "isAccepted"
+          }
+        ]
+      }
+    ]
+  }
+}

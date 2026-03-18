@@ -1,0 +1,322 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Missing Authorization in updateOrder Allows Any User to Modify Any Active Order",
+      "severity": "high",
+      "summary": "The updateOrder function in MarginTradingHook does not verify that the order being modified belongs to the caller's position. Unlike cancelOrder which checks `order.initPosId == initPosId`, updateOrder only verifies the caller has any valid position and sufficient collateral. An attacker can modify any victim's active order parameters (triggerPrice, limitPrice, tokenOut, collAmt) and then fill the modified order to steal the victim's collateral.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 330,
+          "line_end": 354,
+          "desc": "cancelOrder has `_require(order.initPosId == initPosId, Errors.INVALID_INPUT)` at line ~248 but updateOrder at line ~330 omits this check entirely while modifying order storage"
+        }
+      ],
+      "impact": "CRITICAL. Any user with active stop-loss or take-profit orders can have their collateral stolen. The attacker can systematically target all active orders. The collateral is transferred via decollateralize to the attacker with no recovery mechanism. The only cost to the attacker is: (a) creating a minimal position, (b) paying the proportional debt repayment (which is offset by the collateral value received), and (c) paying a small amtOut in tokenOut to the victim.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Swapped Return Values in _calculateRepaySize Break All Order Fills After Interest Accrual",
+      "severity": "high",
+      "summary": "The _calculateRepaySize function returns (uint repayAmt, uint repayShares) but _calculateFillOrderInfo destructures the return as (repayShares, repayAmt), swapping debt shares and token amounts. After any interest accrues (shares ≠ amounts), fillOrder attempts to repay using the token amount as share count (too high), causing reverts. This creates a permanent DoS on all order fills for pools with accrued interest.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 370,
+          "line_end": 397,
+          "desc": "_calculateRepaySize returns `(uint repayAmt, uint repayShares)` at lines 413-425; call site at line 377 destructures as `(repayShares, repayAmt) = _calculateRepaySize(...)` — positions are swapped"
+        }
+      ],
+      "impact": "CRITICAL: All margin trading orders (stop-loss and take-profit) are broken after any interest accrual. This means: (1) Stop-loss orders cannot execute, exposing users to unlimited downside risk. (2) Take-profit orders cannot execute, preventing users from realizing gains. (3) The amtOut calculation is also wrong (uses shares instead of amount for repayAmt), so even if the revert didn't occur, the economic outcomes would be incorrect. (4) This affects ALL users with active margin orders across ALL pools where interest has accrued. (5) Requires a contract upgrade to fix.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "fillOrder Auto-Cancel Only Modifies Memory Copy, Order Remains Active in Storage",
+      "severity": "high",
+      "summary": "In fillOrder, when position collateral is 0, the function loads the order into memory (`Order memory order = __orders[_orderId]`), sets the memory copy's status to Cancelled, emits CancelOrder event, and returns. However, `__orders[_orderId]` in storage remains Active. The order can be repeatedly called (wasting executor gas) and if collateral is later re-added, the stale order becomes fillable with outdated parameters.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 259,
+          "line_end": 284,
+          "desc": "Line 259: `Order memory order = __orders[_orderId]`; Line 268: `order.status = OrderStatus.Cancelled` modifies memory only; Line 269: `return` exits before storage write at line 283"
+        }
+      ],
+      "impact": "HIGH severity. The order lifecycle state machine is broken: an order that should be Cancelled remains Active. This has two concrete impacts: (1) Gas griefing: anyone can repeatedly call fillOrder on the same orderId, each time entering the auto-cancel path, emitting spurious events, and wasting gas without the order ever being cancelled. (2) Stale order execution: if the user re-adds collateral, the order becomes fillable with outdated trigger/limit prices, potentially causing the user to lose collateral at unfavorable terms. Combined with the separately identified updateOrder missing authorization bug (INV-ACCESS-001), an attacker could modify and then fill these zombie orders.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "reducePos Missing Position Existence Check Unlike Other Position Operations",
+      "severity": "high",
+      "summary": "The reducePos function does not check `_require(initPosId != 0, Errors.POSITION_NOT_FOUND)` unlike openPos, increasePos, addCollateral, removeCollateral, and repayDebt which all perform this check. When called with a non-existent posId, initPosId defaults to 0, causing _reducePosInternal to read __marginPositions[0] (all zero values). Subsequent calls to ILendingPool(address(0)) and other zero-address contracts produce unclear reverts.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 186,
+          "line_end": 204,
+          "desc": "reducePos line 195: `uint initPosId = initPosIds[msg.sender][_posId]` without subsequent `_require(initPosId != 0)` check; compare with increasePos line 109, addCollateral line 144, removeCollateral line 159, repayDebt line 172"
+        }
+      ],
+      "impact": "LOW severity code defect. The missing check causes: (1) Inconsistent error messages that make debugging harder for users and integrators, (2) Slightly higher gas consumption before revert compared to an early check, (3) No security exploitation possible since the function always reverts for invalid inputs. No funds are at risk.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "WLpMoeMasterChef.getPendingRewards can revert/divide-by-zero when lpSupply==0, blocking dependent state-changing flows that rely on it",
+      "severity": "high",
+      "summary": "getPendingRewards() computes `moeRewards[0] * 1e18 / lpSupply` and `extraRewards[0] * 1e18 / lpSupply` without guarding lpSupply==0. While getPendingRewards is view, if any state-changing path (on-chain keepers, liquidation valuation, collateral checks, or hook UIs embedded on-chain) depends on it and bubbles the revert, it can block operations for pids with zero deposits.",
+      "description": [
+        {
+          "file": "WLpMoeMasterChef.sol",
+          "line_start": 193,
+          "line_end": 236,
+          "desc": "computes `... / lpSupply` without checking lpSupply!=0"
+        }
+      ],
+      "impact": "As a view function, the direct on-chain impact depends on whether external contracts call it in state-changing transactions (not shown in provided code). However, the code is objectively defective - it will revert for a valid state that the developer explicitly handled in the parallel updateRewards modifier. Off-chain impact includes broken UIs and indexers that query pending rewards. If any future integration relies on this function on-chain (e.g., for reward claiming helpers, dashboards, or liquidation valuation), it would cause DoS.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "LendingPool.decimals can revert for non-standard underlying tokens, cascading into share accounting failures",
+      "severity": "high",
+      "summary": "LendingPool.decimals() calls IERC20Metadata(underlyingToken).decimals() and adds VIRTUAL_SHARE_DECIMALS. If underlyingToken does not implement decimals() or reverts, then any on-chain consumer querying pool decimals (including other contracts, DEXes, or collateral/oracle adapters) may revert. While not directly used in core arithmetic here, it can break integrations and potentially collateral valuation paths if decimals are queried on-chain elsewhere.",
+      "description": [
+        {
+          "file": "LendingPool.sol",
+          "line_start": 61,
+          "line_end": 63,
+          "desc": "IERC20Metadata(underlyingToken).decimals() external call without try/catch or validation"
+        }
+      ],
+      "impact": "MEDIUM impact. The core protocol accounting is unaffected since _toShares/_toAmt don't use decimals(). However, the LendingPool share token becomes non-ERC20-compliant, breaking: (1) third-party integrations querying decimals(), (2) oracle price calculations in Api3OracleReader, (3) any composability with DEXes or other DeFi protocols. The practical likelihood is reduced because the protocol's own oracle also requires decimals(), creating a natural constraint on supported tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "CloseExactOut Strict Equality Check Enables 1-Wei Griefing DoS on reducePos",
+      "severity": "high",
+      "summary": "In coreCallback's CloseExactOut path, a strict equality check `_require(IERC20(swapInfo.tokenOut).balanceOf(address(this)) == swapInfo.amtOut, Errors.SLIPPAGE_CONTROL)` is used. An attacker can front-run any reducePos transaction by sending 1 wei of the borrow token (tokenOut) to the MarginTradingHook contract, causing the balance to be swapInfo.amtOut + 1, failing the equality check and reverting the user's transaction.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 319,
+          "line_end": 332,
+          "desc": "Line 328: '_require(IERC20(swapInfo.tokenOut).balanceOf(address(this)) == swapInfo.amtOut, Errors.SLIPPAGE_CONTROL)' uses == instead of >=. Any dust token deposit breaks this equality."
+        }
+      ],
+      "impact": "HIGH severity DoS. Users cannot close margin positions via CloseExactOut during adverse market conditions. This could force users into liquidation if they cannot reduce their positions. The attack cost is negligible (1 wei of borrToken per persistent DoS). Users can only work around this by using CloseExactIn (tokenOut = borrToken) instead, which changes the trade semantics and may not be desirable. The attacker could profit indirectly by being the liquidator of stuck positions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "MoneyMarketHook Leftover WNATIVE/ETH Sweepable by Any Caller",
+      "severity": "high",
+      "summary": "The MoneyMarketHook.execute function's returnNative path sweeps ALL WETH balance and ALL ETH balance to msg.sender. If any prior transaction left WETH or ETH in the hook (e.g., user overpaid msg.value during repay, or borrow output with returnNative=false), a subsequent caller can steal these funds by calling execute with empty params and returnNative=true.",
+      "description": [
+        {
+          "file": "MoneyMarketHook.sol",
+          "line_start": 72,
+          "line_end": 80,
+          "desc": "Lines 74-79: returnNative sweeps ALL WETH balance and ALL native balance to msg.sender without tracking how much the current tx contributed"
+        }
+      ],
+      "impact": "MEDIUM severity. The vulnerability requires a specific user error (overpaying msg.value with returnNative=false), but the code provides no protection against it and actively enables theft by any third party. The amount at risk per incident equals the overpayment amount. On a chain with a public mempool (like Mantle), MEV bots can automate this extraction. Over time, cumulative losses could be significant.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Underwater Positions (health=0) Cannot Be Liquidated Due to Zero Incentive Multiplier",
+      "severity": "high",
+      "summary": "LiqIncentiveCalculator.getLiqIncentiveMultiplier_e18 returns 0 when health factor is exactly 0. In InitCore.liquidate, this causes repayAmtWithLiqIncentive = repayAmt * 0 / 1e18 = 0, meaning the liquidator repays debt but receives 0 collateral. No rational liquidator will execute this, causing permanent bad debt accumulation. The health==0 bypass of post-liquidation health check further confirms the special-case handling, but without incentive, positions with health=0 are economically un-liquida",
+      "description": [
+        {
+          "file": "LiqIncentiveCalculator.sol",
+          "line_start": 36,
+          "line_end": 37,
+          "desc": "Line 37: 'if (_healthFactor_e18 == 0) return 0;' — returns multiplier of 0, making collateral seizure = 0 in liquidation"
+        },
+        {
+          "file": "InitCore.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: liquidate"
+        }
+      ],
+      "impact": "HIGH severity. Positions with health==0 accumulate as permanent bad debt. While health reaching exactly 0 may be an edge case, it is a plausible scenario (governance reducing collFactor, severe price crashes). The impact compounds over time as these positions can never be cleared. All lenders in affected pools bear the loss. The code clearly has a logical error - the most underwater positions should have the HIGHEST liquidation incentive, not zero.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Oracle Deviation Default of 0 Creates DoS When Secondary Source Is Configured",
+      "severity": "high",
+      "summary": "In InitOracle.getPrice_e36, when both primary and secondary sources return valid prices, a deviation check is performed: (maxPrice * 1e18) / minPrice <= maxPriceDeviations_e18[token]. If maxPriceDeviations_e18 is not set (defaults to 0), this check always fails since any valid price ratio exceeds 0. This means configuring a secondary oracle source without also setting maxPriceDeviation bricks the oracle for that token, blocking all operations including liquidations.",
+      "description": [
+        {
+          "file": "InitOracle.sol",
+          "line_start": 64,
+          "line_end": 71,
+          "desc": "Line 70: '_require((maxPrice_e36 * ONE_E18) / minPrice_e36 <= maxPriceDeviations_e18[_token], ...)' — left side always >= 1e18, right side = 0 when unset → always reverts"
+        }
+      ],
+      "impact": "MEDIUM-HIGH. If triggered, the impact is a complete DoS for all operations involving the affected token. Liquidations are blocked, which can lead to bad debt accumulation during market volatility. The fix requires another governor transaction to set maxPriceDeviations_e18. Duration depends on governance response time. The defect is in the code design - lacking either a safe default, a coupled setter, or a conditional check that gracefully handles unset deviations.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Incompatibility with Fee-on-Transfer Tokens Prevents Debt Repayment",
+      "severity": "high",
+      "summary": "The LendingPool's repay function strictly checks that the increase in token balance matches the calculated repayment amount, which fails for fee-on-transfer tokens.",
+      "description": [
+        {
+          "file": "LendingPool.sol",
+          "line_start": 118,
+          "line_end": 118,
+          "desc": "Strict balance difference check"
+        }
+      ],
+      "impact": "If a FOT token is deployed as a borrowable asset: (1) All borrowers of that token permanently lose the ability to repay, (2) Their debt grows continuously due to interest accrual, (3) They will eventually be liquidated unfairly, losing collateral, (4) The protocol accumulates bad debt if positions become underwater before liquidation. The severity depends on whether FOT tokens are actually configured - the code defect is real regardless.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "coreCallback Sweeps Entire ERC20 Balance Allowing Theft of Stuck Tokens",
+      "severity": "high",
+      "summary": "In `MarginTradingHook.coreCallback`, the contract transfers its entire balance of `tokenIn` to the swap helper (`uint amtIn = IERC20(swapInfo.tokenIn).balanceOf(address(this))`). An attacker can steal any stuck ERC20 tokens in the hook by initiating a margin position that uses the stuck token as `tokenIn`.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 321,
+          "line_end": 322,
+          "desc": "`uint amtIn = IERC20(swapInfo.tokenIn).balanceOf(address(this)); IERC20(swapInfo.tokenIn).safeTransfer(swapHelper, amtIn);`"
+        }
+      ],
+      "impact": "Any ERC20 tokens that end up in the MarginTradingHook contract—whether from accidental transfers, fee-on-transfer token dust, or other sources—can be stolen by any user who opens or increases a margin position using that token as the borrow token. The severity is HIGH because the loss is 100% of stuck tokens with minimal attacker capital required. The attack is simple, single-block, and requires only standard gas costs.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "MoneyMarketHook._handleDeposit Double msg.value Consumption Causes Transaction Revert DoS",
+      "severity": "high",
+      "summary": "When a user submits an execute() call with two DepositParams both targeting WNATIVE pools, _handleDeposit processes them sequentially. The first iteration calls IWNative(WNATIVE).deposit{value: msg.value}() consuming all ETH. The second iteration attempts the same call with the same msg.value amount but the contract has zero ETH remaining, causing an unconditional revert. This is a code defect: msg.value is immutable within a call frame but the ETH balance is already spent.",
+      "description": [
+        {
+          "file": "MoneyMarketHook.sol",
+          "line_start": 218,
+          "line_end": 231,
+          "desc": "IWNative(WNATIVE).deposit{value: msg.value}() called inside a loop over _params without tracking remaining ETH balance"
+        }
+      ],
+      "impact": "Medium severity. Users attempting multi-pool WNATIVE deposits or combined WNATIVE repay+deposit operations via MoneyMarketHook will have their transactions revert. The impact is wasted gas costs and failed transactions. Users must split operations into separate transactions, reducing the atomicity benefit of the multicall pattern. No funds are at risk, but the UX degradation and gas waste are real.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "WLpMoeMasterChef Reward Accounting Underflow When Extra Reward Token Equals LP Token",
+      "severity": "high",
+      "summary": "In the updateRewards modifier, balance deltas are computed as (balanceAfter - rewardBefore). During a deposit via _depositToMasterChef, LP tokens are transferred to MasterChef, reducing the LP balance. If the extraRewardToken returned by MasterChef happens to be the same as the LP token, the rewardBeforeAmts captures the LP balance INCLUDING the LP being deposited. After the deposit body executes, the LP balance drops (tokens sent to MasterChef). The subtraction (balanceAfter - rewardBefore) und",
+      "description": [
+        {
+          "file": "WLpMoeMasterChef.sol",
+          "line_start": 88,
+          "line_end": 95,
+          "desc": "_pidAccRewardPerShares_e18[i] += ((IERC20(rewardToken).balanceOf(address(this)) - rewardBeforeAmts[i]) * ONE_E18) / lpSupply — underflows if balance decreased"
+        }
+      ],
+      "impact": "HIGH severity. All wrap/unwrap/harvest operations for the affected pid are permanently DoSed. Existing wrapped LP positions cannot be unwrapped, locking user funds indefinitely. If WLp tokens are used as collateral in InitCore positions, users cannot close their positions properly. Recovery requires MasterChef governance to change the extraRewarder for the affected pid.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "WLpMoeMasterChef Reward Loss When First Wrapping with lpSupply Zero",
+      "severity": "high",
+      "summary": "In WLpMoeMasterChef's updateRewards modifier, when lpSupply == 0 (no LP deposited yet), the pidAccRewardPerShares_e18 is not incremented even if rewards are distributed during the MasterChef deposit call. Any rewards distributed by MasterChef during the first deposit are permanently lost since they cannot be attributed to any LP holder.",
+      "description": [
+        {
+          "file": "WLpMoeMasterChef.sol",
+          "line_start": 58,
+          "line_end": 78,
+          "desc": "updateRewards modifier: line 62 `lpSupply = IMasterChef(MASTER_CHEF).getDeposit(pid, address(this))` (0 before first wrap); post-body line 71: `if (lpSupply != 0)` — false for first deposit, reward increment skipped"
+        }
+      ],
+      "impact": "LOW impact. While the code pattern IS a defect (failing to handle the edge case of rewards arriving when lpSupply == 0), the practical impact is minimal:\n\n1. Standard MasterChef sends 0 rewards on first deposit → no actual loss\n2. Even if loss occurred, it would be a one-time event per pid (only on first deposit when lpSupply transitions from 0 to non-zero)\n3. The amount at risk would be limited to whatever rewards MasterChef sends during a single deposit call\n4. Stranded rewards are permanently locked, not exploitable for profit by other users\n5. No direct financial attack vector exists because the attacker cannot force MasterChef to distribute rewards when lpSupply is 0",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Multiple Orders Over-Commit Collateral Leading to Unexpected Proportional Scaling",
+      "severity": "high",
+      "summary": "When creating orders via _createOrder, individual order collAmt is checked against current position collateral, but the aggregate collAmt across all active orders for a position is never validated. A user can create multiple orders whose total collAmt exceeds their actual collateral. When orders are filled sequentially, _calculateRepaySize scales down later orders proportionally, but the effective execution price diverges from the user's intended limitPrice, potentially resulting in economic los",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 339,
+          "line_end": 346,
+          "desc": "Line 345: '_require(_collAmt <= collAmt, Errors.INPUT_TOO_HIGH)' checks individual order vs total collateral. No aggregate check across __posOrderIds[initPosId]. _calculateRepaySize at line 438: 'if (_order.collAmt > totalCollAmt) _order.collAmt = totalCollAmt' silently scales down."
+        }
+      ],
+      "impact": "MEDIUM severity. The defect is a missing aggregate validation that allows over-commitment of collateral across orders. Impact: (1) Users' orders execute for significantly less than intended size, (2) Risk management strategies (stop-loss) may fail to protect the intended portion, (3) The scaling is silent with no revert or notification. Mitigating factors: (1) The limitPrice economics per unit are still maintained, (2) The system handles the edge case gracefully rather than reverting or losing funds, (3) Users who understand the system can manage overlapping orders manually.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Front-running collateralize Allows Theft of Orphaned Deposits",
+      "severity": "high",
+      "summary": "The `addCollateral` function in `PosManager` calculates `amtIn` based on the difference between the current token balance and the cached `__collBalances`. If a user transfers tokens to the `PosManager` and calls `InitCore.collateralize` in separate transactions (rather than atomically via multicall), an attacker can front-run the `collateralize` call with their own, claiming the user's tokens for their own position.",
+      "description": [
+        {
+          "file": "PosManager.sol",
+          "line_start": 164,
+          "line_end": 166,
+          "desc": "uint newBalance = IERC20(_pool).balanceOf(address(this)); amtIn = newBalance - __collBalances[_pool];"
+        },
+        {
+          "file": "InitCore.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: collateralize"
+        }
+      ],
+      "impact": "HIGH - Complete loss of deposited tokens for any user who performs mintTo and collateralize in separate transactions. While the protocol provides multicall and hooks for atomic execution, the underlying functions are public and unprotected. This is especially dangerous because: (1) The functions appear safe to call individually, (2) There's no on-chain mechanism preventing split-transaction usage, (3) The attacker needs only gas to execute the attack, (4) 100% of orphaned deposits can be stolen.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Unprotected swap-helper initialization enables malicious swap execution and fund diversion",
+      "severity": "high",
+      "summary": "MarginTradingHook.initialize() is publicly callable (no role check). A first caller can set swapHelper to an attacker-controlled contract. Subsequent openPos/increasePos/reducePos operations transfer all tokenIn to swapHelper and rely on it to perform swaps, enabling theft or forced bad swaps.",
+      "description": [
+        {
+          "file": "MarginTradingHook.sol",
+          "line_start": 45,
+          "line_end": 60,
+          "desc": "function initialize(address _swapHelper) external initializer { swapHelper = _swapHelper; } (no onlyGovernor/onlyGuardian); coreCallback transfers ALL tokenIn balance to swapHelper then calls swapHelper.swap(...)"
+        }
+      ],
+      "impact": "CRITICAL if exploited. All margin trading operations (openPos, increasePos, reducePos) route swap tokens through swapHelper via coreCallback. A malicious swapHelper receives all tokenIn balances and can steal them. Since swapHelper cannot be changed post-initialization, recovery requires a proxy upgrade. The missing _disableInitializers() is a standalone code defect even if the proxy initialization is atomic.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

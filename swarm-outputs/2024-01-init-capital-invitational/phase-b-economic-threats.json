@@ -1,0 +1,964 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "MarginTradingHook.sol",
+      "InitCore.sol",
+      "PosManager.sol",
+      "WLpMoeMasterChef.sol",
+      "MoneyMarketHook.sol",
+      "LendingPool.sol",
+      "Config.sol",
+      "InitOracle.sol",
+      "LiqIncentiveCalculator.sol",
+      "InitErrors.sol",
+      "RiskManager.sol",
+      "Api3OracleReader.sol",
+      "MoeSwapHelper.sol",
+      "DoubleSlopeIRM.sol",
+      "Multicall.sol",
+      "mUSDUSDYHelper.sol",
+      "BaseMappingIdHook.sol",
+      "BaseRebaseHelper.sol",
+      "TransparentUpgradeableProxyReceiveETH.sol",
+      "AccessControlManager.sol",
+      "UncheckedIncrement.sol",
+      "UnderACM.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T05:43:48.847Z",
+    "duration_ms": 502839
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "Missing Authorization in updateOrder Enables Cross-Position Order Hijacking",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The updateOrder function fails to verify that the order belongs to the caller's position. Unlike cancelOrder which checks `order.initPosId == initPosId`, updateOrder only verifies the caller has any valid position. An attacker with any margin position can modify any other user's active order parameters (triggerPrice, limitPrice, tokenOut, collAmt), then fill the manipulated order to steal the victim's collateral.",
+      "investigation_rationale": "This is a clear missing authorization check visible in the code. cancelOrder has the check; updateOrder does not. Combined with fillOrder's ability for anyone to execute orders, this creates a direct fund extraction path.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "updateOrder",
+        "fillOrder",
+        "cancelOrder",
+        "_createOrder"
+      ],
+      "affected_contracts": [
+        "MarginTradingHook.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "updateOrder"
+        },
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "cancelOrder"
+        },
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "fillOrder"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarginTradingHook.sol",
+        "lines": "353-379",
+        "pattern": "updateOrder loads order from __orders[_orderId] and checks initPosId != 0 for caller's position, but NEVER checks order.initPosId == initPosId. Compare to cancelOrder at lines 268-275 which includes _require(order.initPosId == initPosId, Errors.INVALID_INPUT)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Victim has at least one active stop-loss or take-profit order",
+        "Attacker has any valid margin position with non-zero collateral",
+        "Attacker has sufficient borrow tokens and desired tokenOut to fill order"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "updateOrder modifies order.limitPrice_e36 and order.tokenOut without authorization, directly affecting amtOut in _calculateFillOrderInfo",
+        "manipulation_vector": "Attacker sets limitPrice_e36 to maximize their profit: for long positions, set limitPrice extremely low so amtOut approaches 0; set tokenOut to a low-value token",
+        "profit_hypothesis": "Profit = victim's collateral value - debt repaid - cost of amtOut tokens sent to victim. With manipulated limitPrice, amtOut approaches 0, so profit approaches (collateral - debt)"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the exact profit formula given specific limitPrice manipulation?",
+          "Can the attacker set tokenOut to a worthless/cheap ERC20 to minimize costs?",
+          "Are there positions with active orders in production to target?"
+        ],
+        "validation_requirements": [
+          "Construct PoC: create attacker position, call updateOrder with victim's orderId, fill modified order",
+          "Verify collateral transfer to attacker after filling manipulated order",
+          "Calculate net extraction accounting for debt repayment costs"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Sufficient borrToken to repay victim's proportional debt + minimal tokenOut tokens",
+        "estimated_execution_cost": "~0.01 ETH gas on Mantle for 3 transactions",
+        "potential_profit_range": "Up to 100% of victim's net position value (collateral - debt) per order",
+        "estimated_profit_margin": "Near-total extraction of victim's equity",
+        "attack_duration": "2-3 blocks (updateOrder + fillOrder)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Attacker needs borrTokens equal to proportional debt repayment",
+        "optimal_timing": "Any time victim has active orders",
+        "market_impact_assessment": "No market impact required - pure access control exploit"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with active stop-loss or take-profit orders",
+        "estimated_impact_per_user": "Up to 100% of position equity per order",
+        "total_value_at_risk": "All margin position equity with active orders"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Compare cancelOrder auth check vs updateOrder lack thereof",
+        "calculation_validation": "Trace amtOut computation with manipulated limitPrice_e36",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "Swapped Return Values in _calculateRepaySize Permanently DoS Order Filling",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "_calculateRepaySize returns (uint repayAmt, uint repayShares) but _calculateFillOrderInfo destructures the result as (repayShares, repayAmt), swapping the values. When interest accrues and shares diverge from amounts, fillOrder transfers insufficient borrow tokens (shares-count instead of amount) then attempts to repay excessive shares (amount instead of shares-count). The core repay function then tries to transferFrom more tokens than the hook holds, causing a revert. All order filling is permanently broken once interest accrues.",
+      "investigation_rationale": "This is a verifiable code defect: the named return parameters in _calculateRepaySize define the return order as (repayAmt, repayShares), but the destructuring at the call site reverses them.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_calculateFillOrderInfo",
+        "_calculateRepaySize",
+        "fillOrder"
+      ],
+      "affected_contracts": [
+        "MarginTradingHook.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "_calculateFillOrderInfo"
+        },
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "_calculateRepaySize"
+        },
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "fillOrder"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarginTradingHook.sol",
+        "lines": "381-393 and 434-444",
+        "pattern": "_calculateRepaySize at line 434 declares 'returns (uint repayAmt, uint repayShares)' but _calculateFillOrderInfo at line 386 destructures as '(repayShares, repayAmt) = _calculateRepaySize(...)' — first return (repayAmt) assigned to local repayShares, second return (repayShares) assigned to local repayAmt"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Any margin position with active orders",
+        "Interest has accrued on the borrow pool (shares != amount)",
+        "Executor attempts to fill any order"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Local repayAmt = actual_shares (smaller), local repayShares = actual_amount (larger). Executor pays shares-worth of tokens but core.repay expects amount-worth of tokens from hook.",
+        "manipulation_vector": "Not an attack per se but a code defect causing systematic failure",
+        "profit_hypothesis": "No direct profit extraction, but ALL stop-loss and take-profit orders become unfillable, exposing users to unlimited downside risk"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "After what amount of interest accrual does the swap become significant enough to cause revert?",
+          "What is the total value of orders that become permanently unfillable?",
+          "Can users' positions be liquidated because stop-losses don't execute?"
+        ],
+        "validation_requirements": [
+          "Deploy test scenario with accrued interest and attempt to fill order",
+          "Verify revert occurs at the safeTransferFrom in core._repay",
+          "Calculate threshold interest accrual where shares diverge enough"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - this is a systematic bug, not an attack",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Indirect loss: users' stop-losses fail, positions can be liquidated",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent once interest accrues"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Manifests automatically as interest accrues",
+        "market_impact_assessment": "Complete failure of order execution system"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with active stop-loss/take-profit orders",
+        "estimated_impact_per_user": "Full position loss if stop-loss fails to execute during market downturn",
+        "total_value_at_risk": "All margin positions relying on stop-loss protection"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Trace return value ordering between _calculateRepaySize and _calculateFillOrderInfo",
+        "calculation_validation": "Simulate fillOrder with shares-to-amount ratio > 1:1",
+        "execution_complexity": "N/A - automatic failure",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "fillOrder Memory-Only Cancel Leaves Order Permanently Active in Storage",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In fillOrder, when position collateral is 0, the function loads the order into memory (Order memory order = __orders[_orderId]) and sets the memory copy's status to Cancelled. However, the storage __orders[_orderId] is never updated. The order remains Active in storage. If collateral is later re-added to the position, the order can still be filled. Events misleadingly report cancellation, creating a discrepancy between on-chain state and off-chain tracking.",
+      "investigation_rationale": "The variable is declared as 'Order memory order' at the function entry, and 'order.status = OrderStatus.Cancelled' modifies memory only. Storage at __orders[_orderId] is only written at the end: '__orders[_orderId].status = OrderStatus.Filled'.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "fillOrder"
+      ],
+      "affected_contracts": [
+        "MarginTradingHook.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "fillOrder"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarginTradingHook.sol",
+        "lines": "277-306",
+        "pattern": "Line 278: 'Order memory order = __orders[_orderId]' copies to memory. Line 286: 'order.status = OrderStatus.Cancelled' modifies memory only. Line 305: '__orders[_orderId].status = OrderStatus.Filled' is the only storage write, but only reached on successful fill path, not the auto-cancel path."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Position has an active order",
+        "Position's collateral is temporarily reduced to 0 (e.g., via reducePos)",
+        "fillOrder is called while collateral == 0, triggering the auto-cancel path",
+        "User later adds collateral back to the position"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Order remains Active in __orders[_orderId].status despite CancelOrder event being emitted",
+        "manipulation_vector": "Order can be unexpectedly filled after user believes it was cancelled. Combined with ECON-H001 (updateOrder auth bypass), attacker can modify and fill the zombie order.",
+        "profit_hypothesis": "If user re-collateralizes believing orders are cancelled, an executor can fill the stale order at potentially unfavorable terms"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How often do positions reach 0 collateral temporarily?",
+          "Do off-chain order execution systems track CancelOrder events as definitive?",
+          "Can this be combined with updateOrder exploit for amplified impact?"
+        ],
+        "validation_requirements": [
+          "Verify __orders[_orderId].status remains Active after the auto-cancel code path",
+          "Demonstrate that subsequent fillOrder call passes the Active check",
+          "Test interaction with updateOrder vulnerability"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Varies based on order parameters",
+        "estimated_execution_cost": "~0.005 ETH gas on Mantle",
+        "potential_profit_range": "Depends on order terms and collateral value",
+        "estimated_profit_margin": "Variable - potentially high if combined with updateOrder exploit",
+        "attack_duration": "Opportunistic - requires victim to re-add collateral"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Executor needs borrToken and tokenOut to fill",
+        "optimal_timing": "After victim re-adds collateral to position with zombie order",
+        "market_impact_assessment": "Minimal market impact"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users whose positions temporarily had 0 collateral",
+        "estimated_impact_per_user": "Value of order execution at stale/manipulated terms",
+        "total_value_at_risk": "All positions that temporarily reach 0 collateral with active orders"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Compare memory vs storage write in fillOrder auto-cancel path",
+        "calculation_validation": "Trace order status through complete lifecycle",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "CloseExactOut Strict Equality Check Enables 1-Wei Griefing DoS on reducePos",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In coreCallback's CloseExactOut path, a strict equality check `_require(IERC20(swapInfo.tokenOut).balanceOf(address(this)) == swapInfo.amtOut, Errors.SLIPPAGE_CONTROL)` is used. An attacker can front-run any reducePos transaction by sending 1 wei of the borrow token (tokenOut) to the MarginTradingHook contract, causing the balance to be swapInfo.amtOut + 1, failing the equality check and reverting the user's transaction.",
+      "investigation_rationale": "The strict equality (==) instead of (>=) creates a fragile check that can be trivially broken by anyone sending dust tokens to the contract. This is visible in the coreCallback function.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "coreCallback",
+        "reducePos",
+        "_reducePosInternal"
+      ],
+      "affected_contracts": [
+        "MarginTradingHook.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "coreCallback"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarginTradingHook.sol",
+        "lines": "319-332",
+        "pattern": "Line 328: '_require(IERC20(swapInfo.tokenOut).balanceOf(address(this)) == swapInfo.amtOut, Errors.SLIPPAGE_CONTROL)' uses == instead of >=. Any dust token deposit breaks this equality."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User attempts reducePos with tokenOut == collToken (CloseExactOut swap type)",
+        "Attacker front-runs with 1 wei transfer of borrToken (swapInfo.tokenOut) to hook"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "balanceOf(address(this)) == swapInfo.amtOut fails when balance = amtOut + dust",
+        "manipulation_vector": "Front-run any CloseExactOut reducePos with 1 wei token transfer to hook address",
+        "profit_hypothesis": "No direct profit for attacker, but griefing cost is ~1 wei + gas. Users cannot close their margin positions during adverse market conditions."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many reduce position operations use CloseExactOut vs CloseExactIn?",
+          "Can this be sustained as a permanent DoS by repeatedly sending dust?",
+          "What is the user impact of being unable to reduce positions during market volatility?"
+        ],
+        "validation_requirements": [
+          "Send 1 wei of borrow token to hook before reducePos call",
+          "Verify revert at the equality check in coreCallback",
+          "Confirm CloseExactIn path is unaffected (no equality check)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "1 wei of borrow token per DoS attempt",
+        "estimated_execution_cost": "~0.005 ETH gas per front-run on Mantle",
+        "potential_profit_range": "Indirect: prevents position closure during market crashes, potentially forcing liquidations",
+        "estimated_profit_margin": "Griefing attack; attacker profits by being the liquidator of stuck positions",
+        "attack_duration": "Persistent - must front-run each reducePos attempt"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None - 1 wei per attack",
+        "optimal_timing": "During market volatility when users need to close positions",
+        "market_impact_assessment": "Users unable to close positions may face liquidation"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Any user trying to reduce margin position via CloseExactOut",
+        "estimated_impact_per_user": "Inability to close position → potential liquidation loss",
+        "total_value_at_risk": "All margin positions attempting CloseExactOut reduction"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Verify == vs >= comparison in CloseExactOut path",
+        "calculation_validation": "Confirm balanceOf includes dust sent by attacker",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "MoneyMarketHook Leftover WNATIVE/ETH Sweepable by Any Caller",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "The MoneyMarketHook.execute function's returnNative path sweeps ALL WETH balance and ALL ETH balance to msg.sender. If any prior transaction left WETH or ETH in the hook (e.g., user overpaid msg.value during repay, or borrow output with returnNative=false), a subsequent caller can steal these funds by calling execute with empty params and returnNative=true.",
+      "investigation_rationale": "The returnNative block reads full balances (`IERC20(WNATIVE).balanceOf(address(this))` and `address(this).balance`) and sends everything to msg.sender, regardless of what this transaction deposited.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "execute"
+      ],
+      "affected_contracts": [
+        "MoneyMarketHook.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MoneyMarketHook.sol",
+          "function": "execute"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MoneyMarketHook.sol",
+        "lines": "72-80",
+        "pattern": "Lines 74-79: returnNative sweeps ALL WETH balance and ALL native balance to msg.sender without tracking how much the current tx contributed"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Previous transaction left WETH or ETH in MoneyMarketHook",
+        "MEV bot or attacker monitors for leftover balances",
+        "Attacker calls execute with returnNative=true and minimal/empty operation params"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "wNativeBal = IERC20(WNATIVE).balanceOf(address(this)) includes all residual WETH, not just current tx",
+        "manipulation_vector": "Monitor mempool for MoneyMarketHook transactions that leave WNATIVE residue, then backrun",
+        "profit_hypothesis": "Profit = residual WETH/ETH balance in hook contract"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Under what conditions does execute leave WETH residue?",
+          "How frequently do users overpay msg.value?",
+          "Do borrow operations with returnNative=false leave WETH in the hook?"
+        ],
+        "validation_requirements": [
+          "Identify code paths that leave WETH in the hook after execute",
+          "Simulate MEV backrun to extract leftover funds",
+          "Quantify typical residual amounts"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None - just gas for the sweep tx",
+        "estimated_execution_cost": "~0.005 ETH gas on Mantle",
+        "potential_profit_range": "Variable - depends on user's overpayment amount",
+        "estimated_profit_margin": "Near 100% of residual balance minus gas",
+        "attack_duration": "Single block backrun"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Immediately after any tx that leaves WNATIVE in hook",
+        "market_impact_assessment": "No market impact"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users who overpay msg.value or don't set returnNative correctly",
+        "estimated_impact_per_user": "Amount of WETH/ETH left in hook",
+        "total_value_at_risk": "Cumulative residual WETH/ETH across all users"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Trace msg.value flow through _handleRepay and _handleDeposit",
+        "calculation_validation": "Identify exact conditions for WETH residue",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "Underwater Positions (health=0) Cannot Be Liquidated Due to Zero Incentive Multiplier",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "LiqIncentiveCalculator.getLiqIncentiveMultiplier_e18 returns 0 when health factor is exactly 0. In InitCore.liquidate, this causes repayAmtWithLiqIncentive = repayAmt * 0 / 1e18 = 0, meaning the liquidator repays debt but receives 0 collateral. No rational liquidator will execute this, causing permanent bad debt accumulation. The health==0 bypass of post-liquidation health check further confirms the special-case handling, but without incentive, positions with health=0 are economically un-liquidatable.",
+      "investigation_rationale": "The early return of 0 for health_e18==0 was likely intended to avoid division by zero in (1e18/0 - 1), but it should return maxLiqIncentiveMultiplier instead. The bypass of _ensurePosHealthAfterLiq for health==0 shows the code recognizes these positions need special handling.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "getLiqIncentiveMultiplier_e18",
+        "liquidate",
+        "liquidateWLp"
+      ],
+      "affected_contracts": [
+        "LiqIncentiveCalculator.sol",
+        "InitCore.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiqIncentiveCalculator.sol",
+          "function": "getLiqIncentiveMultiplier_e18"
+        },
+        {
+          "file": "InitCore.sol",
+          "function": "liquidate"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiqIncentiveCalculator.sol",
+        "lines": "36-37",
+        "pattern": "Line 37: 'if (_healthFactor_e18 == 0) return 0;' — returns multiplier of 0, making collateral seizure = 0 in liquidation"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Position has collateral but collateral credit = 0 (collFactor set to 0 for all collateral types, or oracle returns 0 for collateral token)",
+        "Position has outstanding debt (borrowCredit > 0)",
+        "Health factor computes to exactly 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "getPosHealthCurrent_e18: health = borrowCredit > 0 ? (collCredit * 1e18) / borrowCredit : max. When collCredit = 0 and borrowCredit > 0, health = 0.",
+        "manipulation_vector": "Positions become un-liquidatable when collateral credit drops to 0 (governance action changing collFactor, oracle failure, etc.)",
+        "profit_hypothesis": "Bad debt accumulates and is socialized across lenders in affected pools"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Under what realistic scenarios does health reach exactly 0?",
+          "What is the expected bad debt accumulation rate from un-liquidatable positions?",
+          "Can an attacker intentionally create positions that reach health=0 to avoid liquidation?"
+        ],
+        "validation_requirements": [
+          "Configure position with collFactor=0 and verify health=0",
+          "Attempt liquidation and verify 0 collateral is returned to liquidator",
+          "Assess whether governance collFactor changes could trigger this"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Initial collateral + debt for position creation",
+        "estimated_execution_cost": "Standard gas for position creation",
+        "potential_profit_range": "Borrower keeps borrowed funds; lenders absorb bad debt",
+        "estimated_profit_margin": "Up to 100% of borrowed amount minus initial collateral",
+        "attack_duration": "Requires governance action to set collFactor to 0"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "After governance changes collateral factors or oracle failure",
+        "market_impact_assessment": "Bad debt socializes losses across all lenders"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All lenders in affected pools",
+        "estimated_impact_per_user": "Proportional share of accumulated bad debt",
+        "total_value_at_risk": "Total debt of un-liquidatable positions"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "getLiqIncentiveMultiplier_e18 return value when health=0 vs near-0",
+        "calculation_validation": "Verify liquidate function flow with multiplier=0",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "LP Price Manipulation via Reserve Inflation When kLast==0",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "WLpMoeMasterChef.calculatePrice_e36 uses live AMM reserves when kLast==0 via the formula 2*sqrt(r0*p0)*sqrt(r1*p1)/totalSupply. While this formula is theoretically manipulation-resistant for single swaps (k=r0*r1 stays constant), an attacker can perform multiple round-trip swaps via flash loan to accumulate swap fees, increasing k and thus inflating the LP price. Each round-trip increases k by the fee percentage (~0.3%). The inflated LP price enables excessive borrowing against WLp collateral.",
+      "investigation_rationale": "The code explicitly handles kLast==0 with reserve-based pricing instead of kLast-based pricing. On Merchant Moe, kLast may be 0 if the protocol fee switch is off, making this the active pricing path.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Merchant Moe pair has kLast == 0 (protocol fee switch off)",
+        "LP tokens from such pairs are used as collateral via WLpMoeMasterChef"
+      ],
+      "config_evidence": "WLpMoeMasterChef.sol lines 136-150 show both kLast==0 and kLast!=0 paths; actual kLast depends on Moe protocol governance",
+      "affected_functions": [
+        "calculatePrice_e36"
+      ],
+      "affected_contracts": [
+        "WLpMoeMasterChef.sol",
+        "InitCore.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WLpMoeMasterChef.sol",
+          "function": "calculatePrice_e36"
+        },
+        {
+          "file": "InitCore.sol",
+          "function": "getCollateralCreditCurrent_e36"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WLpMoeMasterChef.sol",
+        "lines": "142-145",
+        "pattern": "kLast==0 branch uses live reserves: 'price = 2 * (r0 * prices_e36[0]).sqrt() * (r1 * prices_e36[1]).sqrt() / totalSupply' where r0, r1 are current manipulable reserves"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "kLast == 0 on the target Moe pair (fee switch off)",
+        "WLp tokens from this pair are used as collateral",
+        "Flash loan liquidity available for round-trip swaps",
+        "Pool is shallow enough for meaningful k inflation"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "k inflation per round-trip = fee_rate * 2 (buy + sell). 10 round-trips at 0.3% fee → ~6% k increase → ~3% LP price increase",
+        "manipulation_vector": "Flash loan → multiple round-trip swaps in pair → k increases → LP price inflates → borrow against inflated collateral → repay flash loan",
+        "profit_hypothesis": "Extra borrowing = LP_value * collFactor * price_inflation. For $1M LP with 0.8 collFactor and 3% inflation: ~$24K extra borrowing"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Which Moe pairs have kLast==0 and are used as WLp collateral?",
+          "What is the actual pool depth and available flash loan capital?",
+          "Is the gas cost of multiple swaps justified by the profit on Mantle?"
+        ],
+        "validation_requirements": [
+          "Check kLast value for deployed Moe pairs",
+          "Calculate exact k inflation for specific pool depths",
+          "Simulate full attack including gas costs"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Flash loan for round-trip swaps (~$100K-1M depending on pool depth)",
+        "estimated_execution_cost": "Gas for ~20 swaps + borrow + repay on Mantle (~0.1 ETH)",
+        "potential_profit_range": "$1K-$50K depending on LP collateral amount and pool depth",
+        "estimated_profit_margin": "10-100x gas costs if pool is shallow enough",
+        "attack_duration": "Single block (atomic with flash loan)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Shallow target LP pool, deep flash loan source",
+        "optimal_timing": "When maximum WLp collateral is deposited",
+        "market_impact_assessment": "Temporary price disruption in the LP pair"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Lenders in pools where attacker borrows against inflated LP",
+        "estimated_impact_per_user": "Bad debt from undercollateralized position after LP price reverts",
+        "total_value_at_risk": "Value of excess borrowing above true collateral"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check kLast values for whitelisted Moe pairs",
+        "calculation_validation": "Model k inflation from N round-trip swaps vs gas costs",
+        "execution_complexity": "high",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "Multiple Orders Over-Commit Collateral Leading to Unexpected Proportional Scaling",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When creating orders via _createOrder, individual order collAmt is checked against current position collateral, but the aggregate collAmt across all active orders for a position is never validated. A user can create multiple orders whose total collAmt exceeds their actual collateral. When orders are filled sequentially, _calculateRepaySize scales down later orders proportionally, but the effective execution price diverges from the user's intended limitPrice, potentially resulting in economic loss for the position holder.",
+      "investigation_rationale": "Each _createOrder checks `_collAmt <= collAmt` individually. Two orders each requesting 80% of collateral would both pass but represent 160% total commitment.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_createOrder",
+        "_calculateRepaySize",
+        "fillOrder"
+      ],
+      "affected_contracts": [
+        "MarginTradingHook.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "_createOrder"
+        },
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "_calculateRepaySize"
+        },
+        {
+          "file": "MarginTradingHook.sol",
+          "function": "fillOrder"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarginTradingHook.sol",
+        "lines": "339-346 and 434-444",
+        "pattern": "Line 345: '_require(_collAmt <= collAmt, Errors.INPUT_TOO_HIGH)' checks individual order vs total collateral. No aggregate check across __posOrderIds[initPosId]. _calculateRepaySize at line 438: 'if (_order.collAmt > totalCollAmt) _order.collAmt = totalCollAmt' silently scales down."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User creates multiple active orders on the same position",
+        "Total collAmt across orders exceeds actual position collateral",
+        "First order is filled, reducing available collateral for remaining orders"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Order1: collAmt=80, Order2: collAmt=80, total position collateral=100. After Order1 fills (taking 80), Order2's collAmt is scaled to remaining 20, changing repay proportion from 80% to 20% of debt.",
+        "manipulation_vector": "Executor fills orders in sequence that maximizes their profit from the proportional scaling",
+        "profit_hypothesis": "User's second order executes at effectively different terms than intended, potentially below their risk tolerance"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How often do users create overlapping orders?",
+          "What is the maximum economic deviation from intended execution?",
+          "Can an executor strategically order fills to maximize extraction?"
+        ],
+        "validation_requirements": [
+          "Create position with two overlapping orders",
+          "Fill first order and verify second order's effective terms change",
+          "Quantify economic impact of proportional scaling"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Executor needs tokens to fill orders",
+        "estimated_execution_cost": "Standard gas for fill operations",
+        "potential_profit_range": "Variable - depends on price movement and order overlap",
+        "estimated_profit_margin": "Modest - primarily a user protection issue",
+        "attack_duration": "Opportunistic"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Executor needs borrow and output tokens",
+        "optimal_timing": "When multiple orders trigger simultaneously",
+        "market_impact_assessment": "Minimal market impact"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users with multiple overlapping orders",
+        "estimated_impact_per_user": "Difference between intended and actual execution terms",
+        "total_value_at_risk": "All positions with overlapping active orders"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Model effective execution price after proportional scaling",
+        "calculation_validation": "Trace _calculateRepaySize with reduced collateral",
+        "execution_complexity": "medium",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Oracle Deviation Default of 0 Creates DoS When Secondary Source Is Configured",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In InitOracle.getPrice_e36, when both primary and secondary sources return valid prices, a deviation check is performed: (maxPrice * 1e18) / minPrice <= maxPriceDeviations_e18[token]. If maxPriceDeviations_e18 is not set (defaults to 0), this check always fails since any valid price ratio exceeds 0. This means configuring a secondary oracle source without also setting maxPriceDeviation bricks the oracle for that token, blocking all operations including liquidations.",
+      "investigation_rationale": "The default value of 0 in Solidity mappings creates a trap: adding a secondary source for resilience actually breaks the oracle if deviation threshold is forgotten.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Governor sets secondary source without setting maxPriceDeviation for the same token"
+      ],
+      "config_evidence": "InitOracle.sol lines 68-71: deviation check uses maxPriceDeviations_e18[_token] which defaults to 0. setMaxPriceDeviations_e18 requires explicit call per token.",
+      "affected_functions": [
+        "getPrice_e36"
+      ],
+      "affected_contracts": [
+        "InitOracle.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InitOracle.sol",
+          "function": "getPrice_e36"
+        },
+        {
+          "file": "InitOracle.sol",
+          "function": "setMaxPriceDeviations_e18"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InitOracle.sol",
+        "lines": "64-71",
+        "pattern": "Line 70: '_require((maxPrice_e36 * ONE_E18) / minPrice_e36 <= maxPriceDeviations_e18[_token], ...)' — left side always >= 1e18, right side = 0 when unset → always reverts"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Secondary source configured for a token",
+        "maxPriceDeviations_e18 not configured for same token",
+        "Both primary and secondary sources return valid prices"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "maxPriceDeviations_e18[token] = 0 (default). Any valid price ratio > 0, so check fails.",
+        "manipulation_vector": "Configuration error leads to oracle DoS for affected token",
+        "profit_hypothesis": "Existing borrowers cannot be liquidated during DoS period; they can add leverage knowing liquidation is blocked"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are there tokens with secondary sources but no deviation threshold in deployment?",
+          "What is the potential bad debt from blocked liquidations?",
+          "Could an attacker trigger this by influencing governance to add secondary source?"
+        ],
+        "validation_requirements": [
+          "Check deployment scripts for setSecondarySources and setMaxPriceDeviations calls",
+          "Verify oracle reverts when deviation not set but both sources return valid prices",
+          "Assess operational risk of configuration oversight"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - configuration issue",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Indirect: borrowers avoid liquidation during oracle DoS",
+        "estimated_profit_margin": "Depends on duration of DoS and market movement",
+        "attack_duration": "Until governance sets deviation threshold"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Right after secondary source is configured without deviation",
+        "market_impact_assessment": "Complete operational halt for affected token"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with positions involving the affected token",
+        "estimated_impact_per_user": "Cannot deposit, borrow, or be liquidated for the token",
+        "total_value_at_risk": "All TVL involving the affected token"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check deployment configuration for secondary sources and deviations",
+        "calculation_validation": "Simulate oracle call with both sources valid and deviation=0",
+        "execution_complexity": "N/A - configuration error",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "Flash Loan Feeless Borrowing Amplifies All Oracle/Price-Dependent Exploits",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "InitCore.flash implements feeless flash loans - borrowers only need to return the exact original balance to the pool. Combined with free flash liquidity from other protocols (Aave, etc.), attackers can obtain massive capital at zero cost to amplify any price-manipulation-dependent attack (LP price inflation, oracle manipulation, etc.). The lack of flash fees also means the protocol earns nothing from legitimate flash usage, creating a free arbitrage tool.",
+      "investigation_rationale": "The flash function checks `IERC20(tokens[i]).balanceOf(_pools[i]) >= balanceBefores[i]` with no fee requirement. The documentation confirms this: 'Flashloan fees can be bypassed by atomically borrowing and repaying in the same transaction'.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "flash"
+      ],
+      "affected_contracts": [
+        "InitCore.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "InitCore.sol",
+          "function": "flash"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "InitCore.sol",
+        "lines": "237-259",
+        "pattern": "Line 256: '_require(IERC20(tokens[i]).balanceOf(_pools[i]) >= balanceBefores[i], ...)' — only checks balance recovery, no fee component"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Flash-enabled pools have sufficient liquidity",
+        "Attacker has a profitable manipulation strategy that benefits from amplified capital"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Flash loan cost = 0 (no fee). Compare: Aave charges 0.09%, dYdX charges 0 but limited pools. INIT's feeless flash amplifies any attack with pool liquidity.",
+        "manipulation_vector": "Free capital amplification for LP price manipulation (ECON-H007), oracle exploitation, or any capital-intensive attack",
+        "profit_hypothesis": "Attack profit amplified by ratio of flash-loaned capital to attacker's own capital"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the total flash-loanable liquidity across all pools?",
+          "Which attacks become profitable with flash loan amplification that weren't without?",
+          "Should the protocol charge flash fees for revenue and attack deterrence?"
+        ],
+        "validation_requirements": [
+          "Execute flash loan returning exact amount (no fee) to verify feeless operation",
+          "Model attack economics with and without flash amplification",
+          "Assess combined impact with ECON-H007 LP manipulation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (flash loans are free)",
+        "estimated_execution_cost": "Gas only (~0.05 ETH on Mantle for complex tx)",
+        "potential_profit_range": "Amplifies other attacks; standalone: $0 direct profit",
+        "estimated_profit_margin": "Enabler for other attacks, reducing capital requirements to 0",
+        "attack_duration": "Single block"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Pools must have cash > 0",
+        "optimal_timing": "When pools have maximum liquidity for maximum flash loan size",
+        "market_impact_assessment": "Depends on the specific attack being amplified"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Depends on amplified attack type",
+        "estimated_impact_per_user": "Depends on amplified attack type",
+        "total_value_at_risk": "Total flash-loanable liquidity available as attack capital"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Calculate total flash-loanable liquidity across pools",
+        "calculation_validation": "Model combined flash + LP manipulation profitability",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H011",
+      "title": "minLiqIncentiveMultiplier Can Exceed maxLiqIncentiveMultiplier Allowing Excessive Liquidation Extraction",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "LiqIncentiveCalculator applies min and max bounds in sequence: first Math.min(value, max), then Math.max(result, min). If minLiqIncentiveMultiplier_e18[mode] > maxLiqIncentiveMultiplier_e18 due to misconfiguration, the final multiplier equals min (exceeding max). This allows liquidators to extract more collateral than intended, potentially draining positions excessively during liquidation. No validation prevents min > max.",
+      "investigation_rationale": "setMinLiqIncentiveMultiplier_e18 and setMaxLiqIncentiveMultiplier_e18 have no cross-validation. The Math.max applied after Math.min means min effectively overrides max.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Governor misconfigures minLiqIncentiveMultiplier > maxLiqIncentiveMultiplier for a mode"
+      ],
+      "config_evidence": "LiqIncentiveCalculator.sol lines 42-43: multiplier = Math.min(1e18 + incentive, max); multiplier = Math.max(multiplier, min); — min overrides max when min > max",
+      "affected_functions": [
+        "getLiqIncentiveMultiplier_e18",
+        "setMinLiqIncentiveMultiplier_e18",
+        "setMaxLiqIncentiveMultiplier_e18"
+      ],
+      "affected_contracts": [
+        "LiqIncentiveCalculator.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiqIncentiveCalculator.sol",
+          "function": "getLiqIncentiveMultiplier_e18"
+        },
+        {
+          "file": "LiqIncentiveCalculator.sol",
+          "function": "setMinLiqIncentiveMultiplier_e18"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiqIncentiveCalculator.sol",
+        "lines": "42-43",
+        "pattern": "Math.min followed by Math.max without cross-validation: 'multiplier_e18 = Math.min(ONE_E18 + incentive_e18, maxLiqIncentiveMultiplier_e18); multiplier_e18 = Math.max(multiplier_e18, minLiqIncentiveMultiplier_e18[_mode]);'"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Governor sets minLiqIncentiveMultiplier for a mode > maxLiqIncentiveMultiplier",
+        "Position in that mode becomes unhealthy and is liquidated"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "If min=2e18, max=1.5e18: multiplier = max(min(value, 1.5e18), 2e18) = 2e18 regardless of health. Liquidator gets 2x collateral per unit of debt repaid.",
+        "manipulation_vector": "Liquidators profit excessively from every liquidation in the misconfigured mode",
+        "profit_hypothesis": "Excess extraction = (actual_multiplier - intended_max) * repayAmt / 1e18 per liquidation"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are there deployment scripts that set both min and max? Do they validate min <= max?",
+          "What is the maximum over-extraction possible from misconfiguration?",
+          "Could a compromised governor intentionally misconfigure for profit?"
+        ],
+        "validation_requirements": [
+          "Set min > max and verify effective multiplier exceeds max",
+          "Calculate excess collateral extraction per liquidation",
+          "Check deployment scripts for validation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Capital to repay liquidated debt",
+        "estimated_execution_cost": "Standard gas for liquidation",
+        "potential_profit_range": "Excess = (effective_multiplier - intended_max) * debt_repaid per liquidation",
+        "estimated_profit_margin": "Depends on misconfiguration magnitude",
+        "attack_duration": "Persistent until governance corrects"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Standard liquidation capital",
+        "optimal_timing": "When positions in misconfigured mode become unhealthy",
+        "market_impact_assessment": "Excessive draining of liquidated positions"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users being liquidated in misconfigured mode",
+        "estimated_impact_per_user": "Extra collateral loss beyond intended liquidation penalty",
+        "total_value_at_risk": "All positions in the misconfigured mode"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Verify no cross-validation between min and max setters",
+        "calculation_validation": "Simulate liquidation with min > max",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

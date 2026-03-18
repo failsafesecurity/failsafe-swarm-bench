@@ -1,0 +1,1068 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "SecondSwap_Marketplace.sol",
+      "SecondSwap_StepVesting.sol",
+      "SecondSwap_MarketplaceSetting.sol",
+      "SecondSwap_VestingManager.sol",
+      "SecondSwap_VestingDeployer.sol",
+      "SecondSwap_Whitelist.sol",
+      "SecondSwap_WhitelistDeployer.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T05:55:04.630Z",
+    "duration_ms": 458928
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS-H001",
+      "title": "Grantor releaseRate Miscalculation in transferVesting Enables Token Drain from Vesting Contract",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "After transferVesting, the grantor's releaseRate is recalculated as `totalAmount / numOfSteps` instead of `(totalAmount - amountClaimed) / (numOfSteps - stepsClaimed)`. This inflates the per-step claim rate for grantors who have already claimed some steps and transferred a portion of their allocation. Intermediate step claims use `releaseRate * claimableSteps` without capping at the remaining entitlement (only the final step has a catch-all). A seller who has claimed 5 of 10 steps (500 of 1000 tokens), then lists 490 tokens on the marketplace, gets releaseRate = 510/10 = 51 instead of the correct (510-500)/5 = 2. Over the next 4 intermediate steps, the seller claims 204 tokens when only 10 tokens remain in their entitlement. The extra 194 tokens are drained from other beneficiaries' funds held in the same vesting contract.",
+      "investigation_rationale": "This is the highest-severity finding: a provably incorrect formula in a core accounting function that any marketplace seller can exploit to drain tokens belonging to other vesting beneficiaries.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "transferVesting",
+        "claimable",
+        "claim",
+        "listVesting"
+      ],
+      "affected_contracts": [
+        "SecondSwap_StepVesting.sol",
+        "SecondSwap_VestingManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "transferVesting"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "claimable"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "claim"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "158-160",
+        "pattern": "grantorVesting.totalAmount -= _amount; grantorVesting.releaseRate = grantorVesting.totalAmount / numOfSteps — divides by numOfSteps instead of (numOfSteps - grantorVesting.stepsClaimed)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Seller has a vesting allocation with stepsClaimed > 0 (has claimed some steps)",
+        "Seller lists/transfers a portion of remaining allocation on marketplace",
+        "At least one intermediate step remains before final step"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "releaseRate uses totalAmount/numOfSteps ignoring already-claimed steps; intermediate claim path has no cap against (totalAmount - amountClaimed)",
+        "admin_dependency": "None — any marketplace seller can trigger this",
+        "exploitation_window": "Permanent — exploitable whenever a seller with claimed steps lists tokens"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "How many tokens can be extracted per exploit cycle?",
+          "Can the attacker repeatedly list small amounts to maximize the releaseRate inflation?",
+          "Does the final step revert (underflow) permanently lock residual tokens?"
+        ],
+        "validation_requirements": [
+          "Construct PoC: create vesting, claim 5/10 steps, transfer small amount, claim intermediate steps, verify over-claim",
+          "Verify that amountClaimed exceeds totalAmount after intermediate claims",
+          "Verify that the final step reverts due to underflow in totalAmount - amountClaimed"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Obtain vesting allocation (1000 tokens, 10 steps)",
+        "phase_2": "Wait for steps to elapse, claim to advance stepsClaimed (e.g., claim 5 steps = 500 tokens)",
+        "phase_3": "List nearly all remaining allocation on marketplace (e.g., 490 of 500 remaining)",
+        "phase_4": "Wait for intermediate steps, claim at inflated releaseRate (51/step vs correct 2/step), extracting 194 extra tokens from contract",
+        "coordination_requirements": "None — single attacker, on-chain actions only"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Vesting contract becomes insolvent — other beneficiaries cannot claim their tokens",
+        "recovery_difficulty": "Requires contract upgrade or manual token injection; affected beneficiaries' final claims permanently revert",
+        "affected_operations": "All beneficiaries in the same StepVesting contract"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low — single user, standard marketplace operations",
+        "technical_skills": "Basic — just needs to understand the claim/list sequence",
+        "operational_timing": "After having claimed some vesting steps"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Users who claim then list small amounts repeatedly",
+        "operational_anomalies": "amountClaimed exceeding totalAmount in vesting records",
+        "behavioral_patterns": "Sellers who list right after claiming, then claim again immediately",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H002",
+      "title": "VestingManager Intermediary Contaminates Buyer stepsClaimed, Corrupting Vesting Schedules",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "VestingManager acts as intermediary beneficiary in StepVesting for all listed tokens. The first seller's stepsClaimed becomes VestingManager's stepsClaimed. Subsequent sellers at different vesting progress levels add to VestingManager's totalAmount without updating its stepsClaimed. When a buyer purchases, they inherit VestingManager's stepsClaimed (from the first seller), not the actual seller's. If VestingManager's stepsClaimed is low (from early listing), a buyer purchasing from a late-stage seller gets artificially early claim access. Conversely, if stepsClaimed is high, buyers from early sellers get delayed claims. This breaks vesting schedule integrity for all marketplace transactions.",
+      "investigation_rationale": "Every marketplace purchase flows through VestingManager, making this a systemic issue affecting all buyers. The stepsClaimed value inherited by buyers is arbitrary, determined by the first seller who listed to that vesting plan.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "listVesting",
+        "completePurchase",
+        "transferVesting",
+        "_createVesting"
+      ],
+      "affected_contracts": [
+        "SecondSwap_VestingManager.sol",
+        "SecondSwap_StepVesting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "listVesting"
+        },
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "completePurchase"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "_createVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "172-185",
+        "pattern": "_createVesting adds to existing beneficiary (VestingManager) without reconciling stepsClaimed; new beneficiary (buyer) inherits _stepsClaimed from grantor (VestingManager)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multiple sellers list tokens from the same vesting plan at different vesting stages",
+        "At least one buyer purchases listed tokens"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "VestingManager pools all listed vestings as single beneficiary; _createVesting's else branch only recalculates releaseRate, not stepsClaimed",
+        "admin_dependency": "None — normal marketplace flow triggers this",
+        "exploitation_window": "Permanent — every marketplace purchase is affected"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does VestingManager's accumulated stepsClaimed create systematic early/late claiming for buyers?",
+          "Can an attacker strategically be the first seller to set VestingManager's stepsClaimed to 0, then exploit late-stage purchases?",
+          "What is the quantified token-timing impact per transaction?"
+        ],
+        "validation_requirements": [
+          "List tokens from seller at step 0, then list from seller at step 8",
+          "Purchase second seller's tokens as buyer and verify buyer's stepsClaimed = 0 (not 8)",
+          "Verify buyer can immediately claim steps 0-8 worth of tokens"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Be first to list tokens early in vesting (stepsClaimed=0), setting VestingManager's stepsClaimed to 0",
+        "phase_2": "Wait for late-stage seller to list tokens (at step 8 of 10)",
+        "phase_3": "Purchase late-stage seller's tokens, inheriting stepsClaimed=0",
+        "phase_4": "Immediately claim steps 0-8 worth of tokens, gaining early claim access to tokens that should be locked until later steps",
+        "coordination_requirements": "None — single attacker observing on-chain state"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "All marketplace buyers receive incorrect vesting schedules, undermining protocol integrity",
+        "recovery_difficulty": "Cannot be fixed without contract upgrade; existing corrupted vestings cannot be corrected",
+        "affected_operations": "All spotPurchase transactions on every vesting plan"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low — observe first listing's stepsClaimed, time purchase accordingly",
+        "technical_skills": "Basic — standard marketplace interaction",
+        "operational_timing": "After first listing sets VestingManager's stepsClaimed"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Buyers claiming large portions immediately after purchase",
+        "operational_anomalies": "VestingManager's stepsClaimed diverging from current vesting progress",
+        "behavioral_patterns": "Early listing on new vesting plans followed by late-stage purchases",
+        "detection_difficulty": "hard"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H003",
+      "title": "Division by Zero in _createVesting Blocks Vesting Transfers After All Steps Elapsed",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When all vesting steps have elapsed (block.timestamp >= endTime), a grantor's stepsClaimed equals numOfSteps. When transferVesting is called, _createVesting receives _stepsClaimed = grantor.stepsClaimed = numOfSteps. For a NEW beneficiary, releaseRate is calculated as `_totalAmount / (numOfSteps - _stepsClaimed)` = `_totalAmount / 0`, causing a division by zero revert. This means after full vesting, tokens cannot be transferred to new addresses via the marketplace or VestingDeployer, permanently blocking late-stage marketplace purchases and administrative vesting reallocations.",
+      "investigation_rationale": "This blocks a critical protocol function at a predictable time (end of vesting), affecting marketplace liquidity and administrative operations for every vesting plan.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_createVesting",
+        "transferVesting",
+        "completePurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_StepVesting.sol",
+        "SecondSwap_VestingManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "_createVesting"
+        },
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "transferVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "175-177",
+        "pattern": "releaseRate: _totalAmount / (numOfSteps - _stepsClaimed) — when _stepsClaimed == numOfSteps, divides by zero"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "All vesting steps have elapsed (block.timestamp >= endTime)",
+        "Transfer targets a new beneficiary address (no existing vesting record)",
+        "Tokens are still listed on marketplace or transfer is attempted via VestingDeployer"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "_createVesting's new beneficiary path calculates releaseRate = amount / (numOfSteps - stepsClaimed) without checking for zero denominator",
+        "admin_dependency": "None — time-triggered automatic failure",
+        "exploitation_window": "After vesting endTime, all transfers to new addresses permanently fail"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are listed tokens permanently locked if vesting ends while still listed?",
+          "Can existing beneficiaries (with existing _vestings entry) still receive transfers?",
+          "Does this affect VestingDeployer.transferVesting for administrative reallocations?"
+        ],
+        "validation_requirements": [
+          "Deploy vesting, advance past endTime, attempt transferVesting to new address",
+          "Verify division by zero revert",
+          "Test whether existing beneficiary path handles this case (it does via else branch)"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "List tokens on marketplace for a vesting plan nearing endTime",
+        "phase_2": "Wait until all steps elapse (endTime passes)",
+        "phase_3": "Tokens remain listed but cannot be purchased (completePurchase reverts for new buyers)",
+        "phase_4": "Seller cannot recover tokens unless unlisting returns them to their existing vesting record",
+        "coordination_requirements": "None — passive time-based failure"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "All marketplace transactions for ended vesting plans fail; listed tokens potentially stuck",
+        "recovery_difficulty": "Seller must unlist (may incur penalty); tokens for active listings at endTime become untradeable",
+        "affected_operations": "All purchases and transfers for vesting plans past endTime"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None — natural time progression triggers this",
+        "technical_skills": "None",
+        "operational_timing": "Automatic at vesting endTime"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Failed spotPurchase transactions for expired vesting plans",
+        "operational_anomalies": "Listed vestings that cannot be purchased",
+        "behavioral_patterns": "N/A — systemic issue",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H004",
+      "title": "Referral Fees Calculated but Never Transferred to Referrers — Protocol Revenue Leakage",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "In _handleTransfers, `referralFeeCost` is calculated and emitted in the Purchased event, but no actual token transfer to the referral address occurs. The full `buyerFeeTotal + sellerFeeTotal` is sent to feeCollector, including the portion that should go to the referrer. The referral system is entirely non-functional: events misleadingly report non-zero referralReward values while referrers receive nothing. This breaks the protocol's referral incentive mechanism documented in the economic model.",
+      "investigation_rationale": "This is a definitive code defect: the transfer to the referral address is simply missing. Every referral-based purchase triggers incorrect fee distribution and misleading events.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_handleTransfers",
+        "spotPurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_handleTransfers"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "spotPurchase"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "255-270",
+        "pattern": "referralFeeCost calculated at line ~260, feeCollectorTotal = buyerFeeTotal + sellerFeeTotal at line ~265 (does not subtract referralFeeCost), no safeTransfer to _referral anywhere"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A purchase is made with a non-zero _referral address",
+        "The listing has no whitelist (listing.whitelist == address(0))"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "referralFeeCost is computed, emitted in event, but never used in a transfer call; feeCollectorTotal ignores referral deduction",
+        "admin_dependency": "None",
+        "exploitation_window": "Every referral-based purchase"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are integrators or dashboards relying on Purchased event referralReward field?",
+          "What is the cumulative value of misdirected referral fees?",
+          "Is the referralFeeCost formula also inverted (gives 90% to referrer when referralFee=1000 means 10%)?"
+        ],
+        "validation_requirements": [
+          "Execute spotPurchase with referral, verify referrer balance unchanged",
+          "Verify feeCollector receives full buyerFeeTotal + sellerFeeTotal",
+          "Verify Purchased event emits non-zero referralReward despite no transfer"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "N/A — this is a code defect, not an active exploit",
+        "phase_2": "Observe that referral fees are promised but never paid",
+        "phase_3": "feeCollector silently receives referrer's share",
+        "phase_4": "Referral incentive program is non-functional",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Referral incentive system completely broken; potential legal/trust issues with referral partners",
+        "recovery_difficulty": "Requires contract upgrade to add missing transfer; retroactive compensation needed",
+        "affected_operations": "All referral-based purchases"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "None",
+        "operational_timing": "Any referral purchase"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Purchased events with non-zero referralReward but zero balance change for referrer",
+        "operational_anomalies": "feeCollector receiving more than expected",
+        "behavioral_patterns": "N/A — systemic",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "Missing discountPct Upper Bound Allows Creation of Permanently Unpurchasable Listings",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "listVesting validates that discountPct > 0 when discountType is not NO, but enforces no upper bound. A seller can set discountPct >= BASE (10000) with FIX or LINEAR discount type. In _getDiscountedPrice, `BASE - listing.discountPct` underflows (Solidity 0.8 revert), making the listing permanently unpurchasable. The seller's vesting tokens are locked in the listing until they pay a penalty fee to unlist (if within minListingDuration) or wait. Additionally, a discountPct very close to but less than BASE (e.g., 9999) would make purchases nearly free, enabling buyers to acquire vested tokens at 0.01% of list price.",
+      "investigation_rationale": "Missing input validation on a user-supplied parameter creates both griefing (unpurchasable listings polluting marketplace) and economic exploit (near-free purchases) vectors.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "listVesting",
+        "_getDiscountedPrice"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "listVesting"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_getDiscountedPrice"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "207-210",
+        "pattern": "Validation only checks (_discountType != DiscountType.NO && _discountPct > 0) — no upper bound check on _discountPct"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Seller creates listing with discountType = FIX or LINEAR",
+        "discountPct >= BASE (10000) for revert, or very close to BASE for near-free purchases"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "_getDiscountedPrice computes (BASE - discountPct) which underflows when discountPct >= BASE",
+        "admin_dependency": "None — any seller can trigger this",
+        "exploitation_window": "Any listing creation"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can a seller with discountPct=9999 be exploited by a buyer for near-free tokens?",
+          "How does LINEAR discount interact with extreme discountPct values?",
+          "Does the baseAmount > 0 check in _handleTransfers catch near-zero prices?"
+        ],
+        "validation_requirements": [
+          "Create listing with discountPct=10001, attempt purchase, verify revert",
+          "Create listing with discountPct=9999, purchase tokens, verify near-zero cost",
+          "Test LINEAR discount with amount*discountPct/total >= BASE"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Seller accidentally or maliciously creates listing with discountPct=10001",
+        "phase_2": "All purchase attempts revert on underflow",
+        "phase_3": "Seller's vesting tokens locked until unlist (potentially with penalty)",
+        "phase_4": "Alternative: buyer finds listing with discountPct=9999, purchases tokens at 0.01% of price",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Unpurchasable listings pollute marketplace; potential near-free token acquisition",
+        "recovery_difficulty": "Seller must unlist manually; near-free purchases are irreversible",
+        "affected_operations": "Listing creation and purchase for affected listings"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Listings with discountPct >= 9000",
+        "operational_anomalies": "Listings that never receive purchases despite reasonable pricing",
+        "behavioral_patterns": "Sellers creating listings with extreme discount values",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H006",
+      "title": "Whitelist Self-Enrollment Defeats Private Sale Access Control",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "SecondSwap_Whitelist.whitelistAddress() is callable by any address without access control. Any user can add themselves to any private listing's whitelist, up to the maxWhitelist cap. The lotOwner (seller) has no function to add specific addresses or remove unauthorized ones. The only control is the maxWhitelist cap (number of slots). This directly contradicts the documented intent: 'Whitelisting: Access control mechanism for private lots, ensuring only authorized addresses can participate in specific trades.' A determined attacker can front-run legitimate participants (on chains with public mempools) or simply self-whitelist to access any private sale.",
+      "investigation_rationale": "The protocol documentation explicitly states whitelisting ensures only authorized addresses participate. The code implements open self-registration, which is a fundamental access control failure for private sales.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "whitelistAddress",
+        "validateAddress",
+        "spotPurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Whitelist.sol",
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Whitelist.sol",
+          "function": "whitelistAddress"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_validatePurchase"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Whitelist.sol",
+        "lines": "39-44",
+        "pattern": "whitelistAddress() is external with no access control — anyone can call; no lotOwner-gated add/remove function exists"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "A listing exists with _isPrivate = true",
+        "Whitelist has available slots (totalWhitelist < maxWhitelist)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "whitelistAddress() has no msg.sender restriction; lotOwner cannot curate who joins",
+        "admin_dependency": "None — any address can self-whitelist",
+        "exploitation_window": "As soon as whitelist is deployed for a private listing"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the self-registration design intentional (first-come-first-served) despite documentation stating otherwise?",
+          "Can bots fill whitelist slots before legitimate participants?",
+          "Should lotOwner have exclusive add/remove capabilities?"
+        ],
+        "validation_requirements": [
+          "Call whitelistAddress() from unauthorized address, verify success",
+          "Attempt spotPurchase on private listing after self-whitelisting",
+          "Confirm lotOwner has no function to curate whitelist membership"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Monitor marketplace for new private listings (WhitelistCreated events)",
+        "phase_2": "Call whitelistAddress() on the deployed whitelist contract",
+        "phase_3": "Call spotPurchase on the private listing",
+        "phase_4": "Successfully purchase tokens from a sale intended to be restricted",
+        "coordination_requirements": "None — single on-chain transaction"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Private sale mechanism provides no meaningful access control; seller expectations violated",
+        "recovery_difficulty": "Requires contract redesign; existing whitelists cannot be retroactively restricted",
+        "affected_operations": "All private listings across the marketplace"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None — trivial single-tx exploit",
+        "technical_skills": "Basic — call one function",
+        "operational_timing": "Before whitelist fills up"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "whitelistAddress calls from unexpected addresses",
+        "operational_anomalies": "Private sale purchases from non-intended buyers",
+        "behavioral_patterns": "Whitelist slots filling immediately after listing creation",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "Marketplace Freeze Locks All Listed Vesting Tokens with No Recovery Path",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Both listVesting and unlistVesting use the isFreeze modifier, which requires the marketplace to NOT be frozen. When admin freezes the marketplace via setMarketplaceStatus(true), sellers cannot unlist their tokens. Even the admin cannot unlist during freeze because the isFreeze modifier runs before the authorization check. This creates a dead-end state: listed vesting tokens are locked in VestingManager with no recovery mechanism during freeze. The project documentation flags this as a concern: 'ensuring users can still claim back their vesting allocations if a plan is delisted.' The code contradicts this requirement.",
+      "investigation_rationale": "The freeze mechanism blocks the recovery function (unlist), violating the protocol's own documented safety guarantee. Any freeze event—whether for emergency or maintenance—traps user funds.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "unlistVesting",
+        "setMarketplaceStatus"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol",
+        "SecondSwap_MarketplaceSetting.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "unlistVesting"
+        },
+        {
+          "file": "SecondSwap_MarketplaceSetting.sol",
+          "function": "setMarketplaceStatus"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "148-149",
+        "pattern": "unlistVesting has isFreeze modifier — when marketplace is frozen, sellers and admin cannot unlist any vesting"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Active listings exist on the marketplace",
+        "Admin calls setMarketplaceStatus(true) to freeze"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "isFreeze modifier applies to both list AND unlist; no bypass for emergency token recovery",
+        "admin_dependency": "Admin triggers freeze, but then admin also cannot unlist",
+        "exploitation_window": "Duration of any marketplace freeze"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can admin unfreeze, unlist on behalf of sellers, then refreeze as a workaround?",
+          "Do sellers' vesting claims continue to vest during freeze (potentially losing claimable tokens)?",
+          "Should unlistVesting be exempt from freeze for emergency recovery?"
+        ],
+        "validation_requirements": [
+          "Freeze marketplace, attempt unlistVesting as seller and admin, verify revert",
+          "Verify no alternative recovery path exists during freeze",
+          "Confirm unfreeze is the only way to recover listed tokens"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "N/A — this is a design flaw, not an active attack",
+        "phase_2": "Admin freezes marketplace for legitimate emergency",
+        "phase_3": "All listed tokens become inaccessible — sellers cannot recover",
+        "phase_4": "If admin key is lost during freeze, tokens are permanently locked",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "All listed vesting allocations locked during freeze; seller funds inaccessible",
+        "recovery_difficulty": "Admin must unfreeze to allow unlisting; if admin key lost, permanent lock",
+        "affected_operations": "All active listings during any freeze event"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None — triggered by normal admin operation",
+        "technical_skills": "None",
+        "operational_timing": "Any freeze event"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "setMarketplaceStatus(true) calls with active listings",
+        "operational_anomalies": "Failed unlistVesting during freeze",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H008",
+      "title": "PARTIAL Listing minPurchaseAmt Not Validated Against Listing Amount Creates Unpurchasable Listings",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "For PARTIAL listings, listVesting only validates minPurchaseAmt for SINGLE type (`_listingType != ListingType.SINGLE || (_minPurchaseAmt > 0 && _minPurchaseAmt <= _amount)`). For PARTIAL listings, minPurchaseAmt can be 0 or greater than the listed amount. If minPurchaseAmt > amount, the _validatePurchase check `_amount >= listing.minPurchaseAmt || _amount == listing.balance` means only buying the exact full balance works. If someone buys a portion, the remaining balance may be less than minPurchaseAmt, creating an unreachable state where partial purchases fail and only exact-balance purchases succeed. Additionally, minPurchaseAmt=0 with PARTIAL allows dust purchases that could bypass the baseAmount>0 check if token decimals are high.",
+      "investigation_rationale": "Missing validation on a key listing parameter creates degenerate listing states that trap seller tokens or enable economic exploits.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "listVesting",
+        "_validatePurchase"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "listVesting"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_validatePurchase"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "193-196",
+        "pattern": "require only checks _listingType != ListingType.SINGLE condition; PARTIAL listings skip minPurchaseAmt validation against _amount"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Seller creates PARTIAL listing with minPurchaseAmt > total or minPurchaseAmt = 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "listVesting validation for minPurchaseAmt only applies to SINGLE type; PARTIAL has no bounds check",
+        "admin_dependency": "None",
+        "exploitation_window": "Any PARTIAL listing creation"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can dust purchases (minPurchaseAmt=0) pass the baseAmount>0 check for high-decimal tokens?",
+          "How does minPurchaseAmt > balance interact with the `_amount == listing.balance` fallback?",
+          "Can an attacker leave uneconomic dust in a PARTIAL listing, griefing the seller?"
+        ],
+        "validation_requirements": [
+          "Create PARTIAL listing with minPurchaseAmt > amount, verify purchase behavior",
+          "Create PARTIAL listing with minPurchaseAmt=0, attempt micro-purchases",
+          "Verify dust-remaining scenario after partial purchase"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Seller creates PARTIAL listing with minPurchaseAmt=0",
+        "phase_2": "Attacker buys listing.total - 1 wei worth of tokens",
+        "phase_3": "Remaining 1 wei of tokens below any useful threshold, but listing remains active",
+        "phase_4": "Seller must unlist (potentially with penalty) to recover dust",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Sellers can create degenerate listings; buyers can grief PARTIAL listings with dust attacks",
+        "recovery_difficulty": "Seller must pay penalty to unlist early",
+        "affected_operations": "PARTIAL listing creation and purchases"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "PARTIAL listings with extreme minPurchaseAmt values",
+        "operational_anomalies": "Listings with very small remaining balance stuck as LIST",
+        "behavioral_patterns": "Purchases of exactly balance-1 on PARTIAL listings",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "Reentrancy in spotPurchase via Callback-Enabled Currency Tokens Allows Double Purchase",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In spotPurchase, _handleTransfers executes external token transfers (safeTransferFrom from buyer, safeTransfer to seller and feeCollector) BEFORE listing.balance is decremented. If the payment currency token supports transfer callbacks (ERC-777, hooks, or custom callback patterns), an attacker can re-enter spotPurchase during the transfer. Each re-entrant call sees the original listing.balance and passes _validatePurchase. The attacker can purchase the same listing multiple times, receiving more vesting tokens than the listing contains, because VestingManager.completePurchase transfers vesting on each call while the listing balance hasn't been updated.",
+      "investigation_rationale": "Classic checks-effects-interactions violation in the highest-value function. The addCoin function has validation commented out, allowing any token as currency. If a callback-enabled token is added, this becomes exploitable.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A callback-enabled token (ERC-777 or similar) must be added as supported currency via addCoin()"
+      ],
+      "config_evidence": "SecondSwap_Marketplace.sol: addCoin() has decimals validation commented out (lines 159-165), accepting any token without behavioral checks",
+      "affected_functions": [
+        "spotPurchase",
+        "_handleTransfers",
+        "addCoin"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol",
+        "SecondSwap_VestingManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "spotPurchase"
+        },
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "_handleTransfers"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_Marketplace.sol",
+        "lines": "274-290",
+        "pattern": "_handleTransfers makes external calls (safeTransferFrom/safeTransfer) at lines ~250-270, listing.balance decremented at line ~285 in spotPurchase after _handleTransfers returns"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A callback-enabled token (ERC-777, custom hooks) is added as supported currency",
+        "Attacker creates listing with that currency OR targets existing listing with that currency",
+        "Attacker implements callback in their receiving contract"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "_handleTransfers external calls precede listing.balance -= _amount; no reentrancy guard (nonReentrant) on any contract function",
+        "admin_dependency": "Admin must have added the callback token via addCoin()",
+        "exploitation_window": "Any purchase involving callback-enabled currency token"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does the Solidity 0.8 underflow protection on listing.balance prevent completed re-entrant purchases?",
+          "Which transfer callback (buyer receiving change? seller receiving payment?) enables the re-entry point?",
+          "Does VestingManager.completePurchase succeed multiple times since it only increments bought allocation?"
+        ],
+        "validation_requirements": [
+          "Deploy ERC-777 token, add as currency, create listing, attempt re-entrant purchase",
+          "Verify listing.balance state during re-entrant calls",
+          "Verify VestingManager transferVesting succeeds for each re-entrant call"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Deploy attacker contract implementing ERC-777 tokensReceived hook",
+        "phase_2": "Create or find listing using callback-enabled currency",
+        "phase_3": "Call spotPurchase; during safeTransfer to attacker contract (as seller or via intermediate routing), re-enter spotPurchase",
+        "phase_4": "Each re-entrant call sees full listing.balance, passes validation, transfers vesting tokens to attacker",
+        "coordination_requirements": "Attacker deploys callback contract; needs callback token as currency"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "VestingManager drained of vesting allocations beyond listing amount; subsequent legitimate purchases fail",
+        "recovery_difficulty": "Irreversible — vesting tokens transferred to attacker cannot be recovered without governance action",
+        "affected_operations": "All listings using callback-enabled currency"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium — requires deploying attack contract and having callback token",
+        "technical_skills": "Advanced — reentrancy exploit construction",
+        "operational_timing": "After callback token is added as currency"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Multiple Purchased events for same listingId in single transaction",
+        "operational_anomalies": "Listing balance going negative or listing sold out in unexpected ways",
+        "behavioral_patterns": "Purchases from contract addresses with callback hooks",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "setMaxSellPercent Lacks Upper Bound Allowing Token Issuer to Remove All Sell Restrictions",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "VestingManager.setMaxSellPercent() accepts any uint256 value with no upper bound check. A token issuer can set maxSellPercent to type(uint256).max, effectively removing all sell restrictions for their vesting plan. This allows original allocation holders to dump 100% of their vesting on the marketplace, potentially crashing token price. Conversely, setting to 0 blocks all new listings. Both extremes bypass the protocol's intended sell percentage enforcement (default 20%) without any admin oversight or timelock.",
+      "investigation_rationale": "The maxSellPercent parameter is a critical economic control with no bounds validation. Token issuers can unilaterally modify this at any time, contradicting the protocol's sell limit invariant.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setMaxSellPercent",
+        "listVesting"
+      ],
+      "affected_contracts": [
+        "SecondSwap_VestingManager.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "setMaxSellPercent"
+        },
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "listVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_VestingManager.sol",
+        "lines": "118-121",
+        "pattern": "setMaxSellPercent accepts any uint256 with no require(maxSellPercent <= BASE) check"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Caller is the tokenIssuer of the target vesting plan",
+        "Vesting plan has been enabled for selling (sellable=true)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No upper bound check on maxSellPercent parameter; can be set to any value including type(uint256).max",
+        "admin_dependency": "Token issuer (semi-trusted role) controls this",
+        "exploitation_window": "Any time after vesting plan is deployed"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can a token issuer coordinate with insiders to dump 100% of vesting before other holders react?",
+          "Does setting maxSellPercent=0 affect existing listings or only new ones?",
+          "Should s2Admin have override authority over token issuer's maxSellPercent?"
+        ],
+        "validation_requirements": [
+          "Set maxSellPercent to type(uint256).max, verify seller can list 100% of allocation",
+          "Set maxSellPercent to 0, verify new listings blocked",
+          "Verify existing listings remain active after maxSellPercent reduction"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Token issuer sets maxSellPercent to type(uint256).max",
+        "phase_2": "Insiders list 100% of their vesting allocations on marketplace",
+        "phase_3": "Tokens sold at discount, crashing secondary market price",
+        "phase_4": "Token issuer sets maxSellPercent back to 0, trapping remaining holders",
+        "coordination_requirements": "Token issuer + insider sellers"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Secondary market flooded beyond intended limits; token price impact",
+        "recovery_difficulty": "Cannot reverse completed sales; maxSellPercent can be reset but damage done",
+        "affected_operations": "All listings for the affected vesting plan"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None — token issuer role required",
+        "coordination_complexity": "Medium — requires token issuer cooperation",
+        "technical_skills": "Basic",
+        "operational_timing": "Before major sell events"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "MaxSellPercentUpdated events with extreme values",
+        "operational_anomalies": "Sudden surge of listings from single vesting plan",
+        "behavioral_patterns": "maxSellPercent changes followed by large listing activity",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H011",
+      "title": "Implementation Contracts Missing _disableInitializers() Allow Direct Initialization",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "SecondSwap_Marketplace, SecondSwap_VestingManager, and SecondSwap_VestingDeployer use OpenZeppelin's Initializable pattern but do not include constructors calling _disableInitializers(). The implementation contracts deployed behind TransparentUpgradeableProxy remain uninitialized. An attacker can call initialize() directly on the implementation contract, becoming admin. While Transparent proxy separates implementation state from proxy state, initialized implementation contracts are a known best-practice violation that could become exploitable if the upgrade pattern changes to UUPS, or if other contracts reference the implementation address directly.",
+      "investigation_rationale": "All three proxy-deployed contracts lack _disableInitializers(), confirmed by code inspection and deployment scripts showing separate implementation and proxy deployments.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "DeployVestingDeployerProxies.ts, DeployVestingManagerProxies.ts, DeployMarketplaceProxies.ts all deploy implementation separately from proxy",
+      "affected_functions": [
+        "initialize"
+      ],
+      "affected_contracts": [
+        "SecondSwap_Marketplace.sol",
+        "SecondSwap_VestingManager.sol",
+        "SecondSwap_VestingDeployer.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_Marketplace.sol",
+          "function": "initialize"
+        },
+        {
+          "file": "SecondSwap_VestingManager.sol",
+          "function": "initialize"
+        },
+        {
+          "file": "SecondSwap_VestingDeployer.sol",
+          "function": "initialize"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_VestingManager.sol",
+        "lines": "1-100",
+        "pattern": "No constructor present; uses Initializable.initializer but never calls _disableInitializers() in a constructor"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker can identify implementation contract address (deterministic via deployment tx or etherscan)",
+        "Implementation contract has not been previously initialized"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No constructor calling _disableInitializers() in any of the three Initializable contracts",
+        "admin_dependency": "None — attacker interacts directly with implementation",
+        "exploitation_window": "Permanent — implementation remains uninitialized until someone calls initialize()"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can the initialized implementation be leveraged for any attack under Transparent proxy pattern?",
+          "If upgrade pattern changes to UUPS, does this become critical?",
+          "Are implementation addresses discoverable on-chain?"
+        ],
+        "validation_requirements": [
+          "Call initialize() on implementation contract, verify success",
+          "Assess impact of attacker-controlled implementation state under current proxy pattern",
+          "Verify no cross-reference to implementation address in protocol"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify implementation contract addresses from deployment transactions",
+        "phase_2": "Call initialize() on each implementation, setting attacker as admin",
+        "phase_3": "Under current Transparent proxy, impact is limited (separate storage)",
+        "phase_4": "If protocol migrates to UUPS or if other contracts reference implementation, escalate attack",
+        "coordination_requirements": "None — simple on-chain call"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Implementation contract admin captured; no direct proxy impact under Transparent pattern",
+        "operational_disruption": "Limited under current architecture; high if upgrade pattern changes",
+        "recovery_difficulty": "Implementation cannot be re-initialized; must deploy new implementation",
+        "affected_operations": "Implementation contracts only (not proxied state)"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic — call initialize() on known address",
+        "operational_timing": "Any time before someone else initializes"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "initialize() call on implementation address",
+        "operational_anomalies": "Implementation contract with unexpected admin",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "easy"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H012",
+      "title": "Token Issuer Can Arbitrarily Confiscate Any User's Vesting Allocations via transferVesting",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The tokenIssuer authorized on each StepVesting contract can call transferVesting with any _grantor address, unilaterally moving vesting allocations from any beneficiary to any other address without the grantor's consent. Similarly, the VestingDeployer's transferVesting function allows the token owner to specify arbitrary grantor addresses. While the project documentation states 'Token issuers must always be able to reallocate vestings' (confirming this is by design), marketplace buyers who purchase vesting allocations may not realize their purchased allocations can be confiscated by the token issuer at any time. There is no timelock, governance approval, or notification mechanism for such transfers.",
+      "investigation_rationale": "Even though documented as intended, marketplace buyers have a reasonable expectation that purchased allocations are secure. The absence of any safeguard (timelock, multi-sig, event alerting) makes this a trust boundary concern for marketplace participants.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "transferVesting"
+      ],
+      "affected_contracts": [
+        "SecondSwap_StepVesting.sol",
+        "SecondSwap_VestingDeployer.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SecondSwap_StepVesting.sol",
+          "function": "transferVesting"
+        },
+        {
+          "file": "SecondSwap_VestingDeployer.sol",
+          "function": "transferVesting"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SecondSwap_StepVesting.sol",
+        "lines": "140-145",
+        "pattern": "require(msg.sender == tokenIssuer || msg.sender == manager || msg.sender == vestingDeployer) — tokenIssuer can call with any _grantor, no consent required"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Token issuer (or token owner via VestingDeployer) decides to confiscate user funds",
+        "Target user has non-zero vesting allocation"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "transferVesting accepts arbitrary _grantor from authorized callers; no approval or notification mechanism",
+        "admin_dependency": "Token issuer role required (semi-trusted per docs)",
+        "exploitation_window": "Any time token issuer chooses to act"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are marketplace buyers informed that token issuers can confiscate purchased allocations?",
+          "Should purchased allocations (tracked via allocations[buyer].bought) be protected from issuer confiscation?",
+          "Is a timelock or governance approval appropriate for this power?"
+        ],
+        "validation_requirements": [
+          "Token issuer calls transferVesting(buyer, attacker, buyer_balance), verify success",
+          "Verify buyer loses all purchased tokens with no recourse",
+          "Verify no event or notification alerts the buyer"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Malicious or compromised token issuer identifies high-value buyer allocations",
+        "phase_2": "Calls StepVesting.transferVesting(buyer, issuer_address, buyer_balance) or via VestingDeployer",
+        "phase_3": "Buyer's entire vesting allocation transferred to issuer without consent",
+        "phase_4": "Issuer claims or sells the confiscated tokens",
+        "coordination_requirements": "Token issuer key access"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Token issuer confiscates marketplace-purchased allocations",
+        "operational_disruption": "Complete loss of purchased vesting for affected buyers; marketplace trust destroyed",
+        "recovery_difficulty": "Irreversible unless issuer cooperates; no on-chain governance recourse",
+        "affected_operations": "All vesting allocations under issuer's vesting plans"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None — token issuer role required",
+        "coordination_complexity": "Low — single transaction",
+        "technical_skills": "Basic",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "VestingTransferred events with unexpected grantor (not the beneficiary)",
+        "operational_anomalies": "Buyer vesting balances decreasing without claim or marketplace activity",
+        "behavioral_patterns": "Token issuer calling transferVesting with marketplace buyers as grantors",
+        "detection_difficulty": "easy"
+      }
+    }
+  ]
+}

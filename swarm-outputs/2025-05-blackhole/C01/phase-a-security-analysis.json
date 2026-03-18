@@ -1,0 +1,257 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T03:52:37.308Z",
+    "duration_ms": 309829
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User to VotingEscrow",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "create_lock",
+          "increase_amount",
+          "increase_unlock_time",
+          "withdraw",
+          "merge",
+          "split",
+          "transferFrom"
+        ],
+        "failure_modes": [
+          "Loss of user funds if parameters are incorrect",
+          "Delegation corruption on token transfer"
+        ],
+        "attack_vectors": [
+          "Exploiting delegation logic to remove others' votes",
+          "Merging/splitting to manipulate permanent lock balances"
+        ]
+      },
+      {
+        "boundary": "User to VoterV3",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "vote",
+          "poke",
+          "reset"
+        ],
+        "failure_modes": [
+          "Voting with zero weights",
+          "Voting for dead gauges"
+        ],
+        "attack_vectors": [
+          "Manipulating pool weights to misdirect emissions"
+        ]
+      },
+      {
+        "boundary": "Admin to Bribe",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "recoverERC20AndUpdateData",
+          "emergencyRecoverERC20"
+        ],
+        "failure_modes": [
+          "Admin drains reward tokens"
+        ],
+        "attack_vectors": [
+          "Compromised admin key draining bribes"
+        ]
+      },
+      {
+        "boundary": "Executor to AutoVotingEscrowManager",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "performLockAction"
+        ],
+        "failure_modes": [
+          "Executor fails to vote",
+          "Executor votes for suboptimal pools"
+        ],
+        "attack_vectors": [
+          "Executor griefing by not voting or voting maliciously"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unlocked",
+        "to_state": "Locked",
+        "trigger": "create_lock",
+        "conditions": [
+          "value > 0",
+          "unlock_time > block.timestamp"
+        ],
+        "invariants": [
+          "supply increases by value",
+          "user balance increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Locked",
+        "to_state": "Unlocked",
+        "trigger": "withdraw",
+        "conditions": [
+          "block.timestamp >= locked.end",
+          "not SMNFT",
+          "not permanent"
+        ],
+        "invariants": [
+          "supply decreases by value",
+          "NFT is burned"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Normal Lock",
+        "to_state": "SMNFT Lock",
+        "trigger": "increase_unlock_time with isSMNFT=true",
+        "conditions": [
+          "not already SMNFT",
+          "not permanent"
+        ],
+        "invariants": [
+          "tokens are burned",
+          "smNFTBalance increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "User Owned",
+        "to_state": "AVM Managed",
+        "trigger": "enableAutoVoting",
+        "conditions": [
+          "balance >= minBalanceForAutovoting",
+          "not in last hour of epoch"
+        ],
+        "invariants": [
+          "NFT transferred to AutoVotingEscrow instance",
+          "tokenId mapped to AVM index"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Logic Error / Integration Issue",
+        "locations": [
+          "Bribe.sol: getReward",
+          "AutoVotingEscrowManager.sol: setOriginalOwner"
+        ],
+        "severity": "high",
+        "evidence": "In Bribe.sol, `getReward` checks `_owner == avm` where `avm` is the Manager contract, but `_owner` is the AutoVotingEscrow instance. It then uses an empty mapping `originalOwner` from the Manager. Because the condition is false, rewards are sent directly to the AutoVotingEscrow instance, which has no token withdrawal function.",
+        "exploitation_method": "Users who enable auto-voting will have their bribe rewards permanently locked in the AutoVotingEscrow contract when claimed.",
+        "affected_assets": [
+          "Bribe reward tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Incorrect Condition",
+        "locations": [
+          "VotingDelegationLib.sol: moveTokenDelegates"
+        ],
+        "severity": "high",
+        "evidence": "The condition `ownerOfFn(tId) == srcRep` is used to filter tokens to keep in the source delegate's checkpoint. It should be `tId != _tokenId`. This causes the source delegate to lose all delegations from other users whenever a single token is transferred.",
+        "exploitation_method": "An attacker can transfer, mint, or burn a token to trigger `moveTokenDelegates` and wipe out the voting power of any delegate.",
+        "affected_assets": [
+          "Governance voting power"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "DoS with Block Gas Limit",
+        "locations": [
+          "AutoVotingEscrowManager.sol: getTotalVotingPower",
+          "AutoVotingEscrow.sol: getTotalVotingPower"
+        ],
+        "severity": "medium",
+        "evidence": "Iterates over all AVMs and all locks within each AVM (up to 1024 per AVM). With multiple AVMs, this will exceed the block gas limit.",
+        "exploitation_method": "An attacker can create many small locks and enable auto-voting to fill up AVMs, causing `getTotalVotingPower` to revert for any caller.",
+        "affected_assets": [
+          "Protocol availability"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "VotingEscrow.sol",
+          "function": "setTeam(address)",
+          "guards": [
+            "require(msg.sender == team)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "VoterV3.sol",
+          "function": "setPermissionsRegistry(address)",
+          "guards": [
+            "VoterAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Bribe.sol",
+          "function": "emergencyRecoverERC20(address,uint256)",
+          "guards": [
+            "onlyAllowed"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "AutoVotingEscrowManager.sol",
+          "function": "setExecutor(address)",
+          "guards": [
+            "require(msg.sender == executor || msg.sender == owner())"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "PermissionsRegistry.sol",
+          "function": "addRole(string)",
+          "guards": [
+            "onlyBlackMultisig"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "BlackClaims.sol",
+          "function": "revokeUnclaimedReward()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

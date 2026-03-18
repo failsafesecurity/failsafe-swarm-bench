@@ -1,0 +1,203 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T17:24:44.181Z",
+    "duration_ms": 139284
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "logic",
+        "target_contract": "LendingLedger.sol",
+        "description": "update_market epoch loop calculates nextEpoch as `i + BLOCK_EPOCH` instead of the start of the next epoch boundary `((i / BLOCK_EPOCH) + 1) * BLOCK_EPOCH`. When lastRewardBlock is mid-epoch, the loop applies one epoch's cantoPerBlock rate to blocks belonging to subsequent epochs.",
+        "attack_scenario": "lastRewardBlock=150,000 and block.number=350,000. First iteration: epoch=100,000, nextEpoch=250,000, blockDelta=100,000. The rate cantoPerBlock[100,000] is applied to blocks 200,000-250,000 which actually belong to epoch 200,000. If epoch 100,000 has a higher rate than epoch 200,000, users receive excess rewards. If lower, users lose rewards. Governance cannot correct this since it's a structural loop error.",
+        "invariant_logic": "For each block B in [lastRewardBlock, block.number), the reward rate used MUST be cantoPerBlock[(B / BLOCK_EPOCH) * BLOCK_EPOCH]. The loop must advance to the next epoch boundary, not lastRewardBlock + BLOCK_EPOCH.",
+        "solidity_property": "function invariant_epochBoundary() public view { /* For any update call, nextEpoch should be ((i / BLOCK_EPOCH) + 1) * BLOCK_EPOCH, ensuring epoch-aligned iteration */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "LendingLedger.sol",
+        "description": "accCantoPerShare and secRewardsPerShare are stored as uint128 but computed in uint256. The cast `uint128(value)` silently truncates values exceeding 2^128-1, causing the accumulator to wrap and dramatically reduce, breaking the fundamental monotonicity property that accumulators must only increase.",
+        "attack_scenario": "A whitelisted market has very low marketSupply (e.g., 1 wei). cantoReward of ~340 CANTO produces (340e18 * 1e18) / 1 = 3.4e38 which exceeds uint128.max (~3.4e38). The truncation resets accCantoPerShare to a small value. All existing users lose their accumulated unclaimed rewards, while new depositors could claim excess rewards if the accumulator later grows past the pre-truncation value.",
+        "invariant_logic": "accCantoPerShare_new >= accCantoPerShare_old AND secRewardsPerShare_new >= secRewardsPerShare_old for every call to update_market. The intermediate uint256 value MUST fit in uint128 before casting.",
+        "solidity_property": "function invariant_accumulatorMonotonicity(address market) public view { MarketInfo memory m = marketInfo[market]; assert(m.accCantoPerShare >= 0); /* Real check requires storing old value and asserting new >= old */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LendingLedger.sol",
+        "description": "De-whitelisting a market makes all operations (claim, sync_ledger) revert due to update_market's whitelist check. Users with accrued but unclaimed rewards permanently lose access to those rewards. There is no grace period or emergency claim path.",
+        "attack_scenario": "Governance de-whitelists a market that has active users with unclaimed CANTO rewards. All calls to claim() for that market revert with 'Market not whitelisted'. Users' reward balances are frozen with no recovery mechanism. Even re-whitelisting the market resets lastRewardBlock to current block, potentially skipping unclaimed reward intervals.",
+        "invariant_logic": "If user.rewardDebt < (user.amount * market.accCantoPerShare / 1e18) for any user in a market, then the market MUST remain claimable (either whitelisted or via emergency claim path).",
+        "solidity_property": "function invariant_claimability(address market, address user) public view { UserInfo memory u = userInfo[market][user]; MarketInfo memory m = marketInfo[market]; int256 pending = int256((uint256(u.amount) * m.accCantoPerShare) / 1e18) - u.rewardDebt; if (pending > 0) { assert(lendingMarketWhitelist[market] == true); } }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "claim"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "whiteListLendingMarket"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LendingLedger.sol",
+        "description": "sync_ledger uses msg.sender as the lending market address with no additional validation. Any whitelisted contract can report arbitrary _lender addresses and _delta amounts. A compromised or malicious whitelisted market can inflate user balances to drain the reward pool.",
+        "attack_scenario": "A whitelisted lending market is compromised (or is intentionally malicious). It calls sync_ledger(attacker, 1e30) to give the attacker a massive deposit balance with zero actual cNOTE deposited. The attacker then calls claim() to drain all CANTO rewards from the contract. The lendingMarketTotalBalance tracking cannot prevent this since the market controls its own balance reporting.",
+        "invariant_logic": "For all users U and markets M: userInfo[M][U].amount MUST correspond to the actual cNOTE balance of U in market M. lendingMarketTotalBalance[M] MUST equal the sum of all userInfo[M][*].amount.",
+        "solidity_property": "function invariant_balanceConsistency(address market) public view { /* Sum of all user amounts for market MUST equal lendingMarketTotalBalance[market] - verifiable only with enumeration */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "sync_ledger"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "LendingLedger.sol",
+        "description": "setRewards can retroactively modify cantoPerBlock for past epochs that have not yet been consumed by update_market. Since update_market is lazy (only runs when called), governance can change reward rates for past blocks before any market's update_market processes them, altering rewards retroactively.",
+        "attack_scenario": "Epoch 200,000 had cantoPerBlock set to X. No one calls update_market for 5 epochs. Governance calls setRewards to change epoch 200,000's rate to 0 (or to a much higher value). When update_market is finally called, it uses the modified rate for blocks that already passed, either stealing rewards from users or inflating them.",
+        "invariant_logic": "cantoPerBlock[epoch] MUST NOT be modified after epoch + BLOCK_EPOCH <= block.number (i.e., after the epoch has fully elapsed). Only future or current epochs should be modifiable.",
+        "solidity_property": "function invariant_noRetroactiveRewards(uint256 epoch) public view { /* If epoch + BLOCK_EPOCH <= block.number, cantoPerBlock[epoch] must not change from its value at block epoch + BLOCK_EPOCH */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "setRewards"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "LendingLedger.sol",
+        "description": "The update_market loop iterates block-by-block in BLOCK_EPOCH-sized chunks. If a market goes many epochs without being updated, the loop must iterate once per (misaligned) epoch chunk. With the epoch bug (INV-STATE-001), worst case each iteration covers BLOCK_EPOCH blocks. But if lastRewardBlock is very stale (e.g., 1000 epochs behind), the loop runs ~1000 iterations. While bounded, combined with external calls to gaugeController.gauge_relative_weight_write (state-modifying), gas costs could exceed block limits.",
+        "attack_scenario": "A whitelisted market has no activity for a long period. When someone finally calls claim() or sync_ledger(), the update_market loop must process all missed blocks. With gauge_relative_weight_write being called each iteration (which writes to storage), gas costs per iteration are high. After enough epochs, the market becomes permanently stuck—no one can claim or sync because every transaction runs out of gas.",
+        "invariant_logic": "block.number - market.lastRewardBlock MUST be bounded such that the update_market loop completes within gas limits. Alternatively, a mechanism to incrementally advance lastRewardBlock MUST exist.",
+        "solidity_property": "function invariant_updateBounded(address market) public view { MarketInfo memory m = marketInfo[market]; uint256 epochs = (block.number - m.lastRewardBlock) / BLOCK_EPOCH; assert(epochs <= MAX_CATCHUP_EPOCHS); }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LendingLedger.sol",
+        "description": "When a market is re-whitelisted after being de-whitelisted, lastRewardBlock is overwritten to the current block.number, but accCantoPerShare is NOT reset. This creates a discontinuity: the accumulator retains old values, but the reward period between de-listing and re-listing is skipped. Users who had deposits before de-listing and still have nonzero user.amount will not earn rewards for the gap period (correct), but new deposits after re-listing will calculate rewardDebt against the stale accumulator.",
+        "attack_scenario": "Market is de-whitelisted at block 200k with accCantoPerShare=X. Re-whitelisted at block 500k, lastRewardBlock set to 500k, accCantoPerShare still X. A user who deposited before de-listing can still claim based on accCantoPerShare once markets resume. Meanwhile, sync_ledger cannot be called during the gap (reverts), so user.amount is frozen. On re-whitelisting, a withdrawal sync_ledger would subtract from rewardDebt using the current accCantoPerShare. If gap rewards are nonzero, this creates incorrect reward accounting.",
+        "invariant_logic": "If lendingMarketWhitelist[market] transitions false->true, market.accCantoPerShare should be consistent with the new lastRewardBlock such that no phantom rewards are created.",
+        "solidity_property": "function invariant_rewhitelistConsistency(address market) public view { /* After re-whitelisting, pending rewards for users with stale positions should be zero or correctly reflect only post-relist accumulation */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "whiteListLendingMarket"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "claim"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "LendingLedger.sol",
+        "description": "claim() sends native CANTO via low-level call without reentrancy protection. While CEI pattern is followed (rewardDebt updated before transfer), a reentrant call to sync_ledger from a whitelisted market controlled by the caller could modify user.amount mid-claim, affecting future reward calculations.",
+        "attack_scenario": "Attacker controls a whitelisted lending market. Attacker calls claim(). During the CANTO transfer callback, the attacker's receive() function calls their whitelisted market, which calls sync_ledger to increase the attacker's amount. This doesn't affect the current claim (rewardDebt already set), but the increased amount now earns rewards on the full accCantoPerShare without proportional rewardDebt adjustment—wait, sync_ledger does adjust rewardDebt proportionally. So this specific attack is mitigated by sync_ledger's debt adjustment. The invariant still holds that reentrancy should not produce inconsistent state.",
+        "invariant_logic": "After claim() completes: user.rewardDebt == int256((user.amount * market.accCantoPerShare) / 1e18). No reentrancy path should break this postcondition.",
+        "solidity_property": "function invariant_claimPostcondition(address market, address user) public view { UserInfo memory u = userInfo[market][user]; MarketInfo memory m = marketInfo[market]; assert(u.rewardDebt == int256((uint256(u.amount) * m.accCantoPerShare) / 1e18)); }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "claim"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "sync_ledger"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "LendingLedger.sol",
+        "description": "market.lastRewardBlock must monotonically increase and always equal block.number after update_market completes. However, whiteListLendingMarket can reset lastRewardBlock to current block.number on re-whitelisting, which could move it backward if it was already at a higher value from a future-block scenario, or create a gap in reward coverage.",
+        "invariant_logic": "After update_market(M): marketInfo[M].lastRewardBlock == block.number. After whiteListLendingMarket(M, true): marketInfo[M].lastRewardBlock == block.number. lastRewardBlock must never decrease except through the controlled re-whitelist path.",
+        "solidity_property": "function invariant_lastRewardBlockMonotonic(address market) public view { assert(marketInfo[market].lastRewardBlock <= block.number); }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "update_market"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "whiteListLendingMarket"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "LendingLedger.sol",
+        "description": "The contract's CANTO balance must be sufficient to cover all pending reward claims. There is no check that the contract holds enough CANTO to pay claims, and no mechanism to ensure solvency. Governance can set arbitrarily high cantoPerBlock without depositing corresponding CANTO.",
+        "attack_scenario": "Governance sets cantoPerBlock to a high value. Rewards accumulate across many markets and users. Early claimers drain the contract's CANTO balance. Later claimers' transactions revert on the CANTO transfer, permanently locking their reward debt (since rewardDebt is updated before the transfer attempt... wait, actually rewardDebt IS updated before the transfer and the require would revert the entire transaction including the rewardDebt update). So later claimers cannot claim at all, but their state is preserved. Still, the system becomes insolvent.",
+        "invariant_logic": "address(this).balance >= sum of all (int256((user.amount * market.accCantoPerShare) / 1e18) - user.rewardDebt) for all positive pending amounts across all markets and users.",
+        "solidity_property": "function invariant_solvency() public view { /* address(this).balance >= total pending claims - requires enumeration of all users and markets */ }",
+        "inventory_refs": [
+          {
+            "file": "LendingLedger.sol",
+            "function": "claim"
+          },
+          {
+            "file": "LendingLedger.sol",
+            "function": "setRewards"
+          }
+        ]
+      }
+    ]
+  }
+}

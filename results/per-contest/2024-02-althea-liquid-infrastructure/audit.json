@@ -1,0 +1,288 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Burns Accumulate address(0) in Holders Array Causing Permanent Distribution DoS",
+      "severity": "high",
+      "summary": "Every burn operation (burn/burnFrom) triggers _beforeTokenTransfer with to=address(0). Since balanceOf(address(0)) is always 0, the check `this.balanceOf(to) != 0` is always false, causing `holders.push(address(0))` on every burn. The _afterTokenTransfer hook only attempts to remove `from` (the burner), never address(0). Over time, the holders array grows unboundedly with address(0) entries. distributeToAllHolders() processes each entry, eventually exceeding block gas limits. Even partial distri",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 127,
+          "line_end": 133,
+          "desc": "During burn: to=address(0), balanceOf(address(0))=0 always, so holders.push(address(0)) executes on every burn"
+        }
+      ],
+      "impact": "CRITICAL. The holders array grows by one address(0) entry per burn. With enough burns, distributeToAllHolders() becomes permanently unusable (OOG). Partial distribute() calls waste gas on phantom entries. Since distributions are the core mechanism for revenue delivery to token holders, this effectively DoSes the entire protocol. All accumulated revenue becomes inaccessible to holders. There is no on-chain recovery mechanism — no function exists to remove arbitrary entries from the holders array.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "releaseManagedNFT Contains Dead Validation (require(true)) Allowing Silent NFT Release Failures",
+      "severity": "high",
+      "summary": "releaseManagedNFT contains `require(true, 'unable to find released NFT in ManagedNFTs')` which always passes regardless of whether the NFT was actually found and removed from the ManagedNFTs array. If the provided nftContract address is not in ManagedNFTs (wrong address, already released, or never added via addManagedNFT), the NFT token is transferred out but ManagedNFTs is not modified. This leaves stale entries in ManagedNFTs or fails to clean up, causing subsequent withdrawFromManagedNFTs to ",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 282,
+          "line_end": 283,
+          "desc": "require(true, 'unable to find released NFT in ManagedNFTs') — literal true, never reverts"
+        }
+      ],
+      "impact": "The direct impact is that the intended safety check is completely non-functional. The `require(true)` can never revert, making the validation dead code. While this requires an owner operational error to trigger adverse effects (since only the owner can call releaseManagedNFT), the code defect is clear and unambiguous. If triggered, downstream impacts include: (1) silent success misleading the owner, (2) potential stale ManagedNFTs entries if the wrong NFT is released instead of the intended one, (3) withdrawFromManagedNFTs reverting on stale entries (the NFT's withdrawBalancesTo requires owner/approved), blocking revenue collection for all holders.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "_afterTokenTransfer Missing Break After Swap-and-Pop Skips Swapped Element",
+      "severity": "high",
+      "summary": "In _afterTokenTransfer, when removing a holder via swap-and-pop (copying last element to position i, then pop), the loop does not break after removal. After swap-and-pop, `i` increments, causing the element that was swapped from the end into position i to be skipped entirely — it is never checked. This means: (1) if there are duplicate entries of the same address (from bug TECH-H001/H002), only the first is removed per call; (2) the swapped element may be incorrectly left in the array even if it",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 144,
+          "line_end": 155,
+          "desc": "After swap-and-pop: holders[i] = holders[holders.length - 1]; holders.pop(); — no break statement; i++ on next iteration skips the swapped element"
+        }
+      ],
+      "impact": "MEDIUM-HIGH severity. The defect itself is a clear code bug (swap-and-pop without break/decrement). In isolation (unique entries only), it wastes gas but doesn't cause incorrect state. However, combined with the address(0) burn bug, it prevents complete cleanup of phantom entries, leading to: (1) persistent phantom entries in holders[], (2) progressively degraded distribution gas costs, (3) potential permanent DoS on distributeToAllHolders() if enough phantom entries accumulate. The impact is amplified by the lack of any administrative function to clean up the holders array.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Integer Division Truncation in Entitlement Calculation Permanently Locks Low-Decimal Token Revenue",
+      "severity": "high",
+      "summary": "In _beginDistribution, entitlement per unit is calculated as `balance / supply` using integer division. For tokens with fewer decimals than the ERC20's 18 decimals (e.g., USDC with 6 decimals), when balance < supply, entitlementPerUnit truncates to 0. For example, with 1000 LiquidInfrastructureERC20 tokens (1e21 wei supply) and 1000 USDC (1e9 units), entitlement = 1e9 / 1e21 = 0. All USDC revenue rounds to zero per unit and is permanently locked in the contract with no recovery mechanism. The do",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 198,
+          "line_end": 204,
+          "desc": "uint256 entitlement = balance / supply; — integer division truncates to 0 when balance < supply"
+        }
+      ],
+      "impact": "CRITICAL financial impact. 100% of low-decimal token (USDC, USDT) revenue is permanently locked in the contract for any realistic supply and revenue amounts. All token holders receive zero distributions for these tokens. There is no admin withdrawal, sweep, or recovery function to extract the trapped funds. The protocol's primary purpose (distributing revenue to holders) is completely broken for its explicitly documented target tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "setDistributableERC20s Callable During Active Distribution Causes Permanent Contract Lock",
+      "severity": "high",
+      "summary": "setDistributableERC20s has no check for LockedForDistribution. If called during an active distribution, it changes the distributableERC20s array while erc20EntitlementPerUnit was sized for the old array. In distribute(), the inner loop iterates over `distributableERC20s.length` (new length) and accesses `erc20EntitlementPerUnit[j]` (old length). If the new array is longer, this causes an array out-of-bounds revert. Since LockedForDistribution is true and can only be cleared by completing the dis",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 291,
+          "line_end": 296,
+          "desc": "setDistributableERC20s has onlyOwner but no LockedForDistribution check; distribute() at lines 167-175 iterates distributableERC20s.length and indexes erc20EntitlementPerUnit"
+        }
+      ],
+      "impact": "HIGH severity code defect. If triggered with a longer array, all transfers/mints/burns are blocked until the owner recognizes and fixes the issue by resetting distributableERC20s. If triggered with a shorter array (no revert), entitlements calculated for old tokens are applied to new tokens at wrong indices, causing misallocation of funds. Both scenarios represent real harm from a missing guard.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "nextWithdrawal Index Corruption When releaseManagedNFT Called During Partial Withdrawal Cycle",
+      "severity": "high",
+      "summary": "releaseManagedNFT uses swap-and-pop on ManagedNFTs but does not adjust the nextWithdrawal index. If an NFT at index < nextWithdrawal is released during a partial withdrawal cycle, the element swapped from the end (which hasn't been withdrawn from yet) replaces the removed element and is skipped. Worse, if enough NFTs are released such that ManagedNFTs.length < nextWithdrawal, the completion check `nextWithdrawal == ManagedNFTs.length` never triggers (nextWithdrawal > ManagedNFTs.length), and nex",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 265,
+          "line_end": 285,
+          "desc": "releaseManagedNFT swap-and-pop does not adjust nextWithdrawal; withdrawFromManagedNFTs at lines 238-257 relies on nextWithdrawal == ManagedNFTs.length for completion"
+        }
+      ],
+      "impact": "HIGH severity. If nextWithdrawal becomes permanently stuck above ManagedNFTs.length, the withdrawal cycle cannot complete. This means: (1) No new WithdrawalStarted event is emitted (requires nextWithdrawal==0). (2) Revenue from remaining managed NFTs cannot be collected by the ERC20 contract. (3) All future distributions will not include new revenue. (4) Recovery requires adding NFTs back to make ManagedNFTs.length >= nextWithdrawal, which is a non-obvious workaround. Even in the less severe case where ManagedNFTs.length >= nextWithdrawal after releases, an NFT swapped to a lower index is skipped for the current cycle, causing missed revenue collection.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Disapproved Holders Dilute Distribution Entitlements for Approved Holders",
+      "severity": "high",
+      "summary": "The entitlement calculation in _beginDistribution uses totalSupply() as the denominator, which includes tokens held by disapproved holders. During distribution, disapproved holders are skipped (isApprovedHolder check), but their proportional share is not redistributed. It remains in the contract and is included in the NEXT distribution's balance — but totalSupply still includes their tokens, so the dilution persists indefinitely. Approved holders are systematically underpaid relative to their ac",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 196,
+          "line_end": 204,
+          "desc": "uint256 supply = this.totalSupply(); entitlement = balance / supply; — totalSupply includes disapproved holders' tokens"
+        }
+      ],
+      "impact": "Financial impact is proportional to the fraction of totalSupply held by disapproved holders. If disapproved holders collectively hold X% of supply, then approved holders receive (100-X)% of what they should receive each distribution cycle. The undistributed funds remain in the contract but are subject to the same dilution in future cycles. This is a persistent, compounding loss for approved holders with no self-correcting mechanism. The owner could mitigate by re-approving holders or coordinating voluntary burns, but there is no on-chain enforcement.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "addManagedNFT Allows Duplicate NFT Entries Creating Double-Withdrawal and Release Issues",
+      "severity": "high",
+      "summary": "addManagedNFT only checks that the contract owns the NFT but does not check whether the NFT is already in the ManagedNFTs array. If the owner calls addManagedNFT(nft) twice, the same NFT address appears twice in ManagedNFTs. During withdrawFromManagedNFTs, the first withdrawal drains the NFT's balance; the second withdrawal for the same NFT gets 0 (wasting gas). When releaseManagedNFT is called, only one occurrence is removed (the loop breaks), leaving a stale duplicate entry. Subsequent withdra",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 259,
+          "line_end": 263,
+          "desc": "ManagedNFTs.push(nftContract) without checking for existing entry; no deduplication"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect requires owner error (calling addManagedNFT twice for the same NFT), but once triggered: (1) Withdrawal DoS blocks all revenue collection from ALL managed NFTs until the stale entry is somehow resolved, (2) All token holders are affected by blocked distributions since no revenue can be collected, (3) Recovery requires reacquiring ownership of the released NFT which may not be possible if the recipient refuses to return it. The compound effect with the require(true) bug means there's no warning when release doesn't fully clean up.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permanent distribution lock if a single recipient/token transfer reverts (blacklist/pause/nonstandard ERC20), blocking all transfers/mints/burns",
+      "severity": "high",
+      "summary": "distribute() sets LockedForDistribution=true in _beginDistribution(), then performs external ERC20 `transfer()` calls inside nested loops. If any transfer reverts (e.g., token is paused/blacklists a holder; token is nonstandard and reverts on ABI decoding; insufficient balance due to rebasing), the entire distribute() call reverts and the distribution remains locked (LockedForDistribution stays true because state changes prior to revert are rolled back to pre-call, but the lock can still be re-e",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 118,
+          "line_end": 166,
+          "desc": "distribute(): nested loop calls `IERC20(distributableERC20s[j]).transfer(recipient, entitlement)` with no SafeERC20 wrapper; distribution lock blocks all transfers via _beforeTokenTransfer()"
+        }
+      ],
+      "impact": "CRITICAL: Protocol-wide freeze of all ERC20 transfer, mint, and burn operations. Revenue distributions cannot complete. No automated recovery mechanism exists. Admin workarounds (disapproveHolder, setDistributableERC20s) exist but cause entitlement losses and are undocumented. For nonstandard tokens like USDT, the issue affects ALL recipients, not just one, making disapproveHolder ineffective as a workaround.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Duplicate Holder Array Entries via Zero-Value Transfers Enable Reward Theft and Permanent Distribution DoS",
+      "severity": "high",
+      "summary": "Any address (even unapproved, with zero balance) can call transfer(approvedAddress, 0) repeatedly. In _beforeTokenTransfer, balanceOf(to) is checked BEFORE the transfer executes. Since the target has 0 balance and receives 0 tokens, balanceOf(to)==0 on every call, causing holders.push(to) on every call. This creates unbounded duplicate entries in the holders array. During distribution, each duplicate entry triggers a separate entitlement calculation (erc20EntitlementPerUnit * balanceOf(address))",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 127,
+          "line_end": 134,
+          "desc": "bool exists = (this.balanceOf(to) != 0); if (!exists) { holders.push(to); } — checked pre-transfer, no dedup, allows 0-amount transfers to push duplicates"
+        }
+      ],
+      "impact": "CRITICAL: Any external account can permanently brick the entire protocol by inflating the holders array. The attack requires zero tokens, zero approval, and costs only gas. Impact includes: (1) Reward theft - the duplicated holder receives N times their fair share before insolvency. (2) Permanent DoS - once distribution encounters insufficient balance, LockedForDistribution stays true forever, blocking ALL transfers, mints, and burns. (3) Total loss of all distributable ERC20 balances held by the contract.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Silent Transfer Failure in distribute() Permanently Steals Holder Entitlements",
+      "severity": "high",
+      "summary": "In distribute(), the ERC20 transfer to recipients uses `if (toDistribute.transfer(recipient, entitlement))` — a conditional that handles false returns by simply skipping the payout. If a distributable ERC20 returns false instead of reverting (e.g., token with transfer restrictions, blacklists, or non-standard behavior), the recipient's entitlement for that distribution cycle is silently lost. The tokens remain in the contract and become part of the next distribution's pool, but the affected hold",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 191,
+          "line_end": 200,
+          "desc": "if (toDistribute.transfer(recipient, entitlement)) { receipts[j] = entitlement; } — silent skip on false return"
+        }
+      ],
+      "impact": "MEDIUM severity. The impact is that a holder whose address causes a distributable ERC20's transfer() to return false will permanently lose their entitlement for that token every distribution cycle. The lost tokens benefit other holders in subsequent cycles. Detection is difficult because the Distribution event shows receipts[j]=0 which could be confused with a legitimate zero entitlement. No SafeERC20 is used anywhere in the contract. The defect is real but its manifestation depends on specific ERC20 token behavior (returning false vs reverting).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "NFT Thresholds Become Immutable After ERC20 Management Stranding Non-Threshold Revenue",
+      "severity": "high",
+      "summary": "Once a LiquidInfrastructureNFT is transferred to the LiquidInfrastructureERC20 contract, setThresholds requires onlyOwnerOrApproved(AccountId). The ERC20 contract is now the owner but exposes no function to call setThresholds on managed NFTs. The ERC20 also cannot grant ERC721 approvals. If the Cosmos module deposits a new token type to the NFT, it cannot be withdrawn because getThresholds returns the frozen list and withdrawFromManagedNFTs only withdraws threshold-listed tokens.",
+      "description": [
+        {
+          "file": "LiquidInfrastructureNFT.sol",
+          "line_start": 108,
+          "line_end": 122,
+          "desc": "setThresholds requires onlyOwnerOrApproved(AccountId); ERC20 contract is owner but has no function to call setThresholds"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: withdrawFromManagedNFTs(uint256)"
+        }
+      ],
+      "impact": "MEDIUM severity. Any ERC20 token that accumulates on a managed NFT but is not in the frozen threshold list is inaccessible through normal operations. This affects all ERC20 holders who would otherwise be entitled to distributions from that revenue. The workaround (release, update thresholds, re-add) exists but is operationally complex, disrupts the management cycle, and is error-prone due to the separate require(true) bug in releaseManagedNFT.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Public distribution start can be used to intentionally freeze all transfers by forcing a distribution that cannot complete (gas-bound lock)",
+      "severity": "high",
+      "summary": "Any account can start distribution once the period elapses, which immediately sets `LockedForDistribution=true` and blocks all transfers/mints/burns. If the holders set is large enough, the distribution cannot be completed quickly, turning the protocol into a transfer-frozen state for an extended time and potentially indefinitely if completion becomes economically infeasible.",
+      "description": [
+        {
+          "file": "liquid-infrastructure/contracts/LiquidInfrastructureERC20.sol",
+          "line_start": 112,
+          "line_end": 177,
+          "desc": "distribute(uint256) is public; when starting, _beginDistribution() sets LockedForDistribution=true before iterating; completion requires iterating through `holders`"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: mintAndDistribute(address,uint256)"
+        }
+      ],
+      "impact": "HIGH severity. An unprivileged attacker can deterministically freeze all ERC20 token operations (transfers, mints, burns) by calling a single public function. The freeze duration depends on the holders array size and willingness of others to pay gas to complete the distribution. With the address(0) accumulation bug, the array can grow to a size where completing distribution is economically infeasible, creating a potentially permanent freeze. This affects all token holders who cannot transfer, sell, or burn their positions during the lock.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Anyone can grief withdrawals by manipulating nextWithdrawal progress with a reverting/hostile ManagedNFT, stalling revenue collection",
+      "severity": "high",
+      "summary": "withdrawFromManagedNFTs() is public and iterates ManagedNFTs calling external `getThresholds()` and `withdrawBalancesTo()`. If any ManagedNFT in the list reverts (e.g., not actually owned/approved, malicious contract at that address, or legitimate NFT with misconfigured thresholds causing downstream token transfer revert), the whole withdrawal batch reverts and nextWithdrawal does not advance. This allows indefinite stalling of revenue aggregation if any ManagedNFT is broken; since anyone can ca",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 246,
+          "line_end": 260,
+          "desc": "withdrawFromAllManagedNFTs(): calls withdrawFromManagedNFTs(ManagedNFTs.length) with no access control; underlying loop makes external calls to each ManagedNFT without try/catch"
+        }
+      ],
+      "impact": "HIGH. Revenue collection from all ManagedNFTs at indices >= the broken entry is blocked. Since distributions depend on aggregated balances, delayed revenue collection means delayed or reduced distributions for all ERC20 holders. The `require(true)` bug makes this more likely to occur in practice. Owner can remediate but must identify the issue and call releaseManagedNFT, which itself has bugs (require(true), cursor corruption if mid-withdrawal).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Withdrawal DoS via Unowned NFTs in Constructor",
+      "severity": "high",
+      "summary": "The constructor accepts an array of `_managedNFTs` and assigns it directly to `ManagedNFTs` without verifying that the contract actually owns them. If an unowned NFT is included, calls to `withdrawFromManagedNFTs` will revert when attempting to withdraw from that NFT, permanently blocking the withdrawal cycle.",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 466,
+          "line_end": 466,
+          "desc": "Missing ownership validation in constructor"
+        }
+      ],
+      "impact": "If triggered, all NFTs at indices after the unowned one in ManagedNFTs cannot have their revenue collected. The withdrawal cycle permanently stalls at the unowned NFT's index. Token holders lose revenue from all subsequent NFTs. No admin recovery path exists since releaseManagedNFT reverts for unowned NFTs. The only mitigation would be redeployment of the entire ERC20 contract.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Distribution Dust Permanently Locked With No Recovery Mechanism",
+      "severity": "high",
+      "summary": "_endDistribution clears erc20EntitlementPerUnit and resets state but includes no mechanism to sweep undistributed dust (balance mod totalSupply per token per distribution). Over many distribution cycles, significant value accumulates in the contract with no function to recover it. For 18-decimal tokens, dust = balance % totalSupply per cycle. For 6-decimal tokens (see ECON-H003), the entire balance is dust.",
+      "description": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "line_start": 234,
+          "line_end": 242,
+          "desc": "_endDistribution only clears entitlements and resets lock; no dust sweep or carryover logic"
+        }
+      ],
+      "impact": "MEDIUM severity. For 18-decimal distributable tokens: max irrecoverable dust is bounded by supply-1 units (typically negligible in value). For 6-decimal tokens (USDC, USDT): if totalSupply exceeds token balance (common for production deployments), entitlement rounds to 0 and ALL revenue in that token is permanently locked. This is a real code defect regardless of economic exploitability.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

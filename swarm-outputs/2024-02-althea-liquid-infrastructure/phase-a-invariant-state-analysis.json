@@ -1,0 +1,271 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T21:45:24.143Z",
+    "duration_ms": 366432
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "Every burn operation adds address(0) to the holders array. In _beforeTokenTransfer, when to==address(0) (burn), the code checks `this.balanceOf(address(0))` which is always 0, so `exists=false` and `holders.push(address(0))` executes. Mints partially clean up (one entry per mint via _afterTokenTransfer), but net burns cause unbounded accumulation of address(0) entries.",
+        "attack_scenario": "An attacker or normal users burn tokens over time. Each burn adds address(0) to holders. The holders array grows unboundedly with phantom entries, causing distributeToAllHolders() to exceed block gas limits (permanent DoS on distribution). Even partial distribute() calls waste gas iterating over address(0) entries.",
+        "invariant_logic": "forall i in [0, holders.length): holders[i] != address(0)",
+        "solidity_property": "function invariant_noZeroAddressInHolders() public view { for (uint i = 0; i < holders.length; i++) { assert(holders[i] != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_beforeTokenTransfer"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_afterTokenTransfer"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distribute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "releaseManagedNFT contains `require(true, 'unable to find released NFT in ManagedNFTs')` which always passes. If the nftContract is not found in the ManagedNFTs array (e.g., wrong address, already removed, never added via addManagedNFT), the NFT transfer succeeds but ManagedNFTs is not modified. The intended validation that the NFT was found and removed is completely absent.",
+        "attack_scenario": "Owner accidentally releases an NFT with an address not in ManagedNFTs. The NFT is transferred away, no error is raised, and a stale entry remains in ManagedNFTs pointing to a contract this address no longer owns. Subsequent withdrawFromManagedNFTs calls to that stale entry will fail (access denied) or interact with an uncontrolled contract, potentially bricking the withdrawal cycle.",
+        "invariant_logic": "After releaseManagedNFT(nft, to): nft NOT IN ManagedNFTs AND nft.ownerOf(AccountId) == to",
+        "solidity_property": "function invariant_releasedNFTRemoved(address nftContract) public view { for (uint i = 0; i < ManagedNFTs.length; i++) { assert(ManagedNFTs[i] != nftContract); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "releaseManagedNFT"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "Modifying ManagedNFTs (via releaseManagedNFT or addManagedNFT) while nextWithdrawal > 0 (partial withdrawal in progress) corrupts the withdrawal state. A swap-and-pop removal at index < nextWithdrawal causes the swapped-in NFT to be skipped (never withdrawn from in this cycle). If the array shrinks such that nextWithdrawal > ManagedNFTs.length, the equality check `nextWithdrawal == ManagedNFTs.length` fails, and nextWithdrawal is never reset to 0, permanently blocking the withdrawal cycle from completing.",
+        "attack_scenario": "Owner starts withdrawFromManagedNFTs with a partial batch (nextWithdrawal=2 out of 4). Owner then calls releaseManagedNFT to remove an NFT at index 0. The last NFT is swapped in and never gets withdrawn. If enough NFTs are released, nextWithdrawal exceeds the array length and the withdrawal cycle permanently stalls, preventing revenue collection from all remaining NFTs.",
+        "invariant_logic": "nextWithdrawal > 0 implies ManagedNFTs must not be modified (no add or release) until nextWithdrawal resets to 0",
+        "solidity_property": "function invariant_noManagedNFTModDuringWithdrawal() public view { if (nextWithdrawal > 0) { assert(nextWithdrawal <= ManagedNFTs.length); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "withdrawFromManagedNFTs"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "releaseManagedNFT"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "addManagedNFT"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "_afterTokenTransfer's swap-and-pop holder removal loop does not break after finding and removing the target address. The element swapped into position i is skipped because i is incremented past it. For address(0) entries (see INV-STATE-001) that can appear multiple times, adjacent duplicates at the end of the array may not all be removed, causing persistent phantom entries.",
+        "attack_scenario": "Multiple burns create multiple address(0) entries. A subsequent mint tries to clean up address(0) entries, but the missing break causes the swap-and-pop to skip over certain address(0) entries. The holders array retains phantom entries that grow over time, degrading distribution gas costs and potentially causing DoS.",
+        "invariant_logic": "After _afterTokenTransfer(from, to, amount): if balanceOf(from) == 0 then count(holders, from) == 0",
+        "solidity_property": "function invariant_removedHolderNotInArray(address from) public view { if (balanceOf(from) == 0) { for (uint i = 0; i < holders.length; i++) { assert(holders[i] != from); } } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_afterTokenTransfer"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "In distribute(), ERC20 transfers use `if (toDistribute.transfer(recipient, entitlement))` without requiring success. If a distributable ERC20 returns false instead of reverting (as some non-standard tokens do), the recipient silently loses their entitlement for that distribution cycle. The tokens remain in the contract and become part of the next distribution pool, but the original recipient is permanently short-changed for this cycle.",
+        "attack_scenario": "A distributable ERC20 with transfer restrictions (e.g., blacklist, pause) returns false for a specific recipient. That recipient's entitlement is silently skipped. If this occurs systematically (e.g., USDT blacklist), the affected holder permanently receives zero distributions despite holding tokens. No event or revert signals the failure.",
+        "invariant_logic": "For each approved holder and each distributable token: entitlement calculated implies entitlement transferred (no silent drops)",
+        "solidity_property": "function invariant_noSilentTransferFailure() public pure { /* Cannot be expressed as on-chain assert; requires checking return value with require or safeTransfer */ }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distribute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "Entitlement per unit is calculated as `balance / supply` using integer division. If the distributable ERC20 balance is less than the total supply of the LiquidInfrastructureERC20 (e.g., 1e6 USDC balance vs 1e18 supply), entitlement truncates to 0. All revenue for that token is effectively locked in the contract permanently, as each distribution calculates 0 entitlement and the balance persists.",
+        "attack_scenario": "Protocol accumulates revenue in a 6-decimal token (USDC). With 18-decimal LiquidInfrastructureERC20 supply of 1000 tokens (1e21 units), any USDC balance below 1e21 (i.e., $1e15) truncates to 0 per unit. Practically all real-world USDC revenue is permanently unclaimable. The dust accumulates indefinitely.",
+        "invariant_logic": "For each distributable ERC20: balance / totalSupply > 0 OR balance == 0 (i.e., no non-zero balance results in zero distribution)",
+        "solidity_property": "function invariant_entitlementNonZero() public view { uint256 supply = totalSupply(); for (uint i = 0; i < distributableERC20s.length; i++) { uint256 bal = IERC20(distributableERC20s[i]).balanceOf(address(this)); assert(bal == 0 || bal / supply > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_beginDistribution"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distribute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "setDistributableERC20s is callable by the owner even when LockedForDistribution is true. During an active distribution, distribute() iterates over distributableERC20s and indexes into erc20EntitlementPerUnit. If setDistributableERC20s changes the distributableERC20s array mid-distribution, the entitlement amounts (calculated for the old tokens) are applied to the new token addresses, causing wrong tokens to be distributed with wrong amounts.",
+        "attack_scenario": "Distribution is in progress (LockedForDistribution=true, some holders paid). Owner calls setDistributableERC20s to replace [USDC, WETH] with [DAI]. Now distributableERC20s.length=1 but erc20EntitlementPerUnit.length=2. Remaining holders get DAI distributed with the entitlement calculated for USDC. If DAI has a different balance, holders receive incorrect amounts. If the array length mismatch causes an out-of-bounds access, the distribution reverts and becomes stuck.",
+        "invariant_logic": "LockedForDistribution == true implies distributableERC20s.length == erc20EntitlementPerUnit.length AND distributableERC20s array is immutable",
+        "solidity_property": "function invariant_distributableStableDuringLock() public view { if (LockedForDistribution) { assert(distributableERC20s.length == erc20EntitlementPerUnit.length); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "setDistributableERC20s"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distribute"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_beginDistribution"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "Disapproved holders' tokens still count toward totalSupply in the entitlement calculation (balance / totalSupply), but disapproved holders receive 0 during distribution (skipped by isApprovedHolder check). This means every disapproved holder's proportional share is silently withheld, reducing approved holders' payouts. The withheld share stays in the contract but is not redistributed to approved holders.",
+        "attack_scenario": "50% of token supply is held by accounts the admin disapproves. During distribution, entitlement_per_unit = balance / totalSupply counts ALL supply, but only 50% of holders receive payouts. Approved holders receive half of what they should relative to their share of approved supply. The other half stays in the contract. Over multiple cycles with the same state, approved holders are systematically underpaid.",
+        "invariant_logic": "Distribution denominator should be sum of approved holder balances, not totalSupply, to ensure approved holders receive their full proportional share",
+        "solidity_property": "function invariant_entitlementUsesApprovedSupply() public view { /* Supply in entitlement calc should equal sum of balances of approved holders */ }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_beginDistribution"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distribute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "When MinDistributionPeriod is 0, _isPastMinDistributionPeriod() returns true immediately after a distribution ends (same block), because (block.number - LastDistribution) = 0 >= 0. This causes _beforeMintOrBurn() to revert with 'must distribute before minting or burning'. Since distribution was just completed, calling distribute again finds nothing to process. This creates a deadlock where minting and burning are permanently blocked as long as there are holders and supply.",
+        "attack_scenario": "Contract deployed with MinDistributionPeriod=0. After the first distribution, minting new tokens or burning existing tokens becomes impossible. mintAndDistribute also fails because the inner distribute completes, setting LastDistribution to the current block, and the subsequent mint check immediately fails. Token supply becomes permanently frozen.",
+        "invariant_logic": "MinDistributionPeriod > 0 OR (mint and burn are always callable after a distribution completes in the same block)",
+        "solidity_property": "function invariant_noMintBurnDeadlock() public view { /* After _endDistribution in same block: _isPastMinDistributionPeriod should return false */ assert(MinDistributionPeriod > 0 || !_isPastMinDistributionPeriod()); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_isPastMinDistributionPeriod"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_beforeMintOrBurn"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "mintAndDistribute"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "The holders array and ManagedNFTs array are iterated in unbounded loops (distributeToAllHolders, withdrawFromAllManagedNFTs). While partial processing functions exist, the convenience functions have no upper bound. Additionally, the holders array can grow unboundedly due to the address(0) bug (INV-STATE-001), and there is no mechanism to cap the array size or clean up phantom entries outside of mints.",
+        "attack_scenario": "Over time, repeated burns push address(0) into holders. Legitimate holders are also added. When holders.length exceeds the block gas limit for a single distributeToAllHolders call, the convenience function becomes permanently unusable. If partial distribute calls are also expensive enough to require many transactions, the distribution lock persists for an extended period, blocking all transfers.",
+        "invariant_logic": "holders.length <= MAX_SAFE_DISTRIBUTION_SIZE AND all entries in holders have non-zero balance",
+        "solidity_property": "function invariant_holdersArrayBounded() public view { for (uint i = 0; i < holders.length; i++) { assert(balanceOf(holders[i]) > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distributeToAllHolders"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_beforeTokenTransfer"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "_afterTokenTransfer"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "LockedForDistribution blocks transfers, mints, and burns but does not block withdrawFromManagedNFTs (by design) or administrative functions like approveHolder, disapproveHolder, addManagedNFT. Calling disapproveHolder mid-distribution changes which recipients receive payouts: holders already processed were checked with the old allowlist, future holders are checked with the new one. This creates inconsistent distribution within a single cycle.",
+        "attack_scenario": "Distribution is in progress. After distributing to holders[0..5], admin calls disapproveHolder on holders[7]. Holder 7 is skipped even though they were approved when entitlements were calculated. Their share is lost for this cycle. Conversely, admin could approve a new address, transfer tokens to them after distribution unlocks, and they receive nothing while diluting the next cycle's entitlements.",
+        "invariant_logic": "LockedForDistribution == true implies HolderAllowlist state is frozen (no approveHolder/disapproveHolder allowed)",
+        "solidity_property": "function invariant_allowlistFrozenDuringDistribution() public view { /* Cannot be asserted on-chain without snapshotting; requires modifier check on approveHolder/disapproveHolder */ }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "distribute"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "approveHolder"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "disapproveHolder"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiquidInfrastructureERC20.sol",
+        "description": "The constructor accepts _managedNFTs without verifying that this contract owns any of them, unlike addManagedNFT which requires ownership. Unowned NFTs in ManagedNFTs will cause withdrawFromManagedNFTs to revert (withdrawBalancesTo requires owner/approved), blocking the entire withdrawal cycle at that NFT's index.",
+        "invariant_logic": "forall nft in ManagedNFTs: LiquidInfrastructureNFT(nft).ownerOf(AccountId) == address(this)",
+        "solidity_property": "function invariant_ownAllManagedNFTs() public view { for (uint i = 0; i < ManagedNFTs.length; i++) { LiquidInfrastructureNFT nft = LiquidInfrastructureNFT(ManagedNFTs[i]); assert(nft.ownerOf(nft.AccountId()) == address(this)); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "constructor"
+          },
+          {
+            "file": "LiquidInfrastructureERC20.sol",
+            "function": "withdrawFromManagedNFTs"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,408 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T03:03:47.899Z",
+    "duration_ms": 386951
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACC-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "YieldStakingBase.sol",
+        "description": "When botAdmin calls _unstake or _repay, the yield account is looked up via yieldAccounts[msg.sender] (the bot's address), not the actual NFT owner's yield account. This means the bot's forced liquidation path is entirely non-functional because yieldAccounts[botAdmin] is likely address(0) causing a revert, or if it exists, operations execute against the wrong yield account.",
+        "attack_scenario": "A yield position becomes unhealthy (HF < threshold). The botAdmin attempts to call _unstake to force-liquidate, but the transaction reverts because yieldAccounts[botAdmin] == address(0). The unhealthy position cannot be liquidated through the bot mechanism, leading to bad debt accumulation in the lending pool. Even protocolRequestWithdrawal and protocolClaimWithdraw in Lido/EtherFi/SavingsDai implementations all use yieldAccounts[msg.sender], compounding the issue.",
+        "invariant_logic": "For all yield staking operations (unstake, repay): the yield account used MUST be sd.yieldAccount (stored in stake data), NOT yieldAccounts[msg.sender], when msg.sender != nftOwner",
+        "solidity_property": "function invariant_botCanUnstake(address nft, uint256 tokenId) public view { YieldStakeData storage sd = stakeDatas[nft][tokenId]; if (sd.state == Constants.YIELD_STATUS_ACTIVE) { assert(sd.yieldAccount != address(0)); /* bot must be able to use sd.yieldAccount, not yieldAccounts[botAdmin] */ } }",
+        "inventory_refs": [
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_unstake"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_repay"
+          },
+          {
+            "file": "YieldEthStakingLido.sol",
+            "function": "protocolRequestWithdrawal"
+          },
+          {
+            "file": "YieldEthStakingLido.sol",
+            "function": "protocolClaimWithdraw"
+          },
+          {
+            "file": "YieldEthStakingEtherfi.sol",
+            "function": "protocolRequestWithdrawal"
+          },
+          {
+            "file": "YieldEthStakingEtherfi.sol",
+            "function": "protocolClaimWithdraw"
+          },
+          {
+            "file": "YieldSavingsDai.sol",
+            "function": "protocolClaimWithdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VaultLogic.sol",
+        "description": "Isolate loan status must follow the state machine: UNINITIALIZED(0) -> ACTIVE -> AUCTION -> {ACTIVE (via redeem) | deleted (via liquidate)}. No state can be skipped. A loan in ACTIVE cannot be directly liquidated; it must first enter AUCTION. A loan in AUCTION can only be redeemed or liquidated, not borrowed against.",
+        "attack_scenario": "If state transitions are violated, an attacker could liquidate a healthy loan by skipping the auction phase, or borrow additional funds against a loan already in auction, extracting value before liquidation completes.",
+        "invariant_logic": "validateIsolateAuctionLoan requires loanStatus == ACTIVE || AUCTION; validateIsolateRedeemLoan requires loanStatus == AUCTION; validateIsolateLiquidateLoan requires loanStatus == AUCTION; validateIsolateBorrowLoan requires loanStatus == 0 || ACTIVE",
+        "solidity_property": "function invariant_loanStateTransition(address nft, uint256 tokenId) public view { DataTypes.IsolateLoanData storage loan = poolData.loanLookup[nft][tokenId]; assert(loan.loanStatus == 0 || loan.loanStatus == Constants.LOAN_STATUS_ACTIVE || loan.loanStatus == Constants.LOAN_STATUS_AUCTION); if (loan.loanStatus == 0) { assert(loan.scaledAmount == 0 && loan.bidAmount == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateBorrowLoan"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateAuctionLoan"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateRedeemLoan"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateLiquidateLoan"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "PriceOracle.sol",
+        "description": "Chainlink oracle price staleness check lacks a time-based threshold. The current validation only checks updatedAt != 0 and answeredInRound >= roundId, but does not verify that the price was updated within an acceptable time window (e.g., block.timestamp - updatedAt < STALENESS_THRESHOLD). If a Chainlink aggregator stops updating, stale prices could persist indefinitely.",
+        "attack_scenario": "A Chainlink aggregator experiences a heartbeat failure and stops updating for hours. The last recorded price remains valid according to current checks. An attacker sees the real market price has dropped 30% but the oracle still reports the old higher price. They deposit collateral valued at the stale high price and borrow maximum amounts. When the oracle updates, their position is instantly underwater, creating bad debt for the protocol.",
+        "invariant_logic": "For every Chainlink price query: (block.timestamp - updatedAt) < STALENESS_THRESHOLD where STALENESS_THRESHOLD is appropriate for each asset's heartbeat",
+        "solidity_property": "function invariant_oracleFreshness(address asset) public view { (, , , uint256 updatedAt, ) = assetChainlinkAggregators[asset].latestRoundData(); assert(block.timestamp - updatedAt < STALENESS_THRESHOLD); }",
+        "inventory_refs": [
+          {
+            "file": "PriceOracle.sol",
+            "function": "getAssetPriceFromChainlink"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "InterestLogic.sol",
+        "description": "Supply index (uint128) and borrow index (uint128) are cast from uint256 via SafeCast.toUint128(). If the cumulative interest causes the index to exceed type(uint128).max (~3.4e38), the SafeCast will revert, permanently bricking all operations on that asset. Since indices only grow and never shrink, this is an irreversible DoS once reached.",
+        "attack_scenario": "An attacker sets up (or admin misconfigures) an interest rate model that returns extremely high rates. Over time, or through a period without any interactions, the compounded interest causes the borrow index to exceed uint128 max. All subsequent calls to updateInterestIndexs revert, making the asset permanently frozen: no deposits, withdrawals, borrows, or repays can occur.",
+        "invariant_logic": "For all assets and groups: supplyIndex <= type(uint128).max AND borrowIndex <= type(uint128).max; Rate models must be bounded such that compound interest over maximum possible time delta cannot cause overflow",
+        "solidity_property": "function invariant_indexBounds(address asset) public view { DataTypes.AssetData storage ad = poolData.assetLookup[asset]; assert(ad.supplyIndex <= type(uint128).max); uint256[] memory gids = ad.groupList.values(); for (uint i = 0; i < gids.length; i++) { assert(ad.groupLookup[uint8(gids[i])].borrowIndex <= type(uint128).max); } }",
+        "inventory_refs": [
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateSupplyIndex"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateBorrowIndex"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VaultLogic.sol",
+        "description": "An ERC721 token's supply mode (cross vs isolate) must be mutually exclusive. A token recorded as cross-mode supply cannot simultaneously be in isolate-mode supply. The supplyMode field in ERC721TokenData must match the accounting (userScaledCrossSupply vs userScaledIsolateSupply). If a token's supply mode is corrupted, it could be counted as collateral in both cross-margin and isolate-margin simultaneously.",
+        "attack_scenario": "If a token's supplyMode disagrees with the accounting state, a user could have the same NFT counted as cross-margin collateral (enabling cross borrows) while also being used as isolate collateral (enabling isolate borrows), doubling their effective borrowing power from a single NFT.",
+        "invariant_logic": "For all NFT tokens: (tokenData.supplyMode == CROSS implies userScaledCrossSupply includes this token) AND (tokenData.supplyMode == ISOLATE implies userScaledIsolateSupply includes this token) AND NOT(both incremented for same token)",
+        "solidity_property": "function invariant_nftModeExclusive(address nftAsset, uint256 tokenId) public view { DataTypes.ERC721TokenData storage td = assetData.erc721TokenData[tokenId]; if (td.supplyMode == Constants.SUPPLY_MODE_CROSS) { assert(td.owner != address(0)); /* must be tracked in cross supply */ } if (td.supplyMode == Constants.SUPPLY_MODE_ISOLATE) { assert(td.owner != address(0)); /* must be tracked in isolate supply */ } }",
+        "inventory_refs": [
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc721IncreaseCrossSupply"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc721IncreaseIsolateSupply"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc721DecreaseCrossSupply"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc721DecreaseIsolateSupply"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "YieldStakingBase.sol",
+        "description": "Yield stake state must follow: UNINITIALIZED(0) -> ACTIVE -> UNSTAKE -> deleted (via repay). A stake in ACTIVE cannot be repaid directly; it must first be unstaked. A stake in UNSTAKE cannot be staked into again. The state transitions are irreversible except through the complete repay cycle.",
+        "attack_scenario": "If state transitions allow skipping the UNSTAKE phase, a user could repay and release their NFT lock without properly withdrawing from the external yield protocol, leaving the protocol's funds trapped in external contracts (Lido, EtherFi, sDAI).",
+        "invariant_logic": "_stake requires state == 0 || state == ACTIVE; _unstake requires state == ACTIVE; _repay requires state == UNSTAKE; After repay, state is deleted (0)",
+        "solidity_property": "function invariant_yieldStateTransition(address nft, uint256 tokenId) public view { YieldStakeData storage sd = stakeDatas[nft][tokenId]; assert(sd.state == 0 || sd.state == Constants.YIELD_STATUS_ACTIVE || sd.state == Constants.YIELD_STATUS_UNSTAKE); if (sd.state == 0) { assert(sd.debtShare == 0 && sd.yieldShare == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_stake"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_unstake"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_repay"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACC-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "VaultLogic.sol",
+        "description": "An ERC721 token with a non-zero lockerAddr cannot be withdrawn. The locker mechanism prevents NFTs that are being used as yield collateral from being removed. The withdrawal validation must check lockerAddr == address(0) before allowing the withdrawal.",
+        "attack_scenario": "If the locker check is bypassed or missing, a user could deposit an NFT in isolate mode, lock it for yield staking (borrowing against it in both isolate and yield), then withdraw the NFT while the yield position is still active, leaving the protocol with uncollateralized yield debt.",
+        "invariant_logic": "For all ERC721 withdrawals: tokenData.lockerAddr == address(0); For all isolate borrows: tokenData.lockerAddr == address(this) || tokenData.lockerAddr == address(0)",
+        "solidity_property": "function invariant_lockedNftCannotWithdraw(address nft, uint256 tokenId) public view { DataTypes.ERC721TokenData storage td = assetData.erc721TokenData[tokenId]; if (td.lockerAddr != address(0)) { /* this token must not be withdrawable */ assert(true); /* validated in validateWithdrawERC721 */ } }",
+        "inventory_refs": [
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateWithdrawERC721"
+          },
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateBorrowBasic"
+          },
+          {
+            "file": "YieldLogic.sol",
+            "function": "executeYieldSetERC721TokenData"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACC-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "PoolManager.sol",
+        "description": "The dispatch function must never delegatecall to address(0). If a trusted proxy's moduleImpl is address(0) (multi-proxy module) and the corresponding moduleLookup[moduleId] is also address(0) (module uninstalled), the delegatecall would target address(0), which succeeds silently and returns empty data, potentially causing unexpected behavior in callers expecting return data.",
+        "attack_scenario": "An admin uninstalls a module by setting moduleLookup[moduleId] = address(0) but forgets to remove the proxy from trustedSenders. Users calling the proxy would have their transactions silently succeed with no effect, potentially leading to state inconsistencies if the caller expected side effects (e.g., tokens transferred but no accounting update).",
+        "invariant_logic": "In dispatch(): moduleImpl != address(0) after resolution. Formally: (trustedSenders[msg.sender].moduleImpl != address(0)) OR (moduleLookup[trustedSenders[msg.sender].moduleId] != address(0))",
+        "solidity_property": "function invariant_dispatchTarget() internal view { uint32 mid = trustedSenders[msg.sender].moduleId; address impl = trustedSenders[msg.sender].moduleImpl; if (impl == address(0)) impl = moduleLookup[mid]; assert(impl != address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "PoolManager.sol",
+            "function": "dispatch"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "InterestLogic.sol",
+        "description": "Supply and borrow indices must be monotonically non-decreasing (>=1 RAY). They represent cumulative interest multipliers starting at 1e27 (RAY). Any decrease would corrupt all scaled balance accounting, causing users to lose funds or creating phantom balances. The index is updated only when block.timestamp advances.",
+        "invariant_logic": "For all assets: new_supplyIndex >= old_supplyIndex >= RAY; For all groups: new_borrowIndex >= old_borrowIndex >= RAY",
+        "solidity_property": "function invariant_indexMonotonicity(address asset) public view { DataTypes.AssetData storage ad = poolData.assetLookup[asset]; assert(ad.supplyIndex >= WadRayMath.RAY); uint256[] memory gids = ad.groupList.values(); for (uint i = 0; i < gids.length; i++) { assert(ad.groupLookup[uint8(gids[i])].borrowIndex >= WadRayMath.RAY); } }",
+        "inventory_refs": [
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateSupplyIndex"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "_updateBorrowIndex"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "initAssetData"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "initGroupData"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACC-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ValidateLogic.sol",
+        "description": "A user cannot withdraw collateral (ERC20 or ERC721 in cross mode) if it would cause their health factor to drop below the liquidation threshold. The health factor check must be performed AFTER the withdrawal accounting to ensure solvency. Users with outstanding cross-margin debt must maintain sufficient collateral.",
+        "invariant_logic": "After any cross-mode withdrawal: calculateUserAccountDataForHeathFactor(user).healthFactor >= HEALTH_FACTOR_LIQUIDATION_THRESHOLD OR user has zero total cross debt",
+        "solidity_property": "function invariant_postWithdrawHealthFactor(address user) public view { ResultTypes.UserAccountResult memory r = GenericLogic.calculateUserAccountDataForHeathFactor(poolData, user, oracle); if (r.totalDebtInBaseCurrency > 0) { assert(r.healthFactor >= Constants.HEALTH_FACTOR_LIQUIDATION_THRESHOLD); } }",
+        "inventory_refs": [
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateHealthFactor"
+          },
+          {
+            "file": "GenericLogic.sol",
+            "function": "calculateHealthFactorFromBalances"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VaultLogic.sol",
+        "description": "The availableLiquidity accounting must always be consistent with actual token balances. Specifically: for any ERC20 asset, availableLiquidity + totalBidAmount <= actual token balance held by the contract. All inflows (deposits, repays, bid transfers) must increase availableLiquidity or totalBidAmount, and all outflows (withdrawals, borrows, bid refunds) must decrease them, with balance verification checks.",
+        "attack_scenario": "If availableLiquidity diverges from actual balances (e.g., through direct token transfers to the contract or rounding errors accumulating), the protocol could either allow withdrawals that exceed actual balance (causing reverts or insolvency) or block valid withdrawals due to underestimated liquidity.",
+        "invariant_logic": "assetData.availableLiquidity + assetData.totalBidAmout <= IERC20(asset).balanceOf(address(this)); erc20TransferInLiquidity and erc20TransferOutLiquidity both verify balance changes match expected amounts",
+        "solidity_property": "function invariant_liquidityConsistency(address asset) public view { DataTypes.AssetData storage ad = poolData.assetLookup[asset]; assert(ad.availableLiquidity + ad.totalBidAmout <= IERC20(asset).balanceOf(address(this))); }",
+        "inventory_refs": [
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferInLiquidity"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferOutLiquidity"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferInBidAmount"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferOutBidAmount"
+          },
+          {
+            "file": "VaultLogic.sol",
+            "function": "erc20TransferOutBidAmountToLiqudity"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "ConfigureLogic.sol",
+        "description": "Pool creation starts with nextPoolId = INITIAL_POOL_ID and increments. Pool ID 0 is reserved as the null/invalid state used to check pool existence. The nextPoolId must never be 0 and must strictly increase to prevent pool ID reuse after deletion.",
+        "invariant_logic": "ps.nextPoolId >= Constants.INITIAL_POOL_ID AND ps.nextPoolId > 0; For all valid pools: poolData.poolId != 0",
+        "solidity_property": "function invariant_poolIdMonotonicity() public view { DataTypes.PoolStorage storage ps = StorageSlot.getPoolStorage(); assert(ps.nextPoolId >= Constants.INITIAL_POOL_ID); assert(ps.nextPoolId > 0); }",
+        "inventory_refs": [
+          {
+            "file": "ConfigureLogic.sol",
+            "function": "executeCreatePool"
+          },
+          {
+            "file": "PoolManager.sol",
+            "function": "constructor"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACC-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "YieldStakingBase.sol",
+        "description": "The debt share to asset conversion uses a virtual share model (totalDebtShare maps to getTotalDebt). If an attacker can manipulate getTotalDebt() independently (e.g., by repaying debt directly to the pool bypassing the YieldStakingBase), the debt share conversion breaks. Specifically, convertToDebtAssets could return less than actual debt, allowing underpayment on repay, or convertToDebtShares could give fewer shares than expected, understating new borrows.",
+        "attack_scenario": "An attacker directly calls poolYield.yieldRepayERC20 for the YieldStakingBase address (if the underlying module allows external callers for the same staker address), reducing getTotalDebt while totalDebtShare remains unchanged. This deflates the debt-per-share ratio, meaning all remaining stakers' debt shares now represent less actual debt, causing loss for the lending pool.",
+        "invariant_logic": "All debt modifications for the yield staker address must go through YieldStakingBase to keep totalDebtShare synchronized with actual pool debt. convertToDebtAssets(totalDebtShare) should equal getTotalDebt(poolId) within rounding tolerance",
+        "solidity_property": "function invariant_debtShareSync(uint32 poolId) public view { uint256 totalAssets = getTotalDebt(poolId); uint256 computedAssets = convertToDebtAssets(poolId, totalDebtShare); assert(computedAssets <= totalAssets + 1 && computedAssets >= totalAssets - 1); }",
+        "inventory_refs": [
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "convertToDebtShares"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "convertToDebtAssets"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_stake"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_repay"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "ValidateLogic.sol",
+        "description": "An isolate loan's auction can only begin when the loan's health factor is below the liquidation threshold. The validateIsolateAuctionLoan function checks loan status but the actual health factor validation for triggering the auction must ensure the NFT collateral value * liquidationThreshold < total debt. Without this, healthy loans could be pushed into auction.",
+        "attack_scenario": "If auction can be triggered on a healthy loan (HF >= 1), the NFT owner is forced into an auction they shouldn't be in. The first bidder gains power over the loan even though it was solvent, potentially extracting the bid fine from the borrower or acquiring the NFT at a discount.",
+        "invariant_logic": "Auction can only be initiated when loan health factor < HEALTH_FACTOR_LIQUIDATION_THRESHOLD. For active loans being auctioned: nftPrice * liquidationThreshold < borrowAmount * debtAssetPrice (converted to same base)",
+        "solidity_property": "function invariant_auctionRequiresUnhealthy(address nft, uint256 tokenId) public view { DataTypes.IsolateLoanData storage loan = poolData.loanLookup[nft][tokenId]; if (loan.loanStatus == Constants.LOAN_STATUS_AUCTION && loan.bidStartTimestamp == block.timestamp) { ResultTypes.NftLoanResult memory r = GenericLogic.calculateNftLoanData(...); assert(r.healthFactor < Constants.HEALTH_FACTOR_LIQUIDATION_THRESHOLD); } }",
+        "inventory_refs": [
+          {
+            "file": "ValidateLogic.sol",
+            "function": "validateIsolateAuctionLoan"
+          },
+          {
+            "file": "GenericLogic.sol",
+            "function": "calculateNftLoanData"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "InterestLogic.sol",
+        "description": "Interest index updates are idempotent within the same block (checked via lastUpdateTimestamp == block.timestamp). This prevents double-counting of interest within a single block. However, if block.timestamp does not advance (e.g., multiple transactions in the same block), all operations after the first share the same index values, which is correct but means interest accrual granularity is per-block.",
+        "invariant_logic": "updateInterestIndexs is a no-op when assetData.lastUpdateTimestamp == block.timestamp; After update, lastUpdateTimestamp == block.timestamp",
+        "solidity_property": "function invariant_singleUpdatePerBlock(address asset) public view { DataTypes.AssetData storage ad = poolData.assetLookup[asset]; /* After any update in this block */ if (ad.lastUpdateTimestamp == block.timestamp) { /* getNormalizedSupplyIncome returns ad.supplyIndex directly */ assert(InterestLogic.getNormalizedSupplyIncome(ad) == ad.supplyIndex); } }",
+        "inventory_refs": [
+          {
+            "file": "InterestLogic.sol",
+            "function": "updateInterestIndexs"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "getNormalizedSupplyIncome"
+          },
+          {
+            "file": "InterestLogic.sol",
+            "function": "getNormalizedBorrowDebt"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACC-006",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "YieldStakingBase.sol",
+        "description": "The accountYieldInWithdraws tracking in YieldSavingsDai's getAccountTotalUnstakedYield subtracts in-withdrawal amounts from total yield balance. If accountYieldInWithdraws[account] exceeds the actual yield balance (e.g., due to yield loss in external protocol), the subtraction would underflow in Solidity 0.8+, causing a revert that blocks all subsequent stake operations for any NFT using that yield account.",
+        "attack_scenario": "User stakes via SavingsDai. External sDai value drops (e.g., MakerDAO governance reduces DSR). User initiates unstake, which records withdrawAmount based on current share value. Before repay, sDai balance drops further. Now getAccountTotalUnstakedYield reverts because balance < inWithdraws, blocking all new stakes to this yield account.",
+        "invariant_logic": "For SavingsDai: getAccountYieldBalance(account) >= accountYieldInWithdraws[account] must hold at all times; Protocol value losses can violate this",
+        "solidity_property": "function invariant_yieldBalanceSufficient(address account) public view { uint256 balance = getAccountYieldBalance(account); uint256 inWithdraw = accountYieldInWithdraws[account]; assert(balance >= inWithdraw); }",
+        "inventory_refs": [
+          {
+            "file": "YieldSavingsDai.sol",
+            "function": "getAccountTotalUnstakedYield"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_unstake"
+          },
+          {
+            "file": "YieldStakingBase.sol",
+            "function": "_stake"
+          }
+        ]
+      }
+    ]
+  }
+}

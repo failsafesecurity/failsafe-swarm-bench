@@ -1,0 +1,359 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T21:44:21.044Z",
+    "duration_ms": 303334
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-revenue-aggregation",
+        "source": "LiquidInfrastructureNFT contracts (managed NFTs holding ERC20 revenue)",
+        "path": [
+          "External revenue deposited to LiquidInfrastructureNFT contracts",
+          "withdrawFromManagedNFTs() called (public, no access control)",
+          "LiquidInfrastructureNFT.withdrawBalancesTo() transfers ERC20s",
+          "ERC20 balances arrive at LiquidInfrastructureERC20 contract"
+        ],
+        "transformations": [
+          "Threshold-based filtering via NFT getThresholds()",
+          "Aggregation of multiple NFT balances into single contract"
+        ],
+        "sinks": [
+          "LiquidInfrastructureERC20 contract balance"
+        ],
+        "trust_changes": "Revenue moves from individual NFT custody to aggregation contract; anyone can trigger withdrawal",
+        "validation_points": [
+          "LockedForDistribution check prevents withdrawal during distribution"
+        ],
+        "exposure_risks": [
+          "withdrawFromManagedNFTs has no access control - anyone can trigger",
+          "nextWithdrawal state can become inconsistent if releaseManagedNFT is called mid-withdrawal cycle"
+        ],
+        "manipulation_risks": [
+          "An owner calling releaseManagedNFT during an in-progress withdrawal (nextWithdrawal > 0) causes index corruption via swap-and-pop, potentially skipping the NFT swapped to the removed index"
+        ]
+      },
+      {
+        "flow_id": "DF-002-distribution",
+        "source": "Aggregated ERC20 balances held by LiquidInfrastructureERC20 contract",
+        "path": [
+          "distribute(n) called (public, no access control)",
+          "_beginDistribution() locks contract, calculates per-unit entitlements via integer division",
+          "Loop iterates over holders array, computing entitlement = erc20EntitlementPerUnit[j] * balanceOf(holder)",
+          "IERC20.transfer() called for each (holder, token) pair",
+          "_endDistribution() unlocks contract, sets LastDistribution"
+        ],
+        "transformations": [
+          "balance / totalSupply = entitlementPerUnit (floor division)",
+          "entitlementPerUnit * holderBalance = holderEntitlement (multiplication, potential overflow protection by 0.8.x)"
+        ],
+        "sinks": [
+          "Holder addresses via ERC20 transfer",
+          "Dust remains in contract due to integer division truncation"
+        ],
+        "trust_changes": "Contract trusts that holders array accurately reflects current token holders; trusts that external ERC20 transfer() behaves correctly",
+        "validation_points": [
+          "isApprovedHolder check before distribution (but unapproved holders' share is lost)",
+          "MinDistributionPeriod enforcement",
+          "LockedForDistribution prevents concurrent state changes"
+        ],
+        "exposure_risks": [
+          "Entitlement calculation loses precision: (balance/supply)*holderBalance discards balance%supply tokens every distribution",
+          "Silent failure: if transfer() returns false, entitlement is silently skipped without revert"
+        ],
+        "manipulation_risks": [
+          "Anyone can call distribute(1) repeatedly to DOS by forcing many small transactions",
+          "address(0) entries in holders array from burns cause gas waste and potential revert if address(0) is ever approved"
+        ]
+      },
+      {
+        "flow_id": "DF-003-holder-tracking",
+        "source": "ERC20 transfer/mint/burn operations",
+        "path": [
+          "_beforeTokenTransfer: checks lock, checks allowlist for non-zero 'to', enforces mint/burn distribution requirement, adds 'to' to holders if balanceOf(to)==0",
+          "ERC20 core: updates balances and totalSupply",
+          "_afterTokenTransfer: removes 'from' from holders if balanceOf(from)==0 via swap-and-pop (no break)"
+        ],
+        "transformations": [
+          "holders array push on first receive",
+          "holders array swap-and-pop on full send"
+        ],
+        "sinks": [
+          "holders array used for distribution iteration"
+        ],
+        "trust_changes": "Array integrity depends on correct insertion/removal logic",
+        "validation_points": [
+          "balanceOf check before adding (pre-transfer balance)",
+          "balanceOf check before removing (post-transfer balance)"
+        ],
+        "exposure_risks": [
+          "_beforeTokenTransfer adds address(0) to holders on every burn because balanceOf(address(0))==0 always",
+          "_afterTokenTransfer loop does not break after swap-and-pop removal, causing the swapped element to be skipped entirely"
+        ],
+        "manipulation_risks": [
+          "Repeated burns accumulate address(0) entries in holders, growing array unboundedly causing distribution DoS via gas exhaustion",
+          "Minting with amount=0 adds recipients to holders with 0 balance"
+        ]
+      },
+      {
+        "flow_id": "DF-004-nft-management",
+        "source": "Owner operations on ManagedNFTs array",
+        "path": [
+          "addManagedNFT: verifies ownership, pushes to ManagedNFTs",
+          "releaseManagedNFT: transfers NFT, swap-and-pop from ManagedNFTs, require(true) always passes"
+        ],
+        "transformations": [
+          "Array push for add",
+          "Swap-and-pop for removal"
+        ],
+        "sinks": [
+          "ManagedNFTs array used for withdrawal iteration"
+        ],
+        "trust_changes": "Owner is trusted to manage NFT portfolio correctly",
+        "validation_points": [
+          "addManagedNFT checks contract owns the NFT",
+          "releaseManagedNFT has require(true) which NEVER fails - validation is a no-op"
+        ],
+        "exposure_risks": [
+          "releaseManagedNFT silently succeeds even if nftContract is not in ManagedNFTs array",
+          "Constructor sets ManagedNFTs without verifying ownership of any NFTs"
+        ],
+        "manipulation_risks": [
+          "Calling releaseManagedNFT for an NFT not in ManagedNFTs only transfers it out without array modification, while the require(true) falsely indicates success"
+        ]
+      },
+      {
+        "flow_id": "DF-005-kyc-allowlist",
+        "source": "Owner calls to approveHolder/disapproveHolder",
+        "path": [
+          "approveHolder sets HolderAllowlist[holder]=true",
+          "_beforeTokenTransfer checks isApprovedHolder(to) for non-burn transfers",
+          "disapproveHolder sets HolderAllowlist[holder]=false",
+          "distribute checks isApprovedHolder before transferring"
+        ],
+        "transformations": [
+          "Boolean flag in mapping"
+        ],
+        "sinks": [
+          "HolderAllowlist mapping queried during transfers and distributions"
+        ],
+        "trust_changes": "Owner has full control over who can receive tokens",
+        "validation_points": [
+          "_beforeTokenTransfer enforces allowlist for all non-burn recipients"
+        ],
+        "exposure_risks": [
+          "Disapproving a holder who still holds tokens: they cannot transfer tokens except via burn, and their distribution share is silently skipped (tokens remain in contract)"
+        ],
+        "manipulation_risks": [
+          "Owner can disapprove a holder after _beginDistribution but before their distribution slot, causing their entitlement to be permanently lost in the contract"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Only KYC-approved addresses may receive the ERC20 token",
+        "Minting and burning are blocked when MinDistributionPeriod has elapsed without a distribution",
+        "Transfers, mints, and burns are blocked during an active distribution (LockedForDistribution)",
+        "Revenue flows: Infrastructure -> NFT -> ERC20 Contract -> Token Holders",
+        "Distribution entitlement is proportional to token balance relative to total supply"
+      ],
+      "economic_incentives": [
+        "Holding ERC20 tokens entitles proportional share of revenue from managed NFTs",
+        "MinDistributionPeriod forces regular distributions before supply changes",
+        "No staking mechanism - simple balance-based entitlement"
+      ],
+      "governance_mechanisms": [
+        "Owner controls KYC allowlist (approve/disapprove holders)",
+        "Owner controls distributable ERC20s list",
+        "Owner controls NFT portfolio (add/release managed NFTs)",
+        "Owner controls minting of new ERC20 tokens",
+        "No timelock, multisig, or on-chain governance - single owner EOA/contract"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "address(0) added to holders array on every burn operation",
+          "expected_behavior": "Burning tokens should only remove the burner from holders (if balance reaches 0) and not add any new entries",
+          "actual_behavior": "_beforeTokenTransfer unconditionally checks `this.balanceOf(to)` and pushes `to` to holders when balance is 0. During burns, to=address(0) and balanceOf(address(0))=0 always, so address(0) is pushed on EVERY burn. _afterTokenTransfer only checks `from` (the burner), never cleaning up the added address(0).",
+          "risk_level": "high",
+          "exploitation_potential": "After N burn operations, the holders array contains N copies of address(0). Distribution must iterate over all of them, wasting gas. With enough burns, distributeToAllHolders() exceeds block gas limit, making full distribution impossible. Partial distribute() calls would need to process all address(0) entries. If address(0) is ever approved as holder (owner mistake), transfers to it revert (OZ ERC20 disallows transfer to zero address), permanently locking distribution."
+        },
+        {
+          "scenario": "releaseManagedNFT uses require(true) instead of actual validation",
+          "expected_behavior": "Function should revert if the NFT was not found in ManagedNFTs array",
+          "actual_behavior": "require(true, 'unable to find released NFT in ManagedNFTs') always passes regardless of whether the NFT was found and removed. If called with an address not in ManagedNFTs (but still owned by this contract), the NFT is transferred out without any error.",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner could accidentally release an NFT that was never added to ManagedNFTs, or call release on an already-released NFT address. The function completes silently without the intended validation. No funds are lost directly but the check is completely non-functional."
+        },
+        {
+          "scenario": "Distribution entitlement calculation truncates via integer division before multiplication",
+          "expected_behavior": "Each holder receives their precise proportional share of accumulated revenue",
+          "actual_behavior": "entitlementPerUnit = balance / totalSupply (floor division). Per-distribution dust of (balance % totalSupply) remains undistributed. For tokens with 6 decimals (USDC) and totalSupply of 10^18, up to ~10^12 token units (nearly 1 USDC) can be lost per distribution cycle.",
+          "risk_level": "medium",
+          "exploitation_potential": "An attacker who controls totalSupply (via minting/burning coordination with owner) could maximize truncation to trap dust. Over many distribution cycles, significant value accumulates as undistributable dust in the contract. No recovery mechanism exists for this dust."
+        },
+        {
+          "scenario": "Silent failure on ERC20 transfer during distribution",
+          "expected_behavior": "Failed transfers should revert or be retried to ensure holders receive their entitlement",
+          "actual_behavior": "if (toDistribute.transfer(recipient, entitlement)) only records receipt on success. If transfer returns false (rather than reverting), the entitlement is silently lost for that holder with no mechanism to reclaim.",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious or non-standard distributableERC20 returning false causes permanent loss of entitlements. The holder has no recourse, and the tokens remain trapped in the contract. Combined with the non-reverting behavior, this could silently drain expected distributions."
+        },
+        {
+          "scenario": "_afterTokenTransfer loop missing break after swap-and-pop removal",
+          "expected_behavior": "After finding and removing the element, the loop should break to avoid processing the swapped element incorrectly",
+          "actual_behavior": "After swap-and-pop, the element copied from the end to position i is at index i, but i increments on the next iteration, so the swapped element is NEVER checked. If a transfer causes the sender's balance to reach 0 and they need to be removed, the element swapped from the end of the array is permanently skipped in that iteration.",
+          "risk_level": "low",
+          "exploitation_potential": "Since each address should appear at most once in holders (due to the balanceOf check in _beforeTokenTransfer), the missing break only wastes gas by continuing to iterate. However, the swapped element is skipped, which is benign only because we're looking for `from` which appears once. If address(0) appears multiple times (from burn bug), only the first occurrence would be removed per mint operation."
+        },
+        {
+          "scenario": "Disapproved holder's share is silently skipped during distribution",
+          "expected_behavior": "Disapproved holder should either not count toward entitlement calculation or their share should be redistributed",
+          "actual_behavior": "erc20EntitlementPerUnit is calculated based on totalSupply (including disapproved holders' balances). During distribution, disapproved holders are skipped via the isApprovedHolder check, but their proportional share remains undistributed in the contract.",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner can disapprove a holder to trap their distribution share. The disapproved holder cannot transfer their tokens (allowlist check fails) except via burn. Their share of every distribution is permanently lost. Additionally, a large disapproved holder's balance inflates totalSupply, reducing everyone else's per-unit entitlement."
+        },
+        {
+          "scenario": "nextWithdrawal index corruption when releaseManagedNFT called mid-withdrawal",
+          "expected_behavior": "Releasing an NFT should not affect the withdrawal iteration state",
+          "actual_behavior": "releaseManagedNFT uses swap-and-pop on ManagedNFTs array but does not adjust nextWithdrawal. If the released NFT is at index < nextWithdrawal, the element swapped from the end (which may not have been withdrawn yet in this cycle) takes the removed index and is skipped.",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner calling releaseManagedNFT during an active withdrawal cycle causes one NFT's revenue to be skipped for that cycle. The skipped NFT's revenue remains in the NFT contract until the next full withdrawal cycle."
+        },
+        {
+          "scenario": "Zero totalSupply division during _beginDistribution",
+          "expected_behavior": "Distribution should not start when totalSupply is 0",
+          "actual_behavior": "_isPastMinDistributionPeriod returns false when totalSupply==0, preventing distribution. However, if all holders burn their tokens between the period check and the distribute call in a single transaction context, or if the check passes when supply > 0 and then changes, a division by zero could occur in _beginDistribution. In practice, LockedForDistribution prevents this race.",
+          "risk_level": "low",
+          "exploitation_potential": "Low due to LockedForDistribution preventing burns during distribution. The _isPastMinDistributionPeriod guard correctly handles the zero-supply case."
+        },
+        {
+          "scenario": "Non-standard ERC20 tokens as distributableERC20s (fee-on-transfer, rebasing, no-return)",
+          "expected_behavior": "All standard and non-standard ERC20s should be handled correctly",
+          "actual_behavior": "No SafeERC20 usage. Tokens not returning bool from transfer() will cause revert in Solidity 0.8.x. Fee-on-transfer tokens will deliver less than entitlement amount. Rebasing tokens' balances may change between entitlement calculation and transfer.",
+          "risk_level": "high",
+          "exploitation_potential": "If a distributableERC20 is fee-on-transfer, the actual amounts received by holders will be less than calculated, with the fee effectively extracting value. If a token doesn't return bool, all distributions revert permanently. Rebasing tokens could cause insufficient balance during transfer if a negative rebase occurs between _beginDistribution and the actual transfers."
+        },
+        {
+          "scenario": "Constructor accepts ManagedNFTs without ownership validation",
+          "expected_behavior": "All initial ManagedNFTs should be verified as owned by this contract",
+          "actual_behavior": "Constructor sets ManagedNFTs = _managedNFTs directly without calling any ownership verification. addManagedNFT verifies ownership but is not called from constructor.",
+          "risk_level": "low",
+          "exploitation_potential": "Deployer could accidentally include NFTs not owned by the contract. Withdrawal from unowned NFTs would fail at the NFT level (access control). Mostly an operational risk."
+        }
+      ],
+      "assumption_violations": [
+        "Assumption: holders array contains each address at most once. Violated by address(0) being pushed on every burn.",
+        "Assumption: require(true) provides meaningful validation in releaseManagedNFT. Always passes.",
+        "Assumption: ERC20 transfer() always returns bool. Non-standard tokens revert in Solidity 0.8.x ABI decoding.",
+        "Assumption: distributableERC20s do not charge fees on transfer. Fee-on-transfer tokens break entitlement accounting.",
+        "Assumption: ManagedNFTs array manipulation is always consistent with nextWithdrawal state. releaseManagedNFT can corrupt this.",
+        "Assumption: totalSupply accurately represents the entitled population. Disapproved holders inflate totalSupply, diluting others."
+      ],
+      "game_theory_risks": [
+        "Any token holder can trigger distribution at will once MinDistributionPeriod passes, potentially front-running other operations",
+        "An approved holder who gets disapproved has tokens trapped: can't transfer (allowlist), burn is only option but requires distribution first if past MinDistributionPeriod",
+        "Owner can time disapproveHolder calls to coincide with distributions, selectively excluding holders from payouts",
+        "Large holders have outsized influence on entitlement per unit since the calculation uses floor division - they lose fewer tokens to rounding proportionally",
+        "Repeated small burns by malicious approved holders can bloat the holders array with address(0) entries, increasing distribution gas costs for all participants"
+      ],
+      "integration_risks": [
+        "LiquidInfrastructureNFT.getThresholds() returns the ERC20 list used for withdrawals - if thresholds are changed to exclude a token, its balance remains stranded in the NFT",
+        "External ERC20 contracts could be upgraded or paused, breaking withdrawals or distributions",
+        "The x/microtx module integration is assumed to correctly handle threshold-based balance management - any module bugs directly affect revenue flow",
+        "ERC721Holder.onERC721Received allows any NFT to be sent to this contract, not just managed LiquidInfrastructureNFTs"
+      ],
+      "calculation_errors": [
+        "Entitlement = (balance / supply) * holderBalance uses division-first, losing up to (supply-1) units per token per distribution. Should use (balance * holderBalance) / supply for higher precision (with overflow protection).",
+        "Total distributed per token = sum(floor(balance/supply) * holderBalance_i) which is strictly <= balance. The difference (balance - totalDistributed) is permanent dust with no recovery mechanism.",
+        "If holderBalance is very small relative to supply, floor(balance/supply) * holderBalance could equal 0 even when the holder is entitled to a non-zero amount, e.g., balance=999, supply=1000, holderBalance=1 gives entitlement=0."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "LiquidInfrastructureERC20",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "pausable:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "notes": "Custom ERC20 with distribution lock, KYC allowlist, and stale distribution enforcement on mint/burn. Uses OZ ERC20Burnable. No SafeERC20 used for distributable token interactions. balanceOf called via external this.balanceOf() pattern.",
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "distributableERC20s (external)",
+          "behaviors": [
+            "unknown"
+          ],
+          "decimals": -1,
+          "notes": "Owner-configurable list of ERC20s distributed to holders. No validation on token behavior. Fee-on-transfer tokens break accounting. Non-bool-returning tokens cause reverts. No SafeERC20 wrapper used. Rebasing tokens' balance changes between entitlement snapshot and transfer are unhandled.",
+          "approval_model": "unknown",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "LiquidInfrastructureNFT (ERC721)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 0,
+          "notes": "Single-token ERC721 (AccountId=1). Access control via OwnableApprovableERC721. Holds ERC20 revenue balances. withdrawBalancesTo transfers full balanceOf for each requested ERC20."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "holders_array_uniqueness",
+          "state_vars": [
+            "holders[]"
+          ],
+          "description": "Each non-zero address should appear at most once in holders array. VIOLATED: address(0) is pushed on every burn operation."
+        },
+        {
+          "name": "holders_reflect_nonzero_balances",
+          "state_vars": [
+            "holders[]",
+            "balanceOf(holder)"
+          ],
+          "description": "holders array should contain exactly the set of addresses with nonzero balanceOf. VIOLATED: address(0) entries have zero balance but persist in array."
+        },
+        {
+          "name": "distribution_conservation",
+          "state_vars": [
+            "erc20EntitlementPerUnit[]",
+            "totalSupply()",
+            "contract ERC20 balances"
+          ],
+          "description": "Sum of all entitlements should equal total distributable balance. VIOLATED: floor division in entitlement calculation causes permanent dust. Disapproved holders' shares are skipped but not redistributed."
+        },
+        {
+          "name": "managed_nfts_ownership",
+          "state_vars": [
+            "ManagedNFTs[]"
+          ],
+          "description": "All addresses in ManagedNFTs should be LiquidInfrastructureNFT contracts owned by this contract. NOT ENFORCED at construction time. Only addManagedNFT validates ownership."
+        },
+        {
+          "name": "distribution_lock_consistency",
+          "state_vars": [
+            "LockedForDistribution",
+            "nextDistributionRecipient"
+          ],
+          "description": "When LockedForDistribution is true, no transfers/mints/burns should occur. When false, nextDistributionRecipient should be 0. Correctly enforced via _beforeTokenTransfer."
+        }
+      ]
+    }
+  }
+}

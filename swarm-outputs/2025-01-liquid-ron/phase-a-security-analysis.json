@@ -1,0 +1,342 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T02:47:40.493Z",
+    "duration_ms": 178676
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Operator Access",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "harvest",
+          "harvestAndDelegateRewards",
+          "delegateAmount",
+          "redelegateAmount",
+          "undelegateAmount",
+          "finaliseRonRewardsForEpoch"
+        ],
+        "failure_modes": [
+          "Operator cannot access functions due to logical bug in modifier",
+          "Operator fails to finalise epochs, locking user funds",
+          "Operator delegates to malicious or inactive validators"
+        ],
+        "attack_vectors": [
+          "MEV extraction around harvest() and fetchOperatorFee() due to share price manipulation"
+        ]
+      },
+      {
+        "boundary": "Owner Access",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "updateFeeRecipient",
+          "updateOperator",
+          "setOperatorFee",
+          "deployStakingProxy",
+          "pause",
+          "unpause"
+        ],
+        "failure_modes": [
+          "Owner sets excessive operator fee",
+          "Owner pauses contract indefinitely"
+        ],
+        "attack_vectors": [
+          "Compromised owner key can halt protocol or drain value via fee manipulation"
+        ]
+      },
+      {
+        "boundary": "External Staking Protocol (Ronin)",
+        "trust_level": "trusted",
+        "validation": "none",
+        "sanitization": "none",
+        "entry_functions": [
+          "getTotalStaked",
+          "getTotalRewards",
+          "pruneValidatorList"
+        ],
+        "failure_modes": [
+          "Staking protocol upgrades break interface",
+          "Staking protocol slashes validators, reducing totalAssets",
+          "Undelegation delays cause vault insolvency during finalisation"
+        ],
+        "attack_vectors": [
+          "Manipulation of staking rewards to influence vault share price"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "STANDBY",
+        "to_state": "FINALISED",
+        "trigger": "finaliseRonRewardsForEpoch()",
+        "conditions": [
+          "Caller must be operator",
+          "Contract must not be paused",
+          "Vault must have sufficient WRON balance to cover locked shares"
+        ],
+        "invariants": [
+          "Locked shares are burned",
+          "Equivalent assets are transferred to Escrow",
+          "Locked price per share is recorded"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Unrequested",
+        "to_state": "Requested",
+        "trigger": "requestWithdrawal()",
+        "conditions": [
+          "Contract must not be paused",
+          "User must have sufficient shares",
+          "User must be able to receive native RON"
+        ],
+        "invariants": [
+          "User shares are transferred to Vault",
+          "lockedSharesPerEpoch increases by share amount",
+          "User request balance increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Requested",
+        "to_state": "Claimed",
+        "trigger": "redeem(uint256)",
+        "conditions": [
+          "Contract must not be paused",
+          "Epoch status must be FINALISED",
+          "Request must not be fulfilled already"
+        ],
+        "invariants": [
+          "Request is marked as fulfilled",
+          "Assets are transferred from Escrow to Vault",
+          "Native RON is sent to user"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Incorrect Access Control Logic",
+        "locations": [
+          "LiquidRon.sol: modifier onlyOperator()"
+        ],
+        "severity": "critical",
+        "evidence": "The condition `if (msg.sender != owner() || operator[msg.sender]) revert ErrInvalidOperator();` evaluates to true and reverts if `operator[msg.sender]` is true. This completely locks out designated operators from calling any operator functions.",
+        "exploitation_method": "No exploitation needed; it is a core functional bug that prevents the protocol from operating. Operators cannot harvest, delegate, or finalise withdrawals.",
+        "affected_assets": [
+          "All staked assets and rewards (cannot be managed or withdrawn via epochs)"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Share Price Manipulation / Unaccounted State",
+        "locations": [
+          "LiquidRon.sol: totalAssets()",
+          "LiquidRon.sol: harvest()",
+          "LiquidRon.sol: fetchOperatorFee()"
+        ],
+        "severity": "high",
+        "evidence": "`totalAssets()` includes the vault's WRON balance but does not deduct `operatorFeeAmount`. When `harvest()` is called, the WRON balance increases by the full reward, but `getTotalRewards()` (which deducts the fee) drops to 0. This causes an instant artificial increase in `totalAssets()` and share price. Conversely, `fetchOperatorFee()` causes an instant drop.",
+        "exploitation_method": "An attacker can front-run `harvest()` by minting shares, let `harvest()` execute to inflate the share price, and immediately redeem for a profit. They can also front-run `fetchOperatorFee()` by redeeming shares before the price drops, and buying back after.",
+        "affected_assets": [
+          "User deposits (can be diluted by MEV attackers extracting the artificial price difference)"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service via Unbounded Loop",
+        "locations": [
+          "LiquidRon.sol: pruneValidatorList()"
+        ],
+        "severity": "low",
+        "evidence": "The function iterates over all validators and all proxies, making multiple external calls to `roninStaking` per iteration. Since it is public and unprotected, anyone can call it.",
+        "exploitation_method": "If the number of validators and proxies grows large, this function will exceed the block gas limit and revert, preventing the pruning of the validator list.",
+        "affected_assets": [
+          "None directly, but degrades protocol maintenance capabilities"
+        ]
+      },
+      {
+        "swc_id": "SWC-116",
+        "pattern": "Incorrect Event Emission Data",
+        "locations": [
+          "LiquidRon.sol: redeem(uint256 _epoch)"
+        ],
+        "severity": "low",
+        "evidence": "The `WithdrawalClaimed` event emits `epoch` (which is initialized to the current global `withdrawalEpoch`) instead of `_epoch` (the specific epoch being redeemed by the user).",
+        "exploitation_method": "Off-chain indexers and frontends relying on this event will record incorrect epoch data for user claims, leading to UI bugs and accounting errors.",
+        "affected_assets": [
+          "Off-chain accounting integrity"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "LiquidRon.sol",
+          "function": "updateFeeRecipient(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes where operator fees are sent"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "updateOperator(address,bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Grants or revokes operator privileges"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "setOperatorFee(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes fee percentage (max 9.99%)"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "deployStakingProxy()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Deploys new LiquidProxy contract"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "harvest(uint256,address[])",
+          "guards": [
+            "onlyOperator",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Claims rewards from staking"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "harvestAndDelegateRewards(uint256,address[],address)",
+          "guards": [
+            "onlyOperator",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Claims and restakes rewards"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "delegateAmount(uint256,uint256[],address[])",
+          "guards": [
+            "onlyOperator",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Delegates vault assets to validators"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "redelegateAmount(uint256,uint256[],address[],address[])",
+          "guards": [
+            "onlyOperator",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Moves stake between validators"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "undelegateAmount(uint256,uint256[],address[])",
+          "guards": [
+            "onlyOperator",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Removes stake from validators"
+        },
+        {
+          "contract": "LiquidRon.sol",
+          "function": "finaliseRonRewardsForEpoch()",
+          "guards": [
+            "onlyOperator",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Locks price per share and moves assets to escrow for withdrawals"
+        },
+        {
+          "contract": "Pausable.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Halts core protocol functions"
+        },
+        {
+          "contract": "Pausable.sol",
+          "function": "unpause()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Resumes core protocol functions"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "LiquidRon.sol",
+              "lines": "231-239",
+              "function": "getTotalRewards"
+            },
+            {
+              "file": "LiquidRon.sol",
+              "lines": "219-227",
+              "function": "getTotalStaked"
+            }
+          ],
+          "compositional_usage": [
+            "totalAssets calculation relies on RoninStaking contract state as an oracle for staked amounts and pending rewards"
+          ]
+        }
+      ]
+    }
+  }
+}

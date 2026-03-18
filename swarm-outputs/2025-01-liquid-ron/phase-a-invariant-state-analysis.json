@@ -1,0 +1,265 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T02:49:08.333Z",
+    "duration_ms": 266514
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "LiquidRon.sol",
+        "description": "The onlyOperator modifier has inverted logic: `msg.sender != owner() || operator[msg.sender]` reverts when the caller IS an operator (set via updateOperator), and also reverts for the owner if they are set as operator. The intended logic should use AND + negation (`msg.sender != owner() && !operator[msg.sender]`). As written, only the owner who is NOT also flagged as operator can call gated functions; dedicated operators can never call harvest, delegate, undelegate, or finalise functions.",
+        "attack_scenario": "After deployment, the owner calls updateOperator(operatorAddr, true) to enable a bot. The bot attempts to call harvest() or finaliseRonRewardsForEpoch() but always reverts. All staking operations, reward harvesting, and withdrawal finalisations are blocked for every address except the owner (who must not have operator[owner]=true). If the owner accidentally sets operator[owner]=true, ALL operator functions become permanently inaccessible until operator status is toggled back. Meanwhile, user withdrawal requests accumulate and cannot be finalised.",
+        "invariant_logic": "onlyOperator should pass iff (msg.sender == owner() OR operator[msg.sender] == true). Current implementation passes iff (msg.sender == owner() AND operator[msg.sender] == false).",
+        "solidity_property": "function invariant_operatorAccess() public view { address op = 0x1234; /* assume operator[op] == true */ assert(op != owner()); /* operator should be able to call, but modifier reverts for them */ }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "onlyOperator modifier"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "harvest"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "harvestAndDelegateRewards"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "delegateAmount"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "redelegateAmount"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "undelegateAmount"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "finaliseRonRewardsForEpoch"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LiquidRon.sol",
+        "description": "operatorFeeAmount from harvestAndDelegateRewards is tracked as a debt against the vault's WRON balance, but the actual harvested rewards were re-delegated to a validator (never entered the vault). When feeRecipient calls fetchOperatorFee(), the vault withdraws WRON that belongs to depositors, since the fee WRON was never deposited into the vault. This is effectively a drain of depositor funds equal to the accumulated fee amount from harvestAndDelegateRewards calls.",
+        "attack_scenario": "Operator calls harvestAndDelegateRewards repeatedly, accumulating large operatorFeeAmount from re-delegated rewards. The fee recipient calls fetchOperatorFee(), which calls _withdrawRONTo(feeRecipient, amount). The vault unwraps and sends WRON from its balance to the fee recipient. This WRON came from user deposits, not from the harvested rewards (which were re-staked). Depositors' principal is drained by the fee amount.",
+        "invariant_logic": "vault.WRON_balance >= operatorFeeAmount at all times. After harvestAndDelegateRewards, operatorFeeAmount increases but vault WRON balance does not increase, violating this property.",
+        "solidity_property": "function invariant_feeReserve() public view { assert(IERC20(asset()).balanceOf(address(this)) >= operatorFeeAmount); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "harvestAndDelegateRewards"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "fetchOperatorFee"
+          },
+          {
+            "file": "LiquidProxy.sol",
+            "function": "harvestAndDelegateRewards"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidRon.sol",
+        "description": "After harvest() (non-delegating), operatorFeeAmount sits as WRON in the vault's balance and is included in totalAssets() via super.totalAssets() (WRON balance), but it should be excluded since it belongs to the fee recipient, not depositors. totalAssets() is inflated by operatorFeeAmount, causing the share price (assets per share) to be higher than it should be. When fetchOperatorFee() is called, totalAssets drops and share price decreases, harming holders.",
+        "attack_scenario": "Attacker monitors the mempool. They deposit right after a large harvest() (share price inflated by operatorFeeAmount). The fee recipient then calls fetchOperatorFee(), reducing totalAssets and share price. The attacker loses value. Conversely, existing holders see artificially high share prices that drop when fees are claimed. A sophisticated attacker could sandwich: deposit before harvest, then redeem after harvest but before fee claim.",
+        "invariant_logic": "totalAssets() should equal super.totalAssets() - operatorFeeAmount + getTotalStaked() + getTotalRewards(). Currently: totalAssets() = super.totalAssets() + getTotalStaked() + getTotalRewards(), missing the operatorFeeAmount deduction.",
+        "solidity_property": "function invariant_totalAssetsExcludesFees() public view { uint256 correct = IERC20(asset()).balanceOf(address(this)) - operatorFeeAmount + getTotalStaked() + getTotalRewards(); assert(totalAssets() == correct); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "totalAssets"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "harvest"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "fetchOperatorFee"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidRon.sol",
+        "description": "Withdrawal epoch state machine: an epoch must transition STANDBY -> FINALISED exactly once, and withdrawalEpoch must strictly increase. Users can only requestWithdrawal for the current epoch and can only redeem for finalized epochs. Once fulfilled, a request cannot be redeemed again. However, there is no mechanism to cancel a withdrawal request. If operator functions are inaccessible (see INV-ACCESS-001), user shares are locked permanently in the contract with no recourse.",
+        "attack_scenario": "Combined with the onlyOperator bug (INV-ACCESS-001), if no address can call finaliseRonRewardsForEpoch(), all withdrawal requests are stuck forever. Users who called requestWithdrawal() have transferred their LRON to the contract and cannot get it back. Their shares cannot be burned (only finalisation does that), and there is no cancel function.",
+        "invariant_logic": "For all epochs e: (statusPerEpoch[e] == FINALISED) implies (e < withdrawalEpoch). For all epochs e: if a user has request.fulfilled == false and request.shares > 0, then either (1) statusPerEpoch[e] == FINALISED allowing redemption, or (2) a mechanism exists to return shares. Currently condition (2) is never satisfied.",
+        "solidity_property": "function invariant_epochMonotonicity() public view { for (uint256 e = 0; e < withdrawalEpoch; e++) { assert(uint256(statusPerEpoch[e]) == uint256(WithdrawalStatus.FINALISED)); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "requestWithdrawal"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "finaliseRonRewardsForEpoch"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "redeem(uint256)"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidProxy.sol",
+        "description": "LiquidProxy.harvest() loops over _consensusAddrs.length and calls claimRewards(_consensusAddrs) (the full array) on each iteration, resulting in N redundant claim calls. Furthermore, it uses address(this).balance as the claimed amount rather than tracking the actual delta. Any pre-existing native RON in the proxy (from prior undelegations, direct sends via open receive(), etc.) is counted as harvested rewards, inflating operatorFeeAmount and distorting reward accounting.",
+        "attack_scenario": "An attacker sends a small amount of native RON directly to a LiquidProxy (receive() is open and unrestricted). When harvest() is called, address(this).balance includes the attacker's donation. The donation is sent to vault as WRON and operatorFeeAmount is charged on it. The attacker inflates the fee taken from the vault. Additionally, the N redundant claimRewards calls waste gas and could fail if the staking contract doesn't handle double-claims gracefully.",
+        "invariant_logic": "harvestedAmount should equal the actual rewards claimed from the staking contract, not the proxy's total native balance. Pre-existing balance should be excluded.",
+        "solidity_property": "function invariant_harvestAccuracy(uint256 balanceBefore, uint256 balanceAfter) public pure { assert(balanceAfter - balanceBefore == harvestedAmount); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidProxy.sol",
+            "function": "harvest"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "harvest"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LiquidRon.sol",
+        "description": "First-depositor/inflation attack: There is no minimum deposit amount, no dead shares mechanism, and no initial seed deposit. An attacker can be the first depositor with 1 wei of assets, receive 1 share, then donate a large amount of WRON directly to the vault (inflating totalAssets). Subsequent depositors' deposit amounts get rounded down to 0 shares due to the inflated exchange rate, and the attacker captures the donated + deposited value.",
+        "attack_scenario": "Attacker deposits 1 wei to mint 1 share. Attacker transfers 10 WRON directly to the vault contract. totalAssets is now ~10 WRON + 1 wei, totalSupply is 1. A victim deposits 9.99 WRON but previewDeposit returns 0 shares (rounded down). The victim's WRON is added to vault balance but they get nothing. Attacker redeems their 1 share for the entire vault balance.",
+        "invariant_logic": "For any deposit of assets > 0, the shares minted must be > 0. Equivalently: previewDeposit(assets) > 0 for all reasonable deposit amounts.",
+        "solidity_property": "function invariant_noZeroShareMint(uint256 assets) public view { if (assets > 0) { assert(previewDeposit(assets) > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "deposit(uint256,address)"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "deposit()"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "totalAssets"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiquidRon.sol",
+        "description": "The redeem(uint256 _epoch) function declares `uint256 epoch = withdrawalEpoch` and emits `WithdrawalClaimed(msg.sender, epoch, shares, assets)` using the CURRENT withdrawalEpoch instead of the actual epoch being claimed (_epoch). This causes incorrect event data for off-chain indexers and UIs, potentially misattributing withdrawals to wrong epochs.",
+        "attack_scenario": "Off-chain systems (indexers, dashboards, analytics) track withdrawal claims by epoch from events. The wrong epoch value causes reconciliation failures. If any downstream system uses the event's epoch to verify claims or trigger actions, it would process incorrectly.",
+        "invariant_logic": "WithdrawalClaimed event's epoch parameter must equal the _epoch parameter passed to redeem(), not the current withdrawalEpoch.",
+        "solidity_property": "// The emit should be: emit WithdrawalClaimed(msg.sender, _epoch, shares, assets); not emit WithdrawalClaimed(msg.sender, epoch, shares, assets);",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "redeem(uint256)"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "LiquidRon.sol",
+        "description": "pruneValidatorList() has no access control — it is callable by any external address. While it checks that validators have zero rewards and zero staking amounts before removing them, the timing of the check is point-in-time. If staking operations are in-flight or if the Ronin staking contract has eventual consistency, a validator could be pruned while it still has active stake. Once pruned, that validator's stake and rewards are excluded from getTotalStaked() and getTotalRewards(), deflating totalAssets and share price.",
+        "attack_scenario": "An attacker monitors delegation transactions. Right after an operator calls undelegateAmount (which may have a cooldown on the Ronin side before the staking amount is released), the attacker calls pruneValidatorList. The staking contract might temporarily show 0 for that validator. The validator is pruned, and its remaining delegated stake is no longer counted in totalAssets. Share price drops. Attacker can then deposit at the deflated price and profit when the validator is re-added.",
+        "invariant_logic": "A validator should only be pruned if it truly has zero stake AND zero rewards across ALL proxies. The check must be atomic and not susceptible to transient states.",
+        "solidity_property": "function invariant_prunedValidatorHasNoStake(address validator) public view { if (!validatorStakeActive[validator]) { for (uint i = 0; i < stakingProxyCount; i++) { assert(IRoninValidator(roninStaking).getReward(validator, stakingProxies[i]) == 0); } } }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "pruneValidatorList"
+          },
+          {
+            "file": "ValidatorTracker.sol",
+            "function": "_removeValidator"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LiquidProxy.sol",
+        "description": "undelegateAmount() calculates totalUndelegated from the input _amounts array and then sends exactly that amount of WRON to the vault via _depositRONTo. However, bulkUndelegate may not return the exact native RON requested (due to slashing, rounding, or staking contract behavior). If the proxy's native balance after bulkUndelegate is less than totalUndelegated, _depositRONTo will attempt to wrap more RON than available, causing the transaction to revert. If the balance is higher (e.g., from previous residual RON), excess RON is sent to the vault unaccounted.",
+        "invariant_logic": "The amount sent to vault via _depositRONTo after undelegation must equal the actual native RON received from bulkUndelegate, not the requested amount.",
+        "solidity_property": "function invariant_undelegateAmountAccuracy(uint256 balanceBefore) public view { uint256 actualReceived = address(this).balance - balanceBefore; assert(wronSentToVault == actualReceived); }",
+        "inventory_refs": [
+          {
+            "file": "LiquidProxy.sol",
+            "function": "undelegateAmount"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "LiquidRon.sol",
+        "description": "withdrawalEpoch must strictly increase and only through finaliseRonRewardsForEpoch. Each epoch can only be finalised once. However, there is no upper bound or rate limit on epoch advancement. A malicious or compromised operator/owner could rapidly cycle through epochs, potentially finalising empty epochs or epochs with minimal shares, wasting gas and creating confusion in off-chain tracking.",
+        "invariant_logic": "post(withdrawalEpoch) == pre(withdrawalEpoch) + 1, only via finaliseRonRewardsForEpoch. statusPerEpoch[e] transitions from STANDBY to FINALISED exactly once.",
+        "solidity_property": "function invariant_epochStrictlyIncreases(uint256 prevEpoch) public view { assert(withdrawalEpoch >= prevEpoch); /* and each epoch finalised at most once */ }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "finaliseRonRewardsForEpoch"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "LiquidRon.sol",
+        "description": "The withdraw() and redeem() ERC4626 overrides send the assets to address(this) first via super, then unwrap and send native RON to _receiver. If _receiver is a contract that cannot accept native RON (no receive/fallback), the _withdrawRONTo call reverts. However, requestWithdrawal has _checkUserCanReceiveRon which only does a 0-value call check. A contract could accept 0 value but revert on non-zero value transfers (e.g., gas-limited fallback). Users who pass the check during requestWithdrawal may still fail to claim via redeem(epoch) if they cannot receive non-zero RON.",
+        "invariant_logic": "_checkUserCanReceiveRon(user) succeeding with 0 value must imply the user can receive arbitrary non-zero value RON transfers.",
+        "solidity_property": "function invariant_ronReceivable(address user) public { (bool s0,) = payable(user).call{value: 0}(''); (bool s1,) = payable(user).call{value: 1 ether}(''); assert(s0 == s1); /* This can fail */ }",
+        "inventory_refs": [
+          {
+            "file": "LiquidRon.sol",
+            "function": "_checkUserCanReceiveRon"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "redeem(uint256)"
+          },
+          {
+            "file": "LiquidRon.sol",
+            "function": "requestWithdrawal"
+          }
+        ]
+      }
+    ]
+  }
+}

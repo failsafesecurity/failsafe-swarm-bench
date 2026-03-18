@@ -1,0 +1,467 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T00:08:41.201Z",
+    "duration_ms": 168194
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User (msg.sender) via createLock/increaseAmount",
+        "path": [
+          "msg.value received",
+          "locked[msg.sender] updated",
+          "_checkpoint calculates slopes/biases",
+          "slopeChanges updated",
+          "pointHistory updated",
+          "globalEpoch incremented"
+        ],
+        "transformations": [
+          "CANTO value → int128 amount",
+          "timestamp → floor-to-week lock end",
+          "delegated amount → slope (delegated/LOCKTIME)",
+          "slope → bias (slope * time_remaining)"
+        ],
+        "sinks": [
+          "locked mapping",
+          "userPointHistory",
+          "pointHistory",
+          "slopeChanges"
+        ],
+        "trust_changes": "User-supplied value directly cast to int128; overflow possible for extremely large values",
+        "validation_points": [
+          "require(_value > 0)",
+          "require(msg.value == _value)",
+          "require(locked_.amount == 0) for createLock"
+        ],
+        "exposure_risks": [
+          "All lock data is public",
+          "Voting power is deterministically computable"
+        ],
+        "manipulation_risks": [
+          "int128 cast of _value could overflow silently for values > type(int128).max, though practically CANTO supply limits this",
+          "Lock end time rounding to weeks creates slight voting power variation"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "VotingEscrow user point data",
+        "path": [
+          "ve.getLastUserPoint(msg.sender)",
+          "slope_ cast to uint256",
+          "slope * _user_weight / 10000",
+          "bias/slope written to gauge points_weight and points_sum",
+          "changes_weight/changes_sum scheduled"
+        ],
+        "transformations": [
+          "int128 slope → uint256 slope",
+          "slope scaled by user_weight bps",
+          "new_bias = slope * (lock_end - next_time)",
+          "gauge weight aggregated into type sum and total"
+        ],
+        "sinks": [
+          "vote_user_slopes",
+          "vote_user_power",
+          "points_weight",
+          "points_sum",
+          "changes_weight",
+          "changes_sum",
+          "points_total"
+        ],
+        "trust_changes": "Trust transitions from VotingEscrow (trusted source) to GaugeController calculations; no re-verification of lock validity beyond lock_end > next_time",
+        "validation_points": [
+          "require lock_end > next_time",
+          "require power_used <= 10000",
+          "require gauge_type != 0 (or weight == 0)"
+        ],
+        "exposure_risks": [
+          "All vote data is public, enabling front-running of gauge weight votes"
+        ],
+        "manipulation_risks": [
+          "User can vote, then immediately delegate their veCANTO lock - the slope read from VE at vote time may not reflect future delegated state",
+          "Stale voting power: user's slope from getLastUserPoint may differ from actual current voting power if no checkpoint was done"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Lending market (msg.sender) calls sync_ledger",
+        "path": [
+          "msg.sender checked for liquidityGauge mapping",
+          "update_market called",
+          "cantoPerBlock[epoch] * gauge_relative_weight_write used",
+          "accCantoPerShare accumulated",
+          "user.amount and user.rewardDebt updated",
+          "lendingMarketTotalBalance updated"
+        ],
+        "transformations": [
+          "block delta * cantoPerBlock * relative_weight / marketSupply → accCantoPerShare increment",
+          "user delta * accCantoPerShare / 1e18 → rewardDebt adjustment"
+        ],
+        "sinks": [
+          "userInfo mapping",
+          "marketInfo mapping",
+          "lendingMarketTotalBalance mapping"
+        ],
+        "trust_changes": "CRITICAL: msg.sender is trusted as lending market without verification. Any address that has a liquidityGauges mapping entry can indirectly call sync_ledger for a whitelisted market.",
+        "validation_points": [
+          "update_market checks whitelist",
+          "require updatedMarketBalance >= 0"
+        ],
+        "exposure_risks": [
+          "Reward amounts visible on-chain"
+        ],
+        "manipulation_risks": [
+          "Any external contract can call sync_ledger directly - if there's no liquidity gauge, msg.sender must be the whitelisted market itself, but the liquidityGauges two-way mapping could create unintended aliases",
+          "Precision loss in accCantoPerShare due to uint128 truncation and integer division"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "LiquidityGauge _afterTokenTransfer hook",
+        "path": [
+          "ERC20 transfer/mint/burn triggers _afterTokenTransfer",
+          "sync_ledger called on LendingLedger for from and to addresses",
+          "update_market and user balance updates in LendingLedger"
+        ],
+        "transformations": [
+          "ERC20 amount → int256 delta (negative for from, positive for to)"
+        ],
+        "sinks": [
+          "LendingLedger userInfo",
+          "LendingLedger lendingMarketTotalBalance"
+        ],
+        "trust_changes": "LiquidityGauge is trusted by LendingLedger via liquidityGauges mapping. Any ERC20 transfer triggers ledger sync.",
+        "validation_points": [
+          "_burn checks balance",
+          "safeTransferFrom checks allowance"
+        ],
+        "exposure_risks": [
+          "Transfer hook is called for every token movement including direct transfers between users"
+        ],
+        "manipulation_risks": [
+          "Double-counting: on transfer from A to B, sync_ledger is called twice (once negative for A, once positive for B). Both calls trigger update_market separately, which is fine but could have gas implications",
+          "Fee-on-transfer underlying tokens would cause minted gauge tokens to exceed actual underlying held"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Governance sets rewards via setRewards and funds contract",
+        "path": [
+          "cantoPerBlock[epoch] set for range",
+          "update_market reads cantoPerBlock",
+          "claim sends CANTO to user"
+        ],
+        "transformations": [
+          "amountPerBlock stored per epoch",
+          "accumulated into accCantoPerShare per block delta",
+          "user share = amount * accCantoPerShare / 1e18 - rewardDebt"
+        ],
+        "sinks": [
+          "cantoPerBlock mapping",
+          "CANTO transfer to user on claim"
+        ],
+        "trust_changes": "Governance is fully trusted for reward setting and funding",
+        "validation_points": [
+          "Only epoch alignment checked for setRewards",
+          "No check that contract has sufficient CANTO balance"
+        ],
+        "exposure_risks": [
+          "Reward rates are public"
+        ],
+        "manipulation_risks": [
+          "No validation that the contract holds enough CANTO to pay all accumulated rewards - could lead to failed claims",
+          "setRewards has no upper bound, governance could set impossibly high rewards"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Block time parameters (governance-set)",
+        "path": [
+          "setBlockTimeParameters sets averageBlockTime, referenceBlockTime, referenceBlockNumber",
+          "update_market uses these to compute epochTime",
+          "epochTime passed to gaugeController.gauge_relative_weight_write"
+        ],
+        "transformations": [
+          "referenceBlockTime + ((block.number - referenceBlockNumber) * averageBlockTime) / 1000 → epochTime"
+        ],
+        "sinks": [
+          "epochTime used in gauge_relative_weight_write call"
+        ],
+        "trust_changes": "Governance-set parameters directly affect reward calculations for all users",
+        "validation_points": [
+          "No validation on parameter values"
+        ],
+        "exposure_risks": [
+          "Parameters are public"
+        ],
+        "manipulation_risks": [
+          "Malicious or incorrect parameters could cause epochTime to be wildly inaccurate, directing rewards incorrectly",
+          "No requirement to call update_market for all markets before changing parameters, despite comment saying so"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "VotingEscrow withdraw",
+        "path": [
+          "locked[msg.sender] read",
+          "validation checks",
+          "newLocked constructed with amount=0, end=0",
+          "delegated reduced",
+          "_checkpoint called",
+          "CANTO sent to msg.sender"
+        ],
+        "transformations": [
+          "locked.amount → amountToSend",
+          "newLocked.delegated set to 0 AFTER storing to locked[] but BEFORE checkpoint"
+        ],
+        "sinks": [
+          "locked mapping",
+          "pointHistory",
+          "msg.sender receives CANTO"
+        ],
+        "trust_changes": "User retrieves their locked CANTO after lock expiry",
+        "validation_points": [
+          "require lock not expired or unlockOverride",
+          "require lock not delegated to another user"
+        ],
+        "exposure_risks": [
+          "Reentrancy via CANTO transfer - mitigated by nonReentrant"
+        ],
+        "manipulation_risks": [
+          "The line `newLocked.delegated = 0` after `locked[msg.sender] = newLocked` means the checkpoint uses a different delegated value than what was stored. The stored value has delegated = locked_.delegated - amount, but checkpoint sees delegated = 0. This is intentional for zeroing out voting power but creates a discrepancy in the stored locked state vs checkpoint state."
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Users lock CANTO for fixed 5-year period, receiving linearly-decaying voting power",
+        "Every action (createLock, increaseAmount) resets the lock to 5 years from current time",
+        "Voting power = delegated_amount / LOCKTIME * time_remaining",
+        "Gauge weights determine proportion of CANTO rewards directed to each market",
+        "Users allocate voting power in basis points (0.01% granularity) across gauges",
+        "Rewards are calculated per-block within epochs of 100,000 blocks",
+        "Liquidity providers earn rewards proportional to their share of market supply"
+      ],
+      "economic_incentives": [
+        "Lock CANTO → get veCANTO voting power → vote on gauge weights → direct emissions",
+        "Provide liquidity → earn proportional CANTO rewards based on gauge weight",
+        "Longer remaining lock = more voting power (but lock is always 5 years)",
+        "No penalty for early withdrawal when unlockOverride is true"
+      ],
+      "governance_mechanisms": [
+        "Governance can whitelist/delist markets",
+        "Governance can add/remove gauges and change type weights",
+        "Governance sets per-block reward rates per epoch",
+        "Governance can toggle unlock override for emergency withdrawals",
+        "Governance can update block time parameters affecting reward calculations",
+        "No timelock on governance actions"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "VotingEscrow: createLock with value that overflows int128",
+          "expected_behavior": "Revert or handle safely",
+          "actual_behavior": "int128(int256(_value)) silently truncates if _value > type(int128).max (≈1.7e38). Practically impossible with CANTO supply but theoretically unsafe",
+          "risk_level": "low",
+          "exploitation_potential": "Would require sending more CANTO than exists"
+        },
+        {
+          "scenario": "LendingLedger: update_market with epochTime calculation using stale or manipulated block time parameters",
+          "expected_behavior": "epochTime should closely approximate actual wall-clock time",
+          "actual_behavior": "epochTime = referenceBlockTime + ((block.number - referenceBlockNumber) * averageBlockTime) / 1000. The same epochTime is used for ALL iterations of the while loop regardless of the actual epoch being processed - it always uses current block.number",
+          "risk_level": "medium",
+          "exploitation_potential": "The epochTime should vary as `i` progresses through historical blocks, but it's fixed to the current block's estimated time. This means gauge_relative_weight_write is called with the same time for all historical epochs, potentially applying current-period weights to past epochs."
+        },
+        {
+          "scenario": "LendingLedger: accCantoPerShare truncation to uint128",
+          "expected_behavior": "Accumulated rewards per share should be precise",
+          "actual_behavior": "uint128 max is ~3.4e38. With 1e18 scaling, this limits effective reward tracking. If cantoPerBlock is very high and marketSupply is very low (e.g., 1 wei), accCantoPerShare could overflow uint128",
+          "risk_level": "medium",
+          "exploitation_potential": "A user who is the sole depositor with minimal amount could cause accCantoPerShare to overflow, wrapping around and losing rewards for all users"
+        },
+        {
+          "scenario": "GaugeController: vote_for_gauge_weights on removed gauge with weight > 0",
+          "expected_behavior": "Should not be possible to add weight to removed gauge",
+          "actual_behavior": "The check is `require(_user_weight == 0 || gauge_types_[_gauge_addr] != 0)` which correctly allows only 0 weight votes on removed gauges. But the subsequent `gauge_type = gauge_types_[_gauge_addr] - 1` would underflow to -1 (int128) for removed gauges when _user_weight is 0",
+          "risk_level": "high",
+          "exploitation_potential": "When voting 0 on a removed gauge (gauge_types_[_gauge_addr] == 0), the code proceeds past the require but then computes gauge_type = 0 - 1 = -1. This accesses points_sum[-1] and changes_sum[-1], corrupting unrelated storage slots. The `require(gauge_type >= 0)` check only verifies the gauge is added, which is contradicted by the earlier check allowing 0-weight votes on non-gauges."
+        },
+        {
+          "scenario": "LendingLedger: sync_ledger called by arbitrary address with liquidityGauge mapping",
+          "expected_behavior": "Only legitimate lending markets or their gauges should sync",
+          "actual_behavior": "The liquidityGauges mapping is bidirectional: liquidityGauges[market] = gauge AND liquidityGauges[gauge] = market. If msg.sender is a gauge address, it maps to the market. If msg.sender is the market directly, it maps to the gauge. But any address not in the mapping passes through as-is and must be whitelisted.",
+          "risk_level": "medium",
+          "exploitation_potential": "The design relies on only the LiquidityGauge contract calling sync_ledger with itself as msg.sender. But anyone could deploy a contract that calls sync_ledger directly. If that contract's address happens to not be in liquidityGauges, the address itself is used as lendingMarket and must be whitelisted - so this is actually safe for non-mapped addresses. The gauge address IS in the mapping, so only the gauge can route to its market."
+        },
+        {
+          "scenario": "VotingEscrow: withdraw sets newLocked.delegated differently for checkpoint vs storage",
+          "expected_behavior": "Consistent state between storage and checkpoint",
+          "actual_behavior": "locked[msg.sender] = newLocked (with delegated = locked_.delegated - amount), then newLocked.delegated = 0, then _checkpoint(msg.sender, locked_, newLocked) uses delegated=0. Storage has non-zero delegated if there was extra delegation.",
+          "risk_level": "medium",
+          "exploitation_potential": "If a user has self-delegation only (delegatee == msg.sender required), delegated should equal amount. After subtracting amount, delegated becomes 0. So stored.delegated = 0 and checkpoint sees 0. Seems consistent for the self-delegation case. But if somehow delegated != amount (rounding or bugs), there could be a discrepancy."
+        },
+        {
+          "scenario": "GaugeController: _get_weight and _get_sum underflow on slope subtraction",
+          "expected_behavior": "Slope decreases should not underflow",
+          "actual_behavior": "In _get_weight: pt.slope -= d_slope without underflow check. If d_slope > pt.slope (e.g., due to gauge removal modifying changes_weight), this will revert on Solidity 0.8+ checked arithmetic, potentially bricking the gauge",
+          "risk_level": "high",
+          "exploitation_potential": "After remove_gauge_weight zeroes out changes_weight for 263 weeks, any slope changes beyond that window remain. Also, votes placed after gauge removal could create inconsistent slope change data. If _get_weight reverts, it blocks all operations that call it including vote_for_gauge_weights for any gauge of the same type."
+        },
+        {
+          "scenario": "LendingLedger: whiteListLendingMarket sets lastRewardBlock only when whitelisting",
+          "expected_behavior": "When re-whitelisting a market, lastRewardBlock should be updated",
+          "actual_behavior": "lastRewardBlock is set to current block.number when whitelisting. If a market is delisted then re-listed, the old lastRewardBlock from the first listing might still be present if the market was already initialized (the code uses marketInfo[_market] which could be the gauge address, not _market, creating confusion)",
+          "risk_level": "medium",
+          "exploitation_potential": "When whitelisting with _hasGauge=true, the market address in the whitelist is _market but marketInfo is also keyed by _market. However, sync_ledger resolves to the gauge address via liquidityGauges mapping. So marketInfo[gauge_address] is used in update_market, but whiteListLendingMarket sets marketInfo[_market].lastRewardBlock. If _market != gauge_address, the lastRewardBlock is set on the wrong key."
+        },
+        {
+          "scenario": "LendingLedger: whiteListLendingMarket whitelist/gauge key mismatch",
+          "expected_behavior": "Whitelist check in update_market should match the resolved market address",
+          "actual_behavior": "whiteListLendingMarket sets lendingMarketWhitelist[_market] = true and marketInfo[_market].lastRewardBlock. But in sync_ledger, if liquidityGauges[msg.sender] != address(0), lendingMarket becomes the gauge address. update_market then checks lendingMarketWhitelist[gauge_address] which was never set to true. The whitelist is set for _market (the underlying market), not the gauge.",
+          "risk_level": "high",
+          "exploitation_potential": "This means markets with liquidity gauges cannot function: sync_ledger resolves to the gauge address, but update_market requires lendingMarketWhitelist[gauge_address] to be true, which it never is. The system is fundamentally broken for gauge-enabled markets unless the governance separately whitelists the gauge address too."
+        },
+        {
+          "scenario": "LiquidityGauge: fee-on-transfer tokens",
+          "expected_behavior": "Minted gauge tokens should match received underlying",
+          "actual_behavior": "depositUnderlying mints _amount tokens regardless of actual amount received via safeTransferFrom",
+          "risk_level": "medium",
+          "exploitation_potential": "If underlying token has transfer fees, users receive more gauge tokens than underlying held, allowing last withdrawer to fail or draining other users' tokens"
+        },
+        {
+          "scenario": "VotingEscrow: increaseAmount resets lock time but doesn't update delegatee's lock end",
+          "expected_behavior": "When a delegated lock's amount is increased, the delegatee's voting power should reflect the new lock end",
+          "actual_behavior": "increaseAmount sets newLocked.end = _floorToWeek(block.timestamp + LOCKTIME) for the sender, but the delegatee's lock end is not updated. The delegatee's checkpoint uses the delegatee's own lock end time for slope/bias calculations. The delegated amount increases on the delegatee, but their lock end might expire sooner.",
+          "risk_level": "medium",
+          "exploitation_potential": "If delegatee's lock expires before the delegator's new lock end, the delegated voting power is calculated based on delegatee's shorter lock, effectively losing voting power that should exist."
+        },
+        {
+          "scenario": "GaugeController: _remove_gauge_weight only iterates 263 weeks",
+          "expected_behavior": "All future slope changes for the gauge should be cancelled",
+          "actual_behavior": "Loop runs for 263 iterations (263 * WEEK ≈ 5.05 years). Since LOCKTIME is 1825 days ≈ 260.7 weeks, 263 weeks should cover all possible lock expirations. However, if any lock ends beyond 263 weeks from next_time, those slope changes are missed.",
+          "risk_level": "low",
+          "exploitation_potential": "Edge case if locks can extend slightly beyond 263 weeks due to rounding"
+        }
+      ],
+      "assumption_violations": [
+        "LendingLedger assumes liquidityGauges mapping correctly resolves msg.sender to whitelisted market, but the whitelist is set on the original market address while sync_ledger resolves to the gauge address",
+        "LendingLedger assumes block times are stable and governance will update parameters before significant drift, but no enforcement mechanism exists",
+        "GaugeController assumes gauge_types_[addr] is always > 0 for valid gauges, but vote_for_gauge_weights allows 0-weight votes on removed gauges where gauge_types_ == 0, leading to underflow in gauge_type calculation",
+        "LiquidityGauge assumes underlying token transfers exact amounts (no fee-on-transfer)",
+        "VotingEscrow assumes CANTO transfers always succeed or revert cleanly via low-level call",
+        "LendingLedger update_market uses the same epochTime for all historical block iterations, assuming time doesn't change significantly within the catch-up loop"
+      ],
+      "game_theory_risks": [
+        "Users can vote on gauge weights and then delegate their veCANTO, effectively double-counting influence if the system doesn't invalidate gauge votes on delegation",
+        "Large CANTO holders can concentrate voting power on a single gauge to capture most emissions for a market they dominate",
+        "Last-mover advantage in gauge voting: users can observe others' votes and optimally allocate remaining weight",
+        "Flash-loan-like attacks are somewhat mitigated by the 5-year lock requirement, but getLastUserPoint reads could be stale",
+        "Users could rapidly increase amount to get more gauge votes, as increaseAmount doesn't require a cooldown on voting"
+      ],
+      "integration_risks": [
+        "GaugeController reads VotingEscrow state via getLastUserPoint and lockEnd, which could be stale if no checkpoint was recently made",
+        "LendingLedger calls gaugeController.gauge_relative_weight_write which triggers state changes in GaugeController, creating cross-contract state dependencies",
+        "LiquidityGauge _afterTokenTransfer calls back to LendingLedger.sync_ledger on every transfer, creating a tight coupling that could cause unexpected reverts",
+        "No interface enforcement between LendingLedger and lending markets - any contract can call sync_ledger"
+      ],
+      "calculation_errors": [
+        "LendingLedger update_market: epochTime is computed once using current block.number but used for all historical epoch iterations. It should be computed per-iteration based on the block number being processed, not the current block",
+        "LendingLedger: accCantoPerShare accumulation uses (blockDelta * cantoPerBlock[epoch] * gauge_relative_weight) / marketSupply without scaling by 1e18 first, potentially losing precision when cantoPerBlock * weight product is small relative to marketSupply",
+        "GaugeController vote_for_gauge_weights: when voting 0 weight on a removed gauge (gauge_types_ == 0), gauge_type = 0 - 1 = -1 (int128), which is negative. The subsequent require(gauge_type >= 0) would catch this and revert, meaning users CANNOT remove their votes from removed gauges, locking their vote_user_power permanently",
+        "VotingEscrow: in withdraw(), delegated is decreased by amountToSend (the full amount), then set to 0 before checkpoint. If user had delegated to themselves AND received delegation from others, the delegated field could be > amount, and the subtraction followed by zeroing would be inconsistent. However, the require(delegatee == msg.sender) check and the fact that only self-delegated users can withdraw provides some protection."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "CANTO (native)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Native chain token used for VotingEscrow locks and LendingLedger rewards. Transferred via low-level call with value."
+        },
+        {
+          "address_or_symbol": "veCANTO",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "non_standard_return"
+          ],
+          "decimals": 18,
+          "notes": "Non-transferable voting power token. balanceOf decays linearly over time. Not an actual ERC20 - only has balanceOf/totalSupply view functions."
+        },
+        {
+          "address_or_symbol": "LiquidityGauge (ERC20)",
+          "behaviors": [
+            "callback_onTransfer",
+            "mint_burn_restricted",
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "1:1 wrapper of underlying cNOTE-like tokens. _afterTokenTransfer hooks call LendingLedger.sync_ledger. Inherits ERC20Burnable allowing arbitrary burns. Assumes underlying has standard transfer semantics.",
+          "transfer_model": "hooks",
+          "accounting_model": "balanceOf"
+        },
+        {
+          "address_or_symbol": "cNOTE (underlying)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Assumed standard ERC20 lending market token. If fee-on-transfer, gauge accounting breaks."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "voting_power_conservation",
+          "state_vars": [
+            "pointHistory[globalEpoch].bias",
+            "sum(userPointHistory[addr][epoch].bias for all active users)"
+          ],
+          "notes": "Global bias should equal sum of all user biases at any checkpoint, modulo rounding from integer division"
+        },
+        {
+          "name": "vote_power_allocation",
+          "state_vars": [
+            "vote_user_power[user]",
+            "sum(vote_user_slopes[user][gauge].power for all gauges)"
+          ],
+          "notes": "Total allocated power per user should not exceed 10000 bps. BUG: power can get permanently locked if gauge is removed and user cannot vote 0 due to gauge_type underflow"
+        },
+        {
+          "name": "lending_market_balance",
+          "state_vars": [
+            "lendingMarketTotalBalance[market]",
+            "sum(userInfo[market][user].amount for all users)"
+          ],
+          "notes": "Total market balance should equal sum of all user amounts"
+        },
+        {
+          "name": "gauge_token_backing",
+          "state_vars": [
+            "LiquidityGauge.totalSupply()",
+            "IERC20(underlyingToken).balanceOf(gauge)"
+          ],
+          "notes": "Gauge total supply should equal underlying balance held. Violated if fee-on-transfer tokens used."
+        },
+        {
+          "name": "reward_solvency",
+          "state_vars": [
+            "address(lendingLedger).balance",
+            "sum(pending_rewards for all users across all markets)"
+          ],
+          "notes": "Contract CANTO balance should cover all pending rewards. No enforcement mechanism exists."
+        }
+      ]
+    }
+  }
+}

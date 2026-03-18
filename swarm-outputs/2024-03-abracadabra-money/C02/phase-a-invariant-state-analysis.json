@@ -1,0 +1,328 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T01:13:36.559Z",
+    "duration_ms": 510088
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "buyShares becomes permanently non-functional if either _BASE_RESERVE_ or _QUOTE_RESERVE_ reaches 0 while totalSupply() > 0. The else-if branch requires both baseReserve > 0 AND quoteReserve > 0, leaving shares at default 0, which causes _mint to revert with ErrMintAmountNotEnough.",
+        "attack_scenario": "Admin calls setParameters with a large baseOutAmount draining all base tokens. _resetTargetAndReserve sets _BASE_RESERVE_ = 0. Now totalSupply > 0 but baseReserve = 0. No new liquidity can be added. Additionally, sellQuote calls getPMMState where B = 0, and _SolveQuadraticFunctionForTrade reverts with ErrIsZero when V0 = 0. The pool is permanently bricked - no swaps, no new deposits.",
+        "invariant_logic": "totalSupply() > 0 implies (_BASE_RESERVE_ > 0 AND _QUOTE_RESERVE_ > 0)",
+        "solidity_property": "function invariant_reservesPositiveWhenSupplyExists() public view { if (totalSupply() > 0) { assert(_BASE_RESERVE_ > 0 && _QUOTE_RESERVE_ > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "buyShares"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "setParameters"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "_resetTargetAndReserve"
+          },
+          {
+            "file": "Math.sol",
+            "function": "_SolveQuadraticFunctionForTrade"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "MagicLP.sol",
+        "description": "sellBase and sellQuote use tx.origin (not msg.sender) when querying the fee rate model. This means any intermediary contract (router, aggregator, other protocol) inherits the EOA's fee rate rather than its own, and fee rates cannot be reliably applied to the actual caller. A malicious fee rate model could discriminate based on tx.origin, and smart contract wallets/meta-transactions get different rates than intended.",
+        "attack_scenario": "A protocol integrates MagicLP and expects to receive the default fee rate. However, the FeeRateModel implementation checks tx.origin and applies a higher mtFee to certain EOAs. The intermediary protocol has no way to control or predict the fee applied to its swap. An attacker could also exploit this by routing through a specific EOA known to have favorable rates.",
+        "invariant_logic": "Fee rate determination SHOULD use msg.sender (the direct caller) not tx.origin",
+        "solidity_property": "// Cannot be expressed as on-chain assert - requires code audit: sellBase and sellQuote should pass msg.sender to querySellBase/querySellQuote instead of tx.origin",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "sellBase"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "sellQuote"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "flashLoan"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Router.sol",
+        "description": "_validateDecimals performs uint8 subtraction (quoteDecimals - baseDecimals) which reverts on underflow in Solidity 0.8+ when baseDecimals > quoteDecimals. This silently blocks creation of all valid pools where the base token has more decimals than the quote token, with an unhelpful panic error instead of a descriptive revert.",
+        "attack_scenario": "A user tries to create a pool with WBTC (8 decimals) as base and a custom token (6 decimals) as quote via createPool. The call reverts with arithmetic underflow instead of ErrDecimalsDifferenceTooLarge. The decimals difference (2) would be acceptable, but the unidirectional check blocks it. Users must swap base/quote ordering, which changes the pool's pricing semantics entirely.",
+        "invariant_logic": "abs(quoteDecimals - baseDecimals) <= MAX_BASE_QUOTE_DECIMALS_DIFFERENCE (should check both directions)",
+        "solidity_property": "function invariant_validateDecimalsBothDirections(uint8 base, uint8 quote) public pure { if (base > 0 && quote > 0) { uint8 diff = base > quote ? base - quote : quote - base; assert(diff <= 12); } }",
+        "inventory_refs": [
+          {
+            "file": "Router.sol",
+            "function": "_validateDecimals"
+          },
+          {
+            "file": "Router.sol",
+            "function": "createPool"
+          },
+          {
+            "file": "Router.sol",
+            "function": "createPoolETH"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LockingMultiRewards.sol",
+        "description": "If any reward token becomes non-transferable (paused, blacklisted, or reverts on transfer), _getRewards will permanently revert for all users who have accumulated non-zero locked reward amounts for that token. Since reward tokens cannot be removed from the rewardTokens array, the entire reward claiming system is bricked for affected users.",
+        "attack_scenario": "Owner adds a reward token that later gets paused (e.g., a centrally-managed token). Users have accumulated non-zero reward lock items for this token. When their lock expires and they call getRewards(), the safeTransfer of the paused token reverts, blocking claim of ALL rewards (including other functioning tokens). Since there's no function to remove reward tokens or skip individual token claims, users permanently lose access to all accumulated rewards.",
+        "invariant_logic": "For all i in rewardTokens: safeTransfer(rewardTokens[i]) must not revert, OR there must exist a mechanism to skip/remove problematic tokens",
+        "solidity_property": "// Structural invariant: rewardTokens.length <= MAX_NUM_REWARDS AND there is no removeReward function - if any token reverts on transfer, getRewards() is permanently blocked",
+        "inventory_refs": [
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "_getRewards"
+          },
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "addReward"
+          },
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "getRewards"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "buyShares with imbalanced deposits (baseInputRatio != quoteInputRatio) causes excess tokens to be absorbed into reserves without proportional target adjustment. Targets scale by mintRatio (min of both ratios) while reserves include the full excess. This creates a permanent drift between reserves and targets that accumulates over time, distorting PMM pricing.",
+        "attack_scenario": "An attacker repeatedly calls buyShares with excess base tokens (e.g., baseInputRatio = 2x, quoteInputRatio = 1x). Each time, mintRatio = quoteInputRatio, so targets scale 1x but reserves absorb the full 2x base. After many iterations, _BASE_RESERVE_ >> _BASE_TARGET_ while RState isn't corrected. This distorts the PMM pricing curve, allowing the attacker to then trade at favorable rates. The correctRState function can only partially fix this.",
+        "invariant_logic": "After buyShares: (_BASE_RESERVE_ - _BASE_TARGET_) / _BASE_TARGET_ should remain bounded AND consistent with RState",
+        "solidity_property": "function invariant_targetReserveConsistency() public view { if (_RState_ == uint32(PMMPricing.RState.ONE)) { assert(_BASE_RESERVE_ >= _BASE_TARGET_ - 1 && _BASE_RESERVE_ <= _BASE_TARGET_ + _BASE_TARGET_); } }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "buyShares"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "_setReserve"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Factory.sol",
+        "description": "Factory.create() uses tx.origin instead of msg.sender for the creator address in salt computation. This means smart contracts (routers, aggregators, DAOs) cannot be the 'creator' of a pool - the EOA that initiated the transaction is always recorded. Two different protocols deploying from the same admin EOA with identical parameters would collide on CREATE2.",
+        "attack_scenario": "A DAO governance proposal calls Router which calls Factory.create. The salt uses tx.origin (the governance executor EOA) instead of msg.sender (the Router). Later, if the same EOA directly calls Factory.create with the same parameters, the deterministic address collides and CREATE2 reverts. More critically, the pool registry associates the wrong creator, breaking pool enumeration for protocols.",
+        "invariant_logic": "Pool creation salt SHOULD incorporate msg.sender (actual caller) not tx.origin for composability",
+        "solidity_property": "// Design invariant: _computeSalt uses tx.origin-derived creator address; predictDeterministicAddress cannot be reliably used by intermediary contracts",
+        "inventory_refs": [
+          {
+            "file": "Factory.sol",
+            "function": "create"
+          },
+          {
+            "file": "Factory.sol",
+            "function": "_computeSalt"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "setParameters truncates _LP_FEE_RATE_ to uint64, _K_ to uint64, and _I_ to uint128 before storing to uint256 state variables, while init() stores full uint256 values. Although current MAX constants fit within these smaller types, this creates an inconsistency: the same logical parameter value set via init() vs setParameters() produces different stored values if the casts ever become relevant. If MAX_I, MAX_K, or MAX_LP_FEE_RATE constants are ever increased beyond the cast bounds, values would be silently corrupted.",
+        "attack_scenario": "If protocol upgrades increase MAX_I beyond 2^128 (currently 10^36 < 2^128), an admin calling setParameters with a valid newI > 2^128 would store a truncated value. The pool's pricing would use a corrupted _I_ parameter, enabling arbitrage extraction from LPs. The mismatch between validated range and stored type creates a latent vulnerability.",
+        "invariant_logic": "_LP_FEE_RATE_ == uint256(uint64(_LP_FEE_RATE_)) AND _K_ == uint256(uint64(_K_)) AND _I_ == uint256(uint128(_I_)) after setParameters",
+        "solidity_property": "function invariant_noTruncation() public view { assert(_LP_FEE_RATE_ == uint256(uint64(_LP_FEE_RATE_))); assert(_K_ == uint256(uint64(_K_))); assert(_I_ == uint256(uint128(_I_))); }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "setParameters"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "init"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "MagicLP.sol",
+        "description": "sellShares reduces _BASE_TARGET_ and _QUOTE_TARGET_ using divCeil (rounding up the subtraction), while baseAmount and quoteAmount given to users use floor division (rounding down). This asymmetric rounding causes targets to shrink faster than actual reserves, creating a cumulative discrepancy. Over many sell operations, targets can reach 0 while non-trivial shares and reserves remain.",
+        "invariant_logic": "After sellShares: _BASE_TARGET_ >= (_BASE_RESERVE_ * (totalSupply - sharesBurned)) / totalSupply_before (proportional lower bound)",
+        "attack_scenario": "A pool with small target values (e.g., after many partial withdrawals) sees target reduction overshoot. _BASE_TARGET_ reaches 0 while _BASE_RESERVE_ > 0 and totalSupply > 0. The PMM pricing breaks because target = 0 causes division by zero in pricing functions. Remaining LPs cannot withdraw at fair value.",
+        "solidity_property": "function invariant_targetsProportional() public view { if (totalSupply() > 0) { assert(_BASE_TARGET_ > 0 && _QUOTE_TARGET_ > 0); } }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "sellShares"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LockingMultiRewards.sol",
+        "description": "processExpiredLocks explicitly prevents processing the lock at lastLockIndex when locks.length > 1, enforcing that the most recently created lock must be processed LAST. This creates a mandatory processing order that operators must follow. If the most recent lock expires first (possible if older locks were created with later unlock times due to epoch alignment), it cannot be processed until all other locks are handled.",
+        "attack_scenario": "User has 5 locks with various unlock times. Lock at lastLockIndex (most recently created) expires. Operator attempts to process it first but the transaction reverts with ErrInvalidLockIndex. Operator must first process other expired locks to reduce locks.length to 1, even if those other locks haven't expired yet (which would also revert). If only the lastLockIndex lock has expired, the user's expired tokens remain locked indefinitely until other locks also expire.",
+        "invariant_logic": "processExpiredLocks(user, lastLockIndex[user]) is only valid when _userLocks[user].length == 1",
+        "solidity_property": "function invariant_lastLockProcessingOrder(address user, uint256 index) public view { if (index == lastLockIndex[user] && _userLocks[user].length > 1) { /* this combination always reverts */ assert(false); } }",
+        "inventory_refs": [
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "processExpiredLocks"
+          },
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "_createLock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "In flashLoan, the sell_quote and sell_base branches validate the swap economics using pre-mtFee-transfer balances, then transfer mtFee out, then call _sync(). The targets (_BASE_TARGET_ or _QUOTE_TARGET_) are set based on the swap calculation that doesn't account for the mtFee deducted from reserves. After _sync(), reserves reflect the post-mtFee balance but targets don't, creating systematic target-reserve drift proportional to cumulative mtFees. This same pattern exists in sellBase/sellQuote.",
+        "attack_scenario": "Over many flash loan swaps, the cumulative mtFee extraction causes reserves to drift below targets. For example, in the sell_quote branch: _QUOTE_TARGET_ is set for the new state, but base reserves are reduced by mtFee without target adjustment. Eventually, the inconsistency triggers correctRState conditions, allowing anyone to reset the pool to RState.ONE, effectively gifting the accumulated drift to one side of the trade.",
+        "invariant_logic": "After any swap: if RState == BELOW_ONE then _BASE_RESERVE_ >= _BASE_TARGET_; if RState == ABOVE_ONE then _QUOTE_RESERVE_ >= _QUOTE_TARGET_",
+        "solidity_property": "function invariant_rStateConsistency() public view { if (_RState_ == uint32(PMMPricing.RState.BELOW_ONE)) { assert(_BASE_RESERVE_ >= _BASE_TARGET_); } else if (_RState_ == uint32(PMMPricing.RState.ABOVE_ONE)) { assert(_QUOTE_RESERVE_ >= _QUOTE_TARGET_); } }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "flashLoan"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "sellBase"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "sellQuote"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "correctRState"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "The init() function can only be called once due to the _INITIALIZED_ guard, but the implementation contract sets _INITIALIZED_ = true in the constructor. However, for clones created via LibClone, the clone's storage is independent. If a clone is deployed outside the Factory (e.g., directly via LibClone.clone), anyone can call init() with arbitrary parameters including a malicious mtFeeRateModel that drains all swap fees. The onlyImplementationOwner modifier on admin functions uses implementation.owner(), so the malicious pool appears legitimate.",
+        "attack_scenario": "Attacker deploys a clone of the MagicLP implementation manually (not through Factory). They call init() with a malicious mtFeeRateModel that routes all fees to attacker. The pool otherwise behaves normally. Users interact with it thinking it's a legitimate pool (it shares the same implementation). All maintainer fees go to the attacker's address. The Factory's pool registry doesn't include this rogue pool, but external integrators might discover it through other means.",
+        "invariant_logic": "All legitimate MagicLP clones SHOULD only be created through Factory.create which sets maintainerFeeRateModel to the factory's approved model",
+        "solidity_property": "// Invariant: address(_MT_FEE_RATE_MODEL_) == Factory.maintainerFeeRateModel() for all legitimate pools",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "init"
+          },
+          {
+            "file": "Factory.sol",
+            "function": "create"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LockingMultiRewards.sol",
+        "description": "Operators can call stakeFor(account, amount, lock_=true) to create locked positions for any user. Since _createLock checks maxLocks against the user's existing locks, an operator could fill a user's lock slots by creating many small locks across different epochs, preventing the user from creating their own locks.",
+        "attack_scenario": "Malicious operator calls stakeFor(victim, minLockAmount, true) repeatedly across maxLocks different epochs (e.g., 13 weeks). Each call creates a new lock slot for the victim. Once all maxLocks slots are filled, the victim cannot lock any new tokens themselves (ErrMaxUserLocksExceeded). While the operator pays for the staking tokens and the victim does receive the locked position's rewards, the victim loses the ability to time their own locks strategically.",
+        "invariant_logic": "User SHOULD have exclusive control over their lock slot consumption, OR stakeFor with lock should only be callable for users who opt-in",
+        "solidity_property": "function invariant_userLockSlots(address user) public view { assert(_userLocks[user].length <= maxLocks); /* Note: this always holds, but the issue is WHO consumed the slots */ }",
+        "inventory_refs": [
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "stakeFor"
+          },
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "_createLock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LockingMultiRewards.sol",
+        "description": "notifyRewardAmount distributes rewards over the remaining time until nextEpoch (= nextEpoch - block.timestamp). If called with only 1 second remaining in the epoch, the rewardRate becomes extremely high (amount/1). Combined with the requirement amount >= _remainingRewardTime, this is valid but concentrates all rewards into a 1-second window. If totalSupply is 0 during that second, all rewards are permanently lost.",
+        "attack_scenario": "Operator calls notifyRewardAmount(token, 1000e18, 0) when block.timestamp is 1 second before epoch boundary. rewardRate = 1000e18/1 = 1000e18 per second. If no users are staked (totalSupply = 0) during that 1 second, rewardPerToken doesn't increase and the 1000e18 rewards are permanently unclaimable. The tokens sit in the contract but can never be distributed. minRemainingTime=0 bypasses the safety check.",
+        "invariant_logic": "Rewards distributed SHOULD be claimable: sum of all user earnings + remaining distributable >= total rewards notified",
+        "solidity_property": "// Time-resource invariant: notifyRewardAmount with minRemainingTime=0 and _remainingRewardTime close to 0 can permanently strand reward tokens",
+        "inventory_refs": [
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "notifyRewardAmount"
+          },
+          {
+            "file": "LockingMultiRewards.sol",
+            "function": "_rewardPerToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MagicLP.sol",
+        "description": "correctRState is permissionless and resets RState to ONE with targets = reserves when detecting inconsistency (BELOW_ONE with BASE_RESERVE < BASE_TARGET, or ABOVE_ONE with QUOTE_RESERVE < QUOTE_TARGET). Since mtFee extraction in swaps systematically creates small reserve-target mismatches (INV-STATE-008), this function can be called to sandwich trades: the attacker triggers correctRState to reset the pricing curve, then trades at the reset price.",
+        "attack_scenario": "After accumulated mtFee extraction, the pool in ABOVE_ONE state has _QUOTE_RESERVE_ slightly below _QUOTE_TARGET_. Attacker calls correctRState(), resetting to RState.ONE with targets = current reserves. This changes the PMM pricing curve, creating an arbitrage opportunity. Attacker immediately swaps to exploit the price discontinuity, extracting value from LPs.",
+        "invariant_logic": "correctRState() transitions should not create profitable arbitrage opportunities; state corrections should be value-neutral for LPs",
+        "solidity_property": "function invariant_correctRStatePreCondition() public view { if (_RState_ == uint32(PMMPricing.RState.BELOW_ONE)) { assert(_BASE_RESERVE_ >= _BASE_TARGET_); } if (_RState_ == uint32(PMMPricing.RState.ABOVE_ONE)) { assert(_QUOTE_RESERVE_ >= _QUOTE_TARGET_); } }",
+        "inventory_refs": [
+          {
+            "file": "MagicLP.sol",
+            "function": "correctRState"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "sellBase"
+          },
+          {
+            "file": "MagicLP.sol",
+            "function": "sellQuote"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,601 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "payArtist Permanently Loses ETH on Failed Transfers Due to Unchecked Return Values",
+      "severity": "high",
+      "summary": "payArtist zeros collectionTotalAmount before making five ETH transfers via .call(). The success booleans are captured but never checked. If any recipient address is a contract that reverts on ETH receive (or is address(0)), the transfer fails silently. The collectionTotalAmount is already zero, so the failed amount is permanently stuck in the contract with no accounting to reclaim it through payArtist again.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 415,
+          "line_end": 440,
+          "desc": "collectionTotalAmount[_collectionID] = 0 at line 420; five .call{value} transfers at lines 429-433 with success booleans only used in events"
+        }
+      ],
+      "impact": "Financial impact: Partial or total loss of collection mint proceeds for the affected recipients. The failed transfer amount is permanently stuck unless emergencyWithdraw is called, which indiscriminately drains all contract funds. This means recovering stuck funds for one collection requires draining all other collections' pending payments too, creating a cascading disruption. Affected users: Artists and team members expecting payment from the specific collection.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "claimAuction Silent Refund Failures Lock Losing Bidders' ETH",
+      "severity": "high",
+      "summary": "In claimAuction, ETH refunds to losing bidders use .call() without checking the return value. If a losing bidder's address is a contract that reverts on receive, their refund fails silently. The bid status is never set to false during the refund loop, but auctionClaim is set to true, preventing re-execution. The bidder's ETH is permanently locked.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 112,
+          "line_end": 116,
+          "desc": "(bool success, ) = payable(auctionInfoData[_tokenid][i].bidder).call{value: auctionInfoData[_tokenid][i].bid}(\"\"); without require(success); bid status never set to false"
+        }
+      ],
+      "impact": "HIGH severity. Any losing bidder who participated from a contract that cannot receive ETH will permanently lose their bid amount. This could affect users of smart contract wallets, multi-sig wallets with custom guards, or any contract-based bidder. The impact scales with bid size - there is no upper bound on the amount that could be locked. The ETH remains in the AuctionDemo contract with no recovery mechanism, as the contract has no emergency withdrawal function and no pull-pattern for refunds.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Reentrancy in claimAuction via cancelBid at Exact auctionEndTime Enables Double Refunds",
+      "severity": "high",
+      "summary": "At block.timestamp == auctionEndTime, both claimAuction (>=) and cancelBid (<=) satisfy their timestamp checks. claimAuction sets auctionClaim=true but never sets bid statuses to false. During the refund loop, a losing bidder receives ETH via .call(). The bidder's contract can reenter cancelBid for any of its OTHER active bids (status still true). cancelBid sends a second refund for those bids and sets status=false. When claimAuction's loop reaches those bids, status is false so they're skipped.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 104,
+          "line_end": 130,
+          "desc": "auctionClaim set true but bid statuses never set false in claim loop; .call sends ETH enabling callback; cancelBid uses <= endTime so works at equality; cancelBid sends ETH and sets status=false"
+        }
+      ],
+      "impact": "CRITICAL. An attacker can extract double refunds for every losing bid placed from a malicious contract. This drains the AuctionDemo contract of ETH belonging to other auctions' bidders and the auction owner's proceeds. The entire contract balance is at risk, not just the attacker's own bids. Since all auction bids are pooled in one contract, a successful attack on one auction can make other auctions insolvent.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Bid-Claim Timestamp Overlap Allows Orphaned Bids After Auction Finalization",
+      "severity": "high",
+      "summary": "participateToAuction uses block.timestamp <= endTime while claimAuction uses block.timestamp >= endTime. At equality, both execute. participateToAuction does NOT check auctionClaim. If claimAuction executes first (setting auctionClaim=true), a subsequent participateToAuction in the same block succeeds, creating an orphaned bid with no refund path: claimAuction can't be re-called, and cancelBid only works at timestamp <= endTime (possibly same block) but not after.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 57,
+          "line_end": 61,
+          "desc": "participateToAuction: block.timestamp <= endTime (line 58); claimAuction: block.timestamp >= endTime (line 105); no auctionClaim check in participateToAuction"
+        }
+      ],
+      "impact": "HIGH severity. Any bidder whose transaction lands in the same block as claimAuction at exactly endTime loses their entire bid amount with no recovery. The probability increases on L2 chains. The locked ETH benefits no one - it sits permanently in the AuctionDemo contract (unless an emergencyWithdraw mechanism exists, which it doesn't in this contract). The vulnerability is a clear code defect: missing state check.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Phantom supply inflation in Core when mint/airdrop/burnToMint exceeds totalSupply (permanent DoS / supply corruption)",
+      "severity": "high",
+      "summary": "NextGenCore increments collectionCirculationSupply before checking whether totalSupply allows the mint. If the post-increment check fails, the function returns without minting but leaves circulationSupply permanently inflated, which can brick future mints and corrupt supply-derived token ID calculations.",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 79,
+          "line_end": 90,
+          "desc": "collectionCirculationSupply = collectionCirculationSupply + 1 executed BEFORE `if (collectionTotalSupply >= collectionCirculationSupply) { _mintProcessing... }` with no else revert/rollback"
+        }
+      ],
+      "impact": "The code defect is CONFIRMED. If triggered, it permanently inflates collectionCirculationSupply without minting a token. This (1) reduces the effective mintable supply of the collection, (2) corrupts viewCirSupply which is used for tokenId calculation, pricing in salesOption 3, and lastMintDate computation, and (3) cannot be repaired since there is no admin function to decrement circulationSupply. The current MinterContract provides a defense-in-depth layer that prevents triggering under normal operation, but the Core contract's logic is wrong and should be fixed.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Minting can be halted if collection randomizer is unset/EOA: _mintProcessing calls randomizer.calculateTokenHash and will revert",
+      "severity": "high",
+      "summary": "NextGenCore._mintProcessing unconditionally calls `collectionAdditionalData[_collectionID].randomizer.calculateTokenHash(...)`. If a collection's randomizer is not configured, points to address(0), or points to a contract not implementing the interface, the external call will revert and all mints/airdrops/burnToMint for that collection will fail.",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 152,
+          "line_end": 158,
+          "desc": "unconditional external call `collectionAdditionalData[_collectionID].randomizer.calculateTokenHash(...)` without checking randomizer address != 0"
+        }
+      ],
+      "impact": "HIGH impact for affected collections. All minting operations (mint, airDropTokens, burnToMint, mintAndAuction) are blocked until an admin calls addRandomizer(). Users' transactions will revert, wasting gas. If this occurs during a time-limited sale (salesOption 2 with descending price), the collection could miss its minting window entirely. Recovery is possible by calling addRandomizer() with a valid randomizer contract.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Auction Permanent Fund Lock via Malicious Highest Bidder Contract Reverting onERC721Received",
+      "severity": "high",
+      "summary": "A malicious contract bids to become the highest bidder, then its onERC721Received callback reverts. claimAuction always reverts on safeTransferFrom, permanently locking ALL bidder ETH in the contract. There is no alternative refund path since cancelBid requires block.timestamp <= auctionEndTime, and auctionDemo has no emergencyWithdraw function.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 104,
+          "line_end": 120,
+          "desc": "IERC721(gencore).safeTransferFrom(ownerOfToken, highestBidder, _tokenid) called inside claimAuction loop; if highestBidder is a contract that reverts in onERC721Received, entire transaction reverts. No alternative code path for refunds. No emergencyWithdraw exists in auctionDemo."
+        }
+      ],
+      "impact": "CRITICAL: All ETH from all bidders in the targeted auction is permanently locked. The NFT remains with the original owner but cannot be re-auctioned through this contract for the same tokenId (auctionClaim stays false but claimAuction always reverts, and there's no reset mechanism). The attacker sacrifices their own bid amount but causes total loss for all other bidders. For a high-value auction with many participants, the damage multiplier is significant.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Auction DoS via Bid Array Gas Bloat Exceeding Block Gas Limit in claimAuction",
+      "severity": "high",
+      "summary": "An attacker places thousands of incrementally increasing micro-bids to inflate the auctionInfoData array. claimAuction iterates over ALL entries (including cancelled ones), and with sufficient entries the gas cost exceeds the block gas limit, making the auction permanently unclaimable and locking all bidder funds.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 104,
+          "line_end": 120,
+          "desc": "for (uint256 i=0; i< auctionInfoData[_tokenid].length; i++) iterates all bids with storage reads and potential ETH transfers per entry. No pagination or gas limit protection."
+        }
+      ],
+      "impact": "CRITICAL - The attack permanently locks all ETH deposited by legitimate bidders and prevents the NFT from being transferred to the winner. There is no rescue mechanism: cancelBid is disabled after auction end, there is no admin withdrawal function on AuctionDemo, and claimAuction is the only settlement path. The NFT remains with the original owner but cannot be re-auctioned for the same tokenid (auctionClaim is never set to true, but the auction status check would need to be reset by admin on the minter). All losing bidder ETH is permanently frozen.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "No ETH Refund on Overpayment in Mint Functions",
+      "severity": "high",
+      "summary": "mint() and burnOrSwapExternalToMint() use require(msg.value >= getPrice(col) * _numberOfTokens) but never refund the excess. For salesOption 2 (descending price), the price decreases over time, so users who calculate the price at submission may overpay significantly if their transaction executes in a later block. The excess ETH is added to collectionTotalAmount and distributed to artists/team, not refunded.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 233,
+          "line_end": 234,
+          "desc": "require(msg.value >= (getPrice(col) * _numberOfTokens), 'Wrong ETH'); followed by collectionTotalAmount[col] = collectionTotalAmount[col] + msg.value; No refund of msg.value - (getPrice * tokens)."
+        }
+      ],
+      "impact": "MEDIUM severity. For fixed-price sales (salesOption 1 or 3), impact is limited to accidental overpayment. For descending price sales (salesOption 2), the impact is systematic: every minter whose transaction is delayed by even one block during active price decay will overpay. The overpayment scales with the rate of price descent and network congestion. In high-traffic minting events with descending price auctions, cumulative losses across all minters could be significant.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Losing Bidders Have No Independent Refund Mechanism After Auction End",
+      "severity": "high",
+      "summary": "Losing bidders can only receive refunds through claimAuction (which requires the winner or admin to call it) or cancelBid (which requires block.timestamp <= auctionEndTime). After the auction ends, if claimAuction cannot execute for any reason (winner refuses, admin inactive, gas bloat, reverting receiver), losing bidders have no independent withdrawal mechanism. Their funds are permanently locked.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 124,
+          "line_end": 130,
+          "desc": "cancelBid: require(block.timestamp <= minter.getAuctionEndTime(_tokenid), 'Auction ended'). After endTime, only claimAuction can trigger refunds. No independent withdrawal function exists."
+        }
+      ],
+      "impact": "All losing bidders' ETH in any affected auction is permanently locked. The total value at risk equals the sum of all non-winning bids. This is a systemic design flaw that compounds with other auction vulnerabilities (returnHighestBidder bug, timestamp overlap, etc.). Even without an attacker, a simple operational oversight (forgetting to approve the token) permanently locks all funds.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "payArtist Rounding Truncation Permanently Locks Dust ETH in Contract",
+      "severity": "high",
+      "summary": "payArtist computes five separate payments as (royalties * percentage / 100). Integer division truncation means the sum of payments can be less than royalties. Since collectionTotalAmount is zeroed to the full royalties amount, the remainder (dust) is permanently stuck in the contract. Over many collections and payouts, dust accumulates.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 424,
+          "line_end": 432,
+          "desc": "artistRoyalties1 = royalties * add1Percentage / 100; (5 times). Each division truncates. Sum of five truncated values < royalties. Remainder has no accounting or distribution path."
+        }
+      ],
+      "impact": "The maximum dust per payArtist call is 4 wei (not 495 wei as the hypothesis claims). Over thousands of collections, this accumulates to a trivial amount (e.g., 10,000 calls × 4 wei = 40,000 wei ≈ 0.00000000004 ETH). The practical impact is negligible, but the code defect is real: the payment distribution algorithm does not preserve the conservation invariant. The dust is only recoverable via emergencyWithdraw, which has the side effect of draining all contract funds.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Secondary Royalties Not Enforced On-Chain",
+      "severity": "high",
+      "summary": "MinterContract allows artists to propose secondary royalty splits and addresses, but these are never used. NextGenCore implements ERC2981 using a single global default royalty address, completely ignoring the collection-specific secondary configurations.",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 334,
+          "line_end": 336,
+          "desc": "_setDefaultRoyalty sets a global royalty, ignoring collection-specific secondary splits stored in MinterContract"
+        },
+        {
+          "file": "MinterContract.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: setPrimaryAndSecondarySplits(uint256,uint256,uint256,uint256,uint256)"
+        }
+      ],
+      "impact": "MEDIUM severity. The secondary royalty configuration infrastructure (4 functions, 4 storage mappings, associated structs) is non-functional dead code that creates a false expectation of on-chain royalty enforcement. Artists may believe their secondary royalty splits are enforced on-chain when they are not. All secondary royalties flow to a single global address with distribution relying entirely on off-chain trust. The actual royalty recipient address (0x1B1289E34Fe05019511d7b436a5138F361904df0) appears to be a team-controlled address, giving the team unilateral control over secondary royalty distribution.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Losing Bidder Funds Permanently Locked if claimAuction Reverts Due to Missing NFT Approval",
+      "severity": "high",
+      "summary": "claimAuction calls IERC721(gencore).safeTransferFrom(ownerOfToken, highestBidder, _tokenid) to transfer the NFT. If the token owner (the _recipient from mintAndAuction) has not approved the AuctionDemo contract, safeTransferFrom reverts, causing the entire claimAuction to revert. Since cancelBid requires block.timestamp <= auctionEndTime, after the auction ends, losing bidders have NO mechanism to withdraw their funds. There is no separate refund function, no admin override for refunds, and no f",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 112,
+          "line_end": 115,
+          "desc": "safeTransferFrom(ownerOfToken, highestBidder, _tokenid) reverts if owner hasn't approved AuctionDemo; cancelBid requires timestamp <= endTime (line 131); no separate refund function exists"
+        },
+        {
+          "file": "MinterContract.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: mintAndAuction"
+        }
+      ],
+      "impact": "CRITICAL. All ETH from all bidders on the affected auction is permanently locked. The amount at risk equals the sum of all bids placed during the auction. Even honest admins cannot resolve this without deploying a new contract or having the _recipient manually approve and then re-calling claimAuction (which requires off-chain coordination and assumes _recipient cooperates). If _recipient is malicious or unreachable, funds are irrecoverable.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "emergencyWithdraw Drains All Artist Revenue Without Updating Per-Collection Accounting",
+      "severity": "high",
+      "summary": "emergencyWithdraw sends the entire MinterContract balance to adminsContract.owner() but does not zero any collectionTotalAmount mappings. After withdrawal, payArtist can still be called for any collection (collectionTotalAmount > 0 check passes), but the ETH transfers fail silently because the contract has no balance. collectionTotalAmount is zeroed to 0 by payArtist, permanently destroying the artist's claim to their earnings. This is a code defect in accounting: emergencyWithdraw should either",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 461,
+          "line_end": 467,
+          "desc": "emergencyWithdraw sends address(this).balance but does not update collectionTotalAmount; payArtist at line 420 zeros collectionTotalAmount regardless of whether .call transfers succeed"
+        }
+      ],
+      "impact": "HIGH: All pending artist and team payments across all collections can be permanently destroyed in accounting terms. The ETH itself goes to adminsContract.owner() during emergencyWithdraw, but the per-collection records that track who is owed what are irreversibly zeroed. Recovery would require off-chain accounting and manual ETH transfers outside the contract system. This violates the core invariant that SUM(collectionTotalAmount) <= address(this).balance.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "acceptAddressesAndPercentages Can Approve Zero-Address Proposals Burning Artist Funds",
+      "severity": "high",
+      "summary": "acceptAddressesAndPercentages sets collectionArtistPrimaryAddresses.status to true without verifying that proposePrimaryAddressesAndPercentages was ever called. When status is set to true on default state (all addresses are address(0), all percentages are 0), payArtist proceeds normally: the artistPercentage check passes (0 + teamperc1 + teamperc2 == 100), and ETH is sent to address(0) via .call{value: 0}('') for artist shares (0% of royalties). However, the actual funds are sent to team address",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 408,
+          "line_end": 411,
+          "desc": "acceptAddressesAndPercentages directly sets status=_statusPrimary without checking any addresses are non-zero or that a proposal was made; default struct values are all zeros"
+        }
+      ],
+      "impact": "HIGH severity. When artistPercentage > 0 and no proposal exists, the artist's percentage of collection revenue is permanently lost from the artist's perspective. For example, if a collection earns 100 ETH and artistPercentage is 60%, then 60 ETH becomes unrecoverable through normal channels. emergencyWithdraw could recover it but would sweep ALL contract funds including other collections' balances, causing further disruption. This is a missing validation defect that breaks the propose-then-approve workflow.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "AuctionDemo Has No Function to Update gencore Address Creating Permanent Bricking Risk",
+      "severity": "high",
+      "summary": "AuctionDemo's gencore address is set in the constructor and has no update function, unlike other contracts (MinterContract has updateCoreContract, randomizers have updateCoreContract). If NextGenCore is redeployed or upgraded (via addMinterContract pointing to new core), the AuctionDemo cannot be updated to match. claimAuction calls IERC721(gencore).safeTransferFrom and IERC721(gencore).ownerOf, which would reference the stale core contract. Any active auctions would become unresolvable, permane",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 36,
+          "line_end": 40,
+          "desc": "Constructor sets gencore = _gencore; no updateCoreContract function exists; gencore used in claimAuction at line 112-113 for ownerOf and safeTransferFrom"
+        }
+      ],
+      "impact": "MEDIUM-HIGH severity. While the trigger requires admin action (core contract change), the consequence is permanent loss of user funds with no recovery path. The AuctionDemo contract holds bidder ETH and has no emergency withdrawal function. Active auctions become completely unresolvable. The defect is particularly severe because: (1) it's inconsistent with every other contract in the system, suggesting an oversight; (2) there's no fallback recovery mechanism; (3) it affects user funds directly.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Predictable On-Chain Randomness in NextGenRandomizerNXT Allows Trait Sniping",
+      "severity": "high",
+      "summary": "NextGenRandomizerNXT.calculateTokenHash uses keccak256(abi.encodePacked(_mintIndex, blockhash(block.number - 1), randoms.randomNumber(), randoms.randomWord())). Both randomNumber() and randomWord() in XRandoms use block.prevrandao, blockhash(block.number-1), and block.timestamp - all known to the caller at execution time. A minter using a smart contract can predict the exact token hash before committing to the mint, selectively minting only when rare traits would be generated. The _saltfun_o par",
+      "description": [
+        {
+          "file": "RandomizerNXT.sol",
+          "line_start": 55,
+          "line_end": 58,
+          "desc": "hash = keccak256(abi.encodePacked(_mintIndex, blockhash(block.number-1), randoms.randomNumber(), randoms.randomWord())); all inputs deterministic at execution time"
+        },
+        {
+          "file": "XRandoms.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: randomNumber"
+        }
+      ],
+      "impact": "HIGH impact on fairness and economic integrity of any collection using NextGenRandomizerNXT. Rare traits that should be randomly distributed can be systematically captured by attacker contracts, destroying the fair distribution guarantee. Token hashes are immutable once set (enforced by setTokenHash's zero-check), so affected tokens cannot be retroactively fixed. Collections using VRF or ARRNG randomizers are not affected, as those provide async off-chain randomness.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Auction Proceeds Stolen by Contract Owner",
+      "severity": "high",
+      "summary": "The `claimAuction` function transfers the auctioned NFT from its current owner (`ownerOfToken`) to the highest bidder, but it sends the winning bid ETH to `owner()` (the admin of the AuctionDemo contract) instead of `ownerOfToken`. This results in the original NFT owner losing their asset while receiving no compensation, effectively allowing the contract owner to steal all auction proceeds.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 112,
+          "line_end": 113,
+          "desc": "ETH transfer sent to `owner()` instead of `ownerOfToken`"
+        }
+      ],
+      "impact": "CRITICAL. Every auction conducted through this contract results in the NFT owner losing their token without receiving any payment. All auction proceeds (100%) are redirected to the AuctionDemo contract owner. This affects all users whose tokens are auctioned through this system. The only partial mitigation is if the AuctionDemo owner and the token recipient are the same address, but this is not enforced by the code and cannot be guaranteed.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Public Mint DoS via Overlapping Phase Configuration",
+      "severity": "high",
+      "summary": "The `mint` function uses an `if / else if` structure to determine the active phase. If the admin configures overlapping phases (e.g., allowlist ends after public starts), the `if` condition for the allowlist phase evaluates to true during the overlap. Public minters without a Merkle proof will fall into the allowlist branch, fail the proof check, and revert, completely preventing public minting until the allowlist phase ends.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 220,
+          "line_end": 234,
+          "desc": "Strict `if / else if` ordering for phase checks"
+        }
+      ],
+      "impact": "MEDIUM severity. During the overlap window, all non-allowlisted users are denied access to public minting. This causes: (1) wasted gas for users who attempt to mint, (2) lost revenue from public mint sales during the overlap period, (3) user frustration and potential trust loss. The issue resolves automatically when the allowlist phase ends. The defect is in the code's failure to validate phase ordering in the setter AND its inability to handle overlapping phases in the mint function.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Artist Signature Lock Bypassed by updateCollectionInfo",
+      "severity": "high",
+      "summary": "The `artistSignature` function is intended to lock the collection's core identity by setting `artistSigned = true`. However, `updateCollectionInfo` only checks `collectionFreeze`, not `artistSigned`. An admin can change the collection's name, description, and generative scripts after the artist has signed it, violating the trust assumption of the signature.",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 240,
+          "line_end": 240,
+          "desc": "Missing `require(artistSigned[_collectionID] == false)`"
+        }
+      ],
+      "impact": "Medium severity. The artist signature mechanism provides a false sense of security — it restricts setCollectionData but not updateCollectionInfo. A collection admin can alter the core artistic content (generative scripts, name, description, library) that the artist endorsed. This affects: (1) Artist reputation — art is changed under their signed name. (2) Collector trust — tokens may render different art than what was signed. (3) Market integrity — secondary market participants may value tokens based on the artist's signature guarantee. The impact is limited to scenarios involving malicious or compromised admins, which is a realistic threat given the multi-tier admin structure.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Reentrancy in Core minting via ERC721Receiver callback may allow unexpected nested mints/airdrops and break supply/allowance assumptions",
+      "severity": "high",
+      "summary": "NextGenCore._mintProcessing uses _safeMint, which triggers onERC721Received on contract recipients. During this callback, the recipient can call back into other public Core functions (e.g., burn) or external Minter functions that might be callable, potentially creating nested state transitions while the mint flow is in-progress. Combined with the already-fragile circulationSupply accounting and external randomizer calls, this could lead to inconsistent mint limits or supply corruption.",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 160,
+          "line_end": 166,
+          "desc": "_mintProcessing calls _safeMint (external callback) after writing tokenData and tokenIdsToCollectionIds and after calling external randomizer.calculateTokenHash"
+        }
+      ],
+      "impact": "HIGH impact: Per-address mint limits can be bypassed, allowing a single address to mint more than its allowed quota. This undermines collection fairness and scarcity guarantees. For collections with per-address limits (maxCollectionPurchases), an attacker can accumulate more tokens than intended. The burn-during-callback path also creates accounting inconsistencies (per-address counter tracks a non-existent token). Combined with the phantom supply increment bug (circulationSupply incremented before conditional mint), the reentrancy could also lead to supply corruption.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Sales Option 3 Timing Underflow Causes Permanent Minting DoS",
+      "severity": "high",
+      "summary": "In Sales Option 3, lastMintDate is calculated using the collection's total circulation supply. If the admin uses airDropTokens or burnToMint (which increase supply without respecting the 1-per-period rule), lastMintDate is pushed far into the future. Subsequent public mints will underflow the timestamp calculation and revert.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 252,
+          "line_end": 254,
+          "desc": "uint tDiff = (block.timestamp - timeOfLastMint) / ... underflows if timeOfLastMint is in the future"
+        }
+      ],
+      "impact": "HIGH severity. Any collection using Sales Option 3 that also uses airdrops (a standard NFT launch feature) will experience a minting DoS after the first public mint. The duration of the DoS is proportional to `numberOfAirdroppedTokens * timePeriod`. For 100 airdrops at 1 day/period, this is ~100 days of blocked minting. Admin can mitigate by changing salesOption, but this alters the sale mechanics. The defect affects protocol revenue and user experience.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "BurnToMint Bypasses Max Purchases Limit",
+      "severity": "high",
+      "summary": "The burnToMint function does not check the maxCollectionPurchases limit. A user who acquires many burnable tokens from an older collection can burn them to mint an unlimited number of tokens in a new collection, bypassing the public mint limits.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 260,
+          "line_end": 272,
+          "desc": "Missing require(_numberOfTokens <= gencore.viewMaxAllowance(col)) in burnToMint"
+        }
+      ],
+      "impact": "The maxCollectionPurchases limit is a critical fair distribution mechanism. Bypassing it allows a single address to accumulate a disproportionate share of a new collection. While the attack requires acquiring burnable tokens (non-zero cost), the per-address limit is completely unenforced, which is a definitive code defect in the access control/limit enforcement logic.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Per-Address Public Mint Limit Bypass via _safeMint Reentrancy Callback",
+      "severity": "high",
+      "summary": "In NextGenCore.mint(), the per-address mint counter (tokensMintedPerAddress) is incremented AFTER _mintProcessing → _safeMint completes. _safeMint calls onERC721Received on the _mintTo address. A malicious contract at _mintTo can reenter MinterContract.mint() during this callback. The reentrant call reads tokensMintedPerAddress which hasn't been incremented yet, so the per-address limit check passes again. This allows minting arbitrarily many tokens (up to supply cap) from a single address, bypa",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 193,
+          "line_end": 205,
+          "desc": "_mintProcessing (which calls _safeMint with ERC721 callback) executes before tokensMintedPerAddress increment on line 202-204; reentrant call sees stale counter"
+        },
+        {
+          "file": "MinterContract.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: mint(uint256,uint256,uint256,string,address,bytes32[],address,uint256)"
+        }
+      ],
+      "impact": "An attacker can mint far more tokens than maxCollectionPurchases allows per address in a single transaction, potentially monopolizing a limited collection's supply. This directly violates the per-address mint limit invariant that protects fair distribution. The same vulnerability applies to the allowlist phase via tokensMintedAllowlistAddress, though exploiting that also requires a valid merkle proof. The financial impact equals the secondary market value of excess tokens acquired beyond the intended limit.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "VRF callbackGasLimit Default (40000) Insufficient for setTokenHash Storage Write, Permanently Bricking Token Hashes",
+      "severity": "high",
+      "summary": "NextGenRandomizerVRF sets callbackGasLimit to 40000 as a state variable default. The fulfillRandomWords callback must execute gencoreContract.setTokenHash() which performs: 2x cold SLOAD (~4200 gas) + 1x SSTORE zero-to-nonzero (~22100 gas) + external CALL overhead (~2600 gas) + event emission (~1500 gas). Total exceeds 30,000 gas just for setTokenHash, plus fulfillRandomWords overhead. If total exceeds 40,000, the VRF coordinator's callback reverts (out of gas), the token hash is never set, LINK",
+      "description": [
+        {
+          "file": "RandomizerVRF.sol",
+          "line_start": 60,
+          "line_end": 63,
+          "desc": "callbackGasLimit = 40000 default; fulfillRandomWords calls gencoreContract.setTokenHash which requires ~32000+ gas for cold storage operations alone"
+        },
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: setTokenHash"
+        }
+      ],
+      "impact": "HIGH severity. All tokens minted on VRF-based collections using the default callbackGasLimit will have permanently broken metadata (tokenURI returns 'pending'). LINK subscription funds are consumed without successful delivery. There is no mechanism to retry failed VRF callbacks or manually set token hashes for affected tokens. The admin function updatecallbackGasLimitAndkeyHash can prevent future occurrences but cannot fix already-bricked tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Hash Generation in RandomizerRNG.fulfillRandomWords Truncates Token ID via bytes32 Cast, Reducing Hash Uniqueness",
+      "severity": "high",
+      "summary": "In RandomizerRNG.fulfillRandomWords, the hash is computed as bytes32(abi.encodePacked(numbers, requestToToken[id])). Since 'numbers' is a uint256[] array, abi.encodePacked produces 32 bytes per element plus 32 bytes for requestToToken. bytes32() cast takes only the FIRST 32 bytes, effectively discarding the token ID entirely. The hash depends solely on the random number, not on the token-specific identifier. The same defect exists in RandomizerVRF. This contrasts with RandomizerNXT which correct",
+      "description": [
+        {
+          "file": "RandomizerRNG.sol",
+          "line_start": 42,
+          "line_end": 44,
+          "desc": "bytes32(abi.encodePacked(numbers,requestToToken[id])) - encodePacked produces 64+ bytes, bytes32 cast takes only first 32, discarding requestToToken[id]"
+        },
+        {
+          "file": "RandomizerVRF.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: fulfillRandomWords()"
+        }
+      ],
+      "impact": "The defect affects all collections using VRF or RNG randomizers. Token hashes lack the intended per-token uniqueness component. While external RNG should provide unique random words per request, the hash is missing the additional entropy and domain separation the token ID was designed to provide. If two tokens ever received the same random word (e.g., due to RNG provider bug or replay), they would have identical hashes and identical generative art output. The hash immutability guard (setTokenHash write-once) means the defective hash cannot be corrected after being set.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Division by Zero in getPrice When timePeriod Set to 0 via setCollectionCosts Permanently DoSes Minting",
+      "severity": "high",
+      "summary": "setCollectionCosts allows setting timePeriod to 0 with no validation. For salesOption 2, getPrice computes tDiff = (block.timestamp - allowlistStartTime) / timePeriod. Division by zero causes a revert, making all calls to mint() and burnToMint() revert for this collection. For salesOption 3, the same division occurs. Since setCollectionCosts can be called by collection admins (lower privilege tier), a malicious or mistaken collection admin can permanently DoS a collection's minting.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 157,
+          "line_end": 157,
+          "desc": "setCollectionCosts accepts _timePeriod without zero check; getPrice line 536: tDiff = (block.timestamp - allowlistStartTime) / timePeriod causes division by zero"
+        }
+      ],
+      "impact": "MEDIUM severity. Complete DoS of minting for the affected collection when salesOption is 2 or 3. All prospective minters and the artist lose potential revenue during the DoS period. The issue is recoverable by re-calling setCollectionCosts with a non-zero timePeriod, so it is not permanent. However, if the malicious collection admin is not immediately detected and overridden, time-sensitive sales (e.g., Dutch auctions) could be irreparably disrupted since the price curve depends on time.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "RandomizerRNG ethRequired Defaults to 0, Causing ARRNG Requests to Fail and Tokens to Lack Hashes",
+      "severity": "high",
+      "summary": "NextGenRandomizerRNG.ethRequired defaults to 0 (uint256 default). calculateTokenHash calls requestRandomWords(_mintIndex, ethRequired), which forwards ethRequired as msg.value to arrngController.requestRandomWords. If 0 ETH is sent, the ARRNG service may reject the request or fail to fulfill it, leaving the token without a hash permanently. The deployment script (fixturesDeployment.js) does not call updateRNGCost, confirming the default is never set.",
+      "description": [
+        {
+          "file": "RandomizerRNG.sol",
+          "line_start": 38,
+          "line_end": 39,
+          "desc": "ethRequired defaults to 0 (line 18); requestRandomWords sends {value: _ethRequired} (line 38) which is 0; calculateTokenHash passes ethRequired to requestRandomWords (line 48)"
+        }
+      ],
+      "impact": "MEDIUM severity. If a collection is configured to use RandomizerRNG and updateRNGCost is not called: (1) DoS scenario - minting is completely blocked for that collection, or (2) Integrity violation - tokens are minted without hashes, making their generative art permanently unavailable (tokenURI returns 'pending'). Since setTokenHash is write-once and requires tokenToHash == 0x0, if the fulfillment never comes, there is no built-in mechanism to retry or fix the hash for affected tokens. The admin would need to deploy a new randomizer and coordinate manual hash setting, which the current code doesn't support for already-minted tokens.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Auction Manipulation via Highest Bid Cancellation (Bid Spoofing)",
+      "severity": "high",
+      "summary": "The cancelBid function allows any user to cancel their bid at any time before the auction ends, including the current highest bidder. An attacker can place an overwhelmingly high bid to deter other participants, then cancel it right before the auction concludes, allowing a previously placed low bid (by them or an accomplice) to win the auction.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 125,
+          "line_end": 131,
+          "desc": "No validation to prevent the current highest bidder from cancelling their bid"
+        }
+      ],
+      "impact": "HIGH - This vulnerability fundamentally breaks the auction mechanism's price discovery function. An attacker can acquire NFTs at arbitrarily low prices while deterring legitimate competition. The attack is cost-free (excluding gas), repeatable for every auction, and leaves no recovery path once the auction is claimed. The NFT seller (protocol owner who receives proceeds via owner()) suffers direct financial loss. All token auctions in the system are affected.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "External Burn Delegation Broken by Missing ERC721 Approval",
+      "severity": "high",
+      "summary": "The burnOrSwapExternalToMint function supports off-chain delegation via the dmc contract, but still attempts to call safeTransferFrom on the external ERC721 contract. This will revert unless the token owner has also performed an on-chain ERC721 approval, defeating the purpose of gasless delegation.",
+      "description": [
+        {
+          "file": "MinterContract.sol",
+          "line_start": 276,
+          "line_end": 285,
+          "desc": "Delegation check followed by safeTransferFrom where msg.sender is not the owner"
+        }
+      ],
+      "impact": "No impact. The code is functioning as designed and documented. The delegation mechanism correctly serves its purpose of allowing authorized delegates to execute burn/swap operations. The ERC721 approval requirement is a separate, documented prerequisite that applies to both owners and delegates equally.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Randomizer ETH Depletion Halts Public Minting",
+      "severity": "high",
+      "summary": "When using RandomizerRNG, the contract must pay ETH for ARRNG requests. If the contract's ETH balance is depleted, requestRandomWords reverts, which cascades and causes the entire mint transaction to revert, halting all public minting.",
+      "description": [
+        {
+          "file": "RandomizerRNG.sol",
+          "line_start": 37,
+          "line_end": 37,
+          "desc": "arrngController.requestRandomWords{value: _ethRequired} relies on contract balance"
+        }
+      ],
+      "impact": "HIGH severity. If a collection is configured to use RandomizerRNG with ethRequired > 0, minting will eventually halt when the randomizer's ETH balance is exhausted. This causes: (1) Complete denial of minting service for affected collections, (2) Revenue loss for the protocol and artists, (3) User frustration and potential loss of time-sensitive minting opportunities, (4) Requires manual admin intervention to restore service. The severity is amplified because there is no automatic failover or user notification — transactions simply revert with no clear error message about the root cause.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Auction Settlement Failure via Incorrect Highest Bidder Tracking",
+      "severity": "high",
+      "summary": "The `returnHighestBidder` function contains a logic error where it fails to update the `highBid` variable during iteration. Consequently, it returns the last active bidder instead of the actual highest bidder. During `claimAuction`, the contract verifies if the returned bidder's bid matches the actual highest bid amount. Since they mismatch, the NFT is never transferred, the owner is not paid, and all bidders (including the winner) are refunded, completely breaking the auction mechanism.",
+      "description": [
+        {
+          "file": "AuctionDemo.sol",
+          "line_start": 89,
+          "line_end": 94,
+          "desc": "Missing `highBid = auctionInfoData[_tokenid][i].bid;` inside the loop condition"
+        }
+      ],
+      "impact": "The code defect is real but its practical impact is nil under current contract logic. The returnHighestBidder function would malfunction if: (1) a new bid insertion path were added that doesn't enforce ordering, (2) the participateToAuction check were relaxed, or (3) bids could be inserted at arbitrary positions. As-deployed, the bug is latent. The claimed CRITICAL/DoS impact is overstated — auctions settle correctly because the ordering invariant masks the bug.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "burnToMint Mints to Token Owner Instead of Payer",
+      "severity": "high",
+      "summary": "In `NextGenCore.sol`, `burnToMint` mints the new token to `ownerOf(_tokenId)` rather than the `burner` address passed from the MinterContract. If an approved operator (who is not the owner) calls `burnToMint` and pays the required ETH, the new token is minted to the original owner, resulting in a loss of funds for the operator.",
+      "description": [
+        {
+          "file": "NextGenCore.sol",
+          "line_start": 192,
+          "line_end": 192,
+          "desc": "`_mintProcessing(..., ownerOf(_tokenId), ...)` instead of `burner`"
+        }
+      ],
+      "impact": "Medium severity. Any approved operator who calls burnToMint pays ETH but the new token is minted to the token owner. While the common case (owner calling directly) works correctly, the function explicitly allows non-owner callers through `_isApprovedOrOwner`. This creates a financial loss for approved operators/delegates. The impact is bounded by the minting cost and relies on the use of approved operators, which is an explicitly supported ERC721 feature.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

@@ -1,0 +1,299 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T03:18:42.025Z",
+    "duration_ms": 201132
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "AgentNftV2.sol",
+        "description": "addValidator is permissionless - anyone can register themselves as a validator for any virtualId and receive an inflated base score equal to totalProposals",
+        "attack_scenario": "Attacker calls addValidator(virtualId, attackerAddr) for any agent. _initValidatorScore grants them _baseValidatorScore = totalProposals(virtualId), giving them an instant high validator score without any actual participation. This corrupts governance scoring, validator reward distribution, and ELO-based validation.",
+        "invariant_logic": "addValidator(virtualId, validator) SHOULD require (msg.sender == virtualInfos[virtualId].dao || hasRole(VALIDATOR_ADMIN_ROLE, msg.sender) || msg.sender == virtualInfos[virtualId].founder)",
+        "solidity_property": "function invariant_addValidator_access() public view { /* Cannot be checked statically - requires access modifier on addValidator */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentNftV2.sol",
+            "function": "addValidator"
+          },
+          {
+            "file": "ValidatorRegistry.sol",
+            "function": "_addValidator"
+          },
+          {
+            "file": "ValidatorRegistry.sol",
+            "function": "_initValidatorScore"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "AgentToken.sol",
+        "description": "Tax basis points have no upper bound validation, and _taxProcessing uses unchecked arithmetic. If projectBuyTaxBasisPoints or projectSellTaxBasisPoints >= BP_DENOM (10000), the tax exceeds sentAmount_, causing amountLessTax_ to underflow to near uint256.max, minting phantom tokens to recipient.",
+        "attack_scenario": "Owner/factory calls setProjectTaxRates(10001, 10001). On next sell to LP, tax = sentAmount * 10001 / 10000 > sentAmount. In unchecked block: amountLessTax_ = sentAmount - tax wraps to ~uint256.max. Recipient's balance inflates astronomically, breaking the entire token economy.",
+        "invariant_logic": "projectBuyTaxBasisPoints < BP_DENOM AND projectSellTaxBasisPoints < BP_DENOM",
+        "solidity_property": "function invariant_taxBounds() public view { assert(projectBuyTaxBasisPoints < 10000); assert(projectSellTaxBasisPoints < 10000); }",
+        "inventory_refs": [
+          {
+            "file": "AgentToken.sol",
+            "function": "setProjectTaxRates"
+          },
+          {
+            "file": "AgentToken.sol",
+            "function": "_taxProcessing"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "AgentFactoryV4.sol",
+        "description": "Application status transitions must be irreversible: Active -> Executed and Active -> Withdrawn are terminal. Both executeApplication and withdraw check status == Active, but if _executeApplication partially fails after setting status to Executed (revert propagation is correct), the real risk is that withdraw and execute share the same precondition with no mutual exclusion beyond status check. WITHDRAW_ROLE holders can front-run proposers.",
+        "attack_scenario": "Proposer submits proposeAgent and intends to executeApplication. A WITHDRAW_ROLE holder front-runs by calling withdraw(id), setting status to Withdrawn and extracting the applicationThreshold. The proposer's executeApplication then fails. Alternatively, WITHDRAW_ROLE calls executeApplication before proposer is ready, bootstrapping the agent with undesired canStake parameter.",
+        "invariant_logic": "forall id: (status[id] == Executed => status[id] was Active AND status[id] never changes again) AND (status[id] == Withdrawn => status[id] was Active AND status[id] never changes again)",
+        "solidity_property": "function invariant_applicationFinalStates(uint256 id) public view { Application memory app = getApplication(id); if (app.status == ApplicationStatus.Executed || app.status == ApplicationStatus.Withdrawn) { assert(app.withdrawableAmount == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "AgentFactoryV4.sol",
+            "function": "executeApplication"
+          },
+          {
+            "file": "AgentFactoryV4.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "AgentFactoryV3.sol",
+            "function": "executeApplication"
+          },
+          {
+            "file": "AgentFactoryV3.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AgentFactoryV4.sol",
+        "description": "Token-to-application mapping uses 0 as sentinel value for 'not registered', but _nextId can start at 0, causing the first application's token to be treated as unregistered. This allows duplicate registration of the same custom token.",
+        "invariant_logic": "_nextId at initialization MUST be > 0, OR _tokenApplication mapping must use a different sentinel (e.g., type(uint256).max)",
+        "attack_scenario": "If AgentFactoryV4 is initialized with nextId_=0, the first initFromToken creates application id=0, setting _tokenApplication[token]=0. A second call to initFromToken with the same token passes the check `_tokenApplication[tokenAddr] == 0` because the stored value IS 0. This creates two applications for the same token, and the second withdraw would drain the factory's entire balance of that token.",
+        "solidity_property": "function invariant_nextIdNonZero() public view { /* assert(_nextId > 0) at all times after initialization */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentFactoryV4.sol",
+            "function": "initFromToken"
+          },
+          {
+            "file": "AgentFactoryV4.sol",
+            "function": "initialize"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "AgentToken.sol",
+        "description": "Tax rates are documented as 'subject to only ever decreasing' in setProjectTaxRates comments, but the code enforces no such constraint. Owner/factory can increase tax rates arbitrarily at any time.",
+        "attack_scenario": "Token launches with 2% buy/sell tax, attracting holders. Owner then calls setProjectTaxRates(5000, 5000) setting 50% tax, effectively trapping holders who can only sell at 50% loss. Combined with INV-STATE-001, rates above 100% enable token minting via underflow.",
+        "invariant_logic": "newProjectBuyTaxBasisPoints_ <= projectBuyTaxBasisPoints AND newProjectSellTaxBasisPoints_ <= projectSellTaxBasisPoints",
+        "solidity_property": "function invariant_taxOnlyDecreases(uint16 oldBuy, uint16 oldSell, uint16 newBuy, uint16 newSell) public pure { assert(newBuy <= oldBuy && newSell <= oldSell); }",
+        "inventory_refs": [
+          {
+            "file": "AgentToken.sol",
+            "function": "setProjectTaxRates"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AgentToken.sol",
+        "description": "fundedDate acts as a one-way latch: once initial liquidity is added (fundedDate != 0), addInitialLiquidity cannot be called again. This is correctly enforced, but the fundedDate also controls pre-funding transfer restrictions.",
+        "invariant_logic": "fundedDate != 0 => addInitialLiquidity always reverts AND (transfer to uniswapV2Pair from non-self address is allowed)",
+        "solidity_property": "function invariant_fundedDateIrreversible() public view { if (fundedDate != 0) { /* addInitialLiquidity must revert */ } }",
+        "inventory_refs": [
+          {
+            "file": "AgentToken.sol",
+            "function": "_addInitialLiquidity"
+          },
+          {
+            "file": "AgentToken.sol",
+            "function": "_pretaxValidationAndLimits"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AgentToken.sol",
+        "description": "Tax autoswap via _swapTax uses amountOutMin=0 when swapping accumulated tax tokens to pairToken via Uniswap. This provides zero slippage protection, making every tax swap vulnerable to sandwich attacks.",
+        "attack_scenario": "Attacker monitors mempool for transactions that will trigger autoswap (when tax balance >= threshold). Attacker front-runs with a large buy to skew the pool price, the autoswap executes at the manipulated price receiving minimal pairToken, then attacker back-runs to profit. Tax revenue is systematically extracted by MEV bots.",
+        "invariant_logic": "amountOutMin in _swapTax SHOULD be > 0, calculated from oracle price or TWAP with acceptable slippage",
+        "solidity_property": "function invariant_swapSlippage() public pure { /* amountOutMin parameter in swapExactTokensForTokensSupportingFeeOnTransferTokens must be > 0 */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentToken.sol",
+            "function": "_swapTax"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AgentVeToken.sol",
+        "description": "stake() mints veTokens to `receiver` and forcibly delegates to `delegatee`, overriding any existing delegation choice by the receiver. The caller controls both receiver and delegatee, so any address with staking assets can force-delegate someone else's veTokens.",
+        "invariant_logic": "If receiver already has a delegation, stake() should not override it without receiver's consent, OR receiver == msg.sender for delegation changes",
+        "attack_scenario": "Alice has staked and delegated to ValidatorA. Bob calls stake(1, Alice, MaliciousValidator). Alice now has 1 extra veToken but ALL her voting power is re-delegated to MaliciousValidator, shifting governance power without Alice's consent.",
+        "solidity_property": "function invariant_delegationConsent() public view { /* _delegate(receiver, delegatee) in stake should require receiver == msg.sender OR receiver has no prior delegation */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentVeToken.sol",
+            "function": "stake"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AgentMigrator.sol",
+        "description": "Owner can call reset(id) to set migratedAgents[id] = false, allowing re-migration. This creates duplicate token, DAO, veToken, and LP infrastructure for the same agent NFT, with the new infrastructure overwriting the old via migrateVirtual.",
+        "attack_scenario": "Agent id=5 is migrated. Owner calls reset(5). Founder calls migrateAgent(5,...) again, creating a new token/DAO/veToken. The old veToken stakers now hold tokens pointing to an orphaned DAO. The agent's virtualInfo is updated to the new DAO/token, stranding old stakers with worthless veTokens. Additionally, the founder gets new initial LP staked twice.",
+        "invariant_logic": "migratedAgents[id] == true => migratedAgents[id] MUST remain true (migration is irreversible)",
+        "solidity_property": "function invariant_migrationIrreversible(uint256 id) public view { /* once migratedAgents[id] is true, it should never become false */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentMigrator.sol",
+            "function": "reset"
+          },
+          {
+            "file": "AgentMigrator.sol",
+            "function": "migrateAgent"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AgentNftV2.sol",
+        "description": "setDAO allows the current DAO to change itself to a new DAO address with no validation. Combined with permissionless addValidator and governance manipulation, an attacker who gains DAO control can replace the DAO with an arbitrary contract, permanently hijacking agent governance.",
+        "invariant_logic": "setDAO(virtualId, newDAO) SHOULD verify newDAO is a valid governor contract AND the transition was approved through proper governance (proposal + vote)",
+        "attack_scenario": "Attacker gains majority voting power in agent DAO (e.g., via flash loan or validator score inflation from INV-ACCESS-001). Attacker creates and passes a proposal calling setDAO(virtualId, attackerControlledContract). Now all DAO-gated functions (setCoreTypes, setTokenURI) are controlled by attacker. The change is irreversible since only the current DAO can call setDAO.",
+        "solidity_property": "function invariant_daoIntegrity(uint256 virtualId) public view { /* virtualInfos[virtualId].dao should be a valid IAgentDAO with proper governor interface */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentNftV2.sol",
+            "function": "setDAO"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AgentFactory.sol",
+        "description": "AgentFactoryV2.executeApplication uses IERC20.transfer (not safeTransfer) to send assetToken to the newly created agent token. If assetToken is a non-standard ERC20 that returns false on failure (e.g., USDT-like), the transfer silently fails, and addInitialLiquidity proceeds with zero pair tokens, creating a broken liquidity pool.",
+        "invariant_logic": "All external ERC20 transfers MUST use safeTransfer to handle non-standard return values",
+        "solidity_property": "function invariant_safeTransferUsed() public pure { /* IERC20(assetToken).transfer should be IERC20(assetToken).safeTransfer */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentFactory.sol",
+            "function": "executeApplication"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "AgentVeToken.sol",
+        "description": "Founder withdrawal lock (initialLock until matureAt) can be bypassed if admin sets matureAt to a past timestamp via setMatureAt. The admin of agentNft can unlock founder's tokens at will, circumventing the time-lock intended to protect stakers.",
+        "invariant_logic": "matureAt SHOULD only be settable to values >= current matureAt (can only extend, not shorten the lock period)",
+        "attack_scenario": "Agent launches with 10-year maturity lock to reassure stakers that founder LP won't be dumped. Admin colludes with founder and calls setMatureAt(0). Founder immediately withdraws all initialLock LP tokens, dumps them, crashing the agent token price. Stakers suffer losses.",
+        "solidity_property": "function invariant_maturityMonotonic(uint256 oldMatureAt, uint256 newMatureAt) public pure { assert(newMatureAt >= oldMatureAt); }",
+        "inventory_refs": [
+          {
+            "file": "AgentVeToken.sol",
+            "function": "setMatureAt"
+          },
+          {
+            "file": "AgentVeToken.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-006",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "AgentFactoryV4.sol",
+        "description": "When withdrawing a custom token application, the factory transfers its ENTIRE balance of the custom token to the proposer, not the tracked deposited amount. If tokens are sent to the factory by other means (direct transfer, another protocol interaction), the withdrawer receives unearned tokens.",
+        "invariant_logic": "withdraw(id) for custom token applications should only return the exact initialLP amount deposited, not balanceOf(address(this))",
+        "solidity_property": "function invariant_withdrawExactAmount(uint256 id) public view { /* withdrawn custom token amount should equal deposited initialLP amount */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentFactoryV4.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "AgentNftV2.sol",
+        "description": "migrateVirtual does not update the TBA (Token Bound Account) mapping, leaving the old TBA pointing to the original DAO/token while virtualInfo is updated to new components. Services held in the TBA may become inaccessible or controlled by the wrong DAO.",
+        "invariant_logic": "If virtualInfos[id].dao changes, the TBA authorization chain must remain consistent (TBA ownership is derived from NFT ownership, but TBA execution context may reference old DAO)",
+        "attack_scenario": "After migration, the TBA still exists at the same address bound to the NFT. But the DAO address in virtualInfo has changed. Any service NFTs or assets in the TBA may have authorization logic depending on the DAO, creating a mismatch.",
+        "inventory_refs": [
+          {
+            "file": "AgentNftV2.sol",
+            "function": "migrateVirtual"
+          },
+          {
+            "file": "AgentNftV2.sol",
+            "function": "setTBA"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "AgentNftV2.sol",
+        "description": "virtualId minting must be strictly sequential (_nextVirtualId increments by 1). The mint function enforces virtualId == _nextVirtualId, ensuring no ID gaps or collisions. However, _nextVirtualId only increases, and there is no upper bound check.",
+        "invariant_logic": "forall mint calls: virtualId_arg == _nextVirtualId_before AND _nextVirtualId_after == _nextVirtualId_before + 1",
+        "solidity_property": "function invariant_sequentialMinting() public view { /* _nextVirtualId is strictly monotonically increasing by 1 per mint */ }",
+        "inventory_refs": [
+          {
+            "file": "AgentNftV2.sol",
+            "function": "mint"
+          }
+        ]
+      }
+    ]
+  }
+}

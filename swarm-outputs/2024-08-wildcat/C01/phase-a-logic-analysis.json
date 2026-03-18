@@ -1,0 +1,551 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T00:12:03.414Z",
+    "duration_ms": 462496
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-DEPOSIT",
+        "source": "Lender (msg.sender)",
+        "path": [
+          "depositUpTo/deposit calls _depositUpTo",
+          "_getUpdatedState() accrues interest and processes expired batches",
+          "state.maximumDeposit() caps amount",
+          "state.scaleAmount(amount) computes scaled tokens",
+          "_getAccount(msg.sender) checks sanctions",
+          "hooks.onDeposit() external call to hooks contract",
+          "asset.safeTransferFrom() pulls tokens",
+          "account.scaledBalance += scaledAmount",
+          "state.scaledTotalSupply += scaledAmount",
+          "_writeState(state) persists state"
+        ],
+        "transformations": [
+          "amount -> min(amount, maximumDeposit) caps at max supply",
+          "amount -> scaleAmount(amount) = rayDiv(amount, scaleFactor) converts to internal scaled representation",
+          "scaledAmount truncated to uint104"
+        ],
+        "sinks": [
+          "_accounts[msg.sender].scaledBalance",
+          "_state.scaledTotalSupply",
+          "underlying asset balance of market contract"
+        ],
+        "trust_changes": "User-supplied amount enters trusted internal accounting after scaling",
+        "validation_points": [
+          "state.isClosed check",
+          "maximumDeposit() supply cap",
+          "scaledAmount != 0 check",
+          "_getAccount sanctions check",
+          "hooks.onDeposit access control"
+        ],
+        "exposure_risks": [
+          "Hook callback receives lender address and scaled amount"
+        ],
+        "manipulation_risks": [
+          "Fee-on-transfer tokens: actual received amount < credited amount, inflating internal accounting",
+          "Rebasing tokens: balance changes between scaleAmount calculation and transfer"
+        ]
+      },
+      {
+        "flow_id": "DF-002-WITHDRAWAL-QUEUE",
+        "source": "Lender (msg.sender)",
+        "path": [
+          "queueWithdrawal/queueFullWithdrawal called",
+          "_getUpdatedState() accrues interest",
+          "amount -> scaleAmount to get scaledAmount",
+          "_getAccount(msg.sender) sanctions check",
+          "_queueWithdrawal: creates or joins pending batch",
+          "hooks.onQueueWithdrawal external call",
+          "account.scaledBalance -= scaledAmount",
+          "batch.scaledTotalAmount += scaledAmount",
+          "state.scaledPendingWithdrawals += scaledAmount",
+          "_applyWithdrawalBatchPayment if liquidity available",
+          "_writeState persists"
+        ],
+        "transformations": [
+          "amount -> scaleAmount(amount) = rayDiv(amount, scaleFactor)",
+          "For queueFullWithdrawal: scaledAmount = account.scaledBalance, normalizedAmount = normalizeAmount(scaledAmount)"
+        ],
+        "sinks": [
+          "_withdrawalData.batches[expiry]",
+          "_withdrawalData.accountStatuses[expiry][account]",
+          "_state"
+        ],
+        "trust_changes": "User balance moves from active supply to pending withdrawal batch",
+        "validation_points": [
+          "scaledAmount != 0",
+          "sanctions check",
+          "hooks.onQueueWithdrawal"
+        ],
+        "exposure_risks": [
+          "Hook receives lender address, expiry, scaled amount"
+        ],
+        "manipulation_risks": [
+          "Rounding difference between queueWithdrawal (uses scaleAmount on user-provided amount) and queueFullWithdrawal (uses exact scaledBalance) can lead to dust differences"
+        ]
+      },
+      {
+        "flow_id": "DF-003-WITHDRAWAL-EXECUTE",
+        "source": "Anyone (msg.sender calls for accountAddress)",
+        "path": [
+          "executeWithdrawal called with accountAddress and expiry",
+          "_getUpdatedState accrues interest",
+          "_executeWithdrawal loads batch and account status",
+          "mulDiv(batch.normalizedAmountPaid, status.scaledAmount, batch.scaledTotalAmount) computes pro-rata share",
+          "newTotalWithdrawn - status.normalizedAmountWithdrawn = amount to send",
+          "hooks.onExecuteWithdrawal",
+          "state.normalizedUnclaimedWithdrawals -= normalizedAmountWithdrawn",
+          "If sanctioned: create escrow and transfer there",
+          "Else: transfer to accountAddress"
+        ],
+        "transformations": [
+          "Pro-rata calculation: (batch.normalizedAmountPaid * scaledAmount) / scaledTotalAmount",
+          "Incremental withdrawal: newTotal - previousTotal"
+        ],
+        "sinks": [
+          "accountAddress or escrow contract receives underlying tokens"
+        ],
+        "trust_changes": "Reserved withdrawal funds released to user or escrow",
+        "validation_points": [
+          "expiry < block.timestamp (unless closed)",
+          "normalizedAmountWithdrawn != 0",
+          "sanctions check for escrow routing"
+        ],
+        "exposure_risks": [
+          "Anyone can trigger executeWithdrawal for any account, routing sanctioned user funds to escrow"
+        ],
+        "manipulation_risks": [
+          "Pro-rata rounding leaves dust in batch (acknowledged in code comments)",
+          "Sanctioned status can change between queueing and executing, redirecting funds to escrow"
+        ]
+      },
+      {
+        "flow_id": "DF-004-BORROW",
+        "source": "Borrower",
+        "path": [
+          "borrow(amount) called by borrower",
+          "_isFlaggedByChainalysis check on borrower",
+          "_getUpdatedState accrues interest",
+          "state.borrowableAssets(totalAssets()) checks borrowable limit",
+          "hooks.onBorrow external call",
+          "asset.safeTransfer to borrower",
+          "_writeState persists"
+        ],
+        "transformations": [
+          "borrowableAssets = totalAssets - liquidityRequired"
+        ],
+        "sinks": [
+          "Borrower receives underlying tokens"
+        ],
+        "trust_changes": "Protocol assets leave market, increasing delinquency risk",
+        "validation_points": [
+          "onlyBorrower modifier",
+          "Chainalysis sanctions check",
+          "market not closed",
+          "amount <= borrowableAssets"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Borrower can borrow right up to the reserve ratio limit, leaving no buffer for market fluctuations"
+        ]
+      },
+      {
+        "flow_id": "DF-005-INTEREST-ACCRUAL",
+        "source": "Block timestamp progression",
+        "path": [
+          "_getUpdatedState called by any state-modifying function",
+          "state.updateScaleFactorAndFees computes interest since lastInterestAccruedTimestamp",
+          "scaleFactor increases by base interest + delinquency fee",
+          "accruedProtocolFees increases",
+          "timeDelinquent updated based on current delinquency status",
+          "Pending expired batches processed"
+        ],
+        "transformations": [
+          "scaleFactor *= (1 + baseRate * timeDelta + delinquencyFee * timeDelta)",
+          "protocolFee = interestAccrued * protocolFeeBips / BIP",
+          "delinquencyFee applied only when timeDelinquent > gracePeriod"
+        ],
+        "sinks": [
+          "_state.scaleFactor",
+          "_state.accruedProtocolFees",
+          "_state.timeDelinquent"
+        ],
+        "trust_changes": "Time-based state progression trusted via block.timestamp",
+        "validation_points": [
+          "lastInterestAccruedTimestamp != block.timestamp guard",
+          "Two-phase accrual: first to expiry, then to current timestamp"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Tiny deposits at high frequency to maximize rounding in attacker's favor",
+          "Delinquency timer manipulation via strategic repayment just before grace period expires"
+        ]
+      },
+      {
+        "flow_id": "DF-006-CLOSE-MARKET",
+        "source": "Borrower",
+        "path": [
+          "closeMarket called by borrower",
+          "_getUpdatedState accrues interest",
+          "Settle remaining debt: if underfunded, pull from borrower; if excess, return to borrower",
+          "hooks.onCloseMarket",
+          "Set annualInterestBips=0, isClosed=true, reserveRatioBips=10000, timeDelinquent=0",
+          "Calculate availableLiquidity",
+          "Process pending batch with _applyWithdrawalBatchPayment",
+          "Loop through unpaid batches with _processUnpaidWithdrawalBatch",
+          "Revert if scaledPendingWithdrawals != 0",
+          "_writeState"
+        ],
+        "transformations": [
+          "availableLiquidity = currentlyHeld - (normalizedUnclaimedWithdrawals + accruedProtocolFees)",
+          "availableLiquidity -= normalizedAmountPaid per batch iteration"
+        ],
+        "sinks": [
+          "_state with closed market configuration"
+        ],
+        "trust_changes": "Market transitions from active to closed state permanently",
+        "validation_points": [
+          "onlyBorrower",
+          "market not already closed",
+          "All withdrawal batches must be payable (scaledPendingWithdrawals == 0)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "CRITICAL: availableLiquidity -= normalizedAmountPaid can underflow due to rounding in scaleAmount (rayDiv rounds to nearest) producing normalizedAmountPaid > availableLiquidity, blocking market closure"
+        ]
+      },
+      {
+        "flow_id": "DF-007-SANCTIONS-ESCROW",
+        "source": "Chainalysis Oracle",
+        "path": [
+          "isFlaggedByChainalysis checks Chainalysis sanctions list",
+          "isSanctioned combines Chainalysis check with borrower override",
+          "nukeFromOrbit: queues full withdrawal for sanctioned account",
+          "executeWithdrawal: routes funds to escrow if sanctioned at execution time",
+          "Escrow holds funds until sanctions cleared or borrower overrides"
+        ],
+        "transformations": [
+          "Account balance -> queued withdrawal -> escrow-held funds"
+        ],
+        "sinks": [
+          "WildcatSanctionsEscrow contract"
+        ],
+        "trust_changes": "External oracle (Chainalysis) controls fund routing; borrower can override",
+        "validation_points": [
+          "sentinel.isSanctioned(borrower, account)",
+          "sentinel.isFlaggedByChainalysis(account) for borrower borrow check"
+        ],
+        "exposure_risks": [
+          "Escrow address deterministic via CREATE2 - can be precomputed"
+        ],
+        "manipulation_risks": [
+          "Borrower can override sanctions for any account, potentially unfreezing sanctioned funds",
+          "Sanctions status can change between queue and execute, affecting fund routing"
+        ]
+      },
+      {
+        "flow_id": "DF-008-PROTOCOL-FEES",
+        "source": "Interest accrual",
+        "path": [
+          "updateScaleFactorAndFees calculates protocol fee as fraction of interest",
+          "accruedProtocolFees accumulates in state",
+          "collectFees: calculates withdrawableProtocolFees",
+          "Transfers to feeRecipient"
+        ],
+        "transformations": [
+          "protocolFee = interestAccrued * protocolFeeBips / BIP",
+          "withdrawableFees = min(totalAssets - normalizedUnclaimedWithdrawals, accruedProtocolFees)"
+        ],
+        "sinks": [
+          "feeRecipient address receives underlying tokens"
+        ],
+        "trust_changes": "Protocol fees have lower priority than unclaimed withdrawals",
+        "validation_points": [
+          "accruedProtocolFees > 0",
+          "withdrawableFees > 0"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "withdrawableProtocolFees can underflow if totalAssets < normalizedUnclaimedWithdrawals"
+        ]
+      },
+      {
+        "flow_id": "DF-009-MARKET-DEPLOYMENT",
+        "source": "Borrower via HooksFactory",
+        "path": [
+          "deployMarket/deployMarketAndHooks called by registered borrower",
+          "Validate hooks instance is from known template",
+          "Pay origination fee if configured",
+          "Call IHooks.onCreateMarket to finalize hooks config",
+          "Set TmpMarketParameterStorage in transient storage",
+          "Deploy market via CREATE2",
+          "Market constructor reads params from factory.getMarketParameters()",
+          "Register market with ArchController",
+          "Clear transient storage"
+        ],
+        "transformations": [
+          "DeployMarketInputs -> TmpMarketParameterStorage -> MarketParameters",
+          "name = namePrefix + asset.name(), symbol = symbolPrefix + asset.symbol()",
+          "Strings packed into 2 x bytes32 words"
+        ],
+        "sinks": [
+          "New market contract deployed at deterministic address"
+        ],
+        "trust_changes": "Factory is trusted to set market parameters; hooks instance can modify hooks config during onCreateMarket",
+        "validation_points": [
+          "Borrower registered on ArchController",
+          "Hooks template exists and enabled",
+          "Asset not blacklisted",
+          "Salt contains sender address or is zero",
+          "Fee parameters match template",
+          "Market doesn't already exist"
+        ],
+        "exposure_risks": [
+          "Transient storage used for parameter passing - only exists during deployment transaction"
+        ],
+        "manipulation_risks": [
+          "Hooks onCreateMarket can modify the HooksConfig, potentially disabling important hooks",
+          "Name/symbol packed strings limited to 63 bytes total"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "scaledBalance * scaleFactor / RAY = normalized (underlying) balance",
+        "totalDebts = normalizeAmount(scaledTotalSupply) + normalizedUnclaimedWithdrawals + accruedProtocolFees",
+        "borrowableAssets = totalAssets - liquidityRequired",
+        "liquidityRequired = normalizeAmount(scaledRequiredReserves) + accruedProtocolFees + normalizedUnclaimedWithdrawals where scaledRequiredReserves = (scaledTotalSupply - scaledPendingWithdrawals) * reserveRatioBips / BIP + scaledPendingWithdrawals",
+        "Withdrawal batches expire after withdrawalBatchDuration; FIFO queue for unpaid batches",
+        "Market tokens are rebasing: balanceOf = scaledBalance * scaleFactor / RAY",
+        "Protocol fees are lower priority than unclaimed withdrawals"
+      ],
+      "economic_incentives": [
+        "Lenders earn annualInterestBips on deposited assets via increasing scaleFactor",
+        "Borrowers pay base interest + potential delinquency fee",
+        "Delinquency fee applied when timeDelinquent > delinquencyGracePeriod, incentivizing timely repayment",
+        "Protocol earns protocolFeeBips as fraction of interest, extracted from lender yield",
+        "Reserve ratio requirement prevents borrower from withdrawing all assets"
+      ],
+      "governance_mechanisms": [
+        "ArchController owner manages borrower/factory/controller registration and asset blacklist",
+        "Borrower controls market parameters (APR, reserve ratio, max supply) with hook-based guardrails",
+        "Factory owner can update protocol fees for hooks templates",
+        "Protocol fee updates pushed to existing markets via pushProtocolFeeBipsUpdates",
+        "Borrower can override Chainalysis sanctions for specific accounts"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "closeMarket with dust availableLiquidity and scaleFactor >= 2*RAY causes underflow in `availableLiquidity -= normalizedAmountPaid`",
+          "expected_behavior": "Market should close successfully after borrower covers all debts",
+          "actual_behavior": "Reverts due to arithmetic underflow because scaleAmount (rayDiv) rounds up, making normalizedAmountPaid > availableLiquidity. For scaleFactor=2e27, availableLiquidity=1 → normalizedAmountPaid=2.",
+          "risk_level": "high",
+          "exploitation_potential": "A market with scaleFactor >= 2*RAY (100%+ accumulated interest) cannot be closed if dust amounts remain after batch processing. Borrower is stuck with an uncloseable market. The attacker could deliberately create tiny withdrawal batches to trigger this condition. Unlike repayAndProcessUnpaidWithdrawalBatches which uses satSub, closeMarket uses regular subtraction."
+        },
+        {
+          "scenario": "Fee-on-transfer token used as underlying asset",
+          "expected_behavior": "Deposit of amount X credits user with scaled tokens worth X underlying",
+          "actual_behavior": "safeTransferFrom(sender, market, X) delivers X-fee to market, but scaledAmount is computed on X, inflating internal accounting. Over time this creates a deficit where total claims exceed actual assets.",
+          "risk_level": "medium",
+          "exploitation_potential": "Last withdrawers cannot fully withdraw. Attacker deposits with fee-on-transfer token, gets credited full amount, then withdraws more than their fair share. Market becomes insolvent."
+        },
+        {
+          "scenario": "withdrawableProtocolFees underflow when totalAssets < normalizedUnclaimedWithdrawals",
+          "expected_behavior": "Return 0 withdrawable fees gracefully",
+          "actual_behavior": "Arithmetic underflow panic in `totalAssets - state.normalizedUnclaimedWithdrawals`",
+          "risk_level": "low",
+          "exploitation_potential": "collectFees reverts with panic instead of a meaningful error. Not exploitable for fund theft but prevents fee collection and provides poor UX."
+        },
+        {
+          "scenario": "Transfer emits incorrect amount due to scale/normalize rounding",
+          "expected_behavior": "Transfer event amount matches actual value transferred",
+          "actual_behavior": "In _transfer, emit_Transfer uses original `amount` but actual value transferred is normalizeAmount(scaleAmount(amount)) which may differ. Similarly _depositUpTo emits `amount` not the normalized value of scaledAmount.",
+          "risk_level": "low",
+          "exploitation_potential": "External trackers (block explorers, portfolio tools) may show incorrect balances. Off-chain accounting discrepancies."
+        },
+        {
+          "scenario": "Allowance consumed exceeds actual transferred value in transferFrom",
+          "expected_behavior": "Allowance reduced by actual transferred value",
+          "actual_behavior": "Allowance reduced by `amount` parameter, but actual transfer is normalizeAmount(scaleAmount(amount)) which can be less due to rounding. Approver's allowance is consumed faster than value actually moves.",
+          "risk_level": "low",
+          "exploitation_potential": "Minor allowance waste for approvers. Cannot be exploited for profit."
+        },
+        {
+          "scenario": "nukeFromOrbit calls _writeState twice via _blockAccount -> _queueWithdrawal path",
+          "expected_behavior": "State written once with final values",
+          "actual_behavior": "_queueWithdrawal calls _writeState, then nukeFromOrbit calls _writeState again with the same state object. Both recalculate isDelinquent from totalAssets(). Second write overwrites first.",
+          "risk_level": "low",
+          "exploitation_potential": "Gas waste only. Not exploitable since totalAssets is unchanged between the two writes."
+        },
+        {
+          "scenario": "Zero-duration withdrawal batch with withdrawalBatchDuration=0",
+          "expected_behavior": "Batch expires immediately and is processed in same transaction",
+          "actual_behavior": "In _getUpdatedState, hasPendingExpiredBatch checks expiry > 0 && block.timestamp > expiry. If expiry == block.timestamp (created in same block), batch is NOT expired yet. Must wait until next block. With duration 0, expiry = block.timestamp, so the batch won't be processed as expired until the next transaction in a later block.",
+          "risk_level": "low",
+          "exploitation_potential": "Minor delay in withdrawal processing. Cannot be weaponized."
+        },
+        {
+          "scenario": "repayOutstandingDebt/repayDelinquentDebt called when debt is 0",
+          "expected_behavior": "No-op or graceful handling",
+          "actual_behavior": "satSub returns 0, then _repay reverts with NullRepayAmount",
+          "risk_level": "low",
+          "exploitation_potential": "UX issue only. Callers must check debt before calling."
+        },
+        {
+          "scenario": "Hooks onSetAnnualInterestAndReserveRatioBips returns different values than borrower requested",
+          "expected_behavior": "Hook can validate and optionally modify parameters within bounds",
+          "actual_behavior": "Hook return values masked to uint16 and used directly. Validation checks (> BIP) are applied after hook. Hook could set values to maximum uint16 (65535) but BIP check (10000) catches it.",
+          "risk_level": "low",
+          "exploitation_potential": "Hook is trusted by design. If compromised, could set unfavorable rates within BIP bounds."
+        },
+        {
+          "scenario": "processUnpaidWithdrawalBatch processes same batch repeatedly when not fully paid",
+          "expected_behavior": "Move to next batch after processing",
+          "actual_behavior": "In closeMarket loop, _processUnpaidWithdrawalBatch always reads first() from unpaidBatches. If batch isn't fully paid, it stays at front. Loop iterates numBatches times but processes same batch each time with decreasing liquidity.",
+          "risk_level": "medium",
+          "exploitation_potential": "In closeMarket, combined with the rounding underflow issue, this can prevent market closure. The loop wastes gas processing the same batch. In repayAndProcessUnpaidWithdrawalBatches, the while loop has availableLiquidity > 0 condition that mitigates this."
+        },
+        {
+          "scenario": "rescueTokens called on a malicious ERC20 with reentrant callback",
+          "expected_behavior": "Tokens transferred safely",
+          "actual_behavior": "rescueTokens has no nonReentrant modifier. Malicious token could call back. However, reentrant calls to other market functions are protected by nonReentrant. rescueTokens itself re-entering would transfer 0 on second call.",
+          "risk_level": "low",
+          "exploitation_potential": "Limited attack surface since only borrower can call and state-modifying functions are protected."
+        }
+      ],
+      "assumption_violations": [
+        "Assumes underlying asset is standard ERC20 (no fee-on-transfer, no rebasing, no hooks). Violated by deflationary or rebasing tokens.",
+        "Assumes scaleAmount(normalizeAmount(x)) ≈ x with bounded error. Can diverge significantly when scaleFactor >> RAY.",
+        "Assumes totalAssets() >= normalizedUnclaimedWithdrawals at all times. Can be violated if underlying asset is deflationary or lost.",
+        "Assumes Chainalysis oracle is reliable and available. Oracle failure blocks sanctions-related operations.",
+        "Assumes hooks contract is well-behaved and does not consume excessive gas or revert unexpectedly.",
+        "Assumes block.timestamp is not manipulable (true for post-Merge Ethereum but may differ on L2s)."
+      ],
+      "game_theory_risks": [
+        "Borrower can strategically repay just enough to reset delinquency timer before grace period expires, avoiding penalty APR indefinitely while remaining marginally delinquent.",
+        "Last-lender problem: when market is nearly empty, remaining lender may face disproportionate rounding losses. The dust from withdrawal batch rounding accumulates as unrecoverable.",
+        "Borrower can set very high interest rate and low reserve ratio to attract deposits, then borrow max and default. Only mitigated by hooks-based access control.",
+        "Front-running withdrawal batches: a lender seeing a large pending withdrawal could deposit and queue withdrawal to join the same batch, diluting other lenders' share of available liquidity.",
+        "Protocol fee recipient has no incentive to maintain market health but benefits from higher interest rates which increase fees.",
+        "Borrower override of sanctions creates moral hazard - borrower could unsanction addresses to access frozen funds."
+      ],
+      "integration_risks": [
+        "Chainalysis sanctions list dependency: if the oracle address changes or becomes unavailable, all sanctions-related functions will fail",
+        "Hook contracts are immutable per market - if a bug is found in hooks, the market cannot be patched",
+        "SphereX engine integration adds external call overhead to every guarded function and could be a denial-of-service vector if engine reverts",
+        "Factory transient storage pattern for market parameters assumes constructor callback happens atomically - safe in current EVM but relies on transient storage semantics"
+      ],
+      "calculation_errors": [
+        "In onBorrow hook (HooksConfig.sol), size calculation uses `RepayHook_Base_Size` instead of `BorrowHook_Base_Size`. Both happen to equal 0x0224 currently, but if borrow hook parameters change independently, this would produce wrong calldata size.",
+        "closeMarket: `availableLiquidity -= normalizedAmountPaid` does not use satSub, unlike repayAndProcessUnpaidWithdrawalBatches which does. This inconsistency leads to potential revert from rounding-induced underflow.",
+        "_applyWithdrawalBatchPayment uses scaleAmount (rayDiv, rounds to nearest) for available liquidity but mulDiv (rounds down) for payment amount. The mismatch means payment can exceed input liquidity when scaleFactor >= 2*RAY."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "WildcatMarketToken (market token)",
+          "behaviors": [
+            "rebasing:true",
+            "permit:false",
+            "fee_on_transfer:false",
+            "pausable:false",
+            "snapshot:false"
+          ],
+          "decimals": -1,
+          "approval_model": "infinite_ok",
+          "transfer_model": "hooks",
+          "accounting_model": "shares_indexed",
+          "notes": "Rebasing token where balanceOf = scaledBalance * scaleFactor / RAY. Decimals match underlying asset. Transfer triggers hooks and state update. balanceOf is a view that accrues interest. Transfer amount vs scaled amount have rounding discrepancy.",
+          "evidence_refs": [
+            {
+              "file": "WildcatMarketToken.sol",
+              "lines": [
+                14,
+                23
+              ],
+              "function": "balanceOf, _transfer"
+            }
+          ]
+        },
+        {
+          "address_or_symbol": "underlying asset",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:false",
+            "permit:unknown"
+          ],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Protocol assumes standard ERC20 behavior. Fee-on-transfer or rebasing tokens will break accounting. SafeERC20 (LibERC20) used for transfers. No received-amount delta checking performed."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation",
+          "state_vars": [
+            "scaledTotalSupply",
+            "sum(accounts[i].scaledBalance)",
+            "scaledPendingWithdrawals"
+          ],
+          "description": "scaledTotalSupply = sum(all scaledBalances including market's own balance from pending withdrawals). scaledPendingWithdrawals <= scaledTotalSupply."
+        },
+        {
+          "name": "asset_coverage",
+          "state_vars": [
+            "totalAssets()",
+            "normalizedUnclaimedWithdrawals",
+            "accruedProtocolFees"
+          ],
+          "description": "In healthy state: totalAssets() >= normalizedUnclaimedWithdrawals + accruedProtocolFees. Violated when market is delinquent."
+        },
+        {
+          "name": "withdrawal_batch_consistency",
+          "state_vars": [
+            "batch.scaledAmountBurned",
+            "batch.scaledTotalAmount",
+            "batch.normalizedAmountPaid"
+          ],
+          "description": "scaledAmountBurned <= scaledTotalAmount. normalizedAmountPaid monotonically increases. When scaledAmountBurned == scaledTotalAmount, batch is fully paid."
+        },
+        {
+          "name": "delinquency_tracking",
+          "state_vars": [
+            "isDelinquent",
+            "timeDelinquent",
+            "liquidityRequired()",
+            "totalAssets()"
+          ],
+          "description": "isDelinquent = (liquidityRequired() > totalAssets()). timeDelinquent increases while delinquent, decreases while not. Penalty APR applied when timeDelinquent > delinquencyGracePeriod."
+        },
+        {
+          "name": "closed_market_rules",
+          "state_vars": [
+            "isClosed",
+            "annualInterestBips",
+            "reserveRatioBips",
+            "timeDelinquent"
+          ],
+          "description": "When isClosed: annualInterestBips=0, reserveRatioBips=10000, timeDelinquent=0. No new deposits, borrows, or repays. Withdrawals can be executed before expiry."
+        },
+        {
+          "name": "scale_factor_monotonic",
+          "state_vars": [
+            "scaleFactor",
+            "lastInterestAccruedTimestamp"
+          ],
+          "description": "scaleFactor only increases over time (never decreases). Starts at RAY (1e27). Increases via interest accrual and delinquency fees."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,336 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T00:06:18.763Z",
+    "duration_ms": 349061
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "MultiOwnable.sol",
+        "description": "No minimum owner count enforcement allows removal of ALL owners, permanently bricking the wallet and locking all funds with no recovery path.",
+        "attack_scenario": "A compromised or malicious owner calls removeOwnerAtIndex for every owner including themselves. With zero owners, no one can call onlyOwner functions (addOwner, execute, upgrade). The wallet and all its funds become permanently inaccessible since even the EntryPoint path requires valid signature from a registered owner.",
+        "invariant_logic": "For any wallet with balance > 0 or ongoing operations: count(activeOwners) >= 1",
+        "solidity_property": "function invariant_minOwnerCount() public view { uint256 ownerCount = 0; for (uint256 i = 0; i < nextOwnerIndex(); i++) { if (ownerAtIndex(i).length > 0) ownerCount++; } assert(ownerCount >= 1); }",
+        "inventory_refs": [
+          {
+            "file": "MultiOwnable.sol",
+            "function": "removeOwnerAtIndex"
+          },
+          {
+            "file": "MultiOwnable.sol",
+            "function": "_checkOwner"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "CoinbaseSmartWallet.sol",
+        "description": "Wallet initialization is a one-way transition: once nextOwnerIndex > 0, initialize() cannot be called again. This prevents re-initialization attacks on proxy instances.",
+        "attack_scenario": "If initialize could be called multiple times, an attacker could re-initialize the wallet with their own owner set after deployment, taking full control of the wallet and all its funds. The proxy and implementation share the initialization guard via nextOwnerIndex.",
+        "invariant_logic": "initialize() succeeds ⟹ old(nextOwnerIndex) == 0; after initialize() succeeds: nextOwnerIndex > 0 permanently",
+        "solidity_property": "function invariant_initOnce() public view { /* After any successful initialize call */ assert(nextOwnerIndex() > 0); }",
+        "inventory_refs": [
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "initialize"
+          },
+          {
+            "file": "CoinbaseSmartWalletFactory.sol",
+            "function": "createAccount"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "CoinbaseSmartWallet.sol",
+        "description": "Cross-chain replayable UserOperations MUST use REPLAYABLE_NONCE_KEY and non-replayable operations MUST NOT use it. This biconditional enforces that chain-agnostic hash computation only applies to explicitly replayable operations.",
+        "attack_scenario": "If a non-replayable operation could use REPLAYABLE_NONCE_KEY, validateUserOp would compute a chain-agnostic hash, and the operation could be replayed across chains. If a replayable operation used a different key, the standard chain-inclusive hash would be used, breaking cross-chain replay.",
+        "invariant_logic": "(callSelector == 0xbf6ba1fc) ⟺ (nonceKey == REPLAYABLE_NONCE_KEY)",
+        "solidity_property": "function invariant_nonceKeyBiconditional(bytes4 selector, uint256 key) public pure { if (selector == 0xbf6ba1fc) { assert(key == REPLAYABLE_NONCE_KEY); } else { assert(key != REPLAYABLE_NONCE_KEY); } }",
+        "inventory_refs": [
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "validateUserOp"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "CoinbaseSmartWallet.sol",
+        "description": "upgradeToAndCall is whitelisted for cross-chain replay via canSkipChainIdValidation. An upgrade signed for one chain is replayable on ALL chains sharing the same wallet address. If the implementation at that address differs across chains, wallets can be bricked or compromised.",
+        "attack_scenario": "Owner upgrades wallet to implementation X on chain A. The same UserOp is replayed on chain B where address X contains different/malicious code or no code at all. The wallet on chain B is bricked (no code behind proxy) or taken over by the malicious implementation.",
+        "invariant_logic": "canSkipChainIdValidation(upgradeToAndCall.selector) == true ⟹ implementation address MUST contain identical safe code on ALL chains where the wallet exists",
+        "solidity_property": "function invariant_crossChainUpgradeRisk() public pure { assert(canSkipChainIdValidation(UUPSUpgradeable.upgradeToAndCall.selector) == true); /* Design risk: upgrade replays across chains */ }",
+        "inventory_refs": [
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "canSkipChainIdValidation"
+          },
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "executeWithoutChainIdValidation"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "MagicSpend.sol",
+        "description": "In validatePaymasterUserOp, _withdrawableETH is credited additively per UserOp but the balance check is per-UserOp not cumulative. Multiple UserOps from the same sender in one bundle can commit to withdrawing more ETH than the contract holds.",
+        "attack_scenario": "Contract holds 10 ETH. Two UserOps from same sender each request 8 ETH. Each passes the individual balance check (10 >= 8). After both validations in ERC-4337's verification loop, _withdrawableETH = 12 ETH. The first postOp attempts to send ~12 ETH, exceeding the 10 ETH balance, causing forceSafeTransferETH to fail or underpay.",
+        "invariant_logic": "sum(_withdrawableETH[account] for all accounts) <= address(this).balance at all times",
+        "solidity_property": "function invariant_cumulativeBalance(address account) public view { assert(address(this).balance >= _withdrawableETH[account]); }",
+        "inventory_refs": [
+          {
+            "file": "MagicSpend.sol",
+            "function": "validatePaymasterUserOp"
+          },
+          {
+            "file": "MagicSpend.sol",
+            "function": "postOp"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "MagicSpend.sol",
+        "description": "Withdrawal nonces are irreversibly consumed: once _nonceUsed[nonce][account] is set to true, it must remain true forever. This is the sole replay protection for withdraw requests.",
+        "attack_scenario": "If a nonce could be reset to false, an attacker (or the signer) could replay a previously valid withdrawal request unlimited times, draining the MagicSpend contract of all ETH.",
+        "invariant_logic": "forall nonce, account: _nonceUsed[nonce][account] transitions from false → true only; never true → false",
+        "solidity_property": "function invariant_nonceIrreversible(uint256 nonce, address account) public view { /* After _validateRequest sets it true, no code path sets it false */ }",
+        "inventory_refs": [
+          {
+            "file": "MagicSpend.sol",
+            "function": "_validateRequest"
+          },
+          {
+            "file": "MagicSpend.sol",
+            "function": "validatePaymasterUserOp"
+          },
+          {
+            "file": "MagicSpend.sol",
+            "function": "withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "MultiOwnable.sol",
+        "description": "nextOwnerIndex strictly increases and never decreases. removeOwnerAtIndex clears the slot but does not decrement the counter, making owner indices permanently consumed.",
+        "attack_scenario": "If nextOwnerIndex could decrease, a newly added owner could be assigned to a previously used index. Any off-chain system or cross-chain replay referencing the old index would now resolve to the wrong owner, breaking signature validation integrity.",
+        "invariant_logic": "old(nextOwnerIndex) <= new(nextOwnerIndex) for any state transition",
+        "solidity_property": "function invariant_ownerIndexMonotonic(uint256 prevIndex) public view { assert(nextOwnerIndex() >= prevIndex); }",
+        "inventory_refs": [
+          {
+            "file": "MultiOwnable.sol",
+            "function": "_addOwner"
+          },
+          {
+            "file": "MultiOwnable.sol",
+            "function": "removeOwnerAtIndex"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "CoinbaseSmartWallet.sol",
+        "description": "executeWithoutChainIdValidation enforces that only whitelisted selectors can be executed through the cross-chain replay path. The whitelist MUST NOT include execute(), executeBatch(), or any selector that could transfer arbitrary funds or interact with external contracts.",
+        "attack_scenario": "If execute() were whitelisted, an attacker who observes a chain-A UserOp transferring ETH to address X could replay it on chain B, where address X may be attacker-controlled, draining the wallet on chain B.",
+        "invariant_logic": "canSkipChainIdValidation(selector) == true only for {addOwnerPublicKey, addOwnerAddress, removeOwnerAtIndex, upgradeToAndCall}",
+        "solidity_property": "function invariant_whitelistStrict() public pure { assert(!canSkipChainIdValidation(CoinbaseSmartWallet.execute.selector)); assert(!canSkipChainIdValidation(CoinbaseSmartWallet.executeBatch.selector)); assert(!canSkipChainIdValidation(CoinbaseSmartWallet.executeWithoutChainIdValidation.selector)); }",
+        "inventory_refs": [
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "canSkipChainIdValidation"
+          },
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "executeWithoutChainIdValidation"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "WebAuthn.sol",
+        "description": "Signature malleability guard requires s <= P256_N_DIV_2 for secp256r1 signatures. Without this, for every valid signature (r, s), a second valid signature (r, n-s) exists, enabling signature replay or uniqueness violations.",
+        "attack_scenario": "An attacker observes valid signature (r, s) where s > n/2. They compute s' = n - s (where s' < n/2). Without the guard, both signatures are valid. With the guard only s' passes, ensuring signature uniqueness. If the guard were removed, an observer could forge alternate signatures for any observed operation.",
+        "invariant_logic": "WebAuthn.verify returns false if webAuthnAuth.s > P256_N_DIV_2",
+        "solidity_property": "function invariant_noMalleability(uint256 s) public pure { if (s > FCL.n / 2) { /* verify must return false */ } }",
+        "inventory_refs": [
+          {
+            "file": "WebAuthn.sol",
+            "function": "verify"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "MagicSpend.sol",
+        "description": "Expiry enforcement diverges between paymaster and direct withdraw paths. In validatePaymasterUserOp, expiry is delegated to EntryPoint via validationData but the nonce is consumed unconditionally during validation. In withdraw(), expiry is enforced directly with a revert, and nonce consumption reverts with it.",
+        "attack_scenario": "A malicious bundler includes a UserOp with an expired withdrawal request. validatePaymasterUserOp consumes the nonce and returns expiry in validationData. The EntryPoint rejects the UserOp due to expiry, but the nonce is already consumed on-chain. The user must request a new signed withdrawal with a different nonce, causing a griefing vector.",
+        "invariant_logic": "In paymaster path: nonce consumed at validation time, expiry enforced at execution time by EntryPoint. Gap between nonce consumption and expiry enforcement enables nonce griefing.",
+        "solidity_property": "// validatePaymasterUserOp: _validateRequest (nonce consumed) runs before EntryPoint checks (uint48(validationData >> 160) >= block.timestamp)",
+        "inventory_refs": [
+          {
+            "file": "MagicSpend.sol",
+            "function": "validatePaymasterUserOp"
+          },
+          {
+            "file": "MagicSpend.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "MagicSpend.sol",
+            "function": "_validateRequest"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "FCL.sol",
+        "description": "ECDSA signature verification requires r ∈ [1, n-1] and s ∈ [1, n-1], and the public key must lie on the secp256r1 curve. These are necessary preconditions — without them, trivial signature forgeries or mathematically undefined operations could occur.",
+        "attack_scenario": "If r=0 were accepted, the verification equation degenerates. If the public key is not on the curve, invalid-curve attacks allow an attacker to recover the private key or forge signatures by exploiting the group structure of points not on the intended curve.",
+        "invariant_logic": "ecdsa_verify(msg, r, s, Qx, Qy): (r == 0 || r >= n || s == 0 || s >= n || !ecAff_isOnCurve(Qx, Qy)) ⟹ returns false",
+        "solidity_property": "function invariant_ecdsaPreconditions(bytes32 msg_, uint256 r, uint256 s, uint256 Qx, uint256 Qy) public view { if (r == 0 || r >= FCL.n || s == 0 || s >= FCL.n) { assert(FCL.ecdsa_verify(msg_, r, s, Qx, Qy) == false); } }",
+        "inventory_refs": [
+          {
+            "file": "FCL.sol",
+            "function": "ecdsa_verify"
+          },
+          {
+            "file": "FCL.sol",
+            "function": "ecAff_isOnCurve"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "MagicSpend.sol",
+        "description": "postOp asserts mode != PostOpMode.postOpReverted, creating a hard failure if the initial postOp ETH transfer fails. There is no recovery path — user funds committed in _withdrawableETH are lost if the transfer reverts.",
+        "attack_scenario": "A smart contract wallet with a reverting receive() function uses MagicSpend. validatePaymasterUserOp credits _withdrawableETH. After UserOp execution, postOp tries forceSafeTransferETH which may fail if the account's fallback reverts or gas stipend is insufficient. EntryPoint then calls postOp with postOpReverted mode, hitting the assert and failing. The _withdrawableETH was already deleted but funds were never sent.",
+        "invariant_logic": "postOp is called with mode ∈ {opSucceeded, opReverted} only; postOpReverted mode triggers assert failure",
+        "solidity_property": "function invariant_postOpMode(IPaymaster.PostOpMode mode) public pure { assert(mode != IPaymaster.PostOpMode.postOpReverted); }",
+        "inventory_refs": [
+          {
+            "file": "MagicSpend.sol",
+            "function": "postOp"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-006",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "CoinbaseSmartWallet.sol",
+        "description": "WebAuthn verification in _validateSignature hardcodes requireUV=false, meaning user verification (biometric/PIN) is never required for passkey-based signature validation. Only user presence (physical tap) is checked.",
+        "attack_scenario": "An attacker with physical access to an unlocked device containing the passkey can authorize arbitrary wallet operations (transfers, owner changes, upgrades) with just a tap, without needing the user's biometric or PIN. This reduces the security model from two-factor to single-factor for physical access attacks.",
+        "invariant_logic": "All passkey signature validations call WebAuthn.verify with requireUV=false; authenticatorData UP flag is checked but UV flag is not required",
+        "solidity_property": "// _validateSignature: WebAuthn.verify({..., requireUV: false, ...}) — UV never enforced",
+        "inventory_refs": [
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "_validateSignature"
+          },
+          {
+            "file": "WebAuthn.sol",
+            "function": "verify"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "ERC1271.sol",
+        "description": "ERC-1271 signature validation wraps the input hash with an EIP-712 domain separator containing address(this) and block.chainid before validation. This anti-cross-account-replay layer prevents a signature valid for wallet A from being accepted by wallet B owned by the same signer.",
+        "attack_scenario": "Without replaySafeHash: Alice owns wallets A and B with the same Ethereum EOA signer. A dApp requests an ERC-1271 signature from wallet A. The signed hash is then submitted to wallet B, which would also accept it since the same signer controls both. With replaySafeHash, the domain separator differs per wallet address, making the signature invalid on wallet B.",
+        "invariant_logic": "isValidSignature(hash, sig) validates against replaySafeHash(hash) where replaySafeHash includes address(this) and block.chainid in the domain separator",
+        "solidity_property": "function invariant_replaySafe() public view { bytes32 h = keccak256('test'); assert(replaySafeHash(h) != h); }",
+        "inventory_refs": [
+          {
+            "file": "ERC1271.sol",
+            "function": "isValidSignature"
+          },
+          {
+            "file": "ERC1271.sol",
+            "function": "replaySafeHash"
+          },
+          {
+            "file": "ERC1271.sol",
+            "function": "_eip712Hash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "CoinbaseSmartWallet.sol",
+        "description": "The implementation contract's constructor initializes nextOwnerIndex > 0 (with address(0) as owner) to prevent attackers from calling initialize() on the implementation directly. Without this, an attacker could take ownership of the implementation and potentially affect all proxies via UUPS upgrade manipulation.",
+        "attack_scenario": "If the implementation were left uninitialized, an attacker calls initialize() on the implementation, becomes owner, then calls upgradeToAndCall to point the implementation to malicious code. While proxies use delegatecall, certain self-destruct or storage manipulation attacks on the implementation could affect proxy behavior.",
+        "invariant_logic": "implementation.nextOwnerIndex() > 0 always holds; constructor ensures this before any external interaction is possible",
+        "solidity_property": "function invariant_implInitialized() public view { assert(nextOwnerIndex() > 0); }",
+        "inventory_refs": [
+          {
+            "file": "CoinbaseSmartWallet.sol",
+            "function": "constructor"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-008",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "MagicSpend.sol",
+        "description": "The getHash function for withdrawal signature verification includes block.chainid, preventing cross-chain replay of withdrawal requests. A withdrawal request signed for chain A cannot be used on chain B.",
+        "attack_scenario": "Without chainid in the hash, an attacker who observes a valid withdrawal signature on chain A could replay it on chain B where the same MagicSpend contract is deployed, double-withdrawing funds.",
+        "invariant_logic": "getHash(account, req) = toEthSignedMessageHash(abi.encode(address(this), account, block.chainid, req.asset, req.amount, req.nonce, req.expiry))",
+        "solidity_property": "// getHash includes block.chainid — replay across chains requires new signature",
+        "inventory_refs": [
+          {
+            "file": "MagicSpend.sol",
+            "function": "getHash"
+          },
+          {
+            "file": "MagicSpend.sol",
+            "function": "isValidWithdrawSignature"
+          }
+        ]
+      }
+    ]
+  }
+}

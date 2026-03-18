@@ -1,0 +1,191 @@
+{
+  "metadata": {
+    "threat_model_id": "TM_ari_liquid_ron_evmbench_unprivileged_no_front_run_primary_opus_2026Mar09-02h44m37s",
+    "phase": "D",
+    "process": "single_hypothesis_validation",
+    "hypothesis_index": 7,
+    "hypothesis_id": "TECH-H016",
+    "llm_model": "claude",
+    "timestamp": "2026-03-09T03:30:57.123Z",
+    "validation_duration_ms": 117430
+  },
+  "original_hypothesis": {
+    "hypothesis_id": "TECH-H016",
+    "title": "Undelegation path assumes exact/immediate RON return; mismatch can revert or silently mis-account, breaking staking/vault fund conservation",
+    "risk_level": "HIGH",
+    "attack_realism": "MEDIUM",
+    "stride_category": "Denial of Service",
+    "hypothesis_description": "LiquidProxy.undelegateAmount computes `totalUndelegated` as the sum of requested amounts and immediately wraps+sends exactly that amount to the vault. If Ronin staking’s `bulkUndelegate` has a cooldown, returns less due to slashing/rounding, or returns asynchronously, the proxy may not have enough native RON to wrap, causing a revert; or it may wrap more than newly received by using residual RON on the proxy, distorting accounting.",
+    "investigation_rationale": "This is a fragile integration assumption with practical likelihood in staking protocols (cooldowns and partial returns are common). If triggered, it can halt undelegations and prevent rebalancing or withdrawal funding.",
+    "config_dependent": true,
+    "deployment_assumptions": [
+      "Ronin staking bulkUndelegate does not synchronously transfer exact requested RON to caller in the same transaction (cooldown/partial return/slash)"
+    ],
+    "config_evidence": "Repo contains only interface; no Ronin staking implementation included. Must verify actual behavior at configured roninStaking address.",
+    "affected_functions": [
+      "undelegateAmount(uint256[] calldata _amounts, address[] calldata _consensusAddrs)"
+    ],
+    "affected_contracts": [
+      "LiquidProxy.sol"
+    ],
+    "inventory_refs": [
+      {
+        "file": "LiquidProxy.sol",
+        "function": "undelegateAmount(uint256[] calldata _amounts, address[] calldata _consensusAddrs)"
+      }
+    ],
+    "proof_of_signal": {
+      "file": "LiquidProxy.sol",
+      "lines": "88-97",
+      "pattern": "totalUndelegated=sum(_amounts); bulkUndelegate(...); _depositRONTo(vault, totalUndelegated) without checking actual balance delta"
+    },
+    "invariant_citation": {
+      "invariant_id": "INV-STATE-007",
+      "relationship": "DIRECT_VIOLATION"
+    },
+    "preconditions": [
+      "Operator/vault calls undelegateAmount with amounts > 0",
+      "Ronin staking does not transfer exact amount immediately OR any slashing/rounding occurs",
+      "Proxy has insufficient native balance to cover totalUndelegated at wrap time"
+    ],
+    "initial_code_evidence": {
+      "suspicious_location": "LiquidProxy.sol lines 88-97",
+      "vulnerable_pattern": "Assuming external protocol returns exact funds immediately; no balance-delta reconciliation",
+      "specific_concern": "Revert on wrap due to insufficient native balance; or mis-account by using residual proxy balance",
+      "missing_safeguards": "No check of address(this).balance before/after bulkUndelegate; no asynchronous claim/withdraw function"
+    },
+    "investigation_scope": {
+      "analysis_questions": [
+        "Does Ronin staking bulkUndelegate pay out immediately to msg.sender? Is there a waiting period?",
+        "Can undelegated amount differ from requested amounts (slashing/rounding)?",
+        "Can proxy have residual native RON that would be mixed into accounting?"
+      ],
+      "validation_requirements": [
+        "Fork test: call bulkUndelegate and inspect proxy balance delta",
+        "Simulate partial return (mock staking) and confirm revert in _depositRONTo",
+        "Add invariant tests around proxy balance changes and WRON transferred to vault"
+      ]
+    },
+    "preliminary_attack_scenario": "If Ronin staking introduces/has cooldowns, any undelegate attempt reverts because proxy tries to wrap unavailable RON. This blocks operators from making funds liquid, potentially preventing withdrawals and rebalancing.",
+    "prerequisites": [
+      "External protocol behavior mismatch"
+    ],
+    "potential_impact_if_confirmed": {
+      "financial_impact": "Potential withdrawal unavailability (liquidity deadlock) and operational failure of staking management",
+      "affected_users": "All users needing liquidity during stressed conditions",
+      "recovery_possibility": "May require new flow (claim later) and redeploy/migration"
+    },
+    "investigation_complexity": "medium",
+    "validation_priority": "high",
+    "test_coverage_gap": "No integration tests against Ronin staking undelegation semantics",
+    "technical_investigation_focus": {
+      "gas_analysis_needed": "low",
+      "capital_requirements": "none",
+      "execution_timing": "single transaction; or multi-step if protocol uses cooldown",
+      "detection_analysis": "Monitor undelegate tx reverts and proxy native balance behavior"
+    },
+    "original_category": "technical",
+    "original_specialist": "technical"
+  },
+  "validation_context": {
+    "relevant_contracts": [
+      "LiquidRon.sol",
+      "LiquidProxy.sol",
+      "ValidatorTracker.sol",
+      "RonHelper.sol",
+      "Pausable.sol",
+      "Escrow.sol"
+    ],
+    "filtered_test_context_available": false,
+    "filtered_test_files_count": 0,
+    "filtered_test_files": [],
+    "prompt_character_count": 144057
+  },
+  "validation_result": {
+    "validation_status": "CONFIRMED",
+    "confidence_level": "medium",
+    "mechanism": "missing balance-delta reconciliation on undelegation",
+    "impact_summary": "LiquidProxy.undelegateAmount assumes bulkUndelegate returns exact requested RON synchronously. If it doesn't (cooldown/slashing/rounding), the function either reverts (blocking undelegation) or mis-accounts by using residual proxy RON.",
+    "detailed_analysis": "The undelegateAmount function in LiquidProxy.sol (lines 88-97) computes totalUndelegated as the sum of requested _amounts, calls bulkUndelegate on the external Ronin staking contract, then immediately calls _depositRONTo(vault, totalUndelegated). The _depositRONTo function wraps native RON via IWRON.deposit{value: amount}() and transfers the WRON to the vault. This pattern has two failure modes:\n\n1. **Insufficient RON (revert)**: If bulkUndelegate does not return the exact requested RON synchronously (e.g., cooldown period, slashing reduced the staked amount below requested, or rounding), the proxy's native balance will be less than totalUndelegated. The IWRON.deposit{value: totalUndelegated}() call will revert because msg.value exceeds available balance. This completely blocks undelegation.\n\n2. **Excess RON from residual balance (mis-accounting)**: The proxy has an open receive() function (LiquidProxy.sol line 98), allowing anyone to send native RON to it. If the proxy has residual RON (from prior interactions, donations, or partial previous operations), and bulkUndelegate returns less than requested, the residual RON could make up the difference, causing the function to succeed but sending RON that wasn't from the undelegation. This distorts the vault's accounting.\n\nThe correct pattern would be to record address(this).balance before calling bulkUndelegate, then after the call, compute the actual delta and send only that amount to the vault. This balance-delta reconciliation is a standard DeFi integration pattern that is missing here.",
+    "code_evidence_assessment": "LiquidProxy.sol lines 88-97 clearly show the vulnerable pattern: totalUndelegated is computed from input _amounts (not from actual balance received), bulkUndelegate is called, then _depositRONTo sends exactly totalUndelegated without any balance verification. RonHelper.sol lines 31-34 show _depositRONTo sends {value: amount} which will revert if native balance < amount. The Ronin staking contract implementation is not in scope, so we cannot verify whether bulkUndelegate returns exact amounts synchronously.",
+    "vulnerable_code_snippets": [
+      {
+        "function_name": "undelegateAmount",
+        "file_name": "LiquidProxy.sol",
+        "line_numbers": "88-97",
+        "code_snippet": "function undelegateAmount(uint256[] calldata _amounts, address[] calldata _consensusAddrs) external onlyVault {\n    uint256 totalUndelegated;\n    for (uint256 i = 0; i < _amounts.length; i++) {\n        totalUndelegated += _amounts[i];\n    }\n    IRoninValidator(roninStaking).bulkUndelegate(_consensusAddrs, _amounts);\n    _depositRONTo(vault, totalUndelegated);\n}",
+        "vulnerability_explanation": "totalUndelegated is computed from requested _amounts, not from the actual native RON received after bulkUndelegate. No balance-before/balance-after reconciliation is performed. If bulkUndelegate returns less RON than requested (slashing, rounding, cooldown), the _depositRONTo call either reverts (insufficient balance) or uses residual proxy RON (mis-accounting)."
+      },
+      {
+        "function_name": "_depositRONTo",
+        "file_name": "RonHelper.sol",
+        "line_numbers": "31-34",
+        "code_snippet": "function _depositRONTo(address to, uint256 amount) internal {\n    IWRON(wron).deposit{value: amount}();\n    IWRON(wron).transfer(to, amount);\n}",
+        "vulnerability_explanation": "This function sends exactly 'amount' native RON as msg.value to WRON deposit. If the contract's native balance is less than 'amount', the call reverts. There is no fallback or partial-send logic."
+      },
+      {
+        "function_name": "receive",
+        "file_name": "LiquidProxy.sol",
+        "line_numbers": "98",
+        "code_snippet": "receive() external payable {}",
+        "vulnerability_explanation": "Open receive function allows anyone to send native RON to the proxy. This residual RON can be mixed into undelegation accounting if bulkUndelegate returns less than expected but the residual covers the gap."
+      }
+    ],
+    "execution_path_analysis": {
+      "entry_point": "LiquidRon.undelegateAmount (LiquidRon.sol:~175)",
+      "calling_sequence": [
+        "1. Operator calls LiquidRon.undelegateAmount(_proxyIndex, _amounts, _consensusAddrs)",
+        "2. LiquidRon calls ILiquidProxy(stakingProxies[_proxyIndex]).undelegateAmount(_amounts, _consensusAddrs)",
+        "3. LiquidProxy.undelegateAmount sums _amounts into totalUndelegated (lines 89-91)",
+        "4. LiquidProxy calls IRoninValidator(roninStaking).bulkUndelegate(_consensusAddrs, _amounts) (line 93)",
+        "5. LiquidProxy calls _depositRONTo(vault, totalUndelegated) (line 94)",
+        "6. _depositRONTo calls IWRON(wron).deposit{value: totalUndelegated}() - REVERTS if balance < totalUndelegated",
+        "7. _depositRONTo calls IWRON(wron).transfer(vault, totalUndelegated)"
+      ],
+      "vulnerable_code_path": "At step 4, bulkUndelegate is called on the external Ronin staking contract. The actual RON returned to the proxy depends entirely on the staking contract's implementation. At step 5-6, the code assumes the proxy now has at least totalUndelegated native RON. If bulkUndelegate has a cooldown (RON not returned in same tx), returned less due to slashing, or rounds down, the IWRON.deposit{value: totalUndelegated} at step 6 will revert because the proxy's native balance is insufficient. No balance-delta check exists between steps 4 and 5."
+    },
+    "config_validation": {
+      "is_config_dependent": true,
+      "deployment_assumptions_checked": [
+        "Ronin staking bulkUndelegate does not synchronously transfer exact requested RON to caller in the same transaction (cooldown/partial return/slash)"
+      ],
+      "deployment_evidence": "Deployment script (LiquidRon_saigon.s.sol) sets ronStaking = 0x9C245671791834daf3885533D24dce516B763B28 on Saigon testnet. The script calls delegateAmount but does not test undelegateAmount. The actual Ronin staking contract implementation is not provided in scope - only the IRoninValidator interface is available. The interface declares bulkUndelegate(address[],uint256[]) but provides no guarantees about synchronous return of funds.",
+      "config_conclusion": "UNVERIFIABLE"
+    },
+    "attack_scenario_validation": "Scenario 1 (DoS): If Ronin staking has or introduces a cooldown on undelegation (common in PoS staking protocols), every call to undelegateAmount will revert at _depositRONTo because the proxy won't have native RON to wrap. This blocks operators from unstaking funds, preventing withdrawal funding and rebalancing. Scenario 2 (Mis-accounting): If a validator is slashed, reducing staked amounts below the requested undelegation, bulkUndelegate may return less. If the proxy has residual native RON (anyone can send RON via open receive()), the function may succeed but sends RON that wasn't from the undelegation, distorting the vault's asset tracking. Scenario 3 (Excess accounting): If the proxy has accumulated residual RON from donations or prior operations, and bulkUndelegate works correctly, the excess RON sits unused. But in edge cases where bulkUndelegate returns slightly less due to rounding, the residual RON silently covers the gap, masking the accounting discrepancy.",
+    "impact_assessment": "If the Ronin staking contract does not return exact RON synchronously on bulkUndelegate: (1) All undelegation operations become non-functional, blocking operators from making staked funds liquid. (2) Withdrawal requests cannot be funded if vault WRON balance is insufficient, as operators cannot undelegate to replenish it. (3) Rebalancing between validators via undelegate+delegate path is broken. (4) In the residual balance scenario, vault accounting is distorted. The severity is HIGH for DoS impact, MEDIUM for accounting distortion.",
+    "recommended_mitigations": [
+      "Implement balance-delta reconciliation: record uint256 balBefore = address(this).balance before bulkUndelegate, compute uint256 actualReceived = address(this).balance - balBefore after the call, and use actualReceived in _depositRONTo instead of totalUndelegated.",
+      "Add a separate claimUndelegated() function to handle asynchronous undelegation flows (cooldown-based staking protocols).",
+      "Consider adding a sweep function to handle residual native RON on the proxy, with proper access control.",
+      "Add integration tests against the actual Ronin staking contract (fork tests on Saigon/mainnet) to verify bulkUndelegate returns exact RON synchronously."
+    ],
+    "inventory_refs": [
+      {
+        "file": "LiquidProxy.sol",
+        "function": "undelegateAmount(uint256[],address[])"
+      },
+      {
+        "file": "RonHelper.sol",
+        "function": "_depositRONTo(address,uint256)"
+      },
+      {
+        "file": "LiquidProxy.sol",
+        "function": "receive()"
+      }
+    ],
+    "replication_plan": "1. Deploy a mock Ronin staking contract that implements bulkUndelegate with a cooldown (does not return RON immediately). 2. Deploy LiquidRon + LiquidProxy pointing to the mock. 3. Delegate some RON via delegateAmount. 4. Call undelegateAmount and observe the revert at _depositRONTo. 5. Alternatively, deploy a mock that returns slightly less than requested (simulating slashing). 6. Send residual RON to the proxy before undelegation. 7. Call undelegateAmount and verify the accounting distortion (vault receives RON that wasn't from undelegation).",
+    "uncertainties": [
+      "The actual behavior of Ronin staking's bulkUndelegate is unknown - the implementation is not in scope. If it always returns exact amounts synchronously, the revert scenario doesn't apply in the current deployment.",
+      "Whether the Ronin staking contract can be upgraded to change undelegation behavior in the future.",
+      "Whether slashing on Ronin validators can cause the staked amount to be less than the requested undelegation amount.",
+      "The degree to which residual RON accumulation on the proxy is realistic in practice."
+    ],
+    "additional_testing_needed": [
+      "Fork test on Saigon testnet: delegate RON, then call undelegateAmount, verify proxy receives exact RON synchronously from bulkUndelegate.",
+      "Fork test: simulate validator slashing (if possible) and verify undelegation behavior.",
+      "Test with residual RON on proxy before undelegation to verify accounting behavior.",
+      "Check Ronin staking contract source code / documentation for undelegation semantics (cooldown, immediate, partial returns)."
+    ]
+  }
+}

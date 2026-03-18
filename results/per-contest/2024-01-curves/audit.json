@@ -1,0 +1,391 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Broken onlyOwner/onlyManager Modifiers Enable Complete Protocol Takeover",
+      "severity": "high",
+      "summary": "Security.sol modifiers onlyOwner and onlyManager evaluate boolean expressions as no-op statements (`msg.sender == owner;` and `managers[msg.sender] == true;`) without require/revert. Every function guarded by these modifiers is effectively publicly callable by any address. An attacker can call transferOwnership to become owner, setManager to become manager, setProtocolFeePercent to redirect all protocol fees, setFeeRedistributor to a malicious contract, and setERC20Factory to deploy backdoored t",
+      "description": [
+        {
+          "file": "Security.sol",
+          "line_start": 8,
+          "line_end": 15,
+          "desc": "modifier onlyOwner() { msg.sender == owner; _; } — boolean expression as statement with no require/if-revert, compiles as no-op"
+        }
+      ],
+      "impact": "CRITICAL — Complete protocol takeover. All administrative functions are publicly callable. An attacker can: (1) Become owner and manager of all contracts, (2) Redirect all protocol fees to themselves, (3) Replace the fee redistributor to steal holder fees, (4) Replace the ERC20 factory to deploy malicious token contracts, (5) Call onBalanceChange to wipe any user's accumulated fees, (6) Call addFees with arbitrary parameters to manipulate fee distribution. This affects all protocol users and all funds in the system.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Weaponized onBalanceChange Wipes Victim's Unclaimed Fees Due to Broken Access Control",
+      "severity": "high",
+      "summary": "Due to the broken onlyManager modifier (TECH-H001), anyone can call FeeSplitter.onBalanceChange(token, victim). This function sets userFeeOffset[victim] = cumulativeFeePerToken WITHOUT first calling updateFeeCredit to save accumulated fees to unclaimedFees. This permanently destroys the victim's unclaimed fee entitlements.",
+      "description": [
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 90,
+          "line_end": 93,
+          "desc": "onBalanceChange sets data.userFeeOffset[account] = data.cumulativeFeePerToken without calling updateFeeCredit first; combined with broken onlyManager allowing any caller"
+        },
+        {
+          "file": "Security.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: onlyManager"
+        }
+      ],
+      "impact": "CRITICAL: Any user's accumulated holder fees can be permanently destroyed by any external address at zero cost. This affects all token holders across all Curves tokens. The attack is repeatable, automatable, and costs only gas. The wiped fees remain in the FeeSplitter but are no longer attributable to any user, effectively creating a permanent loss for victims while potentially being claimable by other holders whose offsets haven't been manipulated.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "DoS on All Trading by Wrapping All Tokens to ERC20 — addFees Reverts on Zero totalSupply",
+      "severity": "high",
+      "summary": "FeeSplitter.totalSupply() returns (curvesTokenSupply - curvesTokenBalance[token][address(curves)]) * PRECISION, excluding tokens locked in Curves (wrapped to ERC20). If all circulating tokens are withdrawn to ERC20, totalSupply becomes 0, causing addFees to revert with NoTokenHolders. Since _transferFees calls addFees (when holdersFeePercent > 0), ALL buys and sells revert, completely halting trading for that token.",
+      "description": [
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 34,
+          "line_end": 37,
+          "desc": "totalSupply excludes tokens held by Curves contract; addFees reverts if totalSupply_ == 0; _transferFees calls addFees when holdersFeePercent > 0"
+        },
+        {
+          "file": "Curves.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: _transferFees"
+        }
+      ],
+      "impact": "HIGH severity. While buys continue to work (supply incremented before fee distribution), certain sells are permanently blocked when they would cause totalSupply to reach 0. This means: (1) Users can be trapped with unsellable tokens, (2) Other users' withdraw-to-ERC20 actions can unilaterally create this condition, (3) The user's only recourse is to also withdraw to ERC20 (losing ability to sell through bonding curve). Recovery is possible if someone deposits ERC20 tokens back, but this requires voluntary cooperation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Withdraw-Deposit Cycle Exploits Stale Fee Offsets for Disproportionate Fee Claims",
+      "severity": "high",
+      "summary": "Neither withdraw() nor deposit() call feeRedistributor.onBalanceChange. FeeSplitter reads live balances from Curves. An attacker can: (1) hold tokens with offset C0, (2) withdraw to ERC20 (balance drops to 0 in Curves, FeeSplitter sees 0 balance), (3) wait for fee distributions (cumulativeFeePerToken rises to C1, distributed among fewer holders), (4) deposit back (balance restored to N), (5) claim fees: owed = (C1 - C0) * N, capturing fees from the entire period including when they held 0 intern",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 293,
+          "line_end": 309,
+          "desc": "withdraw and deposit modify curvesTokenBalance via _transfer but never call feeRedistributor.onBalanceChange; FeeSplitter uses live balance reads with stale offsets"
+        },
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: updateFeeCredit"
+        }
+      ],
+      "impact": "HIGH financial impact. The attacker captures fees proportional to (C1-C0)*N where C1-C0 includes fee accumulation during a period they held zero internal tokens. This directly reduces the FeeSplitter's ETH balance available for legitimate claimants. If multiple users exploit this pattern, the FeeSplitter becomes insolvent — unable to pay all legitimate claimants. The attack can be repeated across multiple fee distribution periods for compounding effect. The attacker's tokens are never at risk (they hold ERC20 equivalents during the withdrawal period).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Referral Fee on Sells Permanently Locked When No Referral Defined",
+      "severity": "high",
+      "summary": "In _transferFees for sells, sellValue = price - protocolFee - subjectFee - referralFee - holderFee. When no referral is defined (referralFeeDestination == address(0)), the referral .call is skipped with `(true, bytes(''))`. The referralFee ETH is deducted from the seller's payout but never sent to anyone, permanently locked in the Curves contract.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 193,
+          "line_end": 196,
+          "desc": "When !referralDefined, referral .call is (true, bytes('')), skipping transfer; but sellValue already deducted referralFee"
+        }
+      ],
+      "impact": "Every sell transaction on a token subject without a referral destination loses the referralFee portion of ETH permanently. Sellers receive reduced payouts (sellValue has referralFee deducted) while the deducted amount stays in the contract. Over protocol lifetime, this represents significant cumulative ETH lockup. There is no admin function or mechanism to withdraw stuck ETH from the Curves contract.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Excess ETH from Buy Overpayment Permanently Locked in Curves Contract",
+      "severity": "high",
+      "summary": "_buyCurvesToken checks `if (msg.value < price + totalFee) revert InsufficientPayment()` but never refunds the difference when msg.value > price + totalFee. Any excess ETH remains permanently locked in the Curves contract with no extraction mechanism.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 218,
+          "line_end": 224,
+          "desc": "msg.value >= price + totalFee check with no refund of excess; all fee transfers use exact amounts, not remaining balance"
+        }
+      ],
+      "impact": "Every overpayment on any buy transaction results in permanent ETH loss for the buyer. While individual losses depend on the overpayment amount, the cumulative effect across all users is significant. Smart contract integrations are particularly vulnerable as they may intentionally overpay to handle price fluctuations. There is no recovery mechanism — no admin withdrawal, no user refund function, and the excess ETH becomes commingled with bonding curve backing funds.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Any Token Holder Can Deploy ERC20 via withdraw() Bypassing Subject's onlyTokenSubject",
+      "severity": "high",
+      "summary": "withdraw() calls _deployERC20 directly when no ERC20 exists, bypassing the onlyTokenSubject modifier on _mint(). Any holder of a curves token can trigger ERC20 deployment with default name/symbol (or whatever metadata was pre-set). Once deployed, ERC20TokenAlreadyMinted prevents the subject from choosing different metadata.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 293,
+          "line_end": 309,
+          "desc": "withdraw() calls _deployERC20 directly without onlyTokenSubject check; _mint has the modifier but withdraw bypasses _mint"
+        }
+      ],
+      "impact": "MEDIUM severity. No direct financial loss occurs, but the subject permanently loses control over their ERC20 token's identity (name and symbol). This is a permanent, irreversible state change that affects the subject's branding and token discoverability. All subjects' ERC20 tokens would end up with generic 'Curves N' / 'CURVESN' names. The symbolToSubject mapping is also set with the default symbol, potentially causing collisions or confusion. In a protocol where token identity and branding are important for subjects, this is a meaningful loss of control.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "FeeSplitter userTokens Array Accumulates Unbounded Duplicates Causing DoS on Batch Claims",
+      "severity": "high",
+      "summary": "FeeSplitter.onBalanceChange pushes token to userTokens[account] every time it's called with balance > 0, without checking for duplicates. Since onBalanceChange is called on every buy (and can be called by anyone due to broken onlyManager), the array grows unboundedly with duplicate entries. getUserTokensAndClaimable and batchClaiming iterate this array, eventually hitting gas limits.",
+      "description": [
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 92,
+          "line_end": 92,
+          "desc": "if (balanceOf(token, account) > 0) userTokens[account].push(token); — no duplicate check, called on every buy and externally callable"
+        }
+      ],
+      "impact": "MEDIUM severity confirmed. The code defect is real: unbounded duplicate array growth with no pruning mechanism. With broken access control, any user's userTokens can be bloated by anyone at gas-only cost. getUserTokensAndClaimable becomes unusable on-chain. However, the financial impact is limited because: (1) batchClaiming uses caller-supplied list, not userTokens, (2) claimFees works per-token without iterating, (3) no fee double-counting occurs from duplicates. Storage bloat is permanent and irrecoverable.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "FeeSplitter payout via transfer() can permanently block claims for contract wallets, stranding earned ETH",
+      "severity": "high",
+      "summary": "FeeSplitter.claimFees and batchClaiming use payable(msg.sender).transfer(...), which forwards only 2300 gas and reverts for many smart contract wallets/multisigs or accounts with complex receive/fallback logic. Such users can become unable to claim earned fees, effectively locking their entitlements.",
+      "description": [
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 58,
+          "line_end": 66,
+          "desc": "Uses `.transfer(claimable)` and `.transfer(totalClaimable)` which reverts if recipient requires >2300 gas"
+        }
+      ],
+      "impact": "MEDIUM severity. Users operating through smart contract wallets (a growing proportion of Ethereum users, especially on L2s) permanently lose access to their earned holder fees. The ETH remains locked in FeeSplitter with no recovery mechanism. While this doesn't enable theft, it causes permanent loss of earned fees for a meaningful user demographic. Notably, Curves.sol itself uses .call{value:}(\"\") for ETH transfers in _transferFees, demonstrating awareness of the safer pattern, making the use of .transfer() in FeeSplitter inconsistent and clearly a defect.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Bonding curve getPrice underflows for supply=0 and amount>1, preventing multi-mint bootstrap and causing unintended DoS for initial buy-with-name/presale setup",
+      "severity": "high",
+      "summary": "getPrice uses (supply - 1 + amount) where supply is uint256. When supply=0 and amount>1, (supply - 1) underflows and reverts in Solidity 0.8.7, breaking initial purchases that attempt to buy more than 1 token (e.g., buyCurvesTokenWithName with amount>1).",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 60,
+          "line_end": 68,
+          "desc": "getPrice computes `supply - 1 + amount` and `2 * (supply - 1 + amount) + 1`; underflows when supply==0 and amount>1"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect prevents multi-token initialization of curves in a single atomic transaction. Subjects must buy exactly 1 token initially, then buy more in subsequent transactions. This creates a non-atomic bootstrap process that is vulnerable to frontrunning/sandwich attacks between transactions. The workaround exists (sequential buys) but introduces MEV risk and extra gas costs. The defect also affects buyCurvesTokenForPresale, meaning presale bootstrapping with amount>1 fails.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "buy amount=0 allows zero-cost state updates and downstream bloat (ownedCurvesTokenSubjects), enabling gas griefing and storage growth",
+      "severity": "high",
+      "summary": "Curves.buyCurvesToken does not enforce amount>0. For supply>0 subjects, getPrice(supply,0) returns 0 and fees are 0, so a caller can execute _buyCurvesToken with msg.value=0, triggering ownership tracking updates and (if holders fees enabled) FeeSplitter hooks. This can be spammed to bloat per-user subject lists and/or FeeSplitter.userTokens via onBalanceChange side effects.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 128,
+          "line_end": 148,
+          "desc": "_buyCurvesToken has no `require(amount > 0)`; updates balances/supply by `+= amount` and may call _addOwnedCurvesTokenSubject when prior balance was 0"
+        }
+      ],
+      "impact": "MEDIUM severity confirmed. Primary impact: (1) Unbounded growth of FeeSplitter.userTokens[attacker] via duplicate pushes — makes batchClaiming/getUserTokensAndClaimable fail with OOG for the attacker's address. (2) Growth of ownedCurvesTokenSubjects[attacker] across many subjects at zero ETH cost — makes transferAllCurvesTokens fail with OOG. (3) Wasted storage and event emissions. The DoS is primarily self-inflicted (attacker's own arrays), but there are scenarios where this matters: e.g., a contract wallet whose transfer functionality relies on transferAllCurvesTokens, or UI that calls getUserTokensAndClaimable for display. Additionally, the onBalanceChange call resets the attacker's own fee offset, which is a separate issue (INV-STATE-001).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unprotected setCurves() Enables Complete FeeSplitter Drain via Malicious Contract",
+      "severity": "high",
+      "summary": "FeeSplitter.setCurves() has NO access control modifier whatsoever. An attacker can deploy a malicious contract that returns fabricated balance/supply values, call setCurves() to point to it, then call claimFees() to drain all ETH from the FeeSplitter. The malicious contract returns a huge balance for the attacker (inflating owed fees) and the attacker claims everything.",
+      "description": [
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 26,
+          "line_end": 28,
+          "desc": "function setCurves(Curves curves_) public { curves = curves_; } — no modifier, no access check"
+        }
+      ],
+      "impact": "CRITICAL — Complete loss of all ETH held in the FeeSplitter contract. All token holders lose their accumulated and future fee distributions. The attack requires minimal capital (gas costs only), can be executed in a single block, and drains 100% of the contract's ETH balance.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "FeeSplitter Insolvency via Transfer-Based Fee Double-Claiming",
+      "severity": "high",
+      "summary": "The _transfer function does not notify FeeSplitter (no onBalanceChange call). When tokens are transferred to a fresh address, the recipient's userFeeOffset is 0, allowing them to claim all historical fees. If the sender claims first, then transfers to a fresh address which claims again, the FeeSplitter pays out more than it holds, becoming insolvent and leaving other holders unable to claim.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 225,
+          "line_end": 236,
+          "desc": "_transfer updates balances without calling feeRedistributor.onBalanceChange for sender or receiver"
+        },
+        {
+          "file": "FeeSplitter.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: claimFees"
+        }
+      ],
+      "impact": "CRITICAL. The FeeSplitter can be fully drained by any token holder who performs a claim→transfer→claim cycle. All other token holders lose their unclaimed fees permanently. The attack is repeatable until the FeeSplitter is empty. With multiple subjects, the attacker can drain fees across all tokens. The attack requires only gas costs and temporary token holding.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Fee Manipulation via Broken Access Control Enables Sell Lockout and Fund Trapping",
+      "severity": "high",
+      "summary": "Due to broken onlyManager modifier, anyone can call setMaxFeePercent followed by setExternalFeePercent to set total fees ≥ 100% (1 ether). When totalFee >= price, getSellPriceAfterFee underflows (price - totalFee), and _transferFees computes negative sellValue. Sellers cannot sell tokens, permanently trapping their funds in the bonding curve.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 213,
+          "line_end": 218,
+          "desc": "sellValue = price - protocolFee - subjectFee - referralFee - holderFee — underflows if total fees >= price"
+        }
+      ],
+      "impact": "CRITICAL. An attacker can permanently block all sell operations protocol-wide with two transactions costing only gas. All token holders across all curves would be unable to sell their tokens, effectively trapping all ETH locked in the bonding curve. The attacker could also set protocolFeePercent via setProtocolFeePercent (also unprotected via broken onlyOwner) to redirect buy fees to themselves while sells are blocked, extracting value from any new buyers.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unbacked ERC20 Minting via Broken Access Control on Factory Setter",
+      "severity": "high",
+      "summary": "Broken access control allows anyone to replace the ERC20 factory, enabling the deployment of malicious ERC20 tokens that break the 1:1 backing invariant.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 151,
+          "line_end": 153,
+          "desc": "setERC20Factory protected by broken onlyOwner modifier"
+        },
+        {
+          "file": "CurvesERC20Factory.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: deploy"
+        }
+      ],
+      "impact": "CRITICAL: The broken access control on setERC20Factory allows any address to replace the factory with a malicious one. This enables deploying backdoored ERC20 tokens that can be minted without corresponding locked internal tokens, breaking the core 1:1 peg invariant (INV-ECON-002). While the internal bonding curve ETH is protected by the deposit() balance check, the unbacked ERC20 tokens can be sold on external DEXes, defrauding liquidity providers. Additionally, already-deployed legitimate ERC20s are unaffected (they're already deployed), but any subject that hasn't deployed their ERC20 yet is vulnerable. This also enables a timing attack where the attacker replaces the factory before a popular new subject launches.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ERC20 Symbol Squatting via Global Registry",
+      "severity": "high",
+      "summary": "The global symbol registry allows any user to permanently claim valuable ERC20 symbols by creating a cheap curve, enabling extortion of legitimate projects.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 435,
+          "line_end": 435,
+          "desc": "if (symbolToSubject[symbol] != address(0)) revert InvalidERC20Metadata();"
+        }
+      ],
+      "impact": "MEDIUM-HIGH. The global symbol namespace can be exhaustively squatted at near-zero cost. Popular symbols, brand names, and influencer-associated tokens can be permanently blocked or held for ransom. This damages the protocol's usability, brand trust, and creates phishing risks where users might interact with squatter's tokens thinking they are legitimate. While the curve itself is tied to the attacker's address (so users can distinguish), the ERC20 symbol on external DEXs/wallets would show the squatted name, enabling social engineering attacks.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Protocol Fee and Referral Fee Permanently Locked in Curves Contract on Sells",
+      "severity": "high",
+      "summary": "In _transferFees during sells, the sellValue sent to the seller is computed as price - protocolFee - subjectFee - referralFee - holderFee. The protocolFee is deducted from the seller's payout but never forwarded to protocolFeeDestination (only the sellValue goes to firstDestination which is msg.sender on sells). Similarly, when no referral is defined, the referralFee is deducted from sellValue but the transfer is skipped (returns (true, bytes(''))), permanently locking both amounts in the Curves",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 196,
+          "line_end": 220,
+          "desc": "For sells: firstDestination=msg.sender, sellValue=price-protocolFee-subjectFee-referralFee-holderFee sent to seller. protocolFee is deducted but never sent anywhere on sells. referralFee skipped if no referral defined."
+        }
+      ],
+      "impact": "HIGH severity. Every sell permanently locks protocolFee (and referralFee when no referral is set) in the Curves contract. This causes: (1) Protocol loses all fee revenue from sells, (2) Sellers are charged fees that benefit nobody, (3) Locked ETH accumulates over time with no recovery mechanism, (4) Long-term contract solvency could be affected if bonding curve reserves are assumed to match theoretical values. The only fix is contract redeployment or upgrade.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Denial of Service Window at Exact Presale Start Time",
+      "severity": "high",
+      "summary": "There is a logical gap in the presale timing checks. `buyCurvesToken` reverts if `startTime >= block.timestamp`, and `buyCurvesTokenWhitelisted` reverts if `startTime <= block.timestamp`. At the exact block where `startTime == block.timestamp`, neither function can be called.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 213,
+          "line_end": 213,
+          "desc": "Mutually exclusive boundary conditions (`>=` and `<=`) creating a dead zone"
+        }
+      ],
+      "impact": "The impact is a temporary denial of service (one block) at the presale-to-public transition point. All users attempting to buy tokens during this block will have their transactions revert and waste gas. While the issue resolves automatically in the next block, it violates the design invariant that trading should transition smoothly from presale to public sale (INV-STATE-010). The practical impact is low-to-medium: wasted gas for users, potential confusion during high-profile token launches, and a brief delay in the actual public sale start.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Presale Whitelist Manipulation - Subject Can Change Merkle Root During Active Presale",
+      "severity": "high",
+      "summary": "setWhitelist allows the subject to change the merkle root when supply <= 1. Since the subject buys exactly 1 token during buyCurvesTokenForPresale (supply becomes 1), they can call setWhitelist during an active presale to change the whitelist, excluding already-whitelisted users or adding new users. Existing presale participants who planned to buy more tokens find their proofs invalidated.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 288,
+          "line_end": 295,
+          "desc": "setWhitelist: if (supply > 1) revert CurveAlreadyExists(); allows modification when supply == 1 (during active presale)"
+        }
+      ],
+      "impact": "The impact is a violation of presale integrity. Whitelisted users who were promised early access can be excluded mid-presale. The subject gains the ability to discriminate among buyers after seeing demand, creating an unfair advantage. While the economic impact depends on token demand, this fundamentally breaks the trust model of the whitelist presale mechanism. The vulnerability window exists from presale creation until the first non-subject purchase pushes supply above 1.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unbounded ownedCurvesTokenSubjects Array Growth Causes transferAllCurvesTokens Gas DoS",
+      "severity": "high",
+      "summary": "ownedCurvesTokenSubjects array never removes entries even when balance reaches 0 after selling. An attacker can inflate a victim's array by transferring 1 token from many different subjects to the victim's address. Each transfer calls _addOwnedCurvesTokenSubject which adds the subject (with O(n) duplicate check). When the victim calls transferAllCurvesTokens, the unbounded iteration causes out-of-gas.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 264,
+          "line_end": 271,
+          "desc": "_addOwnedCurvesTokenSubject iterates full array for duplicate check, never removes entries; array grows monotonically"
+        }
+      ],
+      "impact": "MEDIUM severity. The transferAllCurvesTokens function becomes permanently unusable for targeted accounts. This is a griefing/DoS attack with no direct fund theft. The victim retains the ability to transfer tokens individually via transferCurvesToken, but loses the batch migration functionality. The attack cost is very low (only gas for creating curves and transferring tokens, no ETH cost for token purchases).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "setNameAndSymbol Does Not Register Symbol - Parallel Subjects Race to Deploy Same Symbol",
+      "severity": "high",
+      "summary": "setNameAndSymbol stores name/symbol in externalCurvesTokens but does NOT register the symbol in symbolToSubject. Multiple subjects can set the same symbol simultaneously. Only the first to deploy ERC20 (via mint or withdraw) gets the symbol registered. The second deployment reverts with InvalidERC20Metadata, potentially after the subject has already promoted their token under that symbol.",
+      "description": [
+        {
+          "file": "Curves.sol",
+          "line_start": 321,
+          "line_end": 326,
+          "desc": "setNameAndSymbol checks symbolToSubject[symbol] != address(0) but does NOT set symbolToSubject[symbol] = curvesTokenSubject, allowing concurrent reservations"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect causes symbol squatting where an attacker can prevent a subject from using their chosen symbol. No direct fund loss occurs since the affected subject can recover by choosing a different symbol. However, if the subject has already promoted their token under a specific symbol (marketing, social media, etc.), the reputational/branding damage could be significant. Additionally, if a holder (not the subject) calls withdraw() before the subject notices the collision, the transaction reverts, causing gas waste and user confusion.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    }
+  ]
+}

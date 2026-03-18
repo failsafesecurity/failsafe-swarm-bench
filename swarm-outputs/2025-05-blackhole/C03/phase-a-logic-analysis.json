@@ -1,0 +1,466 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:52:25.082Z",
+    "duration_ms": 294227
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-emission-distribution",
+        "source": "MinterUpgradeable.update_period()",
+        "path": [
+          "MinterUpgradeable calculates _emission based on epoch phase (growth/decay/tail)",
+          "BLACK minted to MinterUpgradeable if balance insufficient",
+          "Team emissions transferred to team address",
+          "Rebase transferred to RewardsDistributor",
+          "Remaining (_gauge) approved and sent to GaugeManager.notifyRewardAmount()",
+          "GaugeManager computes index ratio from totalWeight from Voter",
+          "GaugeManager._distribute() per gauge computes share from supplyIndex delta * weight",
+          "Claimable accumulated per gauge, distributed via IGauge.notifyRewardAmount() or IGaugeCL.notifyRewardAmount()"
+        ],
+        "transformations": [
+          "weekly * tailEmissionRate / MAX_BPS (tail phase)",
+          "weekly * WEEKLY_GROWTH / MAX_BPS (growth phase, epochCount < 15)",
+          "weekly * WEEKLY_DECAY / MAX_BPS (decay phase)",
+          "_emission * teamRate / MAX_BPS (team cut)",
+          "calculate_rebase formula with smNFT bonus",
+          "amount * 1e18 / totalWeight (index ratio)",
+          "_supplied * _delta / 1e18 (gauge share)"
+        ],
+        "sinks": [
+          "team address (teamEmissions)",
+          "RewardsDistributor (rebase)",
+          "Individual gauges (emissions)",
+          "Minter (killed gauge claimable returned)"
+        ],
+        "trust_changes": "MinterUpgradeable is trusted to produce correct emission. GaugeManager trusts Voter.totalWeight() and Voter.weights() for proportional distribution",
+        "validation_points": [
+          "update_period checks block.timestamp >= active_period + WEEK",
+          "_distribute checks lastTimestamp < currentTimestamp",
+          "notifyRewardAmount requires msg.sender == minter"
+        ],
+        "exposure_risks": [
+          "Anyone can call distributeAll/distribute triggering Minter.update_period()",
+          "Killed gauge claimable returned to minter but share still computed from global index"
+        ],
+        "manipulation_risks": [
+          "Voting weight manipulation affects share distribution",
+          "Epoch timing attacks to influence when distribution occurs",
+          "smNFT balance double-counting in rebase calculation can cause underflow"
+        ]
+      },
+      {
+        "flow_id": "DF-002-fee-distribution-cl",
+        "source": "Algebra CL Pool trading fees accumulated in CommunityVault",
+        "path": [
+          "GaugeManager._distributeFees() called for CL pool",
+          "Reads token balances from CommunityVault",
+          "Calls IAlgebraCommunityVault.withdraw() for each token",
+          "Tokens sent to gauge (communityFeeReceiver)",
+          "IGaugeCL.claimFees() called on gauge",
+          "Gauge reads its own token balances",
+          "Deducts dibsPercentage and sends to dibs address",
+          "Remaining fees approved and sent to internal_bribe via notifyRewardAmount"
+        ],
+        "transformations": [
+          "Algebra fee deducted by vault during withdraw",
+          "referralFee = claimed * dibsPercentage / REFERRAL_FEE_DENOMINATOR",
+          "Net fees = claimed - dibsFee"
+        ],
+        "sinks": [
+          "dibs address (referral/foundation fees)",
+          "internal_bribe contract (LP fee rewards for voters)"
+        ],
+        "trust_changes": "GaugeManager calls vault.withdraw directly - requires appropriate permissions on vault. Gauge trusted to correctly compute and forward fees",
+        "validation_points": [
+          "isGauge and isAlive checks before distribution",
+          "isForPair check in _claimFees"
+        ],
+        "exposure_risks": [
+          "GaugeCL uses balanceOf(address(this)) to determine fees - any tokens sent to gauge are treated as fees",
+          "GaugeManager may lack permission to call vault.withdraw()"
+        ],
+        "manipulation_risks": [
+          "Sending tokens directly to gauge address inflates fee amounts",
+          "dibsPercentage has no upper bound - can be set to >= 1000 (100%+)",
+          "Race between withdraw calls could affect balance reads"
+        ]
+      },
+      {
+        "flow_id": "DF-003-bribe-rewards",
+        "source": "External bribe depositors via Bribe.notifyRewardAmount()",
+        "path": [
+          "Briber calls notifyRewardAmount with reward token and amount",
+          "Token transferred from briber to Bribe contract",
+          "Reward stored in tokenRewardsPerEpoch[token][epochStart]",
+          "Voter.vote() calls Bribe.deposit() to record voting weight",
+          "At claim time, earned() computes share = balanceOf * tokenRewardsPerEpoch / supply per epoch",
+          "GaugeManager.claimBribes() calls Bribe.getReward() which transfers earned to veNFT owner"
+        ],
+        "transformations": [
+          "cp0.balanceOf * tokenRewardsPerEpoch[_rewardToken][_currTs] / _supply per epoch",
+          "Accumulated across all epochs since lastEarn"
+        ],
+        "sinks": [
+          "veNFT owner (bribe rewards)",
+          "AVM original owner if NFT is in AVM"
+        ],
+        "trust_changes": "Voter is trusted to correctly call deposit/withdraw. GaugeManager trusted as sole caller of getReward",
+        "validation_points": [
+          "msg.sender == voter for deposit/withdraw",
+          "msg.sender == gaugeManager for getReward",
+          "isApprovedOrOwner or AVM originalOwner check in claimBribes",
+          "_isRewardToken check in notifyRewardAmount"
+        ],
+        "exposure_risks": [
+          "Silent failure in withdraw if amount > balance leads to supply desync",
+          "getReward sends to VE owner which could be AVM contract - requires AVM originalOwner lookup"
+        ],
+        "manipulation_risks": [
+          "Checkpoint manipulation via deposit/withdraw timing within same epoch",
+          "Supply checkpoint can be manipulated by large vote deposits right before epoch end",
+          "Bribe.withdraw silent failure can desync totalSupply from sum of balanceOf"
+        ]
+      },
+      {
+        "flow_id": "DF-004-gauge-creation",
+        "source": "User calls GaugeManager.createGauge(pool, gaugeType)",
+        "path": [
+          "Validate gaugeType < pairFactories.length",
+          "Validate pool has no existing gauge",
+          "Extract token0, token1 from pool",
+          "Validate tokens are whitelisted and at least one is connector",
+          "Deploy internal and external bribe contracts via BribeFactory",
+          "Deploy gauge via GaugeFactory (standard or CL)",
+          "For CL: set gauge as communityFeeReceiver, create eternal farming",
+          "Approve MAX uint256 of base token to gauge",
+          "Save bribe data, mark gauge alive, push pool to array"
+        ],
+        "transformations": [
+          "Pool address → gauge, internal_bribe, external_bribe addresses",
+          "supplyIndex[gauge] = global index (new gauge starts at current index)"
+        ],
+        "sinks": [
+          "gauges mapping (pool → gauge)",
+          "isGauge, isAlive, isCLGauge mappings",
+          "pools array",
+          "supplyIndex initialized"
+        ],
+        "trust_changes": "No access control on createGauge - anyone can create. Relies on token whitelist and connector checks",
+        "validation_points": [
+          "gaugeType range check",
+          "No duplicate gauge check",
+          "Pool code length check",
+          "Token whitelist and connector checks",
+          "isPair validation"
+        ],
+        "exposure_risks": [
+          "Unlimited approval to newly created gauge",
+          "Anyone can create gauges for whitelisted pairs, potentially creating spam"
+        ],
+        "manipulation_risks": [
+          "Creating gauge for malicious pool that returns controlled token0/token1",
+          "New gauge starts at current supplyIndex - misses prior emissions (intended behavior)"
+        ]
+      },
+      {
+        "flow_id": "DF-005-epoch-upkeep",
+        "source": "EpochController.performUpkeep() triggered by Chainlink Automation or EPOCH_MANAGER",
+        "path": [
+          "Checks condition via IMinter.check()",
+          "Calls genesisManager.checkAtEpochFlip()",
+          "Calls GaugeManager.distributeAll() which calls Minter.update_period() then distributes to all gauges",
+          "Calls GaugeManager.distributeFees() which claims fees for all pools"
+        ],
+        "transformations": [
+          "Epoch transition triggers emission minting and distribution"
+        ],
+        "sinks": [
+          "All gauges receive emissions",
+          "Internal bribes receive fees"
+        ],
+        "trust_changes": "automationRegistry or EPOCH_MANAGER role can trigger epoch flip",
+        "validation_points": [
+          "checkUpkeep validates timing condition",
+          "update_period has its own epoch boundary check"
+        ],
+        "exposure_risks": [
+          "genesisManager not set in initialize - reverts if not configured before first upkeep",
+          "performPreUpkeep uses automationRegistry2 which is also not initialized"
+        ],
+        "manipulation_risks": [
+          "EPOCH_MANAGER role holders can trigger epoch flip at will (if condition met)",
+          "No MEV protection on distribution ordering"
+        ]
+      },
+      {
+        "flow_id": "DF-006-cl-gauge-reward-claim",
+        "source": "User calls GaugeManager.claimRewards(gauge, nftIds, isBonusReward)",
+        "path": [
+          "GaugeManager iterates nftIds, calls IGaugeCL.getReward(tokenId, isBonusReward)",
+          "GaugeCL determines NFT owner via nonfungiblePositionManager.ownerOf(tokenId)",
+          "FarmingCenter.collectRewards() collects accrued rewards",
+          "FarmingCenter.claimReward() sends reward to NFT owner"
+        ],
+        "transformations": [
+          "tokenId → owner resolution",
+          "Reward collection from farming virtual pool"
+        ],
+        "sinks": [
+          "NFT owner receives reward tokens"
+        ],
+        "trust_changes": "GaugeManager is DISTRIBUTION, trusted by GaugeCL. No ownership verification of msg.sender for NFT positions",
+        "validation_points": [
+          "onlyDistribution modifier on getReward",
+          "NFT owner lookup from position manager"
+        ],
+        "exposure_risks": [
+          "Anyone can trigger reward claim for any NFT ID - forced claiming",
+          "Rewards always go to current NFT owner regardless of who called"
+        ],
+        "manipulation_risks": [
+          "Grief vector: force-claim rewards for other users at suboptimal times",
+          "If isBonusReward flag is wrong, wrong reward type is claimed"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "One gauge per pool - enforced by gauges[_pool] == address(0) check",
+        "Emissions distributed proportionally to voting weight per gauge",
+        "Gauges can be killed/revived by GOVERNANCE role - killed gauges return claimable to minter",
+        "Epoch-based system with WEEK = 1800 seconds (testing config, not production 7 days)",
+        "Three emission phases: growth (epochs 1-14, +3%/epoch), decay (epochs 15+, -1%/epoch), tail (weekly < TAIL_START)",
+        "Rebase mechanism prevents veNFT holder dilution",
+        "Fee distribution: trading fees → communityVault → gauge → dibs deduction → internal bribe",
+        "Bribe rewards proportional to voting weight checkpoint at epoch boundaries"
+      ],
+      "economic_incentives": [
+        "veNFT holders earn bribes by voting on gauges, incentivizing directing emissions to productive pools",
+        "LPs earn emissions proportional to gauge allocation from veNFT votes",
+        "Bribers deposit tokens to attract votes to specific pools, increasing emissions allocation",
+        "Team earns teamRate (up to 5%) of all emissions",
+        "Rebase compensates veNFT holders for dilution from new emissions",
+        "dibsPercentage referral fee extracted from trading fees before bribe distribution"
+      ],
+      "governance_mechanisms": [
+        "BlackGovernor allows proposals only targeting Minter.nudge()",
+        "Nudge adjusts tailEmissionRate by ±1% based on governance vote outcome",
+        "GAUGE_ADMIN role manages factories, bribes, minter configuration",
+        "GOVERNANCE role can kill/revive gauges",
+        "Emergency council can activate/deactivate emergency mode on CL gauges",
+        "Quorum based on smNFT past total supply, not overall veNFT supply"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "GaugeManager.setBribeFactory emits incorrect event",
+          "expected_behavior": "Event should emit (oldValue, newValue)",
+          "actual_behavior": "State is updated before event: bribefactory = _bribeFactory; then emit SetBribeFactory(bribefactory, _bribeFactory) emits (newValue, newValue)",
+          "risk_level": "low",
+          "exploitation_potential": "Off-chain monitoring and indexing tools will record incorrect old bribe factory address"
+        },
+        {
+          "scenario": "GaugeManager._setExternalBribe emits internal_bribes instead of external_bribes as old value",
+          "expected_behavior": "emit SetBribeFor(false, external_bribes[_gauge], _external, _gauge)",
+          "actual_behavior": "emit SetBribeFor(false, internal_bribes[_gauge], _external, _gauge) - wrong old value logged",
+          "risk_level": "low",
+          "exploitation_potential": "Off-chain tools and auditing will have incorrect historical records of external bribe changes"
+        },
+        {
+          "scenario": "BribeFactoryV3.addRewardsToBribes has inner loop indexing bug",
+          "expected_behavior": "Inner loop should iterate over _token[i].length for each bribe",
+          "actual_behavior": "Inner loop iterates k from 0 to _token.length (outer array length) but accesses _token[i][k], causing out-of-bounds if inner arrays are shorter or missing tokens if longer",
+          "risk_level": "medium",
+          "exploitation_potential": "Function will revert for most inputs where inner array lengths differ from outer array length, making it unusable. Could skip adding reward tokens to bribes."
+        },
+        {
+          "scenario": "BribeFactoryV3.recoverERC20AndUpdateData calls wrong function on bribe",
+          "expected_behavior": "Should call IBribe.recoverERC20AndUpdateData() to update bribe's tokenRewardsPerEpoch",
+          "actual_behavior": "Calls IBribe.emergencyRecoverERC20() which does NOT update tokenRewardsPerEpoch, leaving stale reward data",
+          "risk_level": "high",
+          "exploitation_potential": "Bribe contracts will have inflated tokenRewardsPerEpoch after recovery, causing users to claim rewards backed by insufficient token balance, leading to failed transfers for later claimants (insolvency)"
+        },
+        {
+          "scenario": "Bribes.withdraw silently fails when amount > balanceOf[tokenId]",
+          "expected_behavior": "Should revert or handle consistently when amount exceeds balance",
+          "actual_behavior": "The if(amount <= balanceOf[tokenId]) guard causes silent no-op, but Voter contract likely expects the withdrawal to succeed, creating desync between Voter's tracked weights and Bribe's actual balanceOf/totalSupply",
+          "risk_level": "high",
+          "exploitation_potential": "If Voter calls withdraw with amount > balance (due to rounding or logic error), totalSupply in Bribe remains inflated. This dilutes all voters' bribe rewards since supply used in earned() calculation is higher than actual deposited amounts. Conversely, individual balanceOf entries remain higher, skewing reward distribution."
+        },
+        {
+          "scenario": "MinterUpgradeable.calculate_rebase potential underflow from smNFT double-counting",
+          "expected_behavior": "circulatingBlack = blackSupply - veBlackSupply should always be non-negative",
+          "actual_behavior": "veBlackSupply = _veTotal + _smNFTBalance + _superMassiveBonus where _veTotal already includes smNFT locked tokens. Adding _smNFTBalance again double-counts, potentially making veBlackSupply > blackSupply, causing uint underflow revert",
+          "risk_level": "high",
+          "exploitation_potential": "If smNFT balances grow sufficiently, update_period() reverts on calculate_rebase underflow, blocking ALL emission distribution and halting the protocol's epoch progression"
+        },
+        {
+          "scenario": "GaugeFactoryCL.setReferralFee has no upper bound",
+          "expected_behavior": "dibsPercentage should be bounded below REFERRAL_FEE_DENOMINATOR (1000)",
+          "actual_behavior": "Any value can be set. If >= 1000, _claimFees will attempt to transfer more than claimed fees, reverting or if unchecked, draining gauge",
+          "risk_level": "medium",
+          "exploitation_potential": "Malicious or compromised GAUGE_ADMIN could set referralFee to >= 1000, causing fee distribution to revert (DoS on fee claims) or overflow/underflow in fee calculations"
+        },
+        {
+          "scenario": "GaugeFactoryCL.createEternalFarming requires reward tokens not transferred to factory",
+          "expected_behavior": "Factory should have reward tokens to seed initial farming incentive",
+          "actual_behavior": "Factory approves 1e10 reward tokens to AlgebraEternalFarming but never receives these tokens. If factory balance < 1e10, addRewards will fail and gauge creation reverts",
+          "risk_level": "high",
+          "exploitation_potential": "CL gauge creation will fail unless the factory is pre-funded with reward tokens. This is a deployment/operational issue that blocks CL gauge creation entirely."
+        },
+        {
+          "scenario": "GaugeCL.setInternalBribe has meaningless validation",
+          "expected_behavior": "Should validate _int is non-zero address",
+          "actual_behavior": "require(_int >= address(0)) is always true since every address >= address(0). Internal bribe can be set to address(0), breaking fee distribution",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner could accidentally set internal_bribe to address(0), causing _claimFees to revert when trying to approve/notifyRewardAmount on zero address"
+        },
+        {
+          "scenario": "GaugeManager.claimRewards for CL gauges has no caller ownership verification",
+          "expected_behavior": "Only NFT owner should be able to trigger reward claims",
+          "actual_behavior": "Any address can call claimRewards(gauge, nftIds, isBonusReward) for any NFT IDs. Rewards are sent to the NFT owner, not the caller",
+          "risk_level": "low",
+          "exploitation_potential": "Grief vector allowing anyone to force-claim rewards for other users at potentially suboptimal times (e.g., tax events, or claiming partial rewards)"
+        },
+        {
+          "scenario": "EpochController.genesisManager not initialized",
+          "expected_behavior": "genesisManager should be set during initialization",
+          "actual_behavior": "initialize() does not set genesisManager. performUpkeep() calls genesisManager.checkAtEpochFlip() which would revert on unset address",
+          "risk_level": "medium",
+          "exploitation_potential": "If setGenesisManager is not called before first upkeep, performUpkeep reverts, blocking epoch transitions until configured"
+        },
+        {
+          "scenario": "GaugeCL._claimFees uses balanceOf(this) as fee amount",
+          "expected_behavior": "Only trading fees should be counted",
+          "actual_behavior": "Any tokens sent to gauge address (accidentally or maliciously) are treated as fee income and forwarded to internal_bribe",
+          "risk_level": "low",
+          "exploitation_potential": "Could be used to inject arbitrary amounts into internal bribes, potentially manipulating bribe reward distribution or causing accounting confusion"
+        },
+        {
+          "scenario": "GaugeManager gives unlimited approval to each created gauge",
+          "expected_behavior": "Approval should be bounded to actual distribution amounts",
+          "actual_behavior": "IERC20(base).approve(_gauge, type(uint256).max) gives each gauge unlimited spending power on GaugeManager's base token balance",
+          "risk_level": "medium",
+          "exploitation_potential": "If a gauge contract is compromised or has a vulnerability, it could drain all base tokens from GaugeManager. All gauges share the same approval pool."
+        },
+        {
+          "scenario": "GaugeCL.notifyRewardAmount unsafe uint128 cast of rewardRate",
+          "expected_behavior": "rewardRate should be validated to fit in uint128",
+          "actual_behavior": "uint128(rewardRate) silently truncates if rewardRate > type(uint128).max",
+          "risk_level": "low",
+          "exploitation_potential": "Extremely large rewards could cause incorrect rate setting, but practically unlikely with normal token supplies"
+        }
+      ],
+      "assumption_violations": [
+        "WEEK = 1800 (30 minutes) in BlackTimeLibrary - likely testing config. If deployed to production, epoch boundaries are 30 minutes instead of 7 days, breaking all time-based economic assumptions",
+        "smNFTBalance is assumed to not be included in ve.balanceOf(ve) but the locked tokens ARE held by the ve contract, leading to double-counting in rebase calculation",
+        "GaugeManager assumes it has COMMUNITY_FEE_WITHDRAWER permission on Algebra vault to call withdraw(), but this role is defined but never configured",
+        "BribeFactoryV3 assumes Bribe contracts have addReward() function, but provided Bribe contract code does not include this function",
+        "GaugeFactoryCL assumes it holds sufficient reward tokens (1e10) for initial farming seeding during gauge creation"
+      ],
+      "game_theory_risks": [
+        "Voters can concentrate votes at end of epoch after seeing bribe deposits, minimizing their exposure window while maximizing bribe capture",
+        "Large veNFT holders can manipulate per-epoch supply checkpoints by timing deposit/withdraw around epoch boundaries to inflate their share of bribe rewards",
+        "Forced reward claiming (CL gauges) allows griefing by triggering claims at suboptimal times",
+        "Killed gauges still have their weight counted in totalWeight, meaning the killed gauge's emission share is sent back to Minter but reduces others' proportional share - emissions are effectively burned"
+      ],
+      "integration_risks": [
+        "Algebra CommunityVault integration assumes specific withdraw() access control that may not be granted to GaugeManager",
+        "AlgebraEternalFarming.setRates() called from GaugeManager._distribute() requires GaugeManager to have appropriate role on farming contract",
+        "Algebra farming incentiveKeys lookup by pool address assumes one-to-one mapping; multiple incentives per pool could cause key mismatch",
+        "IAlgebraPool.communityVault() return value assumed stable - if vault is upgraded, gauge fee receiver becomes stale"
+      ],
+      "calculation_errors": [
+        "GaugeManager.notifyRewardAmount: Math.max(totalWeight, 1) is redundant inside if(totalWeight > 0) block",
+        "MinterUpgradeable.calculate_rebase: potential uint underflow in circulatingBlack = blackSupply - veBlackSupply when smNFT balance is double-counted",
+        "Bribes.earned: uses getPriorBalanceIndex with _currTs + WEEK - 1 to find last checkpoint in epoch, but if no checkpoint exists in that epoch, it returns the most recent earlier one, which may belong to a prior epoch with different balance"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "BLACK",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted",
+            "non_standard_return"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Custom ERC20 with minter-restricted mint. Uses unchecked blocks for recipient balance in _mint and _transfer. No zero-address checks on transfer. transfer() and transferFrom() return bool but use raw _transfer. No EIP-2612 permit. initialMint of 500M tokens (comment says 50M but code mints 500M)."
+        },
+        {
+          "address_or_symbol": "veNFT (VotingEscrow)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "ERC721 NFT representing locked BLACK positions. Supports permanent locks, smNFT (supermassive NFT) with bonus voting power, and AVM delegation."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "one_gauge_per_pool",
+          "state_vars": [
+            "gauges[pool]"
+          ],
+          "description": "Each pool can have at most one gauge. Enforced by require(gauges[_pool] == address(0x0)) in _createGauge."
+        },
+        {
+          "name": "supply_conservation_bribes",
+          "state_vars": [
+            "totalSupply",
+            "sum(balanceOf[tokenId])"
+          ],
+          "description": "Bribe totalSupply should equal sum of all balanceOf entries. VIOLATED: withdraw() silently skips if amount > balanceOf, while Voter may track different amounts."
+        },
+        {
+          "name": "emission_conservation",
+          "state_vars": [
+            "_emission",
+            "_rebase",
+            "_teamEmissions",
+            "_gauge"
+          ],
+          "description": "_emission = _rebase + _teamEmissions + _gauge. Holds as long as calculate_rebase doesn't underflow."
+        },
+        {
+          "name": "gauge_claimable_accuracy",
+          "state_vars": [
+            "claimable[gauge]",
+            "index",
+            "supplyIndex[gauge]"
+          ],
+          "description": "claimable[gauge] should reflect accumulated emissions proportional to voting weight since last distribution. Killed gauges should have claimable = 0."
+        },
+        {
+          "name": "epoch_monotonic_progression",
+          "state_vars": [
+            "active_period",
+            "epochCount"
+          ],
+          "description": "active_period advances by WEEK increments. epochCount increments by 1 each update_period call."
+        },
+        {
+          "name": "black_initial_mint_guard",
+          "state_vars": [
+            "initialMinted"
+          ],
+          "description": "initialMint can only be called once. Comment says 50M but code mints 500 * 1e6 * 1e18 = 500M tokens."
+        }
+      ]
+    }
+  }
+}

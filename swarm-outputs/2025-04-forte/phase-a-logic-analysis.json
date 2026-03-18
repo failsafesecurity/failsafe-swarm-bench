@@ -1,0 +1,272 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T08:01:38.985Z",
+    "duration_ms": 555231
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User-provided packedFloat inputs (uint256 bitmapped values)",
+        "path": [
+          "Input packedFloat values passed to arithmetic functions",
+          "Bit extraction via AND masks: exponent, mantissa, sign, L-flag",
+          "Exponent alignment and mantissa scaling via assembly arithmetic",
+          "Core arithmetic operation (add/sub/mul/div in 256-bit or 512-bit)",
+          "Normalization of result to M (38-digit) or L (72-digit) form",
+          "Re-encoding into packedFloat via OR of fields"
+        ],
+        "transformations": [
+          "Mantissa extraction via MANTISSA_MASK (240-bit)",
+          "Exponent extraction via EXPONENT_MASK (14-bit) and offset by ZERO_OFFSET=8192",
+          "M-to-L upscaling via multiplication by BASE_TO_THE_DIGIT_DIFF (10^34)",
+          "2's complement conversion for signed subtraction",
+          "Normalization: digit counting and scaling to exactly 38 or 72 significant digits"
+        ],
+        "sinks": [
+          "Returned packedFloat output (single uint256 word)"
+        ],
+        "trust_changes": "All data stays within internal library; no external calls or state changes",
+        "validation_points": [
+          "Division by zero check in div()",
+          "Negative input check in sqrt()",
+          "Zero input early-return checks in add/sub/mul/div"
+        ],
+        "exposure_risks": [
+          "No access control - pure library, no stored state",
+          "Malformed packedFloat inputs (non-normalized) not validated on entry"
+        ],
+        "manipulation_risks": [
+          "Crafted non-normalized packedFloat inputs could bypass comparison logic",
+          "Negative-zero (sign bit set, mantissa zero) is not canonical but not rejected"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "packedFloat input to ln() function",
+        "path": [
+          "Extract mantissa, exponent, L-flag from input",
+          "Check if input == 1.0 (return 0)",
+          "Branch: argument > 1 (reciprocal + recursive ln) or argument <= 1 (argument reduction)",
+          "For arg <= 1: determine k (power of 2 multiplier), q1 (1.1^q1), q2 (1.014^q2), q3 (1.0013^q3)",
+          "Multiplier approximation via digit-by-digit integer arithmetic in calculateQ1/Q2/Q3",
+          "Taylor series computation: z + z^2/2 + ... + z^15/15",
+          "Final term combination: result + k*ln2 + q1*ln1.1 + q2*lnB + q3*lnC - m10*ln10"
+        ],
+        "transformations": [
+          "M-to-L mantissa scaling for argument reduction",
+          "76-digit integer arithmetic for multiplier approximations",
+          "Truncation to 38-digit z_int for Taylor series",
+          "packedFloat arithmetic for Taylor series and final combination"
+        ],
+        "sinks": [
+          "Returned packedFloat result of natural logarithm"
+        ],
+        "trust_changes": "Recursive call to ln() for arg > 1 case; all internal",
+        "validation_points": [
+          "Check input == 1.0 returns 0",
+          "No explicit check for negative inputs or zero"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Negative inputs silently accepted - sign bit ignored, computes ln(|input|)",
+          "Zero input not handled - would cause division by zero in reciprocal path",
+          "Taylor series with 15 terms may have insufficient precision for edge cases near 1.0"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "packedFloat inputs to comparison functions (lt, le, gt, ge, eq)",
+        "path": [
+          "Bitwise equality check (early return)",
+          "Extract sign, L-flag, mantissa, exponent",
+          "Normalize both to L-size (multiply M mantissa by 10^34, adjust exponent)",
+          "Branch on sign combinations",
+          "Compare exponents, then mantissas"
+        ],
+        "transformations": [
+          "M-to-L normalization for uniform comparison",
+          "Exponent field arithmetic in packed form"
+        ],
+        "sinks": [
+          "Boolean comparison result"
+        ],
+        "trust_changes": "None - pure comparison",
+        "validation_points": [
+          "Zero-value special handling",
+          "Sign-based branching"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "eq() uses bitwise comparison only - same value in M vs L representation returns false",
+          "le() and ge() use strict lt in body - equal values with different representations return incorrect results"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Mantissa must be exactly 38 digits (M) or 72 digits (L) after normalization",
+        "Exponent stored with offset 8192, range [-8192, +8191]",
+        "MAXIMUM_EXPONENT (-18) determines M/L auto-scaling threshold",
+        "Zero is canonically represented as packedFloat.wrap(0)",
+        "Sign stored in bit 240, L-flag in bit 241"
+      ],
+      "economic_incentives": [],
+      "governance_mechanisms": [],
+      "edge_cases": [
+        {
+          "scenario": "Comparing equal values with different precision modes (M vs L representation)",
+          "expected_behavior": "eq() returns true, le()/ge() return true for equal values",
+          "actual_behavior": "eq() returns false (bitwise comparison). le() and ge() return false because the body uses strict lt/gt comparisons that fail for equal mantissas after L-normalization.",
+          "risk_level": "high",
+          "exploitation_potential": "Any protocol using eq/le/ge for threshold checks or invariant validation could be bypassed. For example, a check like `require(Float128.le(balance, limit))` would fail for a balance that equals the limit but was computed through a different code path producing a different precision mode."
+        },
+        {
+          "scenario": "ln() called with negative packedFloat input",
+          "expected_behavior": "Should revert as ln of negative numbers is undefined for reals",
+          "actual_behavior": "Sign bit (bit 240) is ignored during mantissa/exponent extraction. The function silently computes ln(|input|) and returns it without the sign.",
+          "risk_level": "high",
+          "exploitation_potential": "Protocol invariants relying on ln() to reject negative inputs would be silently violated. DeFi pricing or interest rate calculations using ln of a potentially negative intermediate value would produce incorrect positive results instead of reverting."
+        },
+        {
+          "scenario": "ln() called with zero input",
+          "expected_behavior": "Should revert as ln(0) = -infinity",
+          "actual_behavior": "Zero input passes the check `exponent == ... && mantissa == ...` (which only checks for 1.0). Then ln_helper is called. In the first branch (positiveExp < MAX_DIGITS_M), division by mantissa=0 occurs in `BASE_TO_THE_MAX_DIGITS_M_X_2 / mantissa`, causing a revert.",
+          "risk_level": "medium",
+          "exploitation_potential": "While it does revert, the error message is a generic division-by-zero from EVM rather than a descriptive 'ln of zero' error, making debugging harder."
+        },
+        {
+          "scenario": "Addition/subtraction of numbers with extreme exponent difference (>77 for M-size, >255 for any size)",
+          "expected_behavior": "Smaller number becomes negligible, result equals the larger number",
+          "actual_behavior": "EVM `exp(10, adj)` opcode wraps modularly for adj > ~77. For adj >= 256, exp returns 0 and sdiv returns 0 (correct by coincidence). For 78 <= adj <= 255, the modular result is unpredictable; if it happens to be small, sdiv could return a large garbage value corrupting the addition.",
+          "risk_level": "medium",
+          "exploitation_potential": "Crafting two packedFloats with extreme exponent difference (78-255 digit difference) could produce incorrect arithmetic results. This requires very small and very large numbers to be added, which may occur in multi-step financial calculations."
+        },
+        {
+          "scenario": "Exponent underflow in add/sub when rawExp < MAX_DIGITS_M (38) for M-size numbers",
+          "expected_behavior": "Result exponent correctly computed as rawAExp - 38",
+          "actual_behavior": "Assembly `sub(aExp, shl(242, 38))` wraps in uint256 when rawAExp < 38, producing a massive exponent value. Subsequent normalization operates on this incorrect exponent, producing completely wrong results.",
+          "risk_level": "medium",
+          "exploitation_potential": "Adding two very small numbers (effective exponent < -8154 for M-size) produces incorrect results. While extreme, this could be triggered in scientific computing or deeply nested DeFi calculations."
+        },
+        {
+          "scenario": "sqrt() of very small positive number with rawExp < MAX_DIGITS_M in Heron's method branch",
+          "expected_behavior": "Correct square root computation",
+          "actual_behavior": "Assembly `sub(aExp, MAX_DIGITS_M)` or `sub(aExp, MAX_DIGITS_M_PLUS_1)` wraps for small rawExp. The subsequent `div(sub(aExp, ZERO_OFFSET), 2)` uses unsigned division on a wrapped value, producing a huge exponent in the result.",
+          "risk_level": "medium",
+          "exploitation_potential": "Square root of numbers with effective exponent below approximately -8154 produces incorrect results."
+        },
+        {
+          "scenario": "sub(0, b) where b is a non-canonical zero (e.g., packedFloat with exponent but zero mantissa)",
+          "expected_behavior": "Return negative zero or canonical zero",
+          "actual_behavior": "The check `gt(b, 0)` passes for any non-zero uint256, so the sign bit is XORed. The non-canonical zero with flipped sign is returned as the result, which is still not canonical zero.",
+          "risk_level": "low",
+          "exploitation_potential": "Non-canonical zeros propagate through subtraction operations, potentially causing subsequent comparison failures."
+        },
+        {
+          "scenario": "Taylor series precision for ln near 1.0 after argument reduction where z is close to max (0.014)",
+          "expected_behavior": "At least 38 digits of precision",
+          "actual_behavior": "15-term Taylor series with z ≈ 0.014 has truncation error ≈ z^16/16 ≈ (0.014)^16/16 ≈ 10^(-31). The z variable itself is truncated to 38 digits before Taylor series. Combined with accumulated rounding from 14 multiplications and divisions, precision may drop below 38 significant digits.",
+          "risk_level": "low",
+          "exploitation_potential": "Precision loss in ln() results could accumulate in downstream financial calculations, causing small but systematic errors in pricing or interest calculations."
+        },
+        {
+          "scenario": "Multiplication result normalization when Loperation is false but rExp underflows",
+          "expected_behavior": "Correct handling of small multiplication results",
+          "actual_behavior": "In mul(), `rExp := sub(add(shr(EXPONENT_BIT, aExp), shr(EXPONENT_BIT, bExp)), ZERO_OFFSET)` can underflow when both input exponents are small (sum of raw exponents < 8192). The unsigned underflow produces a huge rExp value, and subsequent normalization operates on this incorrect value.",
+          "risk_level": "medium",
+          "exploitation_potential": "Multiplying two very small numbers (product with effective exponent below representable range) produces incorrect large results instead of zero or minimum representable value."
+        },
+        {
+          "scenario": "Division exponent calculation rExp = (aExp + ZERO_OFFSET) - bExp with unchecked arithmetic",
+          "expected_behavior": "Correct quotient exponent",
+          "actual_behavior": "When dividing a very small number by a very large one, `(aExp + ZERO_OFFSET) - bExp` can underflow. The `unchecked` block explicitly allows this. While Solidity's `unchecked` prevents revert, the resulting huge rExp is incorrect.",
+          "risk_level": "low",
+          "exploitation_potential": "Dividing numbers at extreme ends of the representable range produces incorrect exponents."
+        }
+      ],
+      "assumption_violations": [
+        "The library assumes all packedFloat inputs are properly normalized (exactly 38 or 72 significant digits). Non-normalized inputs cause incorrect behavior in comparison and arithmetic operations.",
+        "eq() assumes that identical values always have identical bit representations. This is violated when the same mathematical value exists in both M-size and L-size formats.",
+        "le() and ge() assume the early bitwise equality check catches all equality cases. They fail when equal values have different M/L representations.",
+        "The EVM `exp` opcode is assumed to return 0 for very large exponents, but for exponents between 78 and 255, it returns non-zero wrapped values that can corrupt division results.",
+        "ln() assumes positive input but does not validate the sign bit, violating the mathematical domain of the natural logarithm."
+      ],
+      "game_theory_risks": [],
+      "integration_risks": [
+        "DeFi protocols using Float128 comparisons (eq, le, ge) for threshold checks will have incorrect behavior when comparing M-size and L-size representations of the same value.",
+        "Protocols relying on ln() for interest rate or pricing calculations could get silently incorrect results for negative inputs.",
+        "The Uint512 external library is trusted for 512-bit arithmetic correctness; any bug there propagates to mul, div, sqrt, and ln.",
+        "Protocols performing arithmetic at extreme value ranges (very small * very small, or adding numbers with >77 orders of magnitude difference) will get incorrect results."
+      ],
+      "calculation_errors": [
+        "le() uses `lt(aMan, bMan)` (strict less-than) instead of `iszero(gt(aMan, bMan))` (less-than-or-equal) for the same-exponent case, failing for equal values with different packed representations.",
+        "ge() uses `lt(bMan, aMan)` (strict less-than) instead of `iszero(gt(bMan, aMan))` (greater-than-or-equal) for the same-exponent case, with the same failure mode.",
+        "In add/sub, `sub(aExp, shl(EXPONENT_BIT, MAX_DIGITS_M))` causes unsigned wraparound when the raw exponent value is less than 38, producing a massive incorrect exponent.",
+        "In sqrt Heron's method branch, `sub(aExp, MAX_DIGITS_M)` or `sub(aExp, MAX_DIGITS_M_PLUS_1)` wraps for small aExp values, then `div(sub(aExp, ZERO_OFFSET), 2)` performs unsigned division on the wrapped value."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "packedFloat",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 0,
+          "notes": "Custom 256-bit packed floating-point type (user-defined value type wrapping uint256). Not an ERC20 token. Contains bit-mapped fields: 14-bit exponent (bits 242-255), L-flag (bit 241), sign (bit 240), mantissa (bits 0-239). Supports dual precision: 38-digit (M) and 72-digit (L)."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "mantissa_normalization",
+          "state_vars": [
+            "mantissa",
+            "L_flag"
+          ],
+          "description": "After any arithmetic operation, mantissa must have exactly 38 significant digits (M-size, L_flag=0) or 72 significant digits (L-size, L_flag=1). MIN_M_DIGIT_NUMBER <= mantissa_M <= MAX_M_DIGIT_NUMBER, MIN_L_DIGIT_NUMBER <= mantissa_L <= MAX_L_DIGIT_NUMBER."
+        },
+        {
+          "name": "zero_canonical_form",
+          "state_vars": [
+            "packedFloat"
+          ],
+          "description": "Zero must always be represented as packedFloat.wrap(0) with all bits zero. No negative zero or zero-mantissa-with-nonzero-exponent permitted."
+        },
+        {
+          "name": "sign_mantissa_separation",
+          "state_vars": [
+            "sign_bit",
+            "mantissa"
+          ],
+          "description": "Sign is stored independently in bit 240. Mantissa field (bits 0-239) must always be non-negative. The sign bit determines overall number sign."
+        },
+        {
+          "name": "exponent_range",
+          "state_vars": [
+            "exponent_field"
+          ],
+          "description": "Raw exponent field (14 bits) ranges 0-16383. Effective exponent = raw - 8192, ranging [-8192, +8191]. MAXIMUM_EXPONENT (-18) constrains auto M/L scaling."
+        },
+        {
+          "name": "comparison_consistency",
+          "state_vars": [
+            "eq_result",
+            "le_result",
+            "ge_result"
+          ],
+          "description": "VIOLATED: If eq(a,b) should be true (same mathematical value), then le(a,b) and ge(a,b) must also be true. This invariant is broken when a and b have different M/L representations of the same value."
+        }
+      ]
+    }
+  }
+}

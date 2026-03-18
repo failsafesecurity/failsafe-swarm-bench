@@ -1,0 +1,449 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T21:48:55.716Z",
+    "duration_ms": 265333
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-batch-posting",
+        "source": "Batch poster (EOA or contract)",
+        "path": [
+          "addSequencerL2BatchFromOrigin / addSequencerL2Batch / addSequencerL2BatchFromBlobs",
+          "isDelayProofRequired check",
+          "formCallDataHash / formBlobDataHash (pack header + data)",
+          "addSequencerL2BatchImpl",
+          "bridge.enqueueSequencerMessage",
+          "submitBatchSpendingReport (conditional)"
+        ],
+        "transformations": [
+          "packHeader: encodes timeBounds + afterDelayedMessagesRead into 40-byte header",
+          "formCallDataHash: keccak256(header ++ data)",
+          "formBlobDataHash: keccak256(header ++ DATA_BLOB_HEADER_FLAG ++ packed(dataHashes))",
+          "blobCost normalization: blobBaseFee * GAS_PER_BLOB * count / block.basefee"
+        ],
+        "sinks": [
+          "Bridge sequencer inbox accumulator",
+          "Delayed message queue (spending report)"
+        ],
+        "trust_changes": "User input (data) becomes authenticated on-chain via batch poster role check and data hash commitment",
+        "validation_points": [
+          "isBatchPoster[msg.sender] check",
+          "msg.sender == tx.origin for Origin variants",
+          "isValidCallDataFlag for calldata header byte",
+          "afterDelayedMessagesRead bounds checking",
+          "sequenceNumber consistency check",
+          "maxDataSize limit"
+        ],
+        "exposure_risks": [
+          "Calldata is publicly visible on L1",
+          "Blob data hashes are publicly readable via reader4844"
+        ],
+        "manipulation_risks": [
+          "Batch poster can choose any valid data flag header byte",
+          "sequenceNumber ~uint256(0) bypass allows any sequence number",
+          "DAS keyset hash validation only if DAS header flag set and data.length >= 33"
+        ]
+      },
+      {
+        "flow_id": "DF-02-force-inclusion",
+        "source": "Any external account (permissionless)",
+        "path": [
+          "forceInclusion called with delayed message parameters",
+          "Validate _totalDelayedMessagesRead > totalDelayedMessagesRead",
+          "Reconstruct messageHash from parameters",
+          "If isDelayBufferable: buffer.update(l1BlockAndTime[0]) then compute delayBufferableBlocks",
+          "Check l1BlockAndTime[0] + delayBlocks_ < block.number",
+          "Verify message against bridge.delayedInboxAccs",
+          "formEmptyDataHash + addSequencerL2BatchImpl"
+        ],
+        "transformations": [
+          "Messages.messageHash reconstructs message hash from kind, sender, block, time, nonce, baseFeeL1, messageDataHash",
+          "Messages.accumulateInboxMessage computes accumulator from prevAcc + messageHash",
+          "buffer.update modifies buffer state based on delayed message block number"
+        ],
+        "sinks": [
+          "Bridge sequencer inbox accumulator",
+          "Buffer state update"
+        ],
+        "trust_changes": "Anyone can trigger but message is validated against bridge delayed inbox accumulator - no trust escalation possible",
+        "validation_points": [
+          "_totalDelayedMessagesRead > totalDelayedMessagesRead",
+          "Block number delay check (l1BlockAndTime[0] + delayBlocks_ < block.number)",
+          "Delayed inbox accumulator verification"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "MISSING timestamp-based delay check (ForceIncludeTimeTooSoon error defined but never used) - only block-based check enforced",
+          "Buffer update with user-supplied l1BlockAndTime[0] could affect delay buffer state for subsequent operations"
+        ]
+      },
+      {
+        "flow_id": "DF-03-delay-proof",
+        "source": "Batch poster",
+        "path": [
+          "addSequencerL2BatchFromBlobsDelayProof / addSequencerL2BatchFromOriginDelayProof / addSequencerL2BatchDelayProof",
+          "delayProofImpl: check afterDelayedMessagesRead > totalDelayedMessagesRead",
+          "delayProofImpl: check buffer.isUpdatable()",
+          "delayProofImpl: fetch bridge.delayedInboxAccs(totalDelayedMessagesRead)",
+          "delayProofImpl: validate delay proof against delayed accumulator",
+          "buffer.update(delayProof.delayedMessage.blockNumber)",
+          "Proceed to addSequencerL2BatchFromCalldataImpl or addSequencerL2BatchFromBlobsImpl"
+        ],
+        "transformations": [
+          "Messages.isValidDelayedAccPreimage validates proof against accumulator",
+          "buffer.update: calcPendingBuffer then store new prevBlockNumber and prevSequencedBlockNumber"
+        ],
+        "sinks": [
+          "BufferData storage (prevBlockNumber, prevSequencedBlockNumber, bufferBlocks)"
+        ],
+        "trust_changes": "Delay proof validated against on-chain accumulator before buffer modification",
+        "validation_points": [
+          "isDelayBufferable check",
+          "isBatchPoster check",
+          "Messages.isValidDelayedAccPreimage",
+          "buffer.isUpdatable guard"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If buffer.isUpdatable() returns false (synced AND full), the proof is silently skipped and buffer is not updated",
+          "delayProof.delayedMessage.blockNumber directly used in buffer.update - validated only via accumulator check"
+        ]
+      },
+      {
+        "flow_id": "DF-04-staking-pool-lifecycle",
+        "source": "Staking pool depositors",
+        "path": [
+          "depositIntoPool: deposit stake tokens",
+          "createAssertion/createEdge: approve + call rollup/challengeManager",
+          "makeStakeWithdrawable + withdrawStakeBackIntoPool: recover stake",
+          "withdrawFromPool: withdraw deposited tokens"
+        ],
+        "transformations": [
+          "safeTransferFrom depositor to pool on deposit",
+          "safeIncreaseAllowance from pool to rollup/challengeManager",
+          "newStakeOnNewAssertion / createLayerZeroEdge transfers tokens from pool",
+          "withdrawStakerFunds returns tokens to pool",
+          "safeTransfer from pool to depositor on withdrawal"
+        ],
+        "sinks": [
+          "Pool contract balance",
+          "Rollup staking",
+          "Challenge manager staking",
+          "Depositor wallets"
+        ],
+        "trust_changes": "Depositors trust the pool contract to correctly manage stake lifecycle; pool trusts rollup/challengeManager to return stake on confirmation",
+        "validation_points": [
+          "ZeroAmount check on deposit/withdraw",
+          "AmountExceedsBalance check on withdraw",
+          "EdgeStakingPool: edgeId verification after creation"
+        ],
+        "exposure_risks": [
+          "Tokens sent directly to pool contract are lost (documented)",
+          "Any excess tokens beyond deposited amount stuck in pool forever (documented)"
+        ],
+        "manipulation_risks": [
+          "AssertionStakingPool.createAssertion uses user-supplied requiredStake from assertionInputs for allowance - if config hash validation in rollup fails, allowance remains increased",
+          "Total deposited can exceed required stake - early withdrawals possible even after protocol move",
+          "No reentrancy guard in withdrawFromPool, though CEI pattern is followed"
+        ]
+      },
+      {
+        "flow_id": "DF-05-bold-upgrade",
+        "source": "L1 Timelock (upgrade executor)",
+        "path": [
+          "BOLDUpgradeAction.perform(validators)",
+          "cleanupOldRollup: pause, refund stakers (max 50), upgrade secondary logic",
+          "createConfig: fetch latest confirmed state from PREIMAGE_LOOKUP",
+          "Deploy challenge manager proxy",
+          "upgradeSurroundingContracts: upgrade bridge, sequencer inbox, inbox, REI, outbox",
+          "Initialize challenge manager with expected rollup address",
+          "Deploy new RollupProxy with CREATE2",
+          "Initialize rollup, set validators, transfer ownership"
+        ],
+        "transformations": [
+          "StateHashPreImageLookup converts state hash to ExecutionState + inboxMaxCount",
+          "ExecutionState converted to AssertionState for genesis",
+          "Config constructed with immutable parameters from BOLDUpgradeAction"
+        ],
+        "sinks": [
+          "New RollupProxy (new rollup state machine)",
+          "Upgraded bridge contracts pointing to new rollup",
+          "Challenge manager initialized with new rollup"
+        ],
+        "trust_changes": "Upgrade executor must be trusted to provide correct PREIMAGE_LOOKUP data and validator list before upgrade execution",
+        "validation_points": [
+          "PREIMAGE_LOOKUP.get validates inboxMaxCount != 0",
+          "stateHash double-check against latestConfirmedStateHash",
+          "CREATE2 address match check",
+          "ROLLUP_READER.isValidator check for each new validator",
+          "Proxy implementation verification after upgrade"
+        ],
+        "exposure_risks": [
+          "StateHashPreImageLookup.set is permissionless - anyone can set pre-images (but validated against hash)",
+          "Window between upgradeSurroundingContracts and rollup deployment where bridge points to non-existent contract (within same tx)"
+        ],
+        "manipulation_risks": [
+          "Only 50 stakers can be refunded in cleanupOldRollup - remaining stakers must manually withdraw",
+          "If PREIMAGE_LOOKUP is not populated before upgrade, PREIMAGE_LOOKUP.get reverts (inboxMaxCount == 0 check)",
+          "createConfig uses empty maxTimeVariation and bufferConfig - relies on SequencerInbox being upgraded in place"
+        ]
+      },
+      {
+        "flow_id": "DF-06-edge-challenge-flow",
+        "source": "Validators",
+        "path": [
+          "createLayerZeroEdge: validator creates edge with stake",
+          "bisectEdge: reduce disagreement range",
+          "updateTimerCacheByChildren / updateTimerCacheByClaim: accumulate unrivaled time",
+          "confirmEdgeByTime / confirmEdgeByOneStepProof: confirm winning edge",
+          "refundStake: recover stake for confirmed edge"
+        ],
+        "transformations": [
+          "Edge store creates/tracks edges with unique IDs based on level, origin, heights, history roots",
+          "Timer cache accumulates unrivaled time through parent-child chain",
+          "Stake routing: first edge stake kept in contract, rival stakes sent to excessStakeReceiver"
+        ],
+        "sinks": [
+          "EdgeStore (on-chain edge state)",
+          "stakeToken balances",
+          "excessStakeReceiver"
+        ],
+        "trust_changes": "Validators are authenticated via whitelist (if enabled); edge creation requires stake as sybil resistance",
+        "validation_points": [
+          "Validator whitelist check (if enabled)",
+          "Assertion hash validation for block-level edges",
+          "History root and prefix proof validation during bisection",
+          "One step proof verification for final confirmation"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "First edge in a rival group keeps stake in contract; if it loses, stake is NOT sent to excessStakeReceiver - stays locked unless protocol has mechanism to recover",
+          "Timer manipulation via strategic edge creation timing",
+          "assertionBlocks time credit only given to first child of predecessor"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Only batch posters can submit L2 batches to the SequencerInbox",
+        "Force inclusion is permissionless but requires the sequencer-only delay window to expire",
+        "Delay buffer depletes when delayed messages experience unexpected delay (beyond threshold)",
+        "Buffer saturation: minimum at threshold, maximum at max",
+        "Assertions must consume at least one inbox message (non-empty assertions)",
+        "Only one assertion in a rival group can be confirmed",
+        "Stakers must be inactive (latestConfirmed or has children) before stake withdrawal",
+        "Edge confirmation requires cumulative unrivaled time >= challengePeriodBlocks"
+      ],
+      "economic_incentives": [
+        "Batch posters receive spending reports for gas reimbursement on L2 (only for ETH-based chains)",
+        "Edge creators must stake tokens; losing stakes go to excessStakeReceiver for honest party reimbursement",
+        "Staking pools allow permissionless participation without running validator infrastructure",
+        "Force inclusion mechanism ensures liveness - sequencer cannot censor indefinitely",
+        "Delay buffer mechanism provides adaptive censorship resistance"
+      ],
+      "governance_mechanisms": [
+        "Rollup owner (via UpgradeExecutor) can update maxTimeVariation, buffer config, validators, batch posters",
+        "Batch poster manager can rotate batch poster keys without rollup owner",
+        "Security council / rollup owner can pause rollup and force-confirm assertions when paused",
+        "DAS keyset management: owner can add/invalidate keysets"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "forceInclusion missing timestamp-based delay check",
+          "expected_behavior": "Force inclusion should require both block AND time delays to expire (dual check)",
+          "actual_behavior": "Only block-based delay (l1BlockAndTime[0] + delayBlocks_ >= block.number) is checked. ForceIncludeTimeTooSoon error is defined but never used.",
+          "risk_level": "medium",
+          "exploitation_potential": "On chains where block production rate varies or is faster than expected, the sequencer-only window could expire earlier by time than intended. An attacker could force-include messages before the intended time-based delay, potentially during periods of fast block production."
+        },
+        {
+          "scenario": "Buffer update skipped when isUpdatable returns false",
+          "expected_behavior": "Buffer should always be updated when new delayed messages are processed",
+          "actual_behavior": "In delayProofImpl, if buffer.isUpdatable() returns false (synced AND full), the entire buffer update including delay proof validation is skipped",
+          "risk_level": "low",
+          "exploitation_potential": "When the buffer is synced and full, a batch poster can post batches with new delayed messages without providing valid delay proofs. This is likely by design since no depletion can occur in this state, but it means delay proof validation is bypassed."
+        },
+        {
+          "scenario": "BOLDUpgradeAction cleanupOldRollup caps staker refunds at 50",
+          "expected_behavior": "All existing stakers should be refunded during upgrade",
+          "actual_behavior": "Only first 50 stakers are processed in the for-loop; remaining stakers must manually withdraw after upgrade via patched user logic",
+          "risk_level": "low",
+          "exploitation_potential": "Remaining stakers' funds are not lost (they can withdraw via patched logic) but they experience degraded UX and may not be aware they need to manually withdraw"
+        },
+        {
+          "scenario": "AssertionStakingPool.createAssertion allowance from user-controlled requiredStake",
+          "expected_behavior": "Allowance should match exactly the required stake from the rollup's configuration",
+          "actual_behavior": "requiredStake is taken from user-supplied assertionInputs.beforeStateData.configData.requiredStake and used in safeIncreaseAllowance before config hash is validated by the rollup",
+          "risk_level": "low",
+          "exploitation_potential": "If the rollup call reverts, the transaction reverts and allowance is unchanged. If a very large requiredStake passes config validation, only the correct amount is transferred. The risk is mitigated by the rollup's configHash validation."
+        },
+        {
+          "scenario": "Blob gas cost calculation with zero basefee",
+          "expected_behavior": "Batch poster should be fairly reimbursed for blob posting costs",
+          "actual_behavior": "When block.basefee is 0, blobCost / block.basefee returns 0, meaning no gas credit for blob costs in spending report",
+          "risk_level": "low",
+          "exploitation_potential": "On chains where basefee can be zero (e.g., some L2s or custom chains), batch posters receive no blob cost reimbursement. However, blobs are explicitly not supported on Arbitrum host chains."
+        },
+        {
+          "scenario": "EdgeChallengeManager first edge stake stuck on loss",
+          "expected_behavior": "All losing stakes should be recoverable or redistributed",
+          "actual_behavior": "The first edge created in a rival group has its stake held in the contract. If this edge loses, the stake cannot be refunded (refundStake likely requires confirmed status). Subsequent rivals' stakes are sent to excessStakeReceiver immediately.",
+          "risk_level": "low",
+          "exploitation_potential": "Over many challenges, stuck stakes could accumulate in the EdgeChallengeManager contract. The excessStakeReceiver mechanism is designed to handle redistribution of excess stakes, but first-edge losing stakes are not routed there."
+        },
+        {
+          "scenario": "DelayBuffer.calcBuffer replenishment rounding",
+          "expected_behavior": "Buffer should replenish at the configured rate",
+          "actual_behavior": "Replenishment uses integer division: (elapsed * replenishRateInBasis) / BASIS. For small elapsed values and small replenishRateInBasis, the replenishment rounds down to zero.",
+          "risk_level": "low",
+          "exploitation_potential": "A sequencer posting frequent small batches could prevent buffer replenishment if each batch interval is too small. This is bounded by the requirement of actual delayed messages and gas costs."
+        },
+        {
+          "scenario": "SequencerInbox sequenceNumber bypass with ~uint256(0)",
+          "expected_behavior": "Sequence numbers should be strictly validated",
+          "actual_behavior": "If sequenceNumber == ~uint256(0) (type(uint256).max), the sequence number check is skipped entirely",
+          "risk_level": "low",
+          "exploitation_potential": "This is an intentional design to allow flexible batch posting, but it means batch posters can submit with any effective sequence number. The bridge's accumulator ensures ordering correctness regardless."
+        },
+        {
+          "scenario": "RollupCreator temporary ownership window",
+          "expected_behavior": "Owner should always be the intended party",
+          "actual_behavior": "During createRollup, the RollupCreator sets itself as owner temporarily, then transfers to upgradeExecutor. During BOLDUpgradeAction.perform, BOLDUpgradeAction sets itself as owner temporarily.",
+          "risk_level": "low",
+          "exploitation_potential": "Since all operations happen within a single transaction, there's no window for exploitation. If the transaction reverts mid-way, all state changes are rolled back."
+        },
+        {
+          "scenario": "forceInclusion with delay buffer proactively updates buffer before delay check",
+          "expected_behavior": "Buffer update should not make force inclusion harder for legitimate force-includers",
+          "actual_behavior": "buffer.update(l1BlockAndTime[0]) is called before the delay check. If the update depletes the buffer, the effective delay (delayBufferableBlocks) becomes smaller, potentially making force inclusion easier. Conversely, if it replenishes, force inclusion becomes harder.",
+          "risk_level": "medium",
+          "exploitation_potential": "A strategic force-includer could choose which delayed message to force include in order to manipulate the buffer update in their favor, potentially enabling earlier force inclusion of subsequent messages."
+        },
+        {
+          "scenario": "setBufferConfig can change buffer parameters while system is active",
+          "expected_behavior": "Buffer config changes should not disrupt ongoing delay tracking",
+          "actual_behavior": "_setBufferConfig adjusts bufferBlocks based on new max/threshold and calls buffer.update(block.number) if synced. This could reset prevBlockNumber and prevSequencedBlockNumber to current block, effectively resetting the delay tracking.",
+          "risk_level": "low",
+          "exploitation_potential": "Rollup owner (via upgrade executor) could reset delay tracking by changing buffer config. This is an admin-only action and requires trust in governance."
+        }
+      ],
+      "assumption_violations": [
+        "Assumption: block.number correlates with time for force inclusion delay - violated if block production rate changes significantly",
+        "Assumption: stakeToken is a well-behaved ERC20 without fee-on-transfer or rebasing - if violated, staking pool accounting breaks",
+        "Assumption: bridge.delayedMessageCount() and sequencerMessageCount() cannot decrease - if bridge is compromised, accounting breaks",
+        "Assumption: block.chainid is immutable in practice - chain ID changes trigger safety mode (1-block delays) via _chainIdChanged()",
+        "Assumption: reader4844 returns correct blob data hashes - if compromised, invalid batch data could be committed",
+        "Assumption: rollup owner / upgrade executor acts honestly - many critical parameters can be changed unilaterally"
+      ],
+      "game_theory_risks": [
+        "Strategic force inclusion timing: Anyone can force-include to manipulate delay buffer state",
+        "Batch poster can strategically time delay proofs to optimize buffer state",
+        "Edge challenge: Creating rivals has cost (stake), but first-edge creator's stake behavior differs from subsequent rivals, creating asymmetric incentives",
+        "Staking pool depositors can free-ride on others' deposits and withdraw early if pool exceeds required stake",
+        "Sequencer can delay including delayed messages up to the delay window without penalty (design intent)"
+      ],
+      "integration_risks": [
+        "reader4844 external call for blob data hashes - must be trusted or verified",
+        "ArbGasInfo precompile for L1 gas fees on Arbitrum host chains",
+        "ArbSys precompile for block numbers on Arbitrum host chains",
+        "Bridge contract trust: SequencerInbox trusts bridge for delayed inbox accumulators and message counts",
+        "IGasRefunder: refundsGas modifier calls external gas refunder which could be malicious (bounded by gas refund amount)",
+        "IERC20Bridge.nativeToken() try-catch during initialization could mask unexpected errors"
+      ],
+      "calculation_errors": [
+        "No mathematical overflow possible in DelayBuffer.calcBuffer since all inputs are uint64 cast to uint256, and replenishRateInBasis <= 10000",
+        "formBlobDataHash: blobCost = reader4844.getBlobBaseFee() * GAS_PER_BLOB * dataHashes.length could theoretically overflow for extreme blob base fees, though practically bounded",
+        "submitBatchSpendingReport: l1Fees / block.basefee could truncate significant digits when basefee is high relative to l1Fees"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "stakeToken",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:assumed_false",
+            "permit:unknown"
+          ],
+          "decimals": 18,
+          "notes": "Used for validator staking and edge creation. SafeERC20 is used throughout. Protocol assumes standard ERC20 behavior - fee-on-transfer tokens would break staking pool accounting. The token is configurable per rollup deployment."
+        },
+        {
+          "address_or_symbol": "nativeToken (ERC20Bridge)",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:assumed_false",
+            "permit:unknown"
+          ],
+          "decimals": 18,
+          "notes": "Custom fee token for ERC20-based rollups. Used via IERC20Bridge interface. SafeERC20 used in RollupCreator for factory deployment fees."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "delayed_messages_monotonic",
+          "state_vars": [
+            "totalDelayedMessagesRead",
+            "bridge.delayedMessageCount()"
+          ],
+          "description": "totalDelayedMessagesRead can only increase and must never exceed bridge.delayedMessageCount()"
+        },
+        {
+          "name": "buffer_bounds",
+          "state_vars": [
+            "buffer.bufferBlocks",
+            "buffer.threshold",
+            "buffer.max"
+          ],
+          "description": "buffer.threshold <= buffer.bufferBlocks <= buffer.max must hold after any buffer update"
+        },
+        {
+          "name": "sequencer_accumulator_ordering",
+          "state_vars": [
+            "bridge.sequencerMessageCount()",
+            "bridge.sequencerInboxAccs()"
+          ],
+          "description": "Sequencer message count strictly increases with each batch; accumulator chain is append-only"
+        },
+        {
+          "name": "staking_pool_balance_conservation",
+          "state_vars": [
+            "sum(depositBalance[*])",
+            "IERC20(stakeToken).balanceOf(pool)"
+          ],
+          "description": "Sum of all deposit balances should not exceed the pool's token balance. Can be less if stake is currently locked in rollup/challenge manager."
+        },
+        {
+          "name": "assertion_status_progression",
+          "state_vars": [
+            "AssertionNode.status"
+          ],
+          "description": "Assertion status can only transition: NoAssertion -> Pending -> Confirmed. No reverse transitions allowed."
+        },
+        {
+          "name": "single_confirmation_per_rival_group",
+          "state_vars": [
+            "confirmedRivals[mutualId]"
+          ],
+          "description": "At most one edge per mutual ID can be confirmed. Once set, confirmedRival cannot change."
+        },
+        {
+          "name": "delay_buffer_effective_delay",
+          "state_vars": [
+            "buffer.bufferBlocks",
+            "delayBlocks"
+          ],
+          "description": "Effective force inclusion delay = min(buffer.bufferBlocks, delayBlocks) when delay bufferable"
+        }
+      ]
+    }
+  }
+}

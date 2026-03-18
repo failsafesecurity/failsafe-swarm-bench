@@ -1,0 +1,528 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:50:08.847Z",
+    "duration_ms": 156617
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "genesis_deposit_flow",
+        "source": "User (depositor) via GenesisPoolManager.depositToken()",
+        "path": [
+          "GenesisPoolManager.depositToken() receives genesisPool address and amount",
+          "Calls IGenesisPool.depositToken(msg.sender, amount)",
+          "GenesisPool.depositToken() validates pool status and timing",
+          "Calculates _maxFundingLeft and caps deposit amount",
+          "Transfers funding tokens from spender to GenesisPool",
+          "Updates userDeposits, totalDeposits, allocation info",
+          "Calls auction.purchased(nativeAmount)",
+          "Returns preLaunchPool boolean to manager",
+          "Manager optionally calls _preLaunchPool() creating gauge"
+        ],
+        "transformations": [
+          "amount capped by min(_maxFundingLeft, _fundingLeft, amount)",
+          "_getNativeTokenAmount converts deposit to native via auction oracle",
+          "_getFundingTokenAmount converts native to funding via auction oracle"
+        ],
+        "sinks": [
+          "userDeposits[spender] mapping",
+          "totalDeposits state variable",
+          "allocationInfo.allocatedFundingAmount",
+          "allocationInfo.allocatedNativeAmount",
+          "Funding token balance in GenesisPool contract"
+        ],
+        "trust_changes": "User-provided genesisPool address is not validated against factory - any address could be passed",
+        "validation_points": [
+          "amount > 0 check in manager",
+          "genesisPool != address(0) in manager",
+          "poolStatus check in GenesisPool",
+          "startTime check in GenesisPool",
+          "_amount > 0 after capping"
+        ],
+        "exposure_risks": [
+          "GenesisPoolManager.depositToken() does not verify genesisPool is from factory - user could pass a malicious contract"
+        ],
+        "manipulation_risks": [
+          "Attacker could pass a malicious genesisPool address that returns true from depositToken, triggering _preLaunchPool on arbitrary pool",
+          "No validation that genesisPool was created by genesisFactory"
+        ]
+      },
+      {
+        "flow_id": "native_token_deposit_flow",
+        "source": "Token owner via GenesisPoolManager.depositNativeToken()",
+        "path": [
+          "Sender provides nativeToken, auctionIndex, genesisPoolInfo, allocationInfo",
+          "Validates whitelist or governance",
+          "Validates funding token is connector",
+          "Checks pair exists and has zero balances",
+          "Gets or creates genesis pool from factory",
+          "Transfers native tokens from sender to genesisPool",
+          "Selects auction from factory by index (falls back to index 0)",
+          "Calls genesisPool.setGenesisPoolInfo()"
+        ],
+        "transformations": [
+          "genesisInfo.duration normalized to epoch multiples",
+          "genesisInfo.startTime normalized to epoch start"
+        ],
+        "sinks": [
+          "GenesisPool contract holds native tokens",
+          "GenesisPool stores genesisInfo, allocationInfo, auction address"
+        ],
+        "trust_changes": "User-provided auctionIndex is used to select auction; if out of range returns address(0) which falls back to auctions[0]",
+        "validation_points": [
+          "Whitelist check",
+          "Token matching checks",
+          "Duration/threshold/startPrice validation",
+          "Supply percent bounds check"
+        ],
+        "exposure_risks": [
+          "If auctions array has a removed (zeroed) entry at index 0, fallback to auctions(0) returns address(0)"
+        ],
+        "manipulation_risks": [
+          "Token owner can re-deposit to same genesis pool after NOT_QUALIFIED status since getGenesisPool returns address(0) for NOT_QUALIFIED, triggering createGenesisPool again with fresh state",
+          "If auctionFactory.auctions(auctionIndex) returns address(0) AND auctions(0) also returns address(0), auction is set to address(0) - calls to auction will revert or behave unexpectedly"
+        ]
+      },
+      {
+        "flow_id": "liquidity_launch_flow",
+        "source": "EpochController via GenesisPoolManager.checkAtEpochFlip()",
+        "path": [
+          "Iterates liveNativeTokens in reverse",
+          "For PRE_LAUNCH_DEPOSIT_DISABLED pools, calls _launchPool()",
+          "_launchPool sets genesis status false, sets gauge genesis pool",
+          "Calls GenesisPool.launch(router, MATURITY_TIME)",
+          "GenesisPool approves tokens to router",
+          "Router.addLiquidity() creates LP",
+          "LP tokens approved to gauge",
+          "Gauge.depositsForGenesis() stakes LP with maturity lock"
+        ],
+        "transformations": [
+          "Native and funding tokens converted to LP tokens via addLiquidity",
+          "Zero slippage protection (amountAMin=0, amountBMin=0)"
+        ],
+        "sinks": [
+          "LP tokens deposited in gauge",
+          "liquidity state variable updated"
+        ],
+        "trust_changes": "Router is trusted for fair exchange rate; zero slippage allows sandwich attacks",
+        "validation_points": [
+          "Only epochController can call",
+          "Pool status must be PRE_LAUNCH_DEPOSIT_DISABLED"
+        ],
+        "exposure_risks": [
+          "Zero slippage protection in addLiquidity allows front-running/sandwich attacks",
+          "Router address set by governance but setRouter has inverted check (requires _router == address(0))"
+        ],
+        "manipulation_risks": [
+          "MEV attacker can sandwich the addLiquidity call to extract value since amountAMin and amountBMin are both 0",
+          "If pair already has liquidity from another source, addLiquidity ratio could be manipulated"
+        ]
+      },
+      {
+        "flow_id": "incentive_transfer_flow",
+        "source": "Token owner via GenesisPool.addIncentives()",
+        "path": [
+          "Token owner provides incentive tokens and amounts",
+          "Validates each token is native or connector",
+          "Transfers tokens from sender to GenesisPool",
+          "Records in incentives mapping and incentiveTokens array",
+          "Later, transferIncentives() approves and sends to external bribe"
+        ],
+        "transformations": [
+          "Tokens accumulated in incentives mapping",
+          "Transferred to external bribe via notifyRewardAmount"
+        ],
+        "sinks": [
+          "External bribe contract receives incentive tokens"
+        ],
+        "trust_changes": "Token trust assumed standard ERC20; fee-on-transfer tokens would cause accounting mismatch",
+        "validation_points": [
+          "Token must be native or connector",
+          "Amount must be > 0",
+          "Token must not be address(0)"
+        ],
+        "exposure_risks": [
+          "Fee-on-transfer tokens: amount recorded != amount received",
+          "Duplicate incentive tokens allowed - push to array each time incentives[_token] == 0, but if claimed and re-added, array grows"
+        ],
+        "manipulation_risks": [
+          "If fee-on-transfer token is used as incentive, recorded amount exceeds actual balance, causing later transfers to fail or steal from other pools"
+        ]
+      },
+      {
+        "flow_id": "claim_refund_flow",
+        "source": "Token owner or depositors claiming refunds",
+        "path": [
+          "claimNative(): tokenOwner claims refundable native tokens",
+          "claimDeposits(): depositors claim funding tokens when NOT_QUALIFIED",
+          "claimIncentives(): tokenOwner claims incentive tokens when NOT_QUALIFIED"
+        ],
+        "transformations": [
+          "Sets refundableNativeAmount to 0 before transfer",
+          "Sets userDeposits[msg.sender] to 0 before transfer"
+        ],
+        "sinks": [
+          "Tokens transferred to msg.sender"
+        ],
+        "trust_changes": "No reentrancy guard on GenesisPool claim functions",
+        "validation_points": [
+          "Pool status check",
+          "Sender authorization check"
+        ],
+        "exposure_risks": [
+          "claimIncentives does not zero out amounts before transfer in the loop - sets to 0 one by one in order, potential reentrancy via callback tokens"
+        ],
+        "manipulation_risks": [
+          "If incentive tokens have transfer callbacks (ERC777), reentrancy in claimIncentives could re-enter and claim again since incentives are zeroed per-iteration"
+        ]
+      },
+      {
+        "flow_id": "governance_proposal_execution",
+        "source": "Governance participants via L2Governor",
+        "path": [
+          "propose() creates proposal with hashed params",
+          "castVote() allows voting during active period",
+          "execute() runs proposal actions",
+          "_execute loops through targets calling each with value"
+        ],
+        "transformations": [
+          "Proposal ID computed from targets, values, calldatas, epochTimeHash"
+        ],
+        "sinks": [
+          "Arbitrary contract calls via targets[i].call{value}(calldatas[i])"
+        ],
+        "trust_changes": "Any proposal in Succeeded, Defeated, or Expired state can be executed",
+        "validation_points": [
+          "State must be Succeeded, Defeated, or Expired"
+        ],
+        "exposure_risks": [
+          "Defeated and Expired proposals can be executed - critical governance flaw"
+        ],
+        "manipulation_risks": [
+          "Attacker can execute defeated proposals to run arbitrary governance actions",
+          "Expired proposals (no quorum reached, vote not succeeded/defeated) are also executable"
+        ]
+      },
+      {
+        "flow_id": "deduct_amount_accounting",
+        "source": "Gauge calling GenesisPool.deductAmount()",
+        "path": [
+          "Gauge calls deductAmount with account and gaugeTokenAmount",
+          "Calculates _depositerLiquidity = liquidity / 2",
+          "Computes userAmount = (totalDeposits * gaugeTokenAmount) / _depositerLiquidity",
+          "Special handling for tokenOwner",
+          "Deducts from userDeposits[account]"
+        ],
+        "transformations": [
+          "gaugeTokenAmount converted to userAmount via proportion",
+          "tokenOwner gets special deduction logic"
+        ],
+        "sinks": [
+          "userDeposits[account] reduced",
+          "tokenOwnerUnstaked increased"
+        ],
+        "trust_changes": "Only gauge can call (onlyGauge modifier)",
+        "validation_points": [
+          "onlyGauge modifier"
+        ],
+        "exposure_risks": [
+          "Division by zero if liquidity is 0 or 1 (since _depositerLiquidity = liquidity / 2)",
+          "Potential underflow in userDeposits[account] -= userAmount if accounting is off"
+        ],
+        "manipulation_risks": [
+          "If liquidity is odd, liquidity/2 truncates, causing _depositerLiquidity to be smaller than half, affecting accounting ratios",
+          "For tokenOwner: gaugeTokenAmount >= pendingOwnerStaked triggers subtraction that may underflow if rounding causes userAmount to be less than the pendingOwnerStaked portion"
+        ]
+      },
+      {
+        "flow_id": "quorum_calculation",
+        "source": "Governor.sol L2GovernorVotesQuorumFraction",
+        "path": [
+          "quorum() called during state() evaluation",
+          "Uses token.getsmNFTPastTotalSupply() without timestamp parameter",
+          "Multiplies by quorumNumerator / quorumDenominator"
+        ],
+        "transformations": [
+          "Total supply * numerator / denominator"
+        ],
+        "sinks": [
+          "Used in _quorumReached comparison"
+        ],
+        "trust_changes": "Quorum uses current total supply instead of historical, allowing manipulation",
+        "validation_points": [
+          "None - no timestamp passed to getsmNFTPastTotalSupply"
+        ],
+        "exposure_risks": [
+          "In Governor.sol, quorum() ignores blockTimestamp parameter and calls getsmNFTPastTotalSupply() without timestamp",
+          "This means quorum is based on current supply, not snapshot supply, making it manipulable"
+        ],
+        "manipulation_risks": [
+          "Attacker can increase total supply to raise quorum threshold, preventing proposals from passing",
+          "Or decrease supply to lower quorum, making it easier to pass malicious proposals"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Genesis pools follow 8-stage lifecycle: DEFAULT -> NATIVE_TOKEN_DEPOSITED -> PRE_LISTING -> PRE_LAUNCH -> PRE_LAUNCH_DEPOSIT_DISABLED -> LAUNCH/PARTIALLY_LAUNCHED/NOT_QUALIFIED",
+        "Deposits only allowed during PRE_LISTING or PRE_LAUNCH after startTime",
+        "Threshold determines minimum allocation for launch eligibility",
+        "Token owner gets refundable native tokens on partial launch or disqualification",
+        "Depositors get refunds only on NOT_QUALIFIED status",
+        "Liquidity is split 50/50 between depositors and token owner for balance tracking",
+        "Governance proposals require quorum and vote success to execute"
+      ],
+      "economic_incentives": [
+        "Token owners provide native tokens and incentives to attract depositors",
+        "Depositors exchange funding tokens for proportional native token allocation",
+        "Incentives are forwarded to external bribe to attract gauge votes",
+        "LP tokens are maturity-locked in gauge to prevent immediate dumping"
+      ],
+      "governance_mechanisms": [
+        "smNFT-based voting power for governance proposals",
+        "Quorum fraction determines minimum participation requirement",
+        "Voting period with delay, active period, and execution"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "GenesisPoolManager.setRouter() has inverted zero-address check",
+          "expected_behavior": "Should require _router != address(0) to prevent setting router to zero",
+          "actual_behavior": "Requires _router == address(0), meaning only address(0) can be set as router, effectively bricking router updates",
+          "risk_level": "high",
+          "exploitation_potential": "Owner cannot update router to a valid address. If current router becomes compromised or needs upgrading, the protocol is stuck. Setting router to address(0) would cause all launch operations to revert."
+        },
+        {
+          "scenario": "Governor execute() allows execution of Defeated and Expired proposals",
+          "expected_behavior": "Only Succeeded proposals should be executable",
+          "actual_behavior": "Execute requires status == Succeeded || status == Defeated || status == Expired, allowing defeated and expired proposals to be executed",
+          "risk_level": "high",
+          "exploitation_potential": "Any defeated governance proposal can be executed, completely undermining the governance model. An attacker can submit a malicious proposal, have it voted down, and still execute it."
+        },
+        {
+          "scenario": "GenesisPoolManager.depositToken() does not validate genesisPool address against factory",
+          "expected_behavior": "Should verify genesisPool was created by the genesis factory",
+          "actual_behavior": "Any non-zero address is accepted as genesisPool, calling depositToken on it",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker deploys malicious contract that implements IGenesisPool interface, returns true from depositToken() to trigger _preLaunchPool(), which creates a gauge for the attacker-chosen pool address from getLiquidityPoolInfo()"
+        },
+        {
+          "scenario": "Zero slippage protection in addLiquidity during launch",
+          "expected_behavior": "Should have minimum amount parameters to prevent sandwich attacks",
+          "actual_behavior": "_addLiquidityAndDistribute passes 0, 0 for amountAMin, amountBMin",
+          "risk_level": "high",
+          "exploitation_potential": "MEV bot can front-run the addLiquidity call, manipulate the pool price, and extract significant value from the genesis pool launch"
+        },
+        {
+          "scenario": "Governor.sol quorum() ignores blockTimestamp parameter",
+          "expected_behavior": "quorum should use historical total supply at proposal snapshot time",
+          "actual_behavior": "Calls token.getsmNFTPastTotalSupply() without passing blockTimestamp, using current supply",
+          "risk_level": "medium",
+          "exploitation_potential": "Quorum threshold can be manipulated by changing total supply between proposal creation and vote deadline"
+        },
+        {
+          "scenario": "Governor.sol _voteSucceeded requires forVotes > abstainVotes (in Governor.sol variant)",
+          "expected_behavior": "Standard governance: forVotes > againstVotes should be sufficient",
+          "actual_behavior": "In Governor.sol L2GovernorCountingSimple, _voteSucceeded requires forVotes > againstVotes AND forVotes > abstainVotes",
+          "risk_level": "medium",
+          "exploitation_potential": "Abstain votes can be weaponized to block proposals even when they have majority support over against votes"
+        },
+        {
+          "scenario": "totalDeposits can be zero when balanceOf() or deductAmount() is called",
+          "expected_behavior": "Division should handle zero denominator",
+          "actual_behavior": "balanceOf divides by totalDeposits which could be zero, causing revert",
+          "risk_level": "medium",
+          "exploitation_potential": "If totalDeposits is 0 but liquidity is set (theoretically shouldn't happen in normal flow), balanceOf() reverts with division by zero"
+        },
+        {
+          "scenario": "liquidity / 2 truncation for odd liquidity values",
+          "expected_behavior": "Exact accounting for all LP tokens",
+          "actual_behavior": "_depositerLiquidity = liquidity / 2 loses 1 wei for odd values; the remaining 1 wei LP token is unaccounted",
+          "risk_level": "low",
+          "exploitation_potential": "Dust amount (1 wei) of LP tokens permanently locked in gauge, negligible economic impact"
+        },
+        {
+          "scenario": "Fee-on-transfer tokens used as funding or incentive tokens",
+          "expected_behavior": "Actual received amount should be tracked",
+          "actual_behavior": "Amount parameter is stored directly without checking actual received balance",
+          "risk_level": "medium",
+          "exploitation_potential": "If funding token has fees, totalDeposits will exceed actual balance, causing last withdrawer to fail or getting less than expected allocation"
+        },
+        {
+          "scenario": "incentiveTokens array grows unboundedly with addIncentives",
+          "expected_behavior": "Should have reasonable bounds",
+          "actual_behavior": "Each new token is pushed to array; also if incentives are claimed and re-added for a new pool cycle, array keeps growing",
+          "risk_level": "low",
+          "exploitation_potential": "Gas griefing: token owner can add many tiny incentives to bloat the array, making claimIncentives and transferIncentives consume excessive gas"
+        },
+        {
+          "scenario": "checkBeforeEpochFlip iterates and removes from liveNativeTokens while iterating in reverse",
+          "expected_behavior": "Safe iteration without skipping elements",
+          "actual_behavior": "Iterates in reverse (i from length to 1) and _removeLiveToken swaps last element. When removing index i-1, the last element replaces it, but since iterating backwards, the replaced element at i-1 won't be visited if i decrements",
+          "risk_level": "medium",
+          "exploitation_potential": "If two consecutive pools at end of array both need action, the replacement from pop could cause one to be skipped in the same epoch"
+        },
+        {
+          "scenario": "GenesisPool.depositToken does not enforce NO_GENESIS_DEPOSIT_WINDOW",
+          "expected_behavior": "Deposits should be blocked within the NO_GENESIS_DEPOSIT_WINDOW before epoch end",
+          "actual_behavior": "depositToken only checks block.timestamp >= genesisInfo.startTime; the deposit window closing is handled at manager level via checkBeforeEpochFlip changing status to PRE_LAUNCH_DEPOSIT_DISABLED",
+          "risk_level": "medium",
+          "exploitation_potential": "If checkBeforeEpochFlip is not called in time, deposits can continue up to the epoch flip, potentially front-running the launch"
+        },
+        {
+          "scenario": "liveNativeTokensIndex not cleaned up on removal",
+          "expected_behavior": "Index mapping should be deleted for removed token",
+          "actual_behavior": "_removeLiveToken does not delete liveNativeTokensIndex[nativeToken] for the removed token, only updates the replacing token's index",
+          "risk_level": "low",
+          "exploitation_potential": "Stale index remains in mapping but functionally inert since the array no longer contains the token"
+        },
+        {
+          "scenario": "GenesisPool constructor does not set poolStatus",
+          "expected_behavior": "poolStatus should be DEFAULT (0)",
+          "actual_behavior": "poolStatus is not explicitly set in constructor, defaults to 0 which is PoolStatus.DEFAULT",
+          "risk_level": "low",
+          "exploitation_potential": "No issue - default value matches expected initial state"
+        }
+      ],
+      "assumption_violations": [
+        "setRouter requires _router == address(0), making it impossible to set a valid router - likely a typo (should be !=)",
+        "Governor execute() assumes only Succeeded proposals should execute but code allows Defeated and Expired",
+        "FixedAuction assumes msg.sender is always a valid GenesisPool that implements getGenesisInfo/getAllocationInfo",
+        "addLiquidity assumes no front-running with 0 slippage tolerance",
+        "depositToken in manager assumes genesisPool parameter is legitimate without factory verification",
+        "claimIncentives assumes incentive tokens are standard ERC20 without callbacks",
+        "GenesisPool assumes auction address remains valid throughout lifecycle"
+      ],
+      "game_theory_risks": [
+        "Token owner can set extremely high startPrice through auction, making native tokens appear more valuable to depositors",
+        "Last-second deposits before PRE_LAUNCH_DEPOSIT_DISABLED status can game the allocation",
+        "Token owner controls incentive distribution and could add then remove incentives (via pool rejection) to manipulate voter behavior",
+        "Governance voting can be gamed by splitting smNFTs to vote from multiple addresses (if delegation is per-address)",
+        "Defeated proposal execution means governance votes are meaningless - any proposal submitted will eventually execute"
+      ],
+      "integration_risks": [
+        "Router.addLiquidity may return different amounts than desired due to existing pool state",
+        "External bribe contract (IBribe) interaction in transferIncentives uses safeApprove which may fail if previous approval is non-zero",
+        "Gauge.depositsForGenesis is trusted to correctly implement maturity lock",
+        "TokenHandler.isConnector and whitelistToken are trusted external calls",
+        "Auction contract is user-selectable by index, potentially using unsuitable pricing mechanism",
+        "PairFactory.setGenesisStatus trusted to correctly restrict trading during genesis"
+      ],
+      "calculation_errors": [
+        "deductAmount: userAmount = (totalDeposits * gaugeTokenAmount) / _depositerLiquidity may not precisely reverse the balanceOf calculation due to integer rounding, causing small accounting discrepancies",
+        "balanceOf: _depositerLiquidity = liquidity / 2; balance = (_depositerLiquidity * userDeposits[account]) / totalDeposits - truncation means sum of all balanceOf may not equal total liquidity",
+        "_eligbleForPreLaunchPool threshold calculation: (proposedNativeAmount * threshold) / 10000 - threshold is described as '100 * of original to support 2 decimals', meaning 50% = 5000, which is correct",
+        "Governor.sol quorum() function in L2GovernorVotesQuorumFraction does not use blockTimestamp parameter at all, always uses current total supply"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "nativeToken (genesis)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "User-provided token for genesis pool. Fee-on-transfer tokens not accounted for in deposit/allocation logic. SafeERC20 used."
+        },
+        {
+          "address_or_symbol": "fundingToken (genesis)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Must be a connector token per tokenHandler.isConnector(). Fee-on-transfer would break totalDeposits accounting. SafeERC20 used."
+        },
+        {
+          "address_or_symbol": "incentiveTokens (genesis)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Must be native token or connector. Fee-on-transfer causes accounting mismatch in incentives mapping. Callback tokens (ERC777) could enable reentrancy in claimIncentives."
+        },
+        {
+          "address_or_symbol": "TELV (TokenFour/Fan.sol)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "notes": "Standard ERC20 with owner-only mint/burn. Initial supply 1M tokens."
+        },
+        {
+          "address_or_symbol": "CustomToken",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "notes": "Standard ERC20 with configurable name/symbol/supply and owner-only mint/burn."
+        },
+        {
+          "address_or_symbol": "theNFT (Thenian)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 0,
+          "notes": "ERC721 NFT with 3-round minting (whitelist, whitelist batch, public). Uses sequential tokenIds from totalSupply()."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "total_deposits_conservation",
+          "state_vars": [
+            "totalDeposits",
+            "sum(userDeposits[all_depositors])"
+          ],
+          "notes": "totalDeposits should equal sum of all userDeposits. Violated if fee-on-transfer tokens used."
+        },
+        {
+          "name": "liquidity_accounting",
+          "state_vars": [
+            "liquidity",
+            "tokenOwnerUnstaked",
+            "sum(userDeposits-based balances)"
+          ],
+          "notes": "liquidity/2 assigned to depositors, liquidity - liquidity/2 to tokenOwner. 1 wei dust possible for odd liquidity."
+        },
+        {
+          "name": "refundable_native_conservation",
+          "state_vars": [
+            "allocationInfo.refundableNativeAmount",
+            "allocationInfo.proposedNativeAmount",
+            "allocationInfo.allocatedNativeAmount"
+          ],
+          "notes": "refundableNativeAmount = proposedNativeAmount - allocatedNativeAmount for partial launch, = proposedNativeAmount for rejection."
+        },
+        {
+          "name": "pool_status_monotonicity",
+          "state_vars": [
+            "poolStatus"
+          ],
+          "notes": "Pool status should only transition forward through lifecycle. setPoolStatus from manager can set arbitrary status."
+        },
+        {
+          "name": "governance_proposal_execution_integrity",
+          "state_vars": [
+            "ProposalState",
+            "executed flag"
+          ],
+          "notes": "VIOLATED: Defeated and Expired proposals can be executed due to execute() state check bug."
+        }
+      ]
+    }
+  }
+}

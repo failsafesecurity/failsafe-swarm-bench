@@ -1,0 +1,312 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T00:10:32.071Z",
+    "duration_ms": 279065
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Governance Admin",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "VotingEscrow.setGovernance",
+          "VotingEscrow.toggleUnlockOverride",
+          "GaugeController.add_gauge",
+          "GaugeController.remove_gauge",
+          "GaugeController.add_type",
+          "GaugeController.change_type_weight",
+          "GaugeController.change_gauge_weight",
+          "GaugeController.remove_gauge_weight",
+          "LendingLedger.setRewards",
+          "LendingLedger.whiteListLendingMarket",
+          "LendingLedger.setBlockTimeParameters"
+        ],
+        "failure_modes": [
+          "Malicious or compromised governance can drain rewards by setting extreme cantoPerBlock",
+          "Governance can freeze user funds by un-whitelisting markets",
+          "Governance can break gauge removal due to underflow bugs"
+        ],
+        "attack_vectors": [
+          "Privilege escalation",
+          "Governance takeover"
+        ]
+      },
+      {
+        "boundary": "Lending Markets / Liquidity Gauges",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "LendingLedger.sync_ledger"
+        ],
+        "failure_modes": [
+          "Compromised market could report fake deposits to steal CANTO rewards",
+          "Market supply dropping to near-zero can cause truncation in reward math"
+        ],
+        "attack_vectors": [
+          "Spoofing msg.sender (prevented by whitelist check)",
+          "Precision loss exploitation on low supply"
+        ]
+      },
+      {
+        "boundary": "End Users",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "VotingEscrow.createLock",
+          "VotingEscrow.increaseAmount",
+          "VotingEscrow.withdraw",
+          "GaugeController.vote_for_gauge_weights",
+          "LendingLedger.claim",
+          "LiquidityGauge.depositUnderlying",
+          "LiquidityGauge.withdrawUnderlying"
+        ],
+        "failure_modes": [
+          "Users can exploit unlockOverride to multiply voting power",
+          "Users can accidentally burn gauge tokens without receiving underlying assets"
+        ],
+        "attack_vectors": [
+          "Flash loan manipulation (mitigated by block/time checkpoints)",
+          "Sybil attacks using multiple addresses for voting power multiplication"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unlocked CANTO",
+        "to_state": "Locked veCANTO",
+        "trigger": "VotingEscrow.createLock / increaseAmount",
+        "conditions": [
+          "Amount > 0",
+          "msg.value == amount"
+        ],
+        "invariants": [
+          "Lock end time is floored to week",
+          "Lock duration is exactly 5 years from current time"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Unvoted",
+        "to_state": "Voted for Gauge",
+        "trigger": "GaugeController.vote_for_gauge_weights",
+        "conditions": [
+          "User weight <= 10000",
+          "Total power used <= 10000",
+          "Lock not expired"
+        ],
+        "invariants": [
+          "Gauge weight increases by user slope",
+          "Scheduled slope drop matches lock end time"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Pending Rewards",
+        "to_state": "Claimed Rewards",
+        "trigger": "LendingLedger.claim",
+        "conditions": [
+          "Market is whitelisted",
+          "User has positive cantoToSend"
+        ],
+        "invariants": [
+          "user.rewardDebt is updated to accumulatedCanto before transfer",
+          "accCantoPerShare only increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow causing Denial of Service",
+        "locations": [
+          "GaugeController.sol: remove_gauge",
+          "GaugeController.sol: _remove_gauge_weight"
+        ],
+        "severity": "critical",
+        "evidence": "In remove_gauge, gauge_types_[_gauge] is set to 0 before calling _remove_gauge_weight. Inside _remove_gauge_weight, `int128 gauge_type = gauge_types_[_gauge] - 1` underflows to -1. Later, `new_sum = old_sum_bias - old_weight_bias` underflows uint256 because old_sum_bias for type -1 is 0, causing the function to always revert.",
+        "exploitation_method": "Governance calling remove_gauge will always fail, making it impossible to remove malicious or deprecated gauges.",
+        "affected_assets": [
+          "Gauge Weights",
+          "CANTO Emissions"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service via Un-whitelisting",
+        "locations": [
+          "LendingLedger.sol: whiteListLendingMarket",
+          "LendingLedger.sol: update_market",
+          "LiquidityGauge.sol: withdrawUnderlying"
+        ],
+        "severity": "critical",
+        "evidence": "If governance sets a market's whitelist status to false, update_market reverts. LiquidityGauge.withdrawUnderlying calls _burn, which triggers sync_ledger, which calls update_market. The revert prevents users from withdrawing their underlying tokens.",
+        "exploitation_method": "If governance un-whitelists a market to stop emissions, all user funds currently deposited in the LiquidityGauge become permanently locked and cannot be withdrawn.",
+        "affected_assets": [
+          "User Underlying Tokens (cNOTE, etc.)"
+        ]
+      },
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Access Control / Logic Flaw (Infinite Voting Power)",
+        "locations": [
+          "VotingEscrow.sol: withdraw",
+          "GaugeController.sol: vote_for_gauge_weights"
+        ],
+        "severity": "high",
+        "evidence": "If unlockOverride is enabled, users can withdraw their locked CANTO early. However, GaugeController is not notified of the withdrawal, and the user's allocated votes remain active until the original 5-year lock expiration.",
+        "exploitation_method": "An attacker can lock CANTO, vote for a gauge, withdraw the CANTO, transfer it to a new address, and repeat. This allows infinite accumulation of gauge weight using a small amount of capital.",
+        "affected_assets": [
+          "Gauge Weights",
+          "CANTO Emissions"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Code With No Effects / State Drift (Block Time Drift)",
+        "locations": [
+          "LendingLedger.sol: update_market",
+          "GaugeController.sol: _gauge_relative_weight"
+        ],
+        "severity": "high",
+        "evidence": "epochTime is calculated using an estimated averageBlockTime. If actual block times are faster, epochTime will drift into the future ahead of block.timestamp. GaugeController's points_total is only filled up to block.timestamp, so passing a future epochTime returns a gauge weight of 0.",
+        "exploitation_method": "Natural network block time fluctuations will cause epochTime to exceed block.timestamp, silently dropping gauge weights to 0 and permanently destroying user rewards for those epochs.",
+        "affected_assets": [
+          "CANTO Rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Unprotected Token Burning / Loss of Funds",
+        "locations": [
+          "LiquidityGauge.sol"
+        ],
+        "severity": "medium",
+        "evidence": "LiquidityGauge inherits ERC20Burnable, exposing public burn() and burnFrom() functions. Calling these burns the gauge tokens and reduces the user's LendingLedger balance via _afterTokenTransfer, but does not transfer the underlying tokens back to the user.",
+        "exploitation_method": "Users or integrating contracts calling standard ERC20 burn functions will permanently lose their underlying deposits, which remain stuck in the LiquidityGauge contract.",
+        "affected_assets": [
+          "User Underlying Tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Truncation / Precision Loss",
+        "locations": [
+          "LendingLedger.sol: update_market"
+        ],
+        "severity": "low",
+        "evidence": "The calculation `uint128((blockDelta * 1e36) / marketSupply)` can exceed type(uint128).max if marketSupply is very small (e.g., 1 wei). Explicit casting to uint128 in Solidity 0.8 silently truncates the higher-order bits.",
+        "exploitation_method": "If a market has near-zero supply, the accumulated rewards per share will be truncated, leading to incorrect reward accounting and loss of rewards for the depositors during that period.",
+        "affected_assets": [
+          "CANTO Rewards"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "VotingEscrow.sol",
+          "function": "setGovernance(address)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Transfers governance role"
+        },
+        {
+          "contract": "VotingEscrow.sol",
+          "function": "toggleUnlockOverride()",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows early withdrawals, breaking GaugeController assumptions"
+        },
+        {
+          "contract": "GaugeController.sol",
+          "function": "add_gauge(address,int128)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "GaugeController.sol",
+          "function": "remove_gauge(address)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Currently broken due to underflow"
+        },
+        {
+          "contract": "LendingLedger.sol",
+          "function": "setRewards(uint256,uint256,uint256)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets CANTO emissions per block"
+        },
+        {
+          "contract": "LendingLedger.sol",
+          "function": "whiteListLendingMarket(address,bool,bool)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can freeze user funds if set to false"
+        },
+        {
+          "contract": "LendingLedger.sol",
+          "function": "setBlockTimeParameters(uint256,uint256,uint256)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Used to manually correct block time drift"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "LendingLedger.sol",
+              "lines": "85-87",
+              "function": "update_market"
+            }
+          ],
+          "compositional_usage": [
+            "averageBlockTime estimation for epochTime"
+          ]
+        }
+      ]
+    }
+  }
+}

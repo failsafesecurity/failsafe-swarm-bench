@@ -1,0 +1,261 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T00:08:34.740Z",
+    "duration_ms": 253823
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Borrower Access",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "borrow",
+          "closeMarket",
+          "setMaxTotalSupply",
+          "setAnnualInterestAndReserveRatioBips",
+          "rescueTokens"
+        ],
+        "failure_modes": [
+          "Borrower sets malicious hooks to block withdrawals or fee updates",
+          "Borrower lowers reserve ratio to extract more funds before defaulting"
+        ],
+        "attack_vectors": [
+          "Deploying a market with a malicious hook template",
+          "Griefing lenders by keeping the market barely collateralized"
+        ]
+      },
+      {
+        "boundary": "Lender Access",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "deposit",
+          "depositUpTo",
+          "queueWithdrawal",
+          "executeWithdrawal",
+          "transfer",
+          "transferFrom"
+        ],
+        "failure_modes": [
+          "Lender queues many tiny withdrawals to bloat the unpaid batches array",
+          "Sanctioned lender attempts to front-run the nukeFromOrbit call"
+        ],
+        "attack_vectors": [
+          "Block gas limit DoS via withdrawal batch spam",
+          "Sybil attacks to distribute funds before sanctions take effect"
+        ]
+      },
+      {
+        "boundary": "ArchController Admin",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "registerBorrower",
+          "registerControllerFactory",
+          "addBlacklist",
+          "updateSphereXEngineOnRegisteredContracts",
+          "addHooksTemplate"
+        ],
+        "failure_modes": [
+          "Admin registers a malicious factory or borrower",
+          "Admin blacklists a legitimate asset, breaking existing markets"
+        ],
+        "attack_vectors": [
+          "Compromised admin key could halt the entire protocol or steal funds via malicious templates"
+        ]
+      },
+      {
+        "boundary": "Sanctions Oracle",
+        "trust_level": "trusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "isFlaggedByChainalysis"
+        ],
+        "failure_modes": [
+          "Oracle incorrectly flags a legitimate user",
+          "Oracle fails to flag a sanctioned user"
+        ],
+        "attack_vectors": [
+          "Oracle manipulation to freeze user funds (mitigated by borrower override)"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Active Market",
+        "to_state": "Closed Market",
+        "trigger": "closeMarket()",
+        "conditions": [
+          "Caller is borrower",
+          "Market is not already closed",
+          "All pending and unpaid withdrawals can be fully paid"
+        ],
+        "invariants": [
+          "APR becomes 0",
+          "Reserve ratio becomes 100%",
+          "Total assets must exactly equal total debts after repayment"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Pending Withdrawal",
+        "to_state": "Expired/Unpaid Withdrawal",
+        "trigger": "updateState() or any state-modifying function",
+        "conditions": [
+          "Current timestamp > batch expiry"
+        ],
+        "invariants": [
+          "Batch is moved to unpaidBatches if not fully collateralized",
+          "Scaled tokens are burned proportionally to available liquidity"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Active Account",
+        "to_state": "Blocked/Escrowed Account",
+        "trigger": "nukeFromOrbit()",
+        "conditions": [
+          "Account is flagged by Chainalysis oracle",
+          "Sanction is not overridden by borrower"
+        ],
+        "invariants": [
+          "Account balance is queued for full withdrawal",
+          "Upon execution, funds are routed to a locked escrow contract"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow / Precision Loss",
+        "locations": [
+          "WildcatMarket.sol: closeMarket()",
+          "WildcatMarketBase.sol: _applyWithdrawalBatchPayment()"
+        ],
+        "severity": "high",
+        "evidence": "In closeMarket(), currentlyHeld is forced to exactly equal totalDebts. availableLiquidity becomes normalizeAmount(scaledTotalSupply). When passed to _applyWithdrawalBatchPayment(), it is scaled back via scaleAmount(). Due to integer division rounding down, scaleAmount(normalizeAmount(x)) is often strictly less than x. This causes scaledAmountBurned to be less than scaledAmountOwed, leaving dust in scaledPendingWithdrawals. The function then reverts at `if (state.scaledPendingWithdrawals != 0) revert_CloseMarketWithUnpaidWithdrawals();`.",
+        "exploitation_method": "Occurs naturally for almost any market where scaledTotalSupply * scaleFactor is not a perfect multiple of RAY. The borrower is permanently prevented from closing the market.",
+        "affected_assets": [
+          "Borrower's ability to close the market and stop interest accrual"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "DoS With Block Gas Limit",
+        "locations": [
+          "WildcatMarket.sol: closeMarket()",
+          "WildcatMarketWithdrawals.sol: repayAndProcessUnpaidWithdrawalBatches()"
+        ],
+        "severity": "medium",
+        "evidence": "closeMarket() contains an unbounded loop: `for (uint256 i; i < numBatches; i++)`. If withdrawalBatchDuration is set to 0 or a very small value, a malicious lender can queue tiny withdrawals repeatedly, creating a massive array of unpaidBatches.",
+        "exploitation_method": "An attacker queues 1 wei withdrawals repeatedly to bloat the unpaidBatches array. When the borrower attempts to close the market, the transaction runs out of gas.",
+        "affected_assets": [
+          "Market state progression",
+          "Borrower funds (forced to pay interest indefinitely)"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "DoS With Failed Call",
+        "locations": [
+          "HooksFactory.sol: pushProtocolFeeBipsUpdates()"
+        ],
+        "severity": "low",
+        "evidence": "The function iterates over an array of markets and calls `market.setProtocolFeeBips()`. If any market in the array is closed, `setProtocolFeeBips()` reverts with `ProtocolFeeChangeOnClosedMarket()`, causing the entire batch update to fail.",
+        "exploitation_method": "A borrower closes their market, inadvertently (or intentionally) blocking the ArchController from updating protocol fees for all other markets using the same template in a single transaction. The admin must manually paginate around the closed market.",
+        "affected_assets": [
+          "Protocol fee revenue"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "WildcatArchController.sol",
+          "function": "registerBorrower(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Grants an address the ability to deploy markets"
+        },
+        {
+          "contract": "WildcatArchController.sol",
+          "function": "updateSphereXEngineOnRegisteredContracts(address[],address[],address[])",
+          "guards": [
+            "spherexOnlyOperatorOrAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Updates the security engine across all registered contracts"
+        },
+        {
+          "contract": "HooksFactory.sol",
+          "function": "addHooksTemplate(address,string,address,address,uint80,uint16)",
+          "guards": [
+            "onlyArchControllerOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Approves a new hook template for borrowers to use"
+        },
+        {
+          "contract": "WildcatMarketConfig.sol",
+          "function": "setAnnualInterestAndReserveRatioBips(uint16,uint16)",
+          "guards": [
+            "onlyBorrower"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes market APR and reserve requirements"
+        },
+        {
+          "contract": "WildcatMarket.sol",
+          "function": "closeMarket()",
+          "guards": [
+            "onlyBorrower"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets APR to 0 and forces full repayment"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Chainlink",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "WildcatSanctionsSentinel.sol",
+              "lines": "63-65",
+              "function": "isFlaggedByChainalysis"
+            }
+          ],
+          "compositional_usage": [
+            "Sanctions screening for nukeFromOrbit and transfer blocks"
+          ]
+        }
+      ]
+    }
+  }
+}

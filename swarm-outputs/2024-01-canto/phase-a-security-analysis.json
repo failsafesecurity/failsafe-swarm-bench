@@ -1,0 +1,239 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T17:25:06.052Z",
+    "duration_ms": 161156
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Governance",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "setGovernance",
+          "setRewards",
+          "whiteListLendingMarket"
+        ],
+        "failure_modes": [
+          "Governance key compromise",
+          "Incorrect parameter setting causing DoS or incorrect rewards"
+        ],
+        "attack_vectors": [
+          "Malicious whitelisting/de-whitelisting of markets",
+          "Setting extreme reward rates to drain the contract"
+        ]
+      },
+      {
+        "boundary": "Lending Market",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "sync_ledger"
+        ],
+        "failure_modes": [
+          "Market de-whitelisted causing DoS",
+          "Market sends incorrect delta values"
+        ],
+        "attack_vectors": [
+          "Market manipulation of supply to trigger truncation bugs",
+          "Reentrancy via market callbacks"
+        ]
+      },
+      {
+        "boundary": "User",
+        "trust_level": "untrusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "claim"
+        ],
+        "failure_modes": [
+          "Reentrancy during CANTO transfer"
+        ],
+        "attack_vectors": [
+          "Reentrancy attacks",
+          "Claiming unearned rewards due to accounting bugs"
+        ]
+      },
+      {
+        "boundary": "GaugeController",
+        "trust_level": "trusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "update_market"
+        ],
+        "failure_modes": [
+          "GaugeController reverts",
+          "GaugeController returns incorrect weights"
+        ],
+        "attack_vectors": [
+          "Manipulation of gauge weights to steal rewards"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Outdated market info",
+        "to_state": "Updated market info up to block.number",
+        "trigger": "update_market",
+        "conditions": [
+          "Market must be whitelisted",
+          "block.number > market.lastRewardBlock"
+        ],
+        "invariants": [
+          "lastRewardBlock equals block.number after update"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Previous user balance and reward debt",
+        "to_state": "New user balance and reward debt",
+        "trigger": "sync_ledger",
+        "conditions": [
+          "Market must be whitelisted",
+          "Updated market balance >= 0"
+        ],
+        "invariants": [
+          "User reward debt correctly reflects new balance",
+          "Market total balance matches sum of user balances"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Unclaimed rewards",
+        "to_state": "Claimed rewards with updated debt",
+        "trigger": "claim",
+        "conditions": [
+          "Market must be whitelisted",
+          "cantoToSend > 0"
+        ],
+        "invariants": [
+          "user.rewardDebt equals accumulatedCanto after claim"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Incorrect Epoch Calculation",
+        "locations": [
+          "LendingLedger.sol: update_market function, line `uint256 nextEpoch = i + BLOCK_EPOCH;`"
+        ],
+        "severity": "high",
+        "evidence": "The calculation `nextEpoch = i + BLOCK_EPOCH` does not align with the actual epoch boundaries if `i` is not a multiple of `BLOCK_EPOCH`. It should be `epoch + BLOCK_EPOCH`.",
+        "exploitation_method": "When a market is updated across an epoch boundary, the rewards for the blocks in the new epoch are calculated using the previous epoch's reward rate and gauge weight, leading to incorrect reward distribution.",
+        "affected_assets": [
+          "CANTO rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Overflow / Silent Downcast Truncation",
+        "locations": [
+          "LendingLedger.sol: update_market function, line `market.accCantoPerShare += uint128((cantoReward * 1e18) / marketSupply);`"
+        ],
+        "severity": "high",
+        "evidence": "Explicit downcasting to `uint128` silently truncates in Solidity 0.8.x if the value exceeds `type(uint128).max`.",
+        "exploitation_method": "If `marketSupply` is small (e.g., 1 wei), `(cantoReward * 1e18) / marketSupply` can easily exceed `type(uint128).max`. The silent truncation will result in a drastically reduced or pseudo-random `accCantoPerShare`, corrupting reward accounting and causing users to lose rewards.",
+        "affected_assets": [
+          "CANTO rewards",
+          "Secondary rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service / Frozen Funds",
+        "locations": [
+          "LendingLedger.sol: whiteListLendingMarket, update_market, sync_ledger"
+        ],
+        "severity": "high",
+        "evidence": "If governance sets `lendingMarketWhitelist[_market] = false`, `update_market` will revert with 'Market not whitelisted'.",
+        "exploitation_method": "De-whitelisting a market causes `sync_ledger` and `claim` to revert. If the lending market relies on `sync_ledger` for user withdrawals, all user funds in that market become permanently frozen. Users are also prevented from claiming already accrued rewards.",
+        "affected_assets": [
+          "User deposits in Lending Markets",
+          "Accrued CANTO rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Incomplete Implementation / Scaling Issue",
+        "locations": [
+          "LendingLedger.sol: update_market function, line `market.secRewardsPerShare += uint128((blockDelta * 1e18) / marketSupply); // TODO: Scaling`"
+        ],
+        "severity": "medium",
+        "evidence": "The code contains a `TODO: Scaling` comment and does not account for the decimals of the underlying market token.",
+        "exploitation_method": "If the lending market uses a token with decimals other than 18 (e.g., USDC with 6 decimals), the `secRewardsPerShare` will be scaled incorrectly, leading to massive over/under-distribution of secondary rewards by third-party platforms relying on `secRewardDebt`.",
+        "affected_assets": [
+          "Secondary rewards"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "LendingLedger.sol",
+          "function": "setGovernance(address)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Transfers governance role"
+        },
+        {
+          "contract": "LendingLedger.sol",
+          "function": "setRewards(uint256,uint256,uint256)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets CANTO rewards per block for given epochs"
+        },
+        {
+          "contract": "LendingLedger.sol",
+          "function": "whiteListLendingMarket(address,bool)",
+          "guards": [
+            "onlyGovernance"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Whitelists or de-whitelists a lending market"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "LendingLedger.sol",
+              "lines": "63-65",
+              "function": "update_market"
+            }
+          ],
+          "compositional_usage": [
+            "GaugeController.gauge_relative_weight_write"
+          ]
+        }
+      ]
+    }
+  }
+}

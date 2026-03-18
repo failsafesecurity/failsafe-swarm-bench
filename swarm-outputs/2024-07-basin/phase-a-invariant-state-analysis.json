@@ -1,0 +1,210 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-08T21:37:07.329Z",
+    "duration_ms": 256980
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "WellUpgradeable.sol",
+        "description": "upgradeTo and upgradeToAndCall lack msg.sender authorization check. _authorizeUpgrade validates that the new implementation is a valid well bored by the aquifer, but never checks that the caller (msg.sender) is the owner or any privileged role. Anyone can upgrade any WellUpgradeable proxy to any other well implementation registered in the same Aquifer.",
+        "attack_scenario": "Attacker deploys a malicious well implementation through the Aquifer (boreWell is permissionless). The malicious implementation contains a drain() function. Attacker calls upgradeTo(maliciousImpl) on a victim WellUpgradeable proxy. All authorization checks pass because: (1) it's a delegatecall, (2) the current implementation is valid, (3) the new implementation was bored by the aquifer, (4) proxiableUUID matches. Attacker then calls drain() to steal all pool tokens.",
+        "invariant_logic": "upgradeTo(newImpl) AND upgradeToAndCall(newImpl, data) MUST require msg.sender == owner()",
+        "solidity_property": "function invariant_upgradeOnlyOwner() public view { // Cannot be expressed as pure assertion; requires testing that non-owner calls to upgradeTo revert }",
+        "inventory_refs": [
+          {
+            "file": "WellUpgradeable.sol",
+            "function": "upgradeTo"
+          },
+          {
+            "file": "WellUpgradeable.sol",
+            "function": "upgradeToAndCall"
+          },
+          {
+            "file": "WellUpgradeable.sol",
+            "function": "_authorizeUpgrade"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Stable2.sol",
+        "description": "decodeWellData has a copy-paste bug: the second conditional checks decimal0 instead of decimal1. After the first if-block sets decimal0 to 18 when it was 0, the second if-block `if (decimal0 == 0)` can never be true, so decimal1 is never defaulted to 18. When data encodes (0, 0) or (nonzero, 0), decimal1 remains 0, causing getScaledReserves to multiply reserves[1] by 10^18 instead of 10^0.",
+        "attack_scenario": "A well is deployed with data = abi.encode(0, 0) intending both tokens to use 18 decimals. decimal0 correctly becomes 18, but decimal1 stays 0. All reserve scaling for token1 is inflated by 10^18. LP supply calculation, swap pricing, and reserve-at-ratio calculations are completely broken. An attacker can exploit the mispricing to drain the pool by swapping at massively distorted rates.",
+        "invariant_logic": "forall data: (decimal0_decoded == 0 => decimal0_used == 18) AND (decimal1_decoded == 0 => decimal1_used == 18)",
+        "solidity_property": "function invariant_decimalDefaults() public pure { uint256[] memory d = decodeWellData(abi.encode(0, 0)); assert(d[0] == 18); assert(d[1] == 18); }",
+        "inventory_refs": [
+          {
+            "file": "Stable2.sol",
+            "function": "decodeWellData"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Stable2.sol",
+        "description": "calcReserveAtRatioSwap and calcReserveAtRatioLiquidity silently return 0 if Newton's method fails to converge within 255 iterations. The named return variable `reserve` is never assigned outside the loop, defaulting to 0. Callers receiving 0 may interpret it as a valid result.",
+        "attack_scenario": "An attacker crafts reserves/ratios that cause the Newton's method to oscillate without converging (e.g., near LUT boundary conditions or extreme price ratios). The function returns 0 instead of reverting. A downstream protocol using this value would compute incorrect reserves, potentially enabling the attacker to manipulate pool state or extract value through mispriced operations.",
+        "invariant_logic": "calcReserveAtRatioSwap(reserves, j, ratios, data) MUST either return a value > 0 or revert; calcReserveAtRatioLiquidity similarly MUST NOT silently return 0",
+        "solidity_property": "function invariant_noSilentZeroReturn() public view { uint256 result = calcReserveAtRatioSwap(reserves, j, ratios, data); assert(result > 0); }",
+        "inventory_refs": [
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioSwap"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioLiquidity"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "Stable2.sol",
+        "description": "updateReserve can underflow when currentPrice drifts outside the [lowPrice, highPrice] LUT range during Newton's method iteration. The step calculation (maxStepSize * priceDelta / priceRange) can exceed the current reserve value when (currentPrice - targetPrice) > (highPrice - lowPrice), making the ratio > 1 and the step > maxStepSize > reserve.",
+        "attack_scenario": "During calcReserveAtRatioSwap iteration, the first step overshoots and currentPrice moves past highPrice. On the next iteration, the step size exceeds the reserve, causing arithmetic underflow (revert in Solidity 0.8+). This creates a DoS condition for specific price targets near LUT boundaries, preventing legitimate reserve calculations.",
+        "invariant_logic": "In updateReserve: step = maxStepSize * |targetPrice - currentPrice| / (highPrice - lowPrice) MUST be <= reserve; equivalently, |currentPrice - targetPrice| MUST be <= (highPrice - lowPrice) for the step to be bounded by maxStepSize",
+        "solidity_property": "function invariant_stepBounded(uint256 reserve, uint256 maxStepSize, uint256 currentPrice, uint256 targetPrice, uint256 highPrice, uint256 lowPrice) public pure { uint256 priceDelta = currentPrice > targetPrice ? currentPrice - targetPrice : targetPrice - currentPrice; uint256 step = maxStepSize * priceDelta / (highPrice - lowPrice); assert(step <= reserve); }",
+        "inventory_refs": [
+          {
+            "file": "Stable2.sol",
+            "function": "updateReserve"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioSwap"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioLiquidity"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "WellUpgradeable.sol",
+        "description": "_authorizeUpgrade checks that IAquifer(aquifer).wellImplementation(_getImplementation()) == ___self, but for an ERC-1167 minimal proxy that has never been upgraded, _getImplementation() reads the ERC1967 implementation slot which was never set (returns address(0)). This means wellImplementation(address(0)) is queried, which likely returns address(0), causing the require to fail. The first upgrade of a freshly bored WellUpgradeable may be permanently blocked.",
+        "attack_scenario": "A WellUpgradeable is bored through the Aquifer. The ERC1967 implementation slot is never initialized (UUPSUpgradeable_init doesn't set it). When the owner attempts to upgrade, _getImplementation() returns address(0), and IAquifer(aquifer).wellImplementation(address(0)) returns address(0) != ___self, causing revert. The well can never be upgraded, breaking the upgradeability promise.",
+        "invariant_logic": "After init(), _getImplementation() MUST return a valid address such that IAquifer(aquifer).wellImplementation(_getImplementation()) == implementation; OR _authorizeUpgrade MUST handle the case where ERC1967 slot is uninitialized",
+        "solidity_property": "function invariant_upgradePathExists() public view { address impl = _getImplementation(); address aquiferAddr = aquifer(); require(IAquifer(aquiferAddr).wellImplementation(impl) == ___self, 'Upgrade path blocked'); }",
+        "inventory_refs": [
+          {
+            "file": "WellUpgradeable.sol",
+            "function": "_authorizeUpgrade"
+          },
+          {
+            "file": "WellUpgradeable.sol",
+            "function": "init"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Stable2.sol",
+        "description": "calcLpTokenSupply does not revert if Newton's method fails to converge in 255 iterations. The named return variable lpTokenSupply retains the last iteration's value, which may be imprecise. Downstream functions like calcReserveAtRatioSwap use this value to compute parityReserve and initial scaled reserves, propagating the error.",
+        "attack_scenario": "With carefully crafted reserve inputs that slow convergence (e.g., extremely imbalanced reserves), calcLpTokenSupply returns an imprecise D value. In calcReserveAtRatioSwap, the imprecise lpTokenSupply leads to incorrect parityReserve, incorrect initial reserve estimates, and ultimately incorrect final reserve values. An integrating protocol relying on these values could be exploited.",
+        "invariant_logic": "calcLpTokenSupply MUST either converge (|D[i+1] - D[i]| <= 1) within 255 iterations OR revert",
+        "solidity_property": "function invariant_lpTokenConverges(uint256[] memory reserves, bytes memory data) public view { uint256 result = calcLpTokenSupply(reserves, data); // Must have actually converged, not just returned last iteration }",
+        "inventory_refs": [
+          {
+            "file": "Stable2.sol",
+            "function": "calcLpTokenSupply"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioSwap"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Stable2.sol",
+        "description": "_calcRate computes rate as reserves[i] - calcReserve(...), which underflows and reverts if the new reserve[i] (after increasing reserve[j] by PRICE_PRECISION) is greater than or equal to original reserves[i]. This can occur at extreme reserve ratios where adding a tiny amount to reserve[j] doesn't decrease reserve[i] at the 18-decimal precision level, or where the stableswap curve inverts behavior.",
+        "invariant_logic": "reserves[i] > calcReserve([reserves[i], reserves[j] + PRICE_PRECISION], i, lpTokenSupply, ...) for all valid reserve states",
+        "solidity_property": "function invariant_ratePositive(uint256[] memory reserves, uint256 i, uint256 j, uint256 lpTokenSupply) public view { uint256[] memory _r = new uint256[](2); _r[i] = reserves[i]; _r[j] = reserves[j] + 1e6; uint256 newReserve = calcReserve(_r, i, lpTokenSupply, abi.encode(18,18)); assert(reserves[i] > newReserve); }",
+        "inventory_refs": [
+          {
+            "file": "Stable2.sol",
+            "function": "_calcRate"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserve"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "Stable2LUT1.sol",
+        "description": "The LUT reverts for prices outside [0.001083e6, 10.37089e6] (liquidity) and [0.001083e6, 10.709509e6] (swap). Any calcReserveAtRatio call with a target price outside this range causes an unrecoverable revert. Since the A parameter is 100 and the LUT is static, extreme market conditions or manipulated ratios can push target prices outside the valid range.",
+        "attack_scenario": "An attacker manipulates pool reserves to create an extreme price ratio (e.g., >10.7x), then calls a function dependent on calcReserveAtRatioSwap/Liquidity. The LUT reverts, causing DoS for any protocol operation that depends on these calculations (e.g., oracle updates, liquidations). The pool becomes non-functional until reserves are rebalanced within the LUT range.",
+        "invariant_logic": "targetPrice = scaledRatios[i] * 1e6 / scaledRatios[j] MUST be within [0.001083e6, 10.37089e6] for liquidity and [0.001083e6, 10.709509e6] for swap",
+        "solidity_property": "function invariant_priceInLUTRange(uint256 targetPrice, bool isSwap) public pure { if(isSwap) { assert(targetPrice >= 1083 && targetPrice <= 10709509); } else { assert(targetPrice >= 1083 && targetPrice <= 10370890); } }",
+        "inventory_refs": [
+          {
+            "file": "Stable2LUT1.sol",
+            "function": "getRatiosFromPriceLiquidity"
+          },
+          {
+            "file": "Stable2LUT1.sol",
+            "function": "getRatiosFromPriceSwap"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioSwap"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioLiquidity"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Stable2.sol",
+        "description": "In calcReserveAtRatioSwap, calcReserve is called inside the Newton's method loop passing the modified scaledReserves (where reserves[j] was just updated) and the original lpTokenSupply (computed from original reserves). If the iterative update of reserves[j] diverges significantly from the original reserves, the calcReserve computation may produce reserve[i] values that are inconsistent with the stableswap invariant for the given lpTokenSupply, causing cascading numerical instability.",
+        "invariant_logic": "Within calcReserveAtRatioSwap loop: 4*A*(scaledReserves[0]+scaledReserves[1]) + D ≈ 4*A*D + D^3/(4*scaledReserves[0]*scaledReserves[1]) where D = lpTokenSupply; the invariant must hold to within precision tolerance after each iteration",
+        "solidity_property": "function invariant_stableswapInvariantHolds(uint256[] memory reserves, uint256 D, uint256 Ann) public pure { uint256 lhs = Ann * (reserves[0] + reserves[1]) / 100 + D; uint256 rhs = Ann * D / 100 + D*D*D / (4 * reserves[0] * reserves[1]); assert(lhs > rhs ? lhs - rhs <= 2 : rhs - lhs <= 2); }",
+        "inventory_refs": [
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserveAtRatioSwap"
+          },
+          {
+            "file": "Stable2.sol",
+            "function": "calcReserve"
+          }
+        ]
+      }
+    ]
+  }
+}

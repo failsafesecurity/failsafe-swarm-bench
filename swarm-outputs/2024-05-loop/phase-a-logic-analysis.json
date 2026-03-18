@@ -1,0 +1,478 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T00:20:17.052Z",
+    "duration_ms": 457870
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-ETH-DEPOSIT",
+        "source": "User msg.value via lockETH / lockETHFor",
+        "path": [
+          "msg.value received",
+          "_processLock checks amount > 0",
+          "totalSupply += amount",
+          "balances[receiver][ETH] += amount"
+        ],
+        "transformations": [
+          "Raw ETH mapped to sentinel ETH address in balance mapping"
+        ],
+        "sinks": [
+          "Contract ETH balance",
+          "totalSupply state",
+          "balances mapping"
+        ],
+        "trust_changes": "User funds become protocol-controlled, tracked via totalSupply",
+        "validation_points": [
+          "onlyBeforeDate(loopActivation)",
+          "amount != 0"
+        ],
+        "exposure_risks": [
+          "lockETHFor allows depositing on behalf of anyone, enabling griefing with dust"
+        ],
+        "manipulation_risks": [
+          "Front-running convertAllETH by sending extra ETH to inflate totalLpETH/totalSupply ratio"
+        ]
+      },
+      {
+        "flow_id": "DF-002-WETH-DEPOSIT",
+        "source": "User ERC20 WETH via lock / lockFor",
+        "path": [
+          "safeTransferFrom(msg.sender, this, amount)",
+          "WETH.withdraw(amount) converts to ETH",
+          "totalSupply += amount",
+          "balances[receiver][ETH] += amount"
+        ],
+        "transformations": [
+          "WETH token → native ETH → tracked as ETH sentinel address in balances"
+        ],
+        "sinks": [
+          "Contract ETH balance",
+          "totalSupply state",
+          "balances mapping under ETH key"
+        ],
+        "trust_changes": "ERC20 approval consumed, WETH atomically unwrapped",
+        "validation_points": [
+          "isTokenAllowed[WETH]",
+          "onlyBeforeDate(loopActivation)",
+          "amount != 0"
+        ],
+        "exposure_risks": [
+          "Fee-on-transfer WETH variant (unlikely for canonical WETH) would cause accounting mismatch"
+        ],
+        "manipulation_risks": [
+          "If WETH.withdraw fails silently, ETH balance wouldn't increase but totalSupply would (not realistic for canonical WETH)"
+        ]
+      },
+      {
+        "flow_id": "DF-003-LRT-DEPOSIT",
+        "source": "User ERC20 LRT tokens via lock / lockFor",
+        "path": [
+          "safeTransferFrom(msg.sender, this, amount)",
+          "balances[receiver][token] += amount"
+        ],
+        "transformations": [
+          "None - raw amount credited directly"
+        ],
+        "sinks": [
+          "Contract token balance",
+          "balances mapping under token key (NOT totalSupply)"
+        ],
+        "trust_changes": "ERC20 approval consumed, tokens held by contract",
+        "validation_points": [
+          "isTokenAllowed[token]",
+          "onlyBeforeDate(loopActivation)",
+          "amount != 0",
+          "token != ETH sentinel"
+        ],
+        "exposure_risks": [
+          "Fee-on-transfer tokens cause balances[user][token] > actual contract holding"
+        ],
+        "manipulation_risks": [
+          "Depositing fee-on-transfer tokens inflates user balance relative to actual tokens held, potentially causing later users' claims to fail due to insufficient contract balance"
+        ]
+      },
+      {
+        "flow_id": "DF-004-CONVERT-ALL-ETH",
+        "source": "Owner triggers convertAllETH",
+        "path": [
+          "Read address(this).balance",
+          "lpETH.deposit{value: totalBalance}(this)",
+          "totalLpETH = lpETH.balanceOf(this)",
+          "startClaimDate = now"
+        ],
+        "transformations": [
+          "All contract ETH → lpETH via deposit",
+          "totalLpETH captures full lpETH balance including any pre-existing lpETH"
+        ],
+        "sinks": [
+          "lpETH contract holds the ETH",
+          "totalLpETH and startClaimDate state vars"
+        ],
+        "trust_changes": "ETH transfers to externally-set lpETH contract - trust fully dependent on owner-set address",
+        "validation_points": [
+          "onlyAuthorized",
+          "onlyBeforeDate(startClaimDate)",
+          "block.timestamp - loopActivation > TIMELOCK"
+        ],
+        "exposure_risks": [
+          "totalLpETH includes any pre-existing lpETH in contract (donation inflation)",
+          "address(this).balance includes unsolicited ETH deposits"
+        ],
+        "manipulation_risks": [
+          "Owner can set malicious lpETH address that steals deposited ETH",
+          "Anyone can inflate totalLpETH by sending lpETH tokens to contract before conversion",
+          "Unsolicited ETH (via receive() or selfdestruct) inflates totalBalance"
+        ]
+      },
+      {
+        "flow_id": "DF-005-ETH-CLAIM",
+        "source": "User calls claim(ETH, ...) after startClaimDate",
+        "path": [
+          "Read balances[user][ETH] as userStake",
+          "claimedAmount = userStake * totalLpETH / totalSupply",
+          "balances[user][ETH] = 0",
+          "lpETH.safeTransfer(receiver, claimedAmount)"
+        ],
+        "transformations": [
+          "Proportional share calculation via mulDiv"
+        ],
+        "sinks": [
+          "lpETH transferred to user/vault",
+          "Balance zeroed out"
+        ],
+        "trust_changes": "User's locked balance converted to proportional lpETH claim",
+        "validation_points": [
+          "onlyAfterDate(startClaimDate)",
+          "userStake != 0"
+        ],
+        "exposure_risks": [
+          "If totalSupply was inflated (e.g., fee-on-transfer WETH), individual claims would be lower than expected"
+        ],
+        "manipulation_risks": [
+          "If totalLpETH is inflated relative to totalSupply, early claimers get more; if deflated, everyone gets less"
+        ]
+      },
+      {
+        "flow_id": "DF-006-LRT-CLAIM-CRITICAL",
+        "source": "User calls claim(LRT_token, percentage, exchange, data) after startClaimDate",
+        "path": [
+          "Read balances[user][token]",
+          "userClaim = userStake * percentage / 100",
+          "_validateData checks calldata",
+          "balances reduced by userClaim",
+          "_fillQuote swaps token→ETH via 0x",
+          "claimedAmount = address(this).balance (FULL BALANCE, NOT DELTA)",
+          "lpETH.deposit{value: claimedAmount}(receiver)"
+        ],
+        "transformations": [
+          "Percentage-based partial claim",
+          "Token→ETH swap via 0x exchange proxy",
+          "ETH→lpETH deposit"
+        ],
+        "sinks": [
+          "lpETH to user",
+          "Tokens sent to exchange proxy via swap"
+        ],
+        "trust_changes": "User tokens transferred to 0x exchange proxy; ETH received; then ETH sent to lpETH contract",
+        "validation_points": [
+          "userStake != 0",
+          "_validateData selector/token/amount/recipient checks",
+          "exchange proxy call success"
+        ],
+        "exposure_risks": [
+          "address(this).balance captures ALL ETH in contract, not just swap output",
+          "Any ETH present from other sources (direct sends, selfdestruct) is stolen by claimer"
+        ],
+        "manipulation_risks": [
+          "Zero-amount claim exploit: if percentage*userStake < 100, userClaim rounds to 0, user spends no tokens but captures all contract ETH",
+          "Repeated calls possible since balance isn't reduced when userClaim=0",
+          "Post-conversion ETH accumulation (via receive()) can be drained by any LRT holder"
+        ]
+      },
+      {
+        "flow_id": "DF-007-0X-CALLDATA-VALIDATION",
+        "source": "User-provided bytes calldata for 0x swap",
+        "path": [
+          "_validateData decodes calldata at hardcoded offsets",
+          "Checks selector, inputToken, outputToken, inputTokenAmount, recipient",
+          "_fillQuote forwards raw calldata to exchangeProxy"
+        ],
+        "transformations": [
+          "Assembly-based decoding of UniswapV3 and TransformERC20 calldata"
+        ],
+        "sinks": [
+          "exchangeProxy receives calldata and executes swap"
+        ],
+        "trust_changes": "User-provided data validated on-chain then sent to trusted exchange proxy",
+        "validation_points": [
+          "Selector must match UNI_SELECTOR or TRANSFORM_SELECTOR",
+          "inputToken must match _token",
+          "inputTokenAmount must match _amount",
+          "recipient must be address(this) or address(0)",
+          "outputToken must be WETH (Uni) or ETH sentinel (Transform)"
+        ],
+        "exposure_risks": [
+          "UniswapV3 _decodeUniswapV3Data assumes bytes param offset is exactly 128 (standard ABI encoding)",
+          "Non-standard ABI encoding can place real encodedPath data at different offset while fake data passes validation"
+        ],
+        "manipulation_risks": [
+          "Attacker crafts non-standard ABI layout where validator reads fake tokens but exchange proxy processes real (different) path",
+          "TransformERC20 recipient is never validated - relies on implicit msg.sender behavior",
+          "TransformERC20 transformations array is not validated and could contain malicious sub-operations"
+        ]
+      },
+      {
+        "flow_id": "DF-008-WITHDRAWAL",
+        "source": "User calls withdraw(token) during grace period or emergency",
+        "path": [
+          "Check emergency mode or time window",
+          "Read and zero balances[user][token]",
+          "If ETH: decrease totalSupply, send ETH",
+          "If token: safeTransfer token"
+        ],
+        "transformations": [
+          "Balance zeroed, totalSupply decreased (ETH only)"
+        ],
+        "sinks": [
+          "ETH or tokens sent to msg.sender"
+        ],
+        "trust_changes": "Protocol-held funds returned to user",
+        "validation_points": [
+          "Time window checks (loopActivation < now < startClaimDate) unless emergency",
+          "lockedAmount != 0",
+          "ETH withdrawal blocked after startClaimDate even in emergency mode"
+        ],
+        "exposure_risks": [
+          "ETH transfer via low-level call - reentrancy possible but balance is zeroed first"
+        ],
+        "manipulation_risks": [
+          "Emergency mode does NOT help ETH depositors after convertAllETH - UseClaimInstead check blocks ETH withdrawals post-claim-date regardless of emergency mode"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Users lock ETH/WETH/LRT tokens before loopActivation deadline for points",
+        "Owner sets loop addresses which resets loopActivation to now, starts TIMELOCK grace period",
+        "After TIMELOCK, owner converts all ETH to lpETH via convertAllETH",
+        "ETH depositors claim proportional lpETH (totalLpETH * userStake / totalSupply)",
+        "LRT depositors swap tokens to ETH via 0x then mint lpETH at 1:1",
+        "LRT balances are NOT part of totalSupply - they are tracked independently",
+        "120-day fallback: if owner never calls setLoopAddresses, after 120 days users can withdraw"
+      ],
+      "economic_incentives": [
+        "Points earned for locking (tracked off-chain via referral events)",
+        "Grace period withdrawals forfeit accumulated points",
+        "claimAndStake provides additional vault rewards",
+        "No on-chain penalty for early withdrawal other than point forfeiture"
+      ],
+      "governance_mechanisms": [
+        "Single owner controls all admin functions (no timelock on admin actions)",
+        "Owner can set lpETH and vault addresses (one-time before activation)",
+        "Owner can allow new tokens at any time",
+        "Owner can toggle emergency mode at any time",
+        "Owner can be transferred without timelock",
+        "No multisig or governance voting required"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "LRT claim with percentage rounding to zero (e.g., userStake=1, _percentage=99 → userClaim = 0)",
+          "expected_behavior": "No tokens swapped, no lpETH received, balance unchanged",
+          "actual_behavior": "No tokens swapped, but claimedAmount = address(this).balance captures ALL ETH in contract, minting free lpETH. Balance remains unchanged allowing repeated exploitation.",
+          "risk_level": "high",
+          "exploitation_potential": "Any LRT holder with even 1 wei of balance can repeatedly drain all ETH accumulated in contract post-conversion. Attack: (1) Wait for any ETH to arrive via receive(), (2) Call claim with percentage that rounds userClaim to 0, (3) Receive all ETH as lpETH, (4) Repeat since balance isn't reduced."
+        },
+        {
+          "scenario": "ETH in contract after convertAllETH (from direct sends or selfdestruct)",
+          "expected_behavior": "Orphaned ETH should not be claimable by LRT users",
+          "actual_behavior": "_claim for non-ETH tokens uses address(this).balance (not delta) for lpETH deposit, capturing all ETH including residual",
+          "risk_level": "high",
+          "exploitation_potential": "First LRT claimer after ETH accumulates captures all residual ETH. Combined with zero-amount claim, any LRT holder can drain repeatedly without spending tokens."
+        },
+        {
+          "scenario": "Non-standard ABI encoding in UniswapV3 swap data",
+          "expected_behavior": "_validateData should correctly verify the actual parameters that will be executed",
+          "actual_behavior": "_decodeUniswapV3Data reads encodedPath length and tokens from hardcoded offsets assuming bytes param offset is 128. If the actual bytes offset is different, validator reads fake data while exchange proxy processes real different data.",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker could craft calldata where validated inputToken/outputToken differ from actually-executed swap path. Practical exploitation limited by: (1) approval is only for _sellToken, (2) sellAmount is at fixed offset and correctly validated, (3) recipient is at fixed offset. Main risk is intermediate path manipulation or if exchange proxy handles edge cases differently."
+        },
+        {
+          "scenario": "Emergency mode activated after convertAllETH - ETH depositors",
+          "expected_behavior": "Emergency mode should allow all users to recover funds",
+          "actual_behavior": "withdraw(ETH) has inner check 'if (block.timestamp >= startClaimDate) revert UseClaimInstead()' that is NOT gated by emergency mode. After convertAllETH sets startClaimDate, ETH depositors cannot withdraw even in emergency - they can only claim, requiring functional lpETH contract.",
+          "risk_level": "medium",
+          "exploitation_potential": "If lpETH contract becomes non-functional or malicious after conversion, ETH depositors' funds are permanently locked. Emergency mode provides no escape hatch for ETH depositors post-conversion."
+        },
+        {
+          "scenario": "Fee-on-transfer LRT token deposited",
+          "expected_behavior": "Balance should reflect actual received amount",
+          "actual_behavior": "balances[receiver][token] += _amount (requested amount), but actual received is _amount - fee. Contract holds fewer tokens than total user balances indicate.",
+          "risk_level": "medium",
+          "exploitation_potential": "Last withdrawer/claimer for that token will find insufficient contract balance. Early claimers drain the actual tokens; late claimers' swaps or withdrawals revert."
+        },
+        {
+          "scenario": "totalSupply is zero when ETH claim is attempted",
+          "expected_behavior": "Should gracefully handle or prevent",
+          "actual_behavior": "userStake.mulDiv(totalLpETH, totalSupply) would divide by zero. However, if totalSupply is 0, no user can have a non-zero ETH balance, so userStake check catches this first.",
+          "risk_level": "low",
+          "exploitation_potential": "None - safely handled by the userStake == 0 check preceding the division."
+        },
+        {
+          "scenario": "setLoopAddresses called with zero addresses",
+          "expected_behavior": "Should validate addresses are non-zero",
+          "actual_behavior": "No validation. lpETH and lpETHVault set to address(0). convertAllETH would send ETH to address(0) via lpETH.deposit which would revert.",
+          "risk_level": "low",
+          "exploitation_potential": "Owner misconfiguration could brick the contract. Funds recoverable only via emergency mode withdrawal (but ETH depositors still subject to UseClaimInstead limitation)."
+        },
+        {
+          "scenario": "Multiple partial LRT claims with different exchange rates",
+          "expected_behavior": "Each partial claim should swap at current market rate with user-specified slippage",
+          "actual_behavior": "No contract-enforced slippage protection. _claim relies entirely on the minBuyAmount in 0x calldata. MEV attackers can sandwich each swap.",
+          "risk_level": "medium",
+          "exploitation_potential": "Sandwich attacks on LRT→ETH swaps. Users can mitigate via 0x calldata slippage settings but contract provides no fallback protection."
+        },
+        {
+          "scenario": "claim() called with _percentage = 101 for non-ETH token",
+          "expected_behavior": "Should revert cleanly",
+          "actual_behavior": "userClaim = userStake * 101 / 100 > userStake. Then balances[msg.sender][_token] = userStake - userClaim underflows and reverts (Solidity 0.8.x checked arithmetic).",
+          "risk_level": "low",
+          "exploitation_potential": "None - arithmetic overflow protection prevents over-claiming. But error message is generic, not descriptive."
+        },
+        {
+          "scenario": "Owner calls setLoopAddresses multiple times",
+          "expected_behavior": "Only callable once",
+          "actual_behavior": "After first call, loopActivation = block.timestamp. Modifier onlyBeforeDate(loopActivation) requires block.timestamp < loopActivation, which fails in same or later block. Effectively one-time.",
+          "risk_level": "low",
+          "exploitation_potential": "None - modifier prevents re-calling."
+        },
+        {
+          "scenario": "claimAndStake re-entrancy through lpETHVault.stake",
+          "expected_behavior": "Safe against re-entrancy",
+          "actual_behavior": "User balance is zeroed in _claim before external calls. lpETH.approve and lpETHVault.stake are called after. Re-entry via vault would find zero balance. However, if vault calls back into claim with a different token, the user could claim that token too in the same tx. This is expected behavior if they have multiple deposits.",
+          "risk_level": "low",
+          "exploitation_potential": "Limited - balance is zeroed before external calls for the specific token being claimed."
+        }
+      ],
+      "assumption_violations": [
+        "CRITICAL: _claim assumes address(this).balance == 0 before swap for non-ETH tokens ('At this point there should not be any ETH'). Violated by: receive() accepting ETH, selfdestruct-forced ETH, or any post-conversion ETH deposit.",
+        "UniswapV3 calldata decoding assumes standard ABI encoding with bytes offset = 128. Non-standard but valid ABI encoding can place data at different offsets.",
+        "Assumes lpETH.deposit is 1:1 ETH→lpETH conversion. If not, totalLpETH reflects actual received amount via balanceOf, so proportional claims adjust. But contract comments and events suggest 1:1 expectation.",
+        "Assumes all allowed tokens are non-rebasing and non-fee-on-transfer. Comment says 'ONLY add wrapped LRT tokens. Contract not compatible with rebase tokens.' If violated, accounting breaks.",
+        "Assumes exchange proxy (0x) is trusted and cannot be upgraded to steal approved tokens. If 0x proxy is compromised, all approved LRT tokens can be drained.",
+        "Assumes owner is trusted and won't set malicious lpETH/vault addresses. No governance, timelock, or multisig protection."
+      ],
+      "game_theory_risks": [
+        "Post-conversion ETH theft: Any ETH sent to contract after convertAllETH can be stolen by first LRT claimer. Combined with zero-amount claim exploit, this is repeatable without cost.",
+        "MEV sandwich attacks on LRT→ETH swaps: No contract-level slippage protection means MEV bots can extract value from every LRT claim swap.",
+        "Front-running convertAllETH: Sending ETH to contract before conversion to inflate totalLpETH ratio benefits all ETH depositors proportionally. Not profitable for attacker unless sole depositor.",
+        "Owner can grief users by never calling setLoopAddresses (funds locked until 120-day fallback) or by setting malicious lpETH address.",
+        "Race between grace period withdrawals and convertAllETH: Users who want to withdraw must do so before owner calls convertAllETH. Owner can reduce this window by calling convertAllETH as soon as TIMELOCK expires."
+      ],
+      "integration_risks": [
+        "0x Exchange Proxy dependency: Contract forwards user-crafted calldata to 0x proxy. If 0x proxy has vulnerabilities or is upgraded maliciously, funds at risk.",
+        "lpETH contract dependency: All ETH is deposited into owner-set lpETH address. Malicious or buggy lpETH contract can steal all deposited ETH.",
+        "lpETHVault dependency: claimAndStake approves and stakes lpETH into vault. Malicious vault can steal approved lpETH.",
+        "WETH dependency: WETH.withdraw() is called during deposit. Non-standard WETH could fail or behave unexpectedly.",
+        "TransformERC20 transformations array is fully user-controlled and not validated. Complex transformation chains could interact with contract in unexpected ways."
+      ],
+      "calculation_errors": [
+        "CRITICAL: In _claim for non-ETH tokens, claimedAmount = address(this).balance uses total balance instead of swap output delta. Should use boughtETHAmount pattern from _fillQuote.",
+        "Percentage rounding: userClaim = userStake * _percentage / 100 rounds down. For small userStake values, userClaim can be 0 even with non-zero percentage, allowing zero-cost claims that capture all contract ETH.",
+        "convertAllETH: totalLpETH = lpETH.balanceOf(address(this)) includes any pre-existing lpETH tokens, not just those received from the deposit. Should use balance delta.",
+        "TIMELOCK check uses <= instead of <: 'block.timestamp - loopActivation <= TIMELOCK' means actual timelock is TIMELOCK + 1 seconds. Minor but imprecise."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "ETH (0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE)",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Sentinel address for native ETH tracking. Used as key in balances mapping. ETH deposits tracked via totalSupply."
+        },
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Immutable address set at construction. Deposits auto-unwrap to ETH via WETH.withdraw(). isTokenAllowed[WETH] = true. Cannot be recovered via recoverERC20."
+        },
+        {
+          "address_or_symbol": "lpETH",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Set by owner via setLoopAddresses. Used with SafeERC20. deposit() expected to mint 1:1 with ETH. Cannot be recovered via recoverERC20."
+        },
+        {
+          "address_or_symbol": "LRT_TOKENS (various allowed tokens)",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Owner-whitelisted tokens. Contract assumes non-rebasing, non-fee-on-transfer per code comments. Fee-on-transfer tokens would break accounting. Used with SafeERC20 for transfers but raw approve() in _fillQuote."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "eth_supply_conservation",
+          "state_vars": [
+            "totalSupply",
+            "sum(balances[*][ETH])"
+          ],
+          "notes": "totalSupply should equal sum of all ETH balances. Maintained by lock (+) and withdraw (-) operations. Violated if ETH is sent directly to contract."
+        },
+        {
+          "name": "lrt_balance_conservation",
+          "state_vars": [
+            "IERC20(token).balanceOf(this)",
+            "sum(balances[*][token])"
+          ],
+          "notes": "Contract token balance should >= sum of user balances for each LRT. VIOLATED by fee-on-transfer tokens where balanceOf < sum(balances)."
+        },
+        {
+          "name": "lpeth_distribution_conservation",
+          "state_vars": [
+            "totalLpETH",
+            "totalSupply",
+            "sum(claimed_lpETH_for_ETH_depositors)"
+          ],
+          "notes": "Total claimed lpETH from ETH deposits should equal totalLpETH. Each claim: userStake * totalLpETH / totalSupply. Sum should converge to totalLpETH as all users claim."
+        },
+        {
+          "name": "post_conversion_eth_zero",
+          "state_vars": [
+            "address(this).balance"
+          ],
+          "notes": "ASSUMED invariant: after convertAllETH, address(this).balance should be 0. VIOLATED by receive() accepting ETH, selfdestruct, or any external ETH transfer. Violation enables free lpETH minting by LRT claimers."
+        },
+        {
+          "name": "phase_monotonicity",
+          "state_vars": [
+            "loopActivation",
+            "startClaimDate",
+            "emergencyMode"
+          ],
+          "notes": "Contract phases progress: deposit → grace period → claim. loopActivation moves forward when setLoopAddresses called. startClaimDate set once by convertAllETH. Emergency mode can be toggled at any time, breaking normal phase progression."
+        }
+      ]
+    }
+  }
+}

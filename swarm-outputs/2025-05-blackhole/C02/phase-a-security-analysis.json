@@ -1,0 +1,204 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T03:50:08.543Z",
+    "duration_ms": 159513
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Router Swap Routing",
+        "trust_level": "untrusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "RouterV2.swapExactTokensForTokens",
+          "RouterV2._swap"
+        ],
+        "failure_modes": [
+          "Attacker can specify arbitrary pair addresses for initial transfer and arbitrary receivers for intermediate swaps"
+        ],
+        "attack_vectors": [
+          "Stealing excess balances from pairs by manipulating route.pair and route.receiver to bypass transferring input tokens while still triggering swaps"
+        ]
+      },
+      {
+        "boundary": "Gauge Emergency Mode",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "GaugeV2.activateEmergencyMode",
+          "GaugeV2.emergencyWithdraw"
+        ],
+        "failure_modes": [
+          "Admin can freeze normal withdrawals and force emergency withdrawals"
+        ],
+        "attack_vectors": [
+          "Centralization risk if admin key is compromised, allowing denial of service on normal gauge operations"
+        ]
+      },
+      {
+        "boundary": "Custom Pool Deployment",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "CustomPoolDeployer.createCustomPool"
+        ],
+        "failure_modes": [
+          "Anyone can deploy custom pools if not restricted, potentially spamming the registry"
+        ],
+        "attack_vectors": [
+          "Deploying malicious or misconfigured pools that are registered as valid in the Algebra API storage"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Pre-swap balances",
+        "to_state": "Post-swap balances with fees extracted",
+        "trigger": "Pair.swap",
+        "conditions": [
+          "amount0Out < reserve0",
+          "amount1Out < reserve1",
+          "K invariant maintained"
+        ],
+        "invariants": [
+          "x3y + y3x >= k (stable) or x*y >= k (volatile)"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Unstaked LP",
+        "to_state": "Staked LP in Gauge",
+        "trigger": "GaugeV2.deposit",
+        "conditions": [
+          "amount > 0"
+        ],
+        "invariants": [
+          "_totalSupply == sum(_balances)"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Arbitrary Transfer / Logic Error",
+        "locations": [
+          "RouterV2.sol: swapExactTokensForTokens",
+          "RouterV2.sol: _swap"
+        ],
+        "severity": "critical",
+        "evidence": "In swapExactTokensForTokens, _safeTransferFrom uses routes[0].pair which is user-controlled, but _swap executes the swap on the actual pair address computed via pairFor(...). Furthermore, in _swap, intermediate swaps send tokens to routes[i].receiver instead of the next pair in the route.",
+        "exploitation_method": "An attacker can pass their own address as routes[0].pair and routes[i].receiver. This allows them to keep their input tokens while forcing the router to execute swaps using the pair's existing excess balances (accumulated from direct transfers or rebases), effectively draining the pair.",
+        "affected_assets": [
+          "All tokens held as excess balance in any Pair contract"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Oracle Manipulation / Incorrect Math",
+        "locations": [
+          "Pair.sol: _update",
+          "Pair.sol: current",
+          "Pair.sol: quote"
+        ],
+        "severity": "high",
+        "evidence": "The TWAP oracle accumulates reserves (reserve0CumulativeLast += _reserve0 * timeElapsed) instead of prices. The current() function calculates the average reserve and derives the price from it.",
+        "exploitation_method": "Using the time-weighted average of reserves to calculate price is mathematically incorrect. An attacker can manipulate the reserves for a short period to drastically skew the average reserves, resulting in a highly manipulated TWAP price that does not reflect the true time-weighted average price.",
+        "affected_assets": [
+          "Any protocol relying on the Pair's TWAP oracle for pricing"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Incorrect Math",
+        "locations": [
+          "TradeHelper.sol: getAmountInStable"
+        ],
+        "severity": "high",
+        "evidence": "getAmountInStable calculates y_1 = reserveOut + output instead of reserveOut - output. It also scales the result using decimalsOut instead of decimalsIn.",
+        "exploitation_method": "Calls to getAmountInStable will return completely incorrect values because it calculates the input required to ADD tokens to the pool rather than REMOVE them. This will cause integrations or frontends to fail or quote incorrect input amounts.",
+        "affected_assets": [
+          "User funds relying on TradeHelper quotes"
+        ]
+      },
+      {
+        "swc_id": "SWC-104",
+        "pattern": "Unchecked Call Return Value / Gas Limit DoS",
+        "locations": [
+          "WAVAX.sol: withdraw"
+        ],
+        "severity": "low",
+        "evidence": "Uses payable(msg.sender).transfer(wad) which forwards only 2300 gas.",
+        "exploitation_method": "Smart contracts with fallback functions consuming more than 2300 gas will be unable to withdraw their WAVAX, leading to locked funds for those specific contracts.",
+        "affected_assets": [
+          "WAVAX held by smart contracts"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "PairFactory.sol",
+          "function": "setFeeManager(address)",
+          "guards": [
+            "onlyManager"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes fee manager"
+        },
+        {
+          "contract": "GaugeV2.sol",
+          "function": "activateEmergencyMode()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Freezes normal operations"
+        },
+        {
+          "contract": "GaugeExtraRewarder.sol",
+          "function": "recoverERC20(uint256,address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can withdraw reward tokens"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "LP-TWAP",
+          "freshness_min_sec": 1800,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "Pair.sol",
+              "lines": "150-180",
+              "function": "current"
+            }
+          ],
+          "compositional_usage": [
+            "TWAP of reserves instead of prices"
+          ]
+        }
+      ]
+    }
+  }
+}

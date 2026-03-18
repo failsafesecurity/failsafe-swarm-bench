@@ -1,0 +1,295 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T17:14:32.388Z",
+    "duration_ms": 170455
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User to Router",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "depositWithExpiry",
+          "deposit"
+        ],
+        "failure_modes": [
+          "Transaction expires before inclusion",
+          "Incorrect msg.value sent for ERC20 deposits"
+        ],
+        "attack_vectors": [
+          "Reentrancy via malicious ERC20 tokens (mitigated by nonReentrant modifier)",
+          "Spoofing zero-value deposit events"
+        ]
+      },
+      {
+        "boundary": "Vault to Router",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "transferOut",
+          "transferOutV5",
+          "batchTransferOutV5",
+          "transferOutAndCall",
+          "transferOutAndCallV5",
+          "batchTransferOutAndCallV5",
+          "transferAllowance",
+          "returnVaultAssets"
+        ],
+        "failure_modes": [
+          "Insufficient vault allowance",
+          "Failed external calls to aggregators or recipients"
+        ],
+        "attack_vectors": [
+          "Allowance manipulation",
+          "Gas griefing via reverting fallback recipients"
+        ]
+      },
+      {
+        "boundary": "Router to Aggregator",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "swapOut",
+          "swapOutV5"
+        ],
+        "failure_modes": [
+          "Aggregator swap fails due to slippage",
+          "Aggregator contract reverts"
+        ],
+        "attack_vectors": [
+          "Aggregator returns false but retains tokens",
+          "Aggregator consumes all forwarded gas"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "User holds assets",
+        "to_state": "Router holds ERC20 / Vault holds ETH, Vault allowance increased",
+        "trigger": "depositWithExpiry",
+        "conditions": [
+          "block.timestamp < expiration"
+        ],
+        "invariants": [
+          "Router ERC20 balance increases by safeAmount",
+          "Vault allowance increases by safeAmount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Vault has allowance, Router holds ERC20",
+        "to_state": "User receives assets, Vault allowance decreased",
+        "trigger": "transferOut / transferOutV5",
+        "conditions": [
+          "Vault allowance >= amount"
+        ],
+        "invariants": [
+          "Vault allowance decreases by amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Old Vault has allowance",
+        "to_state": "New Vault has allowance",
+        "trigger": "transferAllowance",
+        "conditions": [
+          "Old Vault allowance >= amount"
+        ],
+        "invariants": [
+          "Total allowance across vaults remains constant"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-115",
+        "pattern": "Authorization through tx.origin",
+        "locations": [
+          "eth_rune.sol: transferTo(address,uint256)"
+        ],
+        "severity": "high",
+        "evidence": "The function uses `tx.origin` instead of `msg.sender` to determine the source of funds: `_transfer(tx.origin, recipient, amount);`",
+        "exploitation_method": "An attacker can deploy a malicious contract that calls `transferTo` when a user interacts with it, silently stealing the user's ETH_RUNE tokens.",
+        "affected_assets": [
+          "ETH_RUNE"
+        ]
+      },
+      {
+        "swc_id": "SWC-104",
+        "pattern": "Incorrect Fallback Recipient (Logic Error)",
+        "locations": [
+          "THORChain_Router.sol: _transferOutAndCallV5(TransferOutAndCallData)"
+        ],
+        "severity": "high",
+        "evidence": "In the ETH fallback block, `payable(aggregationPayload.target).send(msg.value)` sends funds to the aggregator contract (`target`) instead of the user (`recipient`).",
+        "exploitation_method": "If an aggregator swap fails, the user's ETH is sent to the aggregator contract instead of being returned to the user, resulting in a loss of funds.",
+        "affected_assets": [
+          "ETH"
+        ]
+      },
+      {
+        "swc_id": "SWC-104",
+        "pattern": "Missing ERC20 Fallback Handling",
+        "locations": [
+          "THORChain_Router.sol: _transferOutAndCallV5(TransferOutAndCallData)"
+        ],
+        "severity": "high",
+        "evidence": "The return value `_dexAggSuccess` is ignored, and there is no logic to recover the ERC20 tokens sent to the aggregator if the swap fails.",
+        "exploitation_method": "If the aggregator swap fails for an ERC20 token, the tokens remain stuck in the aggregator contract and are lost to the user.",
+        "affected_assets": [
+          "ERC20 Tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Theft of Stuck Funds via Balance Check",
+        "locations": [
+          "THORChain_Aggregator.sol: swapIn",
+          "AvaxAggregator.sol: swapIn"
+        ],
+        "severity": "high",
+        "evidence": "`_safeAmount = address(this).balance;` is used to determine the deposit amount, attributing the entire contract balance to the caller's memo.",
+        "exploitation_method": "An attacker can call `swapIn` with a minimal token amount. The aggregator will swap them and then deposit its entire ETH/AVAX balance (including any stuck funds from failed fallbacks) to the router under the attacker's memo.",
+        "affected_assets": [
+          "Stuck ETH/AVAX in Aggregator"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "msg.value Reuse in Loop",
+        "locations": [
+          "THORChain_Router.sol: batchTransferOutAndCallV5"
+        ],
+        "severity": "medium",
+        "evidence": "`msg.value` is implicitly reused in the loop when calling `_transferOutAndCallV5`, which passes `msg.value` to the aggregator for every ETH payload.",
+        "exploitation_method": "If a batch contains multiple ETH swaps, the first swap will consume the `msg.value`, causing subsequent ETH swaps in the same batch to fail or drain stuck ETH from the router.",
+        "affected_assets": [
+          "ETH"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "THORChain_Aggregator.sol",
+          "function": "rescueFunds(address,uint256,address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows owner to rescue stuck funds"
+        },
+        {
+          "contract": "eth_rune.sol",
+          "function": "mint(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows owner to mint up to maxSupply"
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "issue(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "redeem(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "setParams(uint256,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "deprecate(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "addBlackList(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "removeBlackList(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "destroyBlackFunds(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "USDT.sol",
+          "function": "unpause()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

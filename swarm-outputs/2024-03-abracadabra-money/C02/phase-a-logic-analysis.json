@@ -1,0 +1,593 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T01:08:00.370Z",
+    "duration_ms": 173901
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User deposits (base + quote tokens)",
+        "path": [
+          "Router.createPool/addLiquidity",
+          "safeTransferFrom to MagicLP",
+          "MagicLP.buyShares",
+          "_setReserve",
+          "_mint"
+        ],
+        "transformations": [
+          "Balance delta calculation (getBaseInput/getQuoteInput)",
+          "Share ratio calculation via min(baseInputRatio, quoteInputRatio)",
+          "Dead shares burn (1001 on first mint)"
+        ],
+        "sinks": [
+          "MagicLP LP token balance",
+          "_BASE_RESERVE_/_QUOTE_RESERVE_ state",
+          "_BASE_TARGET_/_QUOTE_TARGET_ state"
+        ],
+        "trust_changes": "User token balance transitions to pool-managed reserves; trust in pool accounting",
+        "validation_points": [
+          "baseInput != 0 check",
+          "quoteBalance != 0 on first mint",
+          "shares > 2001 on first mint",
+          "shares > 1000 on subsequent mints"
+        ],
+        "exposure_risks": [
+          "Front-running first deposit to manipulate share price",
+          "Excess tokens sent beyond ratio are retained by pool but not credited proportionally"
+        ],
+        "manipulation_risks": [
+          "First depositor can manipulate I parameter ratio to steal from subsequent depositors",
+          "Donation attack: send tokens directly to pool before buyShares to skew ratios"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "Trader swap input (base or quote token)",
+        "path": [
+          "Transfer tokens to MagicLP",
+          "MagicLP.sellBase/sellQuote",
+          "querySellBase/querySellQuote via PMMPricing",
+          "Fee split (lpFee + mtFee)",
+          "_transferOut",
+          "_setReserve"
+        ],
+        "transformations": [
+          "PMM pricing calculation with quadratic formula",
+          "Fee deduction: receiveAmount - lpFee - mtFee",
+          "Reserve and target state updates"
+        ],
+        "sinks": [
+          "Trader receives output tokens",
+          "Maintainer receives mtFee",
+          "Updated _BASE_RESERVE_/_QUOTE_RESERVE_"
+        ],
+        "trust_changes": "tx.origin used for fee rate lookup instead of msg.sender - trust bypassed for meta-transactions",
+        "validation_points": [
+          "NonReentrant guard",
+          "Balance delta for input amount"
+        ],
+        "exposure_risks": [
+          "tx.origin usage in sellBase/sellQuote allows fee manipulation via intermediary contracts"
+        ],
+        "manipulation_risks": [
+          "tx.origin for fee rate: If FeeRateModel gives different rates based on trader address, using tx.origin means a contract calling on behalf of a user gets the user's fee rate, not its own",
+          "Sandwich attacks on swaps with no slippage protection at the MagicLP level"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Flash loan borrower",
+        "path": [
+          "MagicLP.flashLoan",
+          "_transferBaseOut/_transferQuoteOut to assetTo",
+          "ICallee.FlashLoanCall callback",
+          "Balance check post-callback",
+          "Fee payment to maintainer",
+          "_sync"
+        ],
+        "transformations": [
+          "Output tokens sent before callback",
+          "Post-callback balance validation against PMM pricing",
+          "mtFee transferred to maintainer"
+        ],
+        "sinks": [
+          "assetTo receives borrowed tokens",
+          "Maintainer receives fees",
+          "Updated reserves via _sync"
+        ],
+        "trust_changes": "Untrusted callback to assetTo contract; reentrancy guarded by nonReentrant",
+        "validation_points": [
+          "Both balances can't decrease simultaneously",
+          "PMM price check for swap-equivalent validation"
+        ],
+        "exposure_risks": [
+          "Flash loan can be used for price manipulation in external protocols"
+        ],
+        "manipulation_risks": [
+          "Flash loan with both base and quote outputs: if baseBalance >= _BASE_RESERVE_ and quoteBalance >= _QUOTE_RESERVE_, no swap validation occurs - free flash loan without fees",
+          "The mtFee transfer in flashLoan reduces balance further before _sync, but _sync reads balanceOf which already accounts for the transfer"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "LP share holder sells shares",
+        "path": [
+          "MagicLP.sellShares",
+          "Balance/totalSupply ratio calculation",
+          "_BASE_TARGET_ and _QUOTE_TARGET_ reduction (divCeil)",
+          "_burn",
+          "_transferBaseOut/_transferQuoteOut",
+          "_sync",
+          "Optional ICallee.SellShareCall callback"
+        ],
+        "transformations": [
+          "baseAmount = (baseBalance * shareAmount) / totalShares (round down)",
+          "quoteAmount = (quoteBalance * shareAmount) / totalShares (round down)",
+          "Target reduction using divCeil (rounds up reduction, favoring protocol)"
+        ],
+        "sinks": [
+          "Recipient receives base + quote tokens",
+          "Updated reserves and targets"
+        ],
+        "trust_changes": "Callback to `to` address after token transfers - potential for reentrancy but guarded",
+        "validation_points": [
+          "deadline check",
+          "shareAmount <= balanceOf(msg.sender)",
+          "to != address(this)",
+          "baseMinAmount/quoteMinAmount slippage checks"
+        ],
+        "exposure_risks": [
+          "Target values reduced with divCeil may cause slight value leakage from LPs over many operations"
+        ],
+        "manipulation_risks": [
+          "If there are tokens sent directly to the pool (donations), sellShares gives proportional claim to actual balance, not just reserves - this can be gamed"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "User stakes tokens in LockingMultiRewards",
+        "path": [
+          "LockingMultiRewards.stake/stakeFor",
+          "safeTransferFrom staking token",
+          "_updateRewardsForUser",
+          "balance/supply update",
+          "Optional _createLock"
+        ],
+        "transformations": [
+          "If locked: amount * lockingBoostMultiplerInBips / BIPS for effective balance",
+          "Lock duration aligned to next epoch + lockDuration",
+          "Reward accumulation via rewardPerToken calculation"
+        ],
+        "sinks": [
+          "_balances[user].unlocked or .locked",
+          "unlockedSupply or lockedSupply",
+          "stakingTokenBalance"
+        ],
+        "trust_changes": "Operator can stakeFor any account - trust in operator",
+        "validation_points": [
+          "amount != 0",
+          "whenNotPaused",
+          "maxLocks limit",
+          "minLockAmount for locks"
+        ],
+        "exposure_risks": [
+          "Operator can force-stake for arbitrary accounts, potentially griefing by locking small amounts"
+        ],
+        "manipulation_risks": [
+          "Rewards distributed proportionally to boosted balance; a user can lock/unlock timing to maximize reward capture at epoch boundaries"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Operator notifies reward amount",
+        "path": [
+          "LockingMultiRewards.notifyRewardAmount",
+          "_updateRewards (global)",
+          "safeTransferFrom reward token",
+          "Calculate rewardRate",
+          "Set periodFinish to nextEpoch"
+        ],
+        "transformations": [
+          "Remaining rewards from current period added to new amount",
+          "rewardRate = total / remainingRewardTime",
+          "periodFinish set to nextEpoch"
+        ],
+        "sinks": [
+          "_rewardData[token].rewardRate",
+          "_rewardData[token].periodFinish",
+          "_rewardData[token].lastUpdateTime"
+        ],
+        "trust_changes": "Operator trusted to provide correct reward amounts matching transferred tokens",
+        "validation_points": [
+          "Token must exist in rewardTokens",
+          "amount >= _remainingRewardTime",
+          "minRemainingTime check"
+        ],
+        "exposure_risks": [
+          "Reward rate truncation: amount / _remainingRewardTime loses precision, dust remains in contract"
+        ],
+        "manipulation_risks": [
+          "Calling notifyRewardAmount just before epoch ends (small _remainingRewardTime) inflates rewardRate for a very short period, then rewards reset next epoch - potential for reward timing manipulation"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "User claims rewards from LockingMultiRewards",
+        "path": [
+          "getRewards",
+          "_updateRewardsForUser",
+          "_getRewards",
+          "RewardLock check (expired vs active)",
+          "Token transfer or lock creation"
+        ],
+        "transformations": [
+          "earned = (balance * (rewardPerToken - userRewardPerTokenPaid)) / 1e18 + rewards[user][token]",
+          "If lock expired: transfer previous locked amount, store new amount",
+          "If lock not expired: add to existing lock"
+        ],
+        "sinks": [
+          "User receives previously locked rewards",
+          "New rewards locked until next epoch"
+        ],
+        "trust_changes": "Reward tokens only claimable one epoch after earning",
+        "validation_points": [
+          "unlockTime comparison with block.timestamp"
+        ],
+        "exposure_risks": [
+          "If reward token is removed or changed, locked items may reference stale indices"
+        ],
+        "manipulation_risks": [
+          "User can time getRewards calls to just after epoch boundary to immediately claim locked rewards from previous period while locking new ones for only a short time"
+        ]
+      },
+      {
+        "flow_id": "DF-008",
+        "source": "Admin sets MagicLP parameters",
+        "path": [
+          "MagicLP.setParameters",
+          "Validate new params",
+          "Transfer out base/quote",
+          "_resetTargetAndReserve"
+        ],
+        "transformations": [
+          "_LP_FEE_RATE_ cast to uint64",
+          "_K_ cast to uint64",
+          "_I_ cast to uint128",
+          "Target and reserve reset to current balances",
+          "RState reset to ONE"
+        ],
+        "sinks": [
+          "assetTo receives base/quote outflows",
+          "State fully reset"
+        ],
+        "trust_changes": "Implementation owner has full control over pool parameters",
+        "validation_points": [
+          "minBaseReserve/minQuoteReserve checks",
+          "Parameter range validation"
+        ],
+        "exposure_risks": [
+          "Owner can drain pool by setting large baseOutAmount/quoteOutAmount within reserve limits"
+        ],
+        "manipulation_risks": [
+          "Truncation bugs: _LP_FEE_RATE_ stored as uint64 but validated up to 1e16 which fits; _I_ stored as uint128 but validated up to 10^36 which fits in uint128 (max ~3.4e38). However _K_ is stored as uint64 but validated up to 10^18 which does NOT fit in uint64 (max ~1.84e19). Wait, 10^18 = 1e18 and uint64 max = 18446744073709551615 ≈ 1.84e19, so 1e18 fits. OK both fit."
+        ]
+      },
+      {
+        "flow_id": "DF-009",
+        "source": "Router multi-hop swap",
+        "path": [
+          "Router.swapTokensForTokens",
+          "Transfer input to first LP",
+          "_swap loop through path[]",
+          "Each hop: sellBase/sellQuote sending output to next LP",
+          "Final hop outputs to `to`"
+        ],
+        "transformations": [
+          "directions bitmask determines sell base vs sell quote at each hop",
+          "Each intermediate result auto-deposited in next pool"
+        ],
+        "sinks": [
+          "Final recipient `to` receives output tokens"
+        ],
+        "trust_changes": "Router trusts path[] addresses as valid MagicLP pools - no validation",
+        "validation_points": [
+          "Path length <= 256",
+          "Path length > 0",
+          "minimumOut slippage check on final output only",
+          "Deadline check"
+        ],
+        "exposure_risks": [
+          "Malicious LP addresses in path can steal intermediate tokens",
+          "No validation that path[i] is actually a registered MagicLP pool"
+        ],
+        "manipulation_risks": [
+          "Intermediate hops have no slippage protection; only final output is checked against minimumOut"
+        ]
+      },
+      {
+        "flow_id": "DF-010",
+        "source": "Factory pool creation",
+        "path": [
+          "Factory.create",
+          "LibClone.cloneDeterministic",
+          "IMagicLP.init on clone",
+          "_addPool"
+        ],
+        "transformations": [
+          "Salt computed from tx.origin, implementation, tokens, params",
+          "Clone deployed deterministically"
+        ],
+        "sinks": [
+          "pools mapping",
+          "userPools mapping",
+          "New MagicLP clone"
+        ],
+        "trust_changes": "tx.origin used as creator - same issue as swaps; contracts cannot be attributed correctly",
+        "validation_points": [
+          "Init validates addresses, I, K, lpFeeRate ranges"
+        ],
+        "exposure_risks": [
+          "Anyone can create pools for any token pair",
+          "tx.origin as creator means the actual caller contract is not tracked"
+        ],
+        "manipulation_risks": [
+          "Fake pools can be created with adversarial FeeRateModel if factory is called directly (but factory uses its own maintainerFeeRateModel)"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "MagicLP uses PMM (Proactive Market Maker) algorithm with constant I (price) parameter instead of oracle",
+        "LP shares minted proportionally to min(baseInputRatio, quoteInputRatio) * totalSupply",
+        "First LP deposit burns 1001 shares to address(0) as dead shares to prevent inflation attacks",
+        "All minted amounts must exceed 1000 to prevent dust griefing",
+        "LockingMultiRewards rewards are delayed by one epoch (locked until next epoch boundary)",
+        "Locked staking gets a boost multiplier (lockingBoostMultiplerInBips / BIPS) applied to effective balance",
+        "Fee rates split between LP fee (stays in pool) and maintainer fee (extracted)",
+        "Pool reserves tracked as uint112 with overflow protection"
+      ],
+      "economic_incentives": [
+        "Trading fees: lpFeeRate stays in pool (benefits LPs), mtFeeRate goes to maintainer",
+        "Locking boost: locked tokens count as (amount * lockingBoostMultiplerInBips / BIPS) for reward calculation",
+        "Lock duration: 13 weeks by default, locks expire at epoch-aligned boundaries",
+        "Reward distribution: rewards distributed per-second over rewardsDuration epochs"
+      ],
+      "governance_mechanisms": [
+        "MagicLP: onlyImplementationOwner can change parameters, rescue tokens",
+        "Factory: owner can set implementation, add/remove pools, set fee rate model",
+        "LockingMultiRewards: owner manages reward tokens, pausing; operators distribute rewards and process locks",
+        "FeeRateModel: owner sets maintainer and implementation"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "buyShares with baseReserve > 0 but quoteReserve == 0 (or vice versa)",
+          "expected_behavior": "Should handle gracefully or revert",
+          "actual_behavior": "Falls through both if-branches (totalSupply==0 and baseReserve>0&&quoteReserve>0) without minting any shares. shares remains 0, then _mint(to, 0) reverts with ErrMintAmountNotEnough since 0 <= 1000",
+          "risk_level": "medium",
+          "exploitation_potential": "An attacker who gets the pool into a state with one reserve at 0 but totalSupply > 0 effectively bricks the pool for new deposits. This could happen via sellShares draining one side through rounding, then syncing."
+        },
+        {
+          "scenario": "flashLoan with both baseBalance >= _BASE_RESERVE_ and quoteBalance >= _QUOTE_RESERVE_",
+          "expected_behavior": "Should charge some fee for the flash loan",
+          "actual_behavior": "Neither the sell-quote nor sell-base branch executes; tokens are returned without fees. The pool just syncs the new (higher) balances. This is essentially a free flash loan.",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker can borrow tokens for free within a single transaction if they return equal or greater amounts of both tokens. While they must return the tokens, the zero-fee flash loan can be used for arbitrage or governance manipulation."
+        },
+        {
+          "scenario": "sellBase/sellQuote using tx.origin for fee rate lookup",
+          "expected_behavior": "Fee rate should be determined by the actual entity performing the swap",
+          "actual_behavior": "tx.origin is used, meaning contracts calling on behalf of users get the user's fee rate. If FeeRateModel has per-address fee rates, this can be manipulated.",
+          "risk_level": "medium",
+          "exploitation_potential": "A privileged tx.origin (e.g., whitelisted for lower fees) could be tricked into signing a transaction that routes through a malicious contract performing swaps at reduced fees."
+        },
+        {
+          "scenario": "setParameters truncates _LP_FEE_RATE_ to uint64, _K_ to uint64, _I_ to uint128",
+          "expected_behavior": "Values should be stored exactly as validated",
+          "actual_behavior": "The validation checks newLpFeeRate against MAX_LP_FEE_RATE (1e16, fits uint64), newK against MAX_K (1e18, fits uint64 since uint64 max ≈ 1.84e19), newI against MAX_I (1e36, fits uint128). These all fit, so no truncation issue. However, init() stores values without truncation (using uint256 state vars), while setParameters casts. This inconsistency is suspicious but not exploitable given current ranges.",
+          "risk_level": "low",
+          "exploitation_potential": "None with current parameter bounds, but if MAX_I or MAX_K were increased, truncation could silently reduce values."
+        },
+        {
+          "scenario": "LockingMultiRewards: processExpiredLocks reorders locks via swap-and-pop",
+          "expected_behavior": "lastLockIndex should correctly track the user's most recent lock after reordering",
+          "actual_behavior": "If lastLockIndex[user] == lastIndex (last element), it's updated to `index`. But if the lock being processed IS the lastLockIndex and locks.length > 1, it reverts with ErrInvalidLockIndex. This prevents processing the most recent lock unless it's the only lock remaining.",
+          "risk_level": "medium",
+          "exploitation_potential": "Operator must process locks in a specific order. The last lock index cannot be processed until it's the only remaining lock. This could delay unlocking for users with multiple locks if operator doesn't process in correct order."
+        },
+        {
+          "scenario": "LockingMultiRewards: reward token added after users have existing reward locks",
+          "expected_behavior": "New reward token should integrate smoothly with existing reward lock mechanism",
+          "actual_behavior": "In _getRewards, if i >= rewardItemLength (new token index exceeds existing lock items), it pushes a new RewardLockItem. This works for the expired case, but the newly pushed item's previous locked amount is 0 (correct). However, if the lock is NOT expired, the new item is pushed with just the current rewardAmount, which is correct. No issue here.",
+          "risk_level": "low",
+          "exploitation_potential": "Minimal - the logic handles this correctly by checking index bounds."
+        },
+        {
+          "scenario": "MagicLP.ratioSync with _BASE_RESERVE_ == 0",
+          "expected_behavior": "Should handle division by zero",
+          "actual_behavior": "Division by zero in `_BASE_TARGET_ = uint112((uint256(_BASE_TARGET_) * baseBalance) / uint256(_BASE_RESERVE_))` if _BASE_RESERVE_ is 0 but baseBalance changed. This would revert.",
+          "risk_level": "low",
+          "exploitation_potential": "Not directly exploitable since it reverts, but could prevent ratioSync from working if reserves somehow reach 0."
+        },
+        {
+          "scenario": "Router._validateDecimals with baseDecimals > quoteDecimals",
+          "expected_behavior": "Should handle case where base has more decimals than quote",
+          "actual_behavior": "The check `quoteDecimals - baseDecimals > MAX_BASE_QUOTE_DECIMALS_DIFFERENCE` uses unsigned subtraction. If quoteDecimals < baseDecimals, this underflows and wraps to a very large number, always reverting. This means base decimals can NEVER exceed quote decimals.",
+          "risk_level": "high",
+          "exploitation_potential": "This is a significant bug. Any token pair where the base token has more decimals than the quote token cannot be created through the Router. For example, a base token with 18 decimals and a quote token with 6 decimals would be rejected, even though this is a common and valid configuration (e.g., ETH/USDC). Users must use Factory.create directly to bypass this restriction."
+        },
+        {
+          "scenario": "MagicLP.sellShares when totalSupply approaches zero",
+          "expected_behavior": "Clean liquidation of remaining shares",
+          "actual_behavior": "If selling all shares except the 1001 dead shares, baseAmount and quoteAmount are calculated proportionally. The dead shares permanently lock a small fraction of tokens in the pool.",
+          "risk_level": "low",
+          "exploitation_potential": "Minimal - dead shares are by design. Very small dust remains locked."
+        },
+        {
+          "scenario": "Flash loan combined swap - mtFee deducted from contract balance before _sync",
+          "expected_behavior": "Reserves should accurately reflect post-fee balances",
+          "actual_behavior": "In flashLoan, when a sell-base case is detected, mtFee is transferred out via _transferQuoteOut, then _sync reads the post-transfer balance. This is correct. But the actual swap output check compares `_QUOTE_RESERVE_ - quoteBalance > receiveQuoteAmount`, checking if the effective output exceeds the PMM-calculated output. However, mtFee was already sent to the maintainer BEFORE _sync, so the final quoteBalance read by _sync is reduced by mtFee. This means LPs effectively absorb the mtFee cost in the flash loan case.",
+          "risk_level": "medium",
+          "exploitation_potential": "In flash loans, the maintainer fee is paid from the pool's existing balance rather than from the borrower's repayment, effectively taxing LPs. Over many flash loan operations, LP value is eroded."
+        },
+        {
+          "scenario": "LockingMultiRewards: _getRewards assumes rewardTokens ordering matches RewardLockItem ordering",
+          "expected_behavior": "Each RewardLockItem.token should match rewardTokens[i]",
+          "actual_behavior": "Items are pushed in order of rewardTokens array. If rewardTokens order is guaranteed immutable (push only), this holds. Since rewardTokens only grows (addReward pushes, no removal), the ordering is preserved. However, if a token at index i is claimed when expired, the item.amount is overwritten with the new rewardAmount for the SAME index. The item.token field is only set on push, never updated. So if somehow ordering diverged, wrong tokens would be transferred.",
+          "risk_level": "low",
+          "exploitation_potential": "Since addReward only appends, ordering is preserved. Low risk."
+        },
+        {
+          "scenario": "Reward calculation precision loss in LockingMultiRewards",
+          "expected_behavior": "All distributed rewards should be claimable",
+          "actual_behavior": "rewardRate = amount / _remainingRewardTime truncates. Over the period, actual distributed rewards = rewardRate * duration < amount. The difference (dust) remains in the contract permanently. Additionally, pendingRewardsPerToken = (timeElapsed * rewardRate * 1e18) / totalSupply_ truncates, losing precision per user.",
+          "risk_level": "low",
+          "exploitation_potential": "Dust accumulation over time. Not directly exploitable but represents value leakage from reward distributors."
+        }
+      ],
+      "assumption_violations": [
+        "Router._validateDecimals assumes quoteDecimals >= baseDecimals due to unsigned subtraction - this is not always true for valid token pairs",
+        "MagicLP assumes _BASE_TOKEN_ and _QUOTE_TOKEN_ are standard ERC20 tokens without fee-on-transfer, rebasing, or other non-standard behavior",
+        "Factory.create uses tx.origin as creator - assumes direct EOA interaction, breaks for smart contract wallets and meta-transactions",
+        "sellBase/sellQuote use tx.origin for fee rate - assumes caller is EOA, breaks fee model for contract-based traders",
+        "LockingMultiRewards assumes reward tokens never change behavior (no fee-on-transfer consideration on safeTransferFrom for notifyRewardAmount - actual received may be less than amount)",
+        "flashLoan assumes atomic consistency but mtFee extraction from pool balance between swap validation and _sync can introduce accounting discrepancy"
+      ],
+      "game_theory_risks": [
+        "Sandwich attacks on MagicLP swaps: MagicLP has no built-in slippage protection; relies on Router for minimumOut",
+        "LockingMultiRewards: Users can stake just before reward notification and unstake just after to capture disproportionate rewards. The epoch-based lock mitigates but doesn't eliminate this for unlocked staking.",
+        "First depositor attack: First LP can deposit minimal amounts to set unfavorable share ratios, though dead shares (1001) mitigate this partially",
+        "MEV extraction: Operator calling notifyRewardAmount can be front-run by users who stake just before, then unstake after the first reward update",
+        "Lock manipulation: Users can time locks to start just before epoch boundary, getting full lockDuration credit for minimal additional lock time"
+      ],
+      "integration_risks": [
+        "MagicLP as collateral in Cauldron: MagicLpAggregator only safe for closely-priced pairs; misuse with divergent pairs causes mispricing and potential bad debt",
+        "Fee-on-transfer tokens: Neither MagicLP nor LockingMultiRewards account for tokens that take fees on transfer, leading to accounting mismatches",
+        "Rebasing tokens: If base or quote token is rebasing, balance changes without transfers break reserve tracking",
+        "External FeeRateModel: Malicious or buggy FeeRateImpl can return excessive fee rates, potentially draining swap outputs to maintainer",
+        "WETH wrapping in Router: If Router receives ETH but WETH wrapping fails, ETH could be stuck (mitigated by receive() fallback but no explicit recovery)"
+      ],
+      "calculation_errors": [
+        "Math._SolveQuadraticFunctionForTrade: The part2 calculation `(((k * V0) / V1) * V0) + (i * delta)` computes kQ0^2/Q1 but then ADDS i*delta. The comment says 'kQ0^2/Q1-i*deltaB' but since deltaBSig is always negative (selling), the formula adds rather than subtracts. This matches the mathematical derivation where the negative delta is already accounted for by treating it as positive input.",
+        "DecimalMath.divFloor potential overflow: (target * ONE) can overflow for large target values when target > type(uint256).max / 1e18",
+        "getMidPrice in PMMPricing: When state.R == RState.ONE (R=1 case), the BELOW_ONE branch is entered (since RState.ONE == 0 which is not == BELOW_ONE). Actually, RState.ONE = 0, so the if-check `state.R == RState.BELOW_ONE` (which is 2) is false, and `state.R == RState.ABOVE_ONE` (which is 1) is also false for R=ONE, so the else branch (ABOVE_ONE formula) is used. This is correct as when R=1, B0=B, so (B0*B0/B)/B = 1, and R = (1-K) + K*1 = 1, and midPrice = i*1 = i. Correct."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "MagicLP",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": -1,
+          "notes": "Decimals match base token decimals. ERC20 via solady. Minimum mint of 1001. Dead shares of 1001 burned to address(0) on first deposit."
+        },
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Standard WETH with deposit/withdraw. Used as ETH wrapper in Router."
+        },
+        {
+          "address_or_symbol": "stakingToken (LockingMultiRewards)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Assumed standard ERC20. Fee-on-transfer tokens would break stakingTokenBalance accounting. No actual balance check after transfer."
+        },
+        {
+          "address_or_symbol": "rewardTokens (LockingMultiRewards)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Up to 5 reward tokens. Fee-on-transfer tokens in notifyRewardAmount would cause rewardRate to be inflated relative to actual balance, leading to insolvency."
+        },
+        {
+          "address_or_symbol": "_BASE_TOKEN_ (MagicLP)",
+          "behaviors": [],
+          "decimals": -1,
+          "notes": "Arbitrary ERC20. Fee-on-transfer or rebasing tokens break reserve accounting. getBaseInput() relies on balanceOf delta matching actual transfer amount."
+        },
+        {
+          "address_or_symbol": "_QUOTE_TOKEN_ (MagicLP)",
+          "behaviors": [],
+          "decimals": -1,
+          "notes": "Arbitrary ERC20. Same concerns as base token. Router validates decimals difference but with bug (unsigned underflow)."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "reserve_balance_consistency",
+          "state_vars": [
+            "_BASE_RESERVE_",
+            "_QUOTE_RESERVE_",
+            "_BASE_TOKEN_.balanceOf(address(this))",
+            "_QUOTE_TOKEN_.balanceOf(address(this))"
+          ],
+          "description": "After _sync or _setReserve, reserves should equal actual token balances. Violated if fee-on-transfer tokens are used."
+        },
+        {
+          "name": "target_reserve_ordering",
+          "state_vars": [
+            "_BASE_TARGET_",
+            "_BASE_RESERVE_",
+            "_QUOTE_TARGET_",
+            "_QUOTE_RESERVE_",
+            "_RState_"
+          ],
+          "description": "When R=BELOW_ONE: B >= B0 and Q <= Q0. When R=ABOVE_ONE: B <= B0 and Q >= Q0. When R=ONE: B == B0 and Q == Q0."
+        },
+        {
+          "name": "supply_conservation_locking",
+          "state_vars": [
+            "unlockedSupply",
+            "lockedSupply",
+            "sum(_balances[user].unlocked)",
+            "sum(_balances[user].locked)"
+          ],
+          "description": "unlockedSupply == sum of all users' unlocked balances. lockedSupply == sum of all users' locked balances."
+        },
+        {
+          "name": "staking_token_solvency",
+          "state_vars": [
+            "stakingTokenBalance",
+            "stakingToken.balanceOf(address(this))"
+          ],
+          "description": "stakingTokenBalance <= stakingToken.balanceOf(address(this)). Difference is skimmable excess."
+        },
+        {
+          "name": "dead_shares_lock",
+          "state_vars": [
+            "balanceOf(address(0))",
+            "totalSupply()"
+          ],
+          "description": "For any initialized MagicLP pool, balanceOf(address(0)) == 1001, ensuring totalSupply never reaches 0 after first deposit."
+        },
+        {
+          "name": "max_locks_per_user",
+          "state_vars": [
+            "_userLocks[user].length",
+            "maxLocks"
+          ],
+          "description": "_userLocks[user].length <= maxLocks for all users"
+        }
+      ]
+    }
+  }
+}

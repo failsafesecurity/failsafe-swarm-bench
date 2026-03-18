@@ -1,0 +1,990 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "LiquidInfrastructureERC20.sol",
+      "LiquidInfrastructureNFT.sol",
+      "OwnableApprovableERC721.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-08T21:51:49.544Z",
+    "duration_ms": 383847
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H001",
+      "title": "Duplicate Holder Entries via Zero-Value Transfers Enable Reward Theft and Distribution DoS",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Any approved holder can inflate another approved address's entry count in the holders array by repeatedly calling transfer(target, 0). The _beforeTokenTransfer hook checks this.balanceOf(to) != 0 BEFORE the transfer executes. If the target has 0 balance, it is pushed to holders on every zero-value transfer. The attacker does not even need to hold tokens (0 >= 0 passes the balance check). During distribution, each duplicate entry processes entitlementPerUnit * balanceOf(target), multiplying the victim/attacker's reward by the number of duplicate entries. This drains the reward pool, causing later holders' transfers to revert (insufficient contract balance), permanently locking the distribution.",
+      "investigation_rationale": "This is a directly exploitable on-chain vulnerability requiring only that the attacker be an approved holder (normal protocol participant). Zero-value ERC20 transfers are allowed by OpenZeppelin's ERC20 implementation. The pre-transfer balance check in _beforeTokenTransfer creates the duplicate entry vector.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_beforeTokenTransfer",
+        "distribute",
+        "transfer"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beforeTokenTransfer(...)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "distribute(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "127-133",
+        "pattern": "bool exists = (this.balanceOf(to) != 0); if (!exists) { holders.push(to); } — checked BEFORE transfer; 0-value transfers never change balance, allowing unlimited pushes"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker is an approved holder (KYC'd — normal protocol participation)",
+        "Target address is approved and has 0 token balance",
+        "Contract is not locked for distribution"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 127-133",
+        "vulnerable_pattern": "Pre-transfer balance check allows repeated pushes for 0-balance addresses via 0-value transfers",
+        "specific_concern": "holders.push(to) executes every time balanceOf(to)==0, which remains true across unlimited 0-value transfers",
+        "missing_safeguards": "No amount > 0 check, no deduplication in holders array, no mapping to track membership"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does OpenZeppelin ERC20 0.8.12 allow transfer of 0 amount without revert?",
+          "Can a holder with 0 balance call transfer(target, 0)?",
+          "How many duplicate entries can be created within block gas limits?",
+          "Does the distribution loop process all entries without deduplication?"
+        ],
+        "validation_requirements": [
+          "Create approved address, transfer 0 to another approved address N times, verify holders.length increases by N",
+          "Trigger distribution and verify recipient receives N * entitlementPerUnit * balance",
+          "Verify distribution reverts when reward pool is exhausted by duplicate entries"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker (approved, 0 balance) calls transfer(bob, 0) 100 times. Bob (approved, 0 balance) gets 100 entries in holders. Someone transfers tokens to Bob. During distribution, Bob receives 101 * entitlementPerUnit * bobBalance, draining the reward pool. Remaining holders' transfers revert, permanently locking the contract.",
+      "prerequisites": [
+        "Approved holder status (standard KYC)",
+        "Another approved address with 0 balance"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete drainage of all distributable reward tokens; permanent distribution lock freezing all token transfers",
+        "affected_users": "All token holders lose access to rewards and token transferability",
+        "recovery_possibility": "No recovery mechanism — contract permanently locked in distribution state"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No tests for zero-value transfers and their effect on holders array",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~30K gas per 0-value transfer; ~3000 duplicates per 100M gas block",
+        "capital_requirements": "Zero — attacker needs no tokens",
+        "execution_timing": "Single transaction for array inflation, then wait for distribution",
+        "detection_analysis": "Detectable via holders array length vs unique token holder count"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H002",
+      "title": "Burns Accumulate address(0) in Holders Array Causing Permanent Distribution DoS",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Every burn operation (burn/burnFrom) triggers _beforeTokenTransfer with to=address(0). Since balanceOf(address(0)) is always 0, the check `this.balanceOf(to) != 0` is always false, causing `holders.push(address(0))` on every burn. The _afterTokenTransfer hook only attempts to remove `from` (the burner), never address(0). Over time, the holders array grows unboundedly with address(0) entries. distributeToAllHolders() processes each entry, eventually exceeding block gas limits. Even partial distribute() calls waste gas iterating over phantom entries.",
+      "investigation_rationale": "Burns are a public function via ERC20Burnable. Any token holder can burn 1 wei repeatedly to inflate the holders array. The address(0) entries are never cleaned up because _afterTokenTransfer only checks `from`, and no other function removes them.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_beforeTokenTransfer",
+        "_afterTokenTransfer",
+        "distribute",
+        "burn",
+        "burnFrom"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beforeTokenTransfer(...)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_afterTokenTransfer(...)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "distribute(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "127-133",
+        "pattern": "During burn: to=address(0), balanceOf(address(0))=0 always, so holders.push(address(0)) executes on every burn"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker holds any amount of LiquidInfrastructureERC20 tokens",
+        "burn() is not blocked (within MinDistributionPeriod, not locked)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 127-133",
+        "vulnerable_pattern": "to=address(0) during burns always evaluates balanceOf(address(0))==0, triggering holders.push(address(0))",
+        "specific_concern": "No guard against pushing address(0); no cleanup mechanism for phantom entries",
+        "missing_safeguards": "Missing `if (to == address(0)) return;` check before exists check"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How many burns are needed to make distributeToAllHolders() exceed block gas limit?",
+          "Can partial distribute() work around the inflated array, or is gas cost per entry too high?",
+          "Is there any mechanism to remove address(0) entries from holders?"
+        ],
+        "validation_requirements": [
+          "Burn tokens N times and verify holders.length increases by N with address(0) entries",
+          "Calculate gas per holder entry in distribute() to determine DoS threshold",
+          "Verify distributeToAllHolders() reverts with OOG after sufficient burns"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker burns 1 wei per transaction thousands of times. Each burn pushes address(0) to holders. Once holders array contains enough entries (~10K+), distributeToAllHolders() exceeds block gas limit. Even partial distribute() calls spend significant gas on phantom entries. Protocol becomes unable to complete distributions efficiently, potentially permanently.",
+      "prerequisites": [
+        "Token balance (even 1 wei sufficient for many burns)",
+        "burnAndDistribute or burn accessible"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent DoS on distribution mechanism; all accumulated revenue becomes inaccessible",
+        "affected_users": "All token holders cannot receive distributions",
+        "recovery_possibility": "No on-chain recovery — no function to clean holders array"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No tests for holders array state after burns",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~50K gas per holder entry in distribute(); block gas limit / 50K = max processable holders",
+        "capital_requirements": "Minimal — 1 wei per burn operation",
+        "execution_timing": "Multi-transaction attack over time",
+        "detection_analysis": "Detectable via holders.length monitoring"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H003",
+      "title": "releaseManagedNFT Contains Dead Validation (require(true)) Allowing Silent NFT Release Failures",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "releaseManagedNFT contains `require(true, 'unable to find released NFT in ManagedNFTs')` which always passes regardless of whether the NFT was actually found and removed from the ManagedNFTs array. If the provided nftContract address is not in ManagedNFTs (wrong address, already released, or never added via addManagedNFT), the NFT token is transferred out but ManagedNFTs is not modified. This leaves stale entries in ManagedNFTs or fails to clean up, causing subsequent withdrawFromManagedNFTs to revert when attempting to withdraw from an unowned NFT.",
+      "investigation_rationale": "The require(true) is demonstrably wrong code — it should be a boolean tracking whether the NFT was found and removed. This is a logic error that silently allows inconsistent state.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "releaseManagedNFT",
+        "withdrawFromManagedNFTs"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "releaseManagedNFT(address,address)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "withdrawFromManagedNFTs(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "282-283",
+        "pattern": "require(true, 'unable to find released NFT in ManagedNFTs') — literal true, never reverts"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner calls releaseManagedNFT with an address not present in ManagedNFTs array",
+        "This contract owns the NFT being released (transferFrom would succeed)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 270-285",
+        "vulnerable_pattern": "require(true) where a boolean found flag should be used",
+        "specific_concern": "No actual validation that the NFT was found in and removed from ManagedNFTs",
+        "missing_safeguards": "Should use `bool found = false;` then `found = true;` inside the loop, then `require(found)`"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can releaseManagedNFT be called with a duplicate NFT address?",
+          "What happens to withdrawFromManagedNFTs when ManagedNFTs contains a stale (unowned) entry?",
+          "Does the stale entry cause permanent withdrawal DoS?"
+        ],
+        "validation_requirements": [
+          "Call releaseManagedNFT with an NFT not in ManagedNFTs and verify it succeeds",
+          "Verify stale ManagedNFTs entries cause withdrawFromManagedNFTs to revert",
+          "Test withdrawal cycle completion with stale entries"
+        ]
+      },
+      "preliminary_attack_scenario": "Owner releases an NFT using wrong address or calls release twice. First call transfers NFT and removes from array. Second call with same address: NFT ownership check passes if contract still owns it (but it doesn't), transferFrom reverts. Or if a different unmanaged NFT is released, ManagedNFTs retains stale entries while the untracked NFT is sent away. Stale entries block withdrawal cycles.",
+      "prerequisites": [
+        "Owner action (operational error scenario)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Withdrawal cycle DoS; revenue from remaining NFTs becomes inaccessible",
+        "affected_users": "All token holders affected by blocked withdrawals",
+        "recovery_possibility": "Requires manual intervention via addManagedNFT or additional release calls"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests for releaseManagedNFT with non-existent NFT addresses",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Detectable by comparing ManagedNFTs entries with actual NFT ownership"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "_afterTokenTransfer Missing Break After Swap-and-Pop Skips Swapped Element",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In _afterTokenTransfer, when removing a holder via swap-and-pop (copying last element to position i, then pop), the loop does not break after removal. After swap-and-pop, `i` increments, causing the element that was swapped from the end into position i to be skipped entirely — it is never checked. This means: (1) if there are duplicate entries of the same address (from bug TECH-H001/H002), only the first is removed per call; (2) the swapped element may be incorrectly left in the array even if it should be checked for removal conditions.",
+      "investigation_rationale": "The missing break is a demonstrable code defect. Combined with the duplicate entry bugs, this creates a situation where phantom entries can never be fully cleaned up, compounding the DoS risk.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_afterTokenTransfer"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_afterTokenTransfer(...)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "144-155",
+        "pattern": "After swap-and-pop: holders[i] = holders[holders.length - 1]; holders.pop(); — no break statement; i++ on next iteration skips the swapped element"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "An address with 0 post-transfer balance exists in holders",
+        "The address is not the last element in the array"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 144-155",
+        "vulnerable_pattern": "Swap-and-pop without break; loop continues and skips swapped element",
+        "specific_concern": "Element swapped from end to position i is at index i but loop advances to i+1",
+        "missing_safeguards": "Missing `break;` after holders.pop()"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Under what conditions does the skipped element matter?",
+          "Does this compound with the address(0) bug to prevent cleanup?",
+          "Can the swapped element be a different address that should remain, causing accidental removal?"
+        ],
+        "validation_requirements": [
+          "Create scenario where address appears multiple times, transfer all tokens away, verify cleanup removes only one entry",
+          "Verify that the last element swapped in is never checked in subsequent iterations"
+        ]
+      },
+      "preliminary_attack_scenario": "Combined with TECH-H002: multiple address(0) entries exist. A mint to address(0)-adjacent entries triggers _afterTokenTransfer for from=address(0). Only the first address(0) occurrence is removed. The swapped element (which might also be address(0)) is skipped. Phantom entries persist and accumulate, compounding DoS risk.",
+      "prerequisites": [
+        "Duplicate entries in holders array (from TECH-H001 or TECH-H002)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Persistent phantom entries cause gas waste and potential permanent distribution DoS",
+        "affected_users": "All token holders affected by degraded distribution",
+        "recovery_possibility": "No recovery mechanism for corrupted holders array"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests for swap-and-pop behavior with duplicate entries",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Gas overhead per phantom entry in distribution",
+        "capital_requirements": "N/A",
+        "execution_timing": "Accumulates over time",
+        "detection_analysis": "Detectable via holders array inspection"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H005",
+      "title": "Integer Division Truncation in Entitlement Calculation Permanently Locks Low-Decimal Token Revenue",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "In _beginDistribution, entitlement per unit is calculated as `balance / supply` using integer division. For tokens with fewer decimals than the ERC20's 18 decimals (e.g., USDC with 6 decimals), when balance < supply, entitlementPerUnit truncates to 0. For example, with 1000 LiquidInfrastructureERC20 tokens (1e21 wei supply) and 1000 USDC (1e9 units), entitlement = 1e9 / 1e21 = 0. All USDC revenue rounds to zero per unit and is permanently locked in the contract with no recovery mechanism. The documentation explicitly mentions USDC and USDT as target distributable tokens.",
+      "investigation_rationale": "The division-first formula (balance/supply then multiply by holder balance) is a well-known precision loss pattern. The specific concern is that with realistic supply and 6-decimal tokens, ALL revenue truncates to 0, not just dust. The project documentation confirms USDC/USDT are intended distributable tokens.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "Documentation states 'Vetted ERC20 stablecoins (e.g., USDC, DAI, USDT)' as external integrations. Deployment script uses test ERC20s.",
+      "affected_functions": [
+        "_beginDistribution",
+        "distribute"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beginDistribution()"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "distribute(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "198-204",
+        "pattern": "uint256 entitlement = balance / supply; — integer division truncates to 0 when balance < supply"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Distributable ERC20 has fewer decimals than 18 (e.g., USDC with 6 decimals)",
+        "Token balance in contract < totalSupply of LiquidInfrastructureERC20",
+        "This is the expected case for realistic USDC revenue vs 18-decimal supply"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 198-204",
+        "vulnerable_pattern": "Division before multiplication: balance / supply computed first, then multiplied by holder balance in distribute()",
+        "specific_concern": "With 6-decimal USDC and 18-decimal supply, any USDC amount below 10^12 (i.e., $1M) truncates to 0 per unit",
+        "missing_safeguards": "Should compute (balance * holderBalance) / supply per holder for better precision"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the realistic total supply range for this ERC20?",
+          "At what USDC balance does entitlement become non-zero?",
+          "Is accumulated dust recoverable by any mechanism?"
+        ],
+        "validation_requirements": [
+          "Calculate entitlement with realistic supply (e.g., 1000 tokens = 1e21 wei) and USDC balance (e.g., 1000 USDC = 1e9)",
+          "Verify entitlementPerUnit = 0 in this scenario",
+          "Verify funds remain permanently locked"
+        ]
+      },
+      "preliminary_attack_scenario": "Protocol accumulates 10,000 USDC (1e10 units) from managed NFTs. With 1000 ERC20 tokens outstanding (1e21 supply), entitlementPerUnit = 1e10/1e21 = 0. Distribution distributes 0 to every holder. USDC remains in contract permanently. Next distribution accumulates more, same result. Revenue is permanently trapped.",
+      "prerequisites": [
+        "Low-decimal distributable ERC20 (USDC/USDT)",
+        "ERC20 supply > distributable balance"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "100% of low-decimal token revenue permanently locked in contract",
+        "affected_users": "All token holders receive zero distributions for these tokens",
+        "recovery_possibility": "No recovery mechanism — no admin withdrawal for dust/trapped funds"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No tests with realistic decimal mismatch scenarios",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Immediate on first distribution with mismatched decimals",
+        "detection_analysis": "Detectable by comparing pre/post distribution balances"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H006",
+      "title": "setDistributableERC20s Callable During Active Distribution Causes Permanent Contract Lock",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "setDistributableERC20s has no check for LockedForDistribution. If called during an active distribution, it changes the distributableERC20s array while erc20EntitlementPerUnit was sized for the old array. In distribute(), the inner loop iterates over `distributableERC20s.length` (new length) and accesses `erc20EntitlementPerUnit[j]` (old length). If the new array is longer, this causes an array out-of-bounds revert. Since LockedForDistribution is true and can only be cleared by completing the distribution (which now always reverts), the contract is permanently locked — no transfers, mints, or burns can ever occur again.",
+      "investigation_rationale": "The missing LockedForDistribution guard on setDistributableERC20s is a code defect. While it requires admin action, admins may use governance tools or automated scripts that don't coordinate with distribution state. The permanent lock impact makes this critical.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setDistributableERC20s",
+        "distribute"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "setDistributableERC20s(address[])"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "distribute(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "291-296",
+        "pattern": "setDistributableERC20s has onlyOwner but no LockedForDistribution check; distribute() at lines 167-175 iterates distributableERC20s.length and indexes erc20EntitlementPerUnit"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner calls setDistributableERC20s while LockedForDistribution is true",
+        "New distributableERC20s array length differs from erc20EntitlementPerUnit length"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 291-296 and 167-175",
+        "vulnerable_pattern": "Missing !LockedForDistribution guard on setDistributableERC20s",
+        "specific_concern": "Array length mismatch: distributableERC20s.length (modified) != erc20EntitlementPerUnit.length (frozen at _beginDistribution)",
+        "missing_safeguards": "require(!LockedForDistribution) in setDistributableERC20s"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can the admin accidentally trigger this via governance or script?",
+          "Is there any way to recover from the permanent lock?",
+          "What if the new array is shorter — does it silently distribute wrong tokens?"
+        ],
+        "validation_requirements": [
+          "Start distribution, call setDistributableERC20s with longer array, call distribute, verify OOB revert",
+          "Verify contract is permanently locked after this sequence",
+          "Test with shorter array to check silent misallocation"
+        ]
+      },
+      "preliminary_attack_scenario": "Distribution starts with 1 distributable ERC20 (erc20EntitlementPerUnit.length=1). Admin calls setDistributableERC20s with 3 tokens. Next distribute() call iterates j=0,1,2 but erc20EntitlementPerUnit only has index 0. Access to erc20EntitlementPerUnit[1] causes array OOB revert. Distribution can never complete. Contract permanently locked.",
+      "prerequisites": [
+        "Admin calls setDistributableERC20s during active distribution"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "All ERC20 tokens permanently frozen (no transfers, mints, burns); all reward tokens locked",
+        "affected_users": "All token holders and the protocol itself",
+        "recovery_possibility": "No recovery — permanent state corruption"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No tests for setDistributableERC20s during active distribution",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Two transactions during distribution window",
+        "detection_analysis": "Detectable by checking LockedForDistribution state before admin calls"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "nextWithdrawal Index Corruption When releaseManagedNFT Called During Partial Withdrawal Cycle",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "releaseManagedNFT uses swap-and-pop on ManagedNFTs but does not adjust the nextWithdrawal index. If an NFT at index < nextWithdrawal is released during a partial withdrawal cycle, the element swapped from the end (which hasn't been withdrawn from yet) replaces the removed element and is skipped. Worse, if enough NFTs are released such that ManagedNFTs.length < nextWithdrawal, the completion check `nextWithdrawal == ManagedNFTs.length` never triggers (nextWithdrawal > ManagedNFTs.length), and nextWithdrawal is never reset to 0, permanently stalling the withdrawal cycle.",
+      "investigation_rationale": "The interaction between ManagedNFTs array modification and the withdrawal cursor is a multi-function state flow issue. The code does not guard against ManagedNFTs modification while nextWithdrawal > 0.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "releaseManagedNFT",
+        "withdrawFromManagedNFTs",
+        "addManagedNFT"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "releaseManagedNFT(address,address)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "withdrawFromManagedNFTs(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "265-285",
+        "pattern": "releaseManagedNFT swap-and-pop does not adjust nextWithdrawal; withdrawFromManagedNFTs at lines 238-257 relies on nextWithdrawal == ManagedNFTs.length for completion"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Partial withdrawal in progress (nextWithdrawal > 0)",
+        "Owner calls releaseManagedNFT for an NFT at index < nextWithdrawal",
+        "Or enough NFTs released that ManagedNFTs.length < nextWithdrawal"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 265-285 and 238-257",
+        "vulnerable_pattern": "ManagedNFTs mutation during active withdrawal cycle without adjusting nextWithdrawal",
+        "specific_concern": "nextWithdrawal > ManagedNFTs.length makes the reset condition unreachable",
+        "missing_safeguards": "require(nextWithdrawal == 0) in releaseManagedNFT/addManagedNFT"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can nextWithdrawal exceed ManagedNFTs.length permanently?",
+          "Does this block all future withdrawal cycles?",
+          "Is there any way to reset nextWithdrawal without completing the cycle?"
+        ],
+        "validation_requirements": [
+          "Start withdrawal for 3 of 4 NFTs (nextWithdrawal=3), release 2 NFTs, verify nextWithdrawal > ManagedNFTs.length",
+          "Call withdrawFromManagedNFTs and verify cycle never completes",
+          "Verify revenue accumulation stops"
+        ]
+      },
+      "preliminary_attack_scenario": "Owner starts withdrawing from 4 NFTs with numWithdrawals=2 (nextWithdrawal=2). Owner then releases NFTs at index 0 and 1 (swap-and-pop reduces array to 2). Now nextWithdrawal=2 == ManagedNFTs.length=2, which actually completes the cycle correctly. But if owner releases NFT at index 3 (last) while nextWithdrawal=2, array becomes [0,1,2], length=3, and cycle continues normally. The dangerous case: release at index < nextWithdrawal before cycle completes, making length < nextWithdrawal.",
+      "prerequisites": [
+        "Owner action during partial withdrawal",
+        "Specific timing of release vs withdrawal state"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Revenue collection permanently blocked; managed NFT revenue inaccessible",
+        "affected_users": "All token holders lose access to future distributions",
+        "recovery_possibility": "May require adding NFTs back to reach nextWithdrawal threshold"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests for ManagedNFTs modification during active withdrawal cycle",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Admin operation during withdrawal window",
+        "detection_analysis": "Detectable by monitoring nextWithdrawal vs ManagedNFTs.length"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H008",
+      "title": "Disapproved Holders Dilute Distribution Entitlements for Approved Holders",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The entitlement calculation in _beginDistribution uses totalSupply() as the denominator, which includes tokens held by disapproved holders. During distribution, disapproved holders are skipped (isApprovedHolder check), but their proportional share is not redistributed. It remains in the contract and is included in the NEXT distribution's balance — but totalSupply still includes their tokens, so the dilution persists indefinitely. Approved holders are systematically underpaid relative to their actual share of the approved supply.",
+      "investigation_rationale": "The asymmetry between entitlement calculation (uses totalSupply including disapproved) and actual distribution (skips disapproved) creates a persistent fund leak. Disapproved holders' tokens cannot be forcibly burned, so the dilution is permanent until the holder is re-approved or voluntarily burns.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_beginDistribution",
+        "distribute",
+        "disapproveHolder"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beginDistribution()"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "distribute(uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "196-204",
+        "pattern": "uint256 supply = this.totalSupply(); entitlement = balance / supply; — totalSupply includes disapproved holders' tokens"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-008",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "At least one holder with non-zero balance is disapproved",
+        "Distribution occurs while disapproved holder's balance inflates totalSupply"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 196-204 and 164-176",
+        "vulnerable_pattern": "totalSupply used as denominator but disapproved holders' balances skipped in distribution",
+        "specific_concern": "Disapproved holder owning 50% of supply reduces approved holders' per-unit entitlement by 50%",
+        "missing_safeguards": "Should use sum of approved holder balances as denominator, or force-burn disapproved tokens"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What fraction of supply could realistically be disapproved?",
+          "Can a disapproved holder ever recover their tokens?",
+          "Does the undistributed portion accumulate and eventually become distributable if the holder is re-approved?"
+        ],
+        "validation_requirements": [
+          "Create scenario with 50% supply held by disapproved holder, verify approved holders receive only 50% of entitled share",
+          "Verify undistributed portion stays in contract and compounds over distributions"
+        ]
+      },
+      "preliminary_attack_scenario": "Holder A owns 50% of supply and gets disapproved. Every distribution calculates entitlementPerUnit = balance / totalSupply (includes A's 50%). During distribution, A is skipped, so 50% of entitlements go uncollected. Approved holders receive half their expected share per cycle. Over N distributions, a significant fraction of revenue is trapped.",
+      "prerequisites": [
+        "Owner disapproves a holder with significant token balance"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Proportional to disapproved supply fraction — up to 50%+ revenue loss for approved holders per cycle",
+        "affected_users": "All approved holders receive reduced distributions",
+        "recovery_possibility": "Re-approving the holder would allow them to receive future distributions, but past cycles are lost"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests for distribution behavior with disapproved holders who still have balance",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Persistent across all distributions while disapproved",
+        "detection_analysis": "Detectable by comparing totalSupply vs sum of approved holder balances"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "Non-Standard ERC20 Tokens (USDT) Cause Permanent Distribution Lock via ABI Decoding Revert",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The contract uses IERC20.transfer() without SafeERC20 wrapper. In Solidity 0.8.x, the compiler generates returndata size checks for the expected bool return value. Tokens like USDT that don't return a value from transfer() cause the ABI decoding to revert. In distribute(), this revert occurs during the distribution loop while LockedForDistribution is true. Since the distribution cannot complete (every call to distribute reverts at the USDT transfer), and LockedForDistribution can only be cleared by completing the distribution, the contract is permanently locked.",
+      "investigation_rationale": "The project documentation explicitly lists USDT as a target distributable token. USDT's non-standard transfer (no return value) is well-documented. The combination with the distribution lock creates a permanent DoS, not just a failed transfer.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "USDT or another non-bool-returning ERC20 is included in distributableERC20s"
+      ],
+      "config_evidence": "Documentation states 'Vetted ERC20 stablecoins (e.g., USDC, DAI, USDT)' as external integrations. No SafeERC20 import or usage in the contract.",
+      "affected_functions": [
+        "distribute",
+        "_beginDistribution"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol",
+        "LiquidInfrastructureNFT.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "distribute(uint256)"
+        },
+        {
+          "file": "LiquidInfrastructureNFT.sol",
+          "function": "_withdrawBalancesTo(address[],address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "170-173",
+        "pattern": "if (toDistribute.transfer(recipient, entitlement)) — Solidity 0.8.x requires bool return; USDT transfer() returns void"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "USDT or equivalent non-standard ERC20 is in distributableERC20s",
+        "Contract holds a non-zero balance of the non-standard token",
+        "Distribution begins successfully but reverts on first transfer attempt"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 170-173",
+        "vulnerable_pattern": "IERC20.transfer() without SafeERC20; Solidity 0.8.x ABI decode requires bool return",
+        "specific_concern": "USDT transfer() returns void, causing revert on return data decode",
+        "missing_safeguards": "Should use SafeERC20.safeTransfer() from OpenZeppelin"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does USDT on Althea-L1 have the same non-standard transfer behavior?",
+          "Does the revert occur in _beginDistribution (balanceOf) or distribute (transfer)?",
+          "Is the NFT withdrawal also affected by this same issue?"
+        ],
+        "validation_requirements": [
+          "Deploy with USDT-like token in distributableERC20s, attempt distribution, verify permanent revert",
+          "Verify LiquidInfrastructureNFT._withdrawBalancesTo also reverts with USDT"
+        ]
+      },
+      "preliminary_attack_scenario": "Admin adds USDT to distributableERC20s. NFTs accumulate USDT revenue. Withdrawal transfers USDT to ERC20 contract (may also revert here). During distribution, toDistribute.transfer() on USDT reverts due to ABI decode failure. Distribution permanently stuck. All token transfers frozen.",
+      "prerequisites": [
+        "USDT or non-standard ERC20 configured as distributable token"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent contract freeze; all token transfers, mints, burns disabled; all rewards locked",
+        "affected_users": "All token holders",
+        "recovery_possibility": "No recovery — permanent state corruption"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests with non-standard ERC20 tokens",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "First distribution after USDT is added",
+        "detection_analysis": "Detectable via test deployment with USDT mock"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "MinDistributionPeriod=0 Creates Permanent Mint/Burn Deadlock",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If MinDistributionPeriod is set to 0, _isPastMinDistributionPeriod() returns true immediately after a distribution ends (same block), because (block.number - LastDistribution) = 0 >= 0. This causes _beforeMintOrBurn() to always revert with 'must distribute before minting or burning'. Calling distribute() again completes instantly but sets LastDistribution = block.number again. Minting and burning become permanently impossible while holders and supply exist, freezing the token supply forever.",
+      "investigation_rationale": "The deployment script uses MinDistributionPeriod=10, but MinDistributionPeriod is set in the constructor and cannot be changed after deployment. If deployed with 0 (configuration error), the deadlock is permanent and unrecoverable.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "MinDistributionPeriod is set to 0 at deployment"
+      ],
+      "config_evidence": "Deployment script sets MinDistributionPeriod=10, but constructor accepts arbitrary value with no minimum check",
+      "affected_functions": [
+        "_isPastMinDistributionPeriod",
+        "_beforeMintOrBurn",
+        "mint",
+        "burn",
+        "mintAndDistribute"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_isPastMinDistributionPeriod()"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beforeMintOrBurn()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "185-191",
+        "pattern": "return (block.number - LastDistribution) >= MinDistributionPeriod; — with MinDistributionPeriod=0, always true when holders and supply exist"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-009",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "MinDistributionPeriod == 0",
+        "totalSupply > 0 and holders.length > 0",
+        "Distribution has occurred at least once"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 185-191 and 137-142",
+        "vulnerable_pattern": "0 >= 0 always true; _beforeMintOrBurn always reverts after distribution",
+        "specific_concern": "Token supply permanently frozen; no way to add or remove tokens from circulation",
+        "missing_safeguards": "require(MinDistributionPeriod > 0) in constructor, or >= changed to >"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does mintAndDistribute work around this? (distribute then mint in same block)",
+          "Is there a setter for MinDistributionPeriod? (No — immutable after construction)",
+          "Can the contract be redeployed as a workaround?"
+        ],
+        "validation_requirements": [
+          "Deploy with MinDistributionPeriod=0, mint tokens, distribute, attempt mint again — verify revert",
+          "Verify mintAndDistribute also fails in this scenario"
+        ]
+      },
+      "preliminary_attack_scenario": "Contract deployed with MinDistributionPeriod=0. Owner mints tokens to holders. Distribution occurs. Owner tries to mint more tokens — _beforeMintOrBurn reverts because _isPastMinDistributionPeriod returns true. mintAndDistribute also fails: inner distribute completes but mint immediately fails same-block check. Token supply permanently frozen.",
+      "prerequisites": [
+        "MinDistributionPeriod configured to 0"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Token supply permanently frozen; no new mints or burns possible",
+        "affected_users": "All protocol participants; protocol growth halted",
+        "recovery_possibility": "Requires redeployment; existing contract unrecoverable"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No tests with MinDistributionPeriod=0",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Immediately after first distribution",
+        "detection_analysis": "Detectable by checking MinDistributionPeriod value post-deployment"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H011",
+      "title": "addManagedNFT Allows Duplicate NFT Entries Creating Double-Withdrawal and Release Issues",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "addManagedNFT only checks that the contract owns the NFT but does not check whether the NFT is already in the ManagedNFTs array. If the owner calls addManagedNFT(nft) twice, the same NFT address appears twice in ManagedNFTs. During withdrawFromManagedNFTs, the first withdrawal drains the NFT's balance; the second withdrawal for the same NFT gets 0 (wasting gas). When releaseManagedNFT is called, only one occurrence is removed (the loop breaks), leaving a stale duplicate entry. Subsequent withdrawal cycles hit the stale entry (NFT no longer owned), causing reverts.",
+      "investigation_rationale": "Combined with the require(true) bug in releaseManagedNFT, this creates a compounding state corruption. The stale entry from an incomplete duplicate removal cannot be detected or removed.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "addManagedNFT",
+        "releaseManagedNFT",
+        "withdrawFromManagedNFTs"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "addManagedNFT(address)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "releaseManagedNFT(address,address)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "259-263",
+        "pattern": "ManagedNFTs.push(nftContract) without checking for existing entry; no deduplication"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner calls addManagedNFT with same NFT address more than once",
+        "Contract owns the NFT at time of each call"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 259-263",
+        "vulnerable_pattern": "No duplicate check before push to ManagedNFTs",
+        "specific_concern": "releaseManagedNFT with break only removes first occurrence, leaving stale duplicate",
+        "missing_safeguards": "Mapping to track managed NFT membership, or duplicate check before push"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can addManagedNFT be called for the same NFT twice?",
+          "Does releaseManagedNFT handle duplicates correctly?",
+          "What is the impact of a stale ManagedNFTs entry on withdrawals?"
+        ],
+        "validation_requirements": [
+          "Call addManagedNFT(nft) twice, verify ManagedNFTs contains duplicate",
+          "Release the NFT, verify one entry remains",
+          "Attempt withdrawal cycle, verify revert on stale entry"
+        ]
+      },
+      "preliminary_attack_scenario": "Owner accidentally adds same NFT twice. When releasing it, releaseManagedNFT breaks after finding and removing the first occurrence. A stale duplicate entry remains. Next withdrawal cycle tries to withdraw from the released (unowned) NFT and reverts, blocking revenue collection.",
+      "prerequisites": [
+        "Owner adds same NFT address to ManagedNFTs more than once"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Withdrawal DoS blocking revenue collection from all managed NFTs",
+        "affected_users": "All token holders affected by blocked distributions",
+        "recovery_possibility": "Difficult — no way to remove stale entry without owning the NFT again"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No tests for duplicate addManagedNFT calls",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Single admin error",
+        "detection_analysis": "Detectable via ManagedNFTs array inspection for duplicates"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H012",
+      "title": "Disapproved Holders' Tokens Are Permanently Trapped with No Exit Path",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When a holder is disapproved via disapproveHolder(), they can no longer transfer their tokens (allowlist check in _beforeTokenTransfer reverts for non-zero `to`). Their only exit path is burning, but burn() calls _beforeMintOrBurn() which requires a distribution to have occurred within MinDistributionPeriod. If _isPastMinDistributionPeriod returns true, the holder must first trigger a distribution before burning. However, burnAndDistribute() calls distributeToAllHolders() which may exceed gas limits if the holders array is bloated. The disapproved holder's tokens and their distribution entitlement are effectively trapped.",
+      "investigation_rationale": "This represents a design flaw where disapproval creates a state with no viable exit path for the affected holder. The combination of allowlist enforcement on transfers and distribution requirement on burns creates a deadlock for disapproved holders.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "disapproveHolder",
+        "_beforeTokenTransfer",
+        "_beforeMintOrBurn",
+        "burn",
+        "burnAndDistribute"
+      ],
+      "affected_contracts": [
+        "LiquidInfrastructureERC20.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "disapproveHolder(address)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beforeTokenTransfer(...)"
+        },
+        {
+          "file": "LiquidInfrastructureERC20.sol",
+          "function": "_beforeMintOrBurn()"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "LiquidInfrastructureERC20.sol",
+        "lines": "118-124",
+        "pattern": "isApprovedHolder(to) check on transfers; combined with _beforeMintOrBurn distribution requirement on burns at lines 137-142"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Holder is disapproved while still holding tokens",
+        "MinDistributionPeriod has elapsed (making burns require prior distribution)",
+        "Distribution is difficult to complete (bloated holders array or other DoS)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "LiquidInfrastructureERC20.sol lines 118-124 and 137-142",
+        "vulnerable_pattern": "Disapproved holder cannot transfer (allowlist check) and may not be able to burn (distribution requirement)",
+        "specific_concern": "No mechanism for the holder or admin to recover trapped tokens",
+        "missing_safeguards": "Allow burns without distribution requirement for disapproved holders, or add admin force-burn"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can a disapproved holder call burnAndDistribute successfully?",
+          "What happens if distributeToAllHolders exceeds gas limit?",
+          "Can the owner help by calling distribute() in batches before the holder burns?"
+        ],
+        "validation_requirements": [
+          "Disapprove holder with balance, attempt transfer (verify revert), attempt burn during stale period (verify revert)",
+          "Test burnAndDistribute path under various conditions"
+        ]
+      },
+      "preliminary_attack_scenario": "Owner disapproves holder who owns 30% of supply. Holder cannot transfer tokens. MinDistributionPeriod elapses. Holder tries to burn — reverted by _beforeMintOrBurn. Holder tries burnAndDistribute — if holders array is bloated, distributeToAllHolders exceeds gas. Tokens permanently trapped. Meanwhile, the 30% supply dilutes all other holders' entitlements per TECH-H008.",
+      "prerequisites": [
+        "Owner disapproves a holder who still holds tokens",
+        "MinDistributionPeriod has elapsed"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Affected holder loses all token value; other holders suffer diluted distributions",
+        "affected_users": "Disapproved holder and indirectly all other holders via dilution",
+        "recovery_possibility": "Owner can re-approve the holder; no forced-burn mechanism"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No tests for disapproved holder exit paths",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Gas cost of distributeToAllHolders with bloated array",
+        "capital_requirements": "N/A",
+        "execution_timing": "Persistent condition after disapproval",
+        "detection_analysis": "Detectable by checking disapproved holders with non-zero balance"
+      }
+    }
+  ]
+}

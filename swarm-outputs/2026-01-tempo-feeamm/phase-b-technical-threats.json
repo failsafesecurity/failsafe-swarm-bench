@@ -1,0 +1,848 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "FeeAMM.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T03:39:58.917Z",
+    "duration_ms": 481191
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H001",
+      "title": "Reentrancy in executeFeeSwap via Malicious userToken Drains validatorToken Reserves",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "executeFeeSwap performs IERC20(userToken).transferFrom before updating pool.reserveUserToken and pool.reserveValidatorToken. If userToken is a malicious/ERC-777 token controlled by the attacker, the callback during transferFrom allows recursive reentry into executeFeeSwap. Since reserveValidatorToken has not been decremented by any prior call in the reentrancy chain, each reentrant invocation passes the sufficiency check and sends out amountOut of real validatorTokens. The attacker drains the entire validatorToken reserve while the malicious token sends nothing (or minimal tokens) on reentrant calls.",
+      "investigation_rationale": "The code clearly shows external call before state update on lines ~119-124. No reentrancy guard (nonReentrant) is present anywhere in the contract. The attacker controls the userToken contract and can create pools permissionlessly.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeFeeSwap"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "109-130",
+        "pattern": "IERC20(userToken).transferFrom at line ~119 executes BEFORE pool.reserveUserToken += and pool.reserveValidatorToken -= at lines ~121-122, and BEFORE IERC20(validatorToken).transfer at line ~124"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker deploys a malicious ERC-777/callback-enabled token as userToken",
+        "Pool exists with real validatorToken (e.g., USDC) and the malicious userToken, with liquidity from other LPs",
+        "No reentrancy guard on executeFeeSwap (verified: none exists)",
+        "validatorToken is a standard ERC-20 that successfully transfers"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 109-130",
+        "vulnerable_pattern": "external call (transferFrom) before state update (reserve increment/decrement)",
+        "specific_concern": "pool.reserveValidatorToken not decremented before userToken.transferFrom callback; attacker can recursively drain validatorToken",
+        "missing_safeguards": "No ReentrancyGuard / nonReentrant modifier; no checks-effects-interactions pattern"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can a malicious userToken's transferFrom callback successfully reenter executeFeeSwap multiple times?",
+          "How many recursive calls are possible before gas runs out (stack depth limit ~1024)?",
+          "Does the uint128 arithmetic revert on the final state update when nested calls unwind?"
+        ],
+        "validation_requirements": [
+          "Deploy malicious ERC-777-like token with transferFrom callback",
+          "Create pool and seed with real validatorToken",
+          "Execute reentrancy attack and measure extracted validatorTokens vs deposited"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker deploys malicious userToken with callback hook. Creates pool (maliciousToken/USDC). LPs deposit USDC. Attacker calls executeFeeSwap; during transferFrom, malicious token reenters executeFeeSwap N times. Each call extracts amountOut USDC from unchanged reserves. Total drain: N * amountOut, limited only by pool's USDC reserve and gas.",
+      "prerequisites": [
+        "Malicious callback-enabled token deployment",
+        "Pool with real validatorToken liquidity from other LPs"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete drainage of all validatorToken reserves in affected pools",
+        "affected_users": "All LPs who deposited validatorToken to pools using malicious userToken",
+        "recovery_possibility": "None - funds irrecoverably transferred to attacker"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No reentrancy tests for executeFeeSwap with callback-enabled tokens",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~30K gas per recursive call; estimate max recursion depth",
+        "capital_requirements": "Minimal - attacker deploys worthless token, needs gas only",
+        "execution_timing": "Single atomic transaction",
+        "detection_analysis": "Detectable via internal transaction traces showing recursive executeFeeSwap calls"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H002",
+      "title": "Cross-Function Reentrancy: burn() External Calls Before State Update Enable executeFeeSwap/rebalanceSwap Exploitation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "burn() performs IERC20(userToken).transfer and IERC20(validatorToken).transfer BEFORE updating liquidityBalances, totalSupply, and pool reserves. If either token has a callback (ERC-777 tokensReceived), the attacker's receiving contract can reenter executeFeeSwap or rebalanceSwap while reserves still reflect pre-burn values. For executeFeeSwap reentry: the attacker swaps received userTokens for validatorTokens against inflated (un-decremented) reserveValidatorToken. For rebalanceSwap reentry: the attacker extracts userTokens against inflated reserveUserToken. The burn amounts were calculated against stale reserves, so the combined extraction exceeds the attacker's fair share.",
+      "investigation_rationale": "Lines ~243-256 clearly show two external transfer calls before all four state variable updates. No reentrancy guard exists. This is a textbook checks-effects-interactions violation with concrete cross-function exploitation paths.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "burn",
+        "executeFeeSwap",
+        "rebalanceSwap"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "burn"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "rebalanceSwap"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "243-256",
+        "pattern": "IERC20.transfer(to, amount) at lines ~243-244 before liquidityBalances -= at line ~246, totalSupply -= at line ~247, reserves -= at lines ~248-249"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker has LP tokens in a pool where userToken or validatorToken is ERC-777/callback-enabled",
+        "Attacker calls burn from a contract that implements tokensReceived callback",
+        "to parameter set to the attacker's contract (receives callback on token receipt)",
+        "Pool has reserves from other LPs"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 230-260",
+        "vulnerable_pattern": "Two external calls (transfer) before four state updates (balances, supply, reserves)",
+        "specific_concern": "During callback from first transfer, all pool state (reserves, supply, LP balances) still reflects pre-burn values; reentrant swap uses inflated reserves for calculation",
+        "missing_safeguards": "No nonReentrant modifier on burn, executeFeeSwap, or rebalanceSwap"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the maximum value extractable via burn→executeFeeSwap vs burn→rebalanceSwap reentry?",
+          "Does the outer burn's state update underflow after the reentrant swap modifies reserves?",
+          "Can the attacker combine both reentry paths (first transfer → executeFeeSwap, second transfer → rebalanceSwap)?"
+        ],
+        "validation_requirements": [
+          "Build PoC with ERC-777 token as userToken, attacker contract as `to`",
+          "Measure value extracted vs legitimate burn-only withdrawal",
+          "Verify state consistency after attack completes"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker provides liquidity, receives LP tokens from their contract. Calls burn(userToken, validatorToken, liquidity, attackerContract). When attackerContract receives userToken via ERC-777 callback, it approves FeeAMM and calls executeFeeSwap with received userTokens. Since reserves haven't been decremented, the swap executes against inflated reserves, extracting excess validatorTokens. Combined burn+swap extraction exceeds attacker's pro-rata share, stealing from other LPs.",
+      "prerequisites": [
+        "ERC-777 compatible token in pool",
+        "Attacker has LP position",
+        "Other LPs have funds at risk"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Attacker extracts significantly more than their fair share; remaining LPs' claims exceed actual reserves (insolvency)",
+        "affected_users": "All other LPs in the affected pool",
+        "recovery_possibility": "None - pool becomes insolvent"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No cross-function reentrancy tests between burn and swap functions",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "burn + executeFeeSwap in single callback ~300K gas",
+        "capital_requirements": "Initial LP deposit to obtain LP tokens; recovered via the attack",
+        "execution_timing": "Single atomic transaction",
+        "detection_analysis": "Visible via internal transaction trace: burn→transfer→executeFeeSwap sequence"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H003",
+      "title": "rebalanceSwap Optimistic State Update Creates Phantom Reserve Inflation Exploitable via Cross-Function Reentrancy",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "rebalanceSwap updates pool.reserveValidatorToken += amountIn and pool.reserveUserToken -= amountOut BEFORE calling IERC20(validatorToken).transferFrom. If validatorToken is ERC-777, the tokensToSend hook fires BEFORE the actual transfer, so the contract's reserve state reflects tokens not yet received. During this callback, the attacker can reenter burn() which calculates withdrawal amounts using the inflated reserveValidatorToken. The burn transfers out more validatorToken than the attacker deserves, and if the contract's actual balance (from other pools/deposits) covers the transfer, the attack succeeds.",
+      "investigation_rationale": "Lines ~145-155 show state updates before external calls. This is an optimistic update pattern that creates phantom reserves. Combined with no reentrancy guard, this enables cross-function exploitation.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "rebalanceSwap",
+        "burn"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "rebalanceSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "burn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "145-160",
+        "pattern": "pool.reserveValidatorToken += uint128(amountIn) and pool.reserveUserToken -= uint128(amountOut) at lines ~148-149 BEFORE IERC20(validatorToken).transferFrom at line ~151"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "validatorToken is ERC-777 or has tokensToSend callback",
+        "Attacker has LP tokens in the same pool",
+        "Contract holds enough validatorToken balance (from other pools or deposits) to cover inflated burn amount",
+        "No reentrancy guard present (verified: none exists)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 145-160",
+        "vulnerable_pattern": "State updated optimistically before external transferFrom call",
+        "specific_concern": "reserveValidatorToken is inflated by amountIn before tokens actually arrive; reentering burn uses inflated value for proportional calculation",
+        "missing_safeguards": "No nonReentrant modifier; no balance-before/after check"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the contract hold enough validatorToken balance from other pools to cover the inflated burn amount?",
+          "Can the attacker create multiple pools with the same validatorToken to increase available balance?",
+          "After the reentrancy completes, does the outer rebalanceSwap's transferFrom succeed or revert?"
+        ],
+        "validation_requirements": [
+          "Deploy ERC-777 validatorToken; create pool with LP tokens",
+          "Call rebalanceSwap; in tokensToSend hook, reenter burn()",
+          "Verify extracted amount exceeds fair share"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker calls rebalanceSwap with large amountOut. Reserves updated: validatorToken reserve inflated by amountIn. During transferFrom callback, attacker reenters burn(). burn() calculates amountValidatorToken using inflated reserve, sends excess validatorTokens. When callback completes, the actual transfer happens but the pool is already insolvent.",
+      "prerequisites": [
+        "ERC-777 validatorToken",
+        "LP tokens in target pool",
+        "Sufficient contract balance to cover inflated withdrawal"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Pool insolvency; excess validatorToken extracted at expense of other LPs",
+        "affected_users": "All LPs in pools using the affected validatorToken",
+        "recovery_possibility": "None - extracted tokens cannot be clawed back"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No tests for optimistic state update interaction with callback tokens",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "rebalanceSwap + burn in single callback ~250K gas",
+        "capital_requirements": "Need LP tokens + validatorTokens for rebalanceSwap; partial recovery via attack",
+        "execution_timing": "Single atomic transaction",
+        "detection_analysis": "Internal transaction trace shows rebalanceSwap→transferFrom→burn sequence"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "mint() Reentrancy via validatorToken Callback Mints Excess LP Tokens Against Stale Pool State",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "mint() calls IERC20(validatorToken).transferFrom (line ~197) BEFORE updating pool.reserveValidatorToken (line ~200), totalSupply, and liquidityBalances (lines ~202-203). If validatorToken has a callback hook (ERC-777 tokensToSend), the attacker can reenter mint() during the transfer. The inner mint() calculates liquidity using the stale (lower) reserveValidatorToken in the denominator, yielding more LP tokens than warranted. After both calls complete, the attacker holds a disproportionate share of LP tokens, diluting existing LPs.",
+      "investigation_rationale": "The data flow analysis confirms transferFrom before state update in mint. The liquidity calculation for subsequent deposits uses denom = reserveValidatorToken + (N * reserveUserToken / SCALE). A stale lower reserveValidatorToken means smaller denom and more LP tokens per deposit.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "mint"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "mint"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "177-205",
+        "pattern": "IERC20(validatorToken).transferFrom at line ~197 before pool.reserveValidatorToken += at line ~200 and totalSupply += at line ~202"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "validatorToken is ERC-777 or has tokensToSend/tokensReceived callback",
+        "Pool already has existing liquidity (not first deposit, so subsequent-deposit branch is taken)",
+        "Attacker can split deposit into outer + inner reentrant calls",
+        "No reentrancy guard on mint (verified: none exists)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 190-205",
+        "vulnerable_pattern": "transferFrom external call before reserve and supply state updates",
+        "specific_concern": "Liquidity calculation uses stale reserveValidatorToken in denominator; inner reentrant mint gets more LP tokens",
+        "missing_safeguards": "No nonReentrant modifier; no pre/post balance verification"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How much excess LP token can the attacker mint compared to a normal two-step deposit?",
+          "Does the inner mint's state update change the outer mint's calculation on return?",
+          "Can this be combined with burn to extract real tokens at inflated LP share?"
+        ],
+        "validation_requirements": [
+          "Deploy ERC-777 validatorToken with callback on transferFrom",
+          "Create pool, add initial liquidity, then perform reentrant mint",
+          "Compare LP tokens minted vs expected for equivalent single deposit"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker calls mint(amount1) with ERC-777 validatorToken. During transferFrom, callback reenters mint(amount2). Inner mint calculates liquidity using stale reserves (lower denominator), getting excess LP tokens. Both calls complete, attacker holds more LP share than proportional. Attacker burns LP tokens to extract more than deposited, diluting other LPs.",
+      "prerequisites": [
+        "ERC-777 validatorToken",
+        "Existing pool with other LPs' liquidity"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "LP dilution; attacker extracts more tokens on burn than deposited, at expense of other LPs",
+        "affected_users": "Existing LPs in the affected pool",
+        "recovery_possibility": "Damage is permanent once LP tokens are minted disproportionately"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No reentrancy tests for mint with callback tokens",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~200K gas for nested mint calls",
+        "capital_requirements": "Requires validatorToken deposits (recovered via burn exploit)",
+        "execution_timing": "Single atomic transaction: mint→callback→mint→burn",
+        "detection_analysis": "Detectable via nested mint internal transactions"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H005",
+      "title": "Unchecked Transfer Return Values in rebalanceSwap Enable Free Token Extraction",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "rebalanceSwap updates pool state (reserves incremented/decremented) BEFORE calling IERC20(validatorToken).transferFrom and IERC20(userToken).transfer. Neither call checks the boolean return value (no SafeERC20). If validatorToken returns false on transferFrom (instead of reverting), the contract never receives tokens but has already credited reserves and proceeds to transfer out userTokens. The attacker gets free userTokens while the pool's accounting becomes inflated for validatorToken reserves.",
+      "investigation_rationale": "The contract uses raw IERC20 interface calls without SafeERC20 wrappers. Lines ~151-156 show transferFrom and transfer calls with return values discarded. The optimistic state update at lines ~148-149 makes this doubly dangerous.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Pool must be created with a token that returns false on failure instead of reverting (e.g., BAT, ZRX, some USDT implementations)"
+      ],
+      "config_evidence": "No token whitelist or SafeERC20 usage in FeeAMM.sol; any token can be used in permissionless pool creation",
+      "affected_functions": [
+        "rebalanceSwap",
+        "executeFeeSwap",
+        "mint",
+        "burn"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "rebalanceSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "mint"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "burn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "148-156",
+        "pattern": "pool state updated at 148-149, then IERC20(validatorToken).transferFrom at 151 and IERC20(userToken).transfer at 155 with return values discarded"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "validatorToken returns false instead of reverting on failed transferFrom",
+        "Pool has userToken reserves to extract",
+        "Attacker calls rebalanceSwap without sufficient allowance or balance for validatorToken"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 148-156",
+        "vulnerable_pattern": "Optimistic state update + unchecked transfer return values",
+        "specific_concern": "State records token receipt that never happened; subsequent transfer sends real tokens out",
+        "missing_safeguards": "No SafeERC20 library; no return value checks; no balance-before/after verification"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Which commonly deployed tokens on target chain return false instead of reverting?",
+          "Does the ABI decoder in Solidity 0.8.28 auto-revert on false return, or is it silently ignored?",
+          "Can the attack be repeated to drain entire userToken reserves?"
+        ],
+        "validation_requirements": [
+          "Deploy test token that returns false on transferFrom",
+          "Create pool, add liquidity, then call rebalanceSwap with insufficient allowance",
+          "Verify userTokens are extracted without validatorTokens being received"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker creates pool with a token that returns false on failure. Provides liquidity. Calls rebalanceSwap with zero allowance for validatorToken. transferFrom returns false (no tokens sent), but state already updated. userToken.transfer sends real tokens to attacker. Repeat to drain all userToken reserves.",
+      "prerequisites": [
+        "Non-reverting token that returns false",
+        "Pool with userToken reserves"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete drainage of userToken reserves from affected pools",
+        "affected_users": "All LPs in pools with non-reverting tokens",
+        "recovery_possibility": "None - tokens extracted and pool permanently desynchronized"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No tests with non-standard ERC20 tokens that return false on failure",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard gas (~100K per call)",
+        "capital_requirements": "Zero - attack works without sending any real tokens",
+        "execution_timing": "Single transaction, repeatable",
+        "detection_analysis": "Detectable by monitoring reserve/balance divergence"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H006",
+      "title": "Fee-on-Transfer Token Accounting Mismatch Causes Progressive Pool Insolvency",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "All deposit functions (executeFeeSwap, rebalanceSwap, mint) credit the full nominal amount to internal reserves rather than measuring the actual balance change. With fee-on-transfer tokens, the contract receives fewer tokens than the nominal amount, causing reserves to systematically exceed actual balances. Over time, the pool becomes insolvent: later LPs and swappers cannot withdraw because the contract tries to transfer more tokens than it holds. Early participants who detect this can extract real value before the deficit becomes apparent.",
+      "investigation_rationale": "Lines ~121 (executeFeeSwap: reserveUserToken += amountIn), ~148 (rebalanceSwap: reserveValidatorToken += amountIn), and ~200 (mint: reserveValidatorToken += amountValidatorToken) all use the nominal input amount, never checking actual received balance.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Pool must include a fee-on-transfer token (e.g., STA, PAXG, deflationary tokens)"
+      ],
+      "config_evidence": "No token whitelist exists; contract is permissionless; no balance-before/after measurement in any function",
+      "affected_functions": [
+        "executeFeeSwap",
+        "rebalanceSwap",
+        "mint",
+        "burn"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "rebalanceSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "mint"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "burn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "121, 148, 200",
+        "pattern": "pool.reserve += nominal_amount without checking balanceOf before/after transfer"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Pool is created with a fee-on-transfer token as userToken or validatorToken",
+        "Multiple users interact with the pool over time, accumulating accounting deficit",
+        "No mechanism exists to reconcile reserves with actual balances"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 119-122, 148-151, 197-200",
+        "vulnerable_pattern": "Reserve accounting uses nominal transfer amounts, not actual received amounts",
+        "specific_concern": "reserves > actual balanceOf after each fee-on-transfer deposit; deficit grows linearly with transaction count",
+        "missing_safeguards": "No balance-before/after measurement; no SafeERC20; no token type validation"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What fee-on-transfer tokens exist on the target deployment chain?",
+          "How quickly does the deficit grow to cause burn/swap reverts?",
+          "Can an early LP strategically exit before insolvency while others are trapped?"
+        ],
+        "validation_requirements": [
+          "Create pool with simulated 2% fee-on-transfer token",
+          "Execute multiple deposits and swaps, track reserve vs balance divergence",
+          "Verify last LP's burn reverts due to insufficient actual balance"
+        ]
+      },
+      "preliminary_attack_scenario": "Pool created with fee-on-transfer token. Each deposit credits more to reserves than actually received. After many transactions, reserveToken exceeds actual balance by significant amount. Early LPs burn and receive their full calculated share (contract still has enough). Last LPs' burns revert as contract tries to transfer more than it holds. Early exiters profit at expense of later ones.",
+      "prerequisites": [
+        "Fee-on-transfer token in pool",
+        "Multiple deposits to accumulate deficit"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Last LPs lose entire deposited value; funds permanently locked in insolvent pool",
+        "affected_users": "Later LPs who cannot withdraw due to insufficient contract balance",
+        "recovery_possibility": "No recovery mechanism exists; trapped funds are unrecoverable"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No tests with fee-on-transfer tokens",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard gas consumption",
+        "capital_requirements": "No special capital needed",
+        "execution_timing": "Multi-transaction accumulation over time",
+        "detection_analysis": "Monitorable by comparing contract balanceOf vs sum of pool reserves"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "burn() Transfers Zero userToken When Pool Has No userToken Reserves, Potentially Reverting and Locking LP Funds",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When a pool has zero reserveUserToken (e.g., no fee swaps have occurred yet, or all userTokens have been rebalanced out), burn() calculates amountUserToken = liquidity * 0 / totalSupply = 0 and calls IERC20(userToken).transfer(to, 0). Some ERC-20 implementations revert on zero-value transfers (e.g., USDT on certain chains, BNB). If this reverts, the entire burn transaction fails, permanently locking the LP's funds since they cannot withdraw. There is no alternative withdrawal path.",
+      "investigation_rationale": "The burn function always transfers both tokens regardless of calculated amounts. Lines ~243-244 show both transfers happen unconditionally. A zero-value transfer revert blocks the entire withdrawal.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "userToken must be a token that reverts on zero-value transfer"
+      ],
+      "config_evidence": "No check for zero amount before transfer at FeeAMM.sol lines 243-244; some tokens (USDT, BNB) are known to revert on zero transfers",
+      "affected_functions": [
+        "burn"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "burn"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "_calculateBurnAmounts"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "243-244",
+        "pattern": "IERC20(userToken).transfer(to, amountUserToken) called unconditionally; amountUserToken can be 0 when reserveUserToken is 0"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Pool has zero or negligible reserveUserToken (common state: pool just created, no fee swaps yet)",
+        "userToken reverts on zero-value transfer (e.g., USDT on some chains)",
+        "LP wants to withdraw via burn()"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 231-244",
+        "vulnerable_pattern": "Unconditional transfer of both tokens without zero-amount check",
+        "specific_concern": "amountUserToken = liquidity * reserveUserToken / totalSupply = 0 when reserveUserToken = 0; transfer(to, 0) reverts on some tokens",
+        "missing_safeguards": "No conditional check: if (amountUserToken > 0) before transfer"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Which target-chain tokens revert on zero-value transfer?",
+          "Can the LP work around this by doing a tiny executeFeeSwap first to make reserveUserToken > 0?",
+          "Is this a permanent lock or can the LP recover via other means?"
+        ],
+        "validation_requirements": [
+          "Test burn() with a token that reverts on zero transfer when reserveUserToken = 0",
+          "Verify LP funds are permanently locked",
+          "Check if any workaround exists"
+        ]
+      },
+      "preliminary_attack_scenario": "Legitimate pool created with USDT as userToken. LPs deposit validatorToken. Before any fee swaps occur (reserveUserToken = 0), an LP tries to burn. burn() calls USDT.transfer(to, 0) which reverts. LP funds are locked. Even if someone later does a feeSwap, the dust amounts from rounding could still produce zero for small burns.",
+      "prerequisites": [
+        "Token that reverts on zero transfer",
+        "Pool state where one reserve is zero"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "LP funds permanently locked in pool until reserveUserToken becomes non-zero",
+        "affected_users": "All LPs in pools with zero userToken reserves and zero-revert userToken",
+        "recovery_possibility": "Partial - someone could do a minimal feeSwap to make reserveUserToken > 0, enabling burns"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No tests for burn with zero reserves or zero-revert tokens",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A - transaction reverts",
+        "capital_requirements": "None - this is a DoS condition",
+        "execution_timing": "Occurs naturally when no fee swaps have happened",
+        "detection_analysis": "Detectable by checking pool reserve state before burn attempt"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H008",
+      "title": "executeFeeSwap Accepts Zero amountIn, Enabling No-Cost Event Emission and Potential Token Interaction Side Effects",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "executeFeeSwap does not validate that amountIn > 0. With amountIn = 0: amountOut = 0, the reserve sufficiency check passes trivially, transferFrom(msg.sender, this, 0) and transfer(msg.sender, 0) are called. This emits a FeeSwap event with zero amounts, which could confuse off-chain systems that track swap volumes or trigger downstream logic. Additionally, for tokens that revert on zero transfer, this creates a DoS vector for event-based monitoring. More critically, this allows interacting with pools without economic cost, which could be leveraged in combination with callback tokens for reentrancy setups.",
+      "investigation_rationale": "Line ~110 computes amountOut = (amountIn * M) / SCALE without checking amountIn != 0. Unlike rebalanceSwap which explicitly checks amountOut != 0, executeFeeSwap has no such guard.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeFeeSwap"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "107-130",
+        "pattern": "No require(amountIn > 0) check; amountOut = (0 * M) / SCALE = 0; proceeds to call transferFrom and transfer with 0"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Any pool exists",
+        "Caller can call executeFeeSwap with amountIn = 0"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 107-110",
+        "vulnerable_pattern": "Missing zero-amount validation on amountIn",
+        "specific_concern": "Zero-value transfers and misleading events; potential reentrancy amplifier via zero-cost token interactions",
+        "missing_safeguards": "No require(amountIn > 0) unlike rebalanceSwap's require(amountOut != 0)"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can zero-amount executeFeeSwap calls be chained with callback tokens for reentrancy at zero cost?",
+          "Do off-chain systems rely on FeeSwap events for accounting/monitoring?",
+          "Does zero-value transferFrom trigger callbacks on ERC-777 tokens?"
+        ],
+        "validation_requirements": [
+          "Call executeFeeSwap with amountIn = 0, verify it succeeds",
+          "Check if zero-value transferFrom triggers ERC-777 hooks",
+          "Assess off-chain event processing impact"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker calls executeFeeSwap(userToken, validatorToken, 0) repeatedly. Each call emits FeeSwap events with zero amounts, polluting event logs. If userToken has callback hooks, the zero-value transferFrom triggers the hook, enabling reentrancy setup without economic cost.",
+      "prerequisites": [
+        "Existing pool",
+        "No gas cost concern for attacker"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Limited direct financial impact; primarily enables griefing and reentrancy setups",
+        "affected_users": "Off-chain systems processing events; potential indirect impact on all pool users via reentrancy",
+        "recovery_possibility": "Events are permanent; reentrancy damage may be irreversible"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "low",
+      "test_coverage_gap": "No tests for zero-amount swap edge case",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "~50K gas per zero-value swap",
+        "capital_requirements": "Zero",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Detectable via event monitoring for zero-amount swaps"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "LP Virtual Price Decrease via executeFeeSwap Rounding Enables Slow Value Extraction from LPs",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "The LP virtual price is defined as (reserveValidatorToken + N * reserveUserToken / SCALE) / totalSupply. executeFeeSwap converts userToken to validatorToken at rate M/SCALE (0.997), increasing reserveUserToken and decreasing reserveValidatorToken. The effective value change per unit swapped is: +1 userToken (valued at N/SCALE ≈ 0.9985 in the LP formula) minus 1 * M/SCALE = 0.997 validatorToken. Net change = +0.9985 - 0.997 = +0.0015 per unit, which is positive. However, the integer truncation in amountOut = (amountIn * M) / SCALE can cause micro-losses. For very small amountIn values, truncation can make the effective fee larger than intended, but this is favorable to LPs. Conversely, for specific amounts where N * reserveUserToken / SCALE truncation compounds, the virtual price could decrease slightly across many small operations.",
+      "investigation_rationale": "The economic invariant INV-ECON-001 requires virtual price monotonicity. Integer truncation in the fixed-rate formula (amountOut = amountIn * 9970 / 10000) and in the LP value formula (N * reserveUserToken / SCALE) may compound to violate this invariant under specific amount patterns.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeFeeSwap",
+        "rebalanceSwap",
+        "mint",
+        "_calculateBurnAmounts"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "mint"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "110, 188-189",
+        "pattern": "Integer division truncation in amountOut = (amountIn * M) / SCALE and in denom = reserveValidatorToken + (N * reserveUserToken) / SCALE"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multiple small swaps executed to accumulate truncation errors",
+        "Specific amountIn values chosen to maximize truncation impact",
+        "LP virtual price tracked across operations"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol lines 110, 188-189",
+        "vulnerable_pattern": "Integer division truncation in fee calculation and LP value formula",
+        "specific_concern": "Compound truncation across executeFeeSwap and mint LP calculation may allow virtual price to decrease",
+        "missing_safeguards": "No virtual price invariant check after state updates"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Does the virtual price strictly increase for every executeFeeSwap, or can truncation cause decrease?",
+          "What specific amountIn values maximize truncation-induced LP value loss?",
+          "Is the cumulative effect significant enough to be exploitable for profit?"
+        ],
+        "validation_requirements": [
+          "Mathematically prove or disprove virtual price monotonicity for all valid inputs",
+          "Fuzz test with many small swaps and track virtual price changes",
+          "Calculate maximum extractable value from truncation compound errors"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker performs many small executeFeeSwaps with carefully chosen amounts that maximize truncation losses. Each swap slightly decreases the virtual price. Attacker then provides liquidity at the reduced virtual price, effectively buying LP shares cheap. Subsequent swaps or rebalances restore the virtual price, and attacker burns LP tokens at higher value.",
+      "prerequisites": [
+        "Many small transactions (gas-intensive)",
+        "Precise amount calculation to exploit truncation"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Marginal per-swap LP value loss; cumulative effect potentially significant for high-volume pools",
+        "affected_users": "All LPs in affected pools",
+        "recovery_possibility": "Fees from future swaps may offset losses if attack is small-scale"
+      },
+      "investigation_complexity": "high",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No fuzz tests for virtual price monotonicity across swap sequences",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Many small transactions required; gas cost may exceed profit",
+        "capital_requirements": "Minimal per-swap, but many swaps needed",
+        "execution_timing": "Multi-transaction over time",
+        "detection_analysis": "Trackable by monitoring LP virtual price changes per swap"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "Pool Reserves Not Tracked Per-Token Across Multiple Pools Sharing Same Token Create Cross-Pool Insolvency",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The contract holds tokens for ALL pools in a single balance (address(this)), but tracks reserves per-pool. If the same token (e.g., USDC) is used as validatorToken in Pool-A and Pool-B, the contract's total USDC balance covers both pools' reserveValidatorToken. A reentrancy or accounting exploit on Pool-A that over-extracts USDC can consume USDC that was deposited for Pool-B. Pool-B becomes insolvent even though it was never directly attacked. Burns and swaps on Pool-B revert when the contract's actual balance is insufficient.",
+      "investigation_rationale": "The contract uses a single address for all token holdings but tracks per-pool reserves independently. No mechanism ensures the sum of all pools' reserves for a given token stays below the contract's actual balance. Any vulnerability that inflates one pool's extraction (reentrancy, unchecked returns) can drain tokens belonging to other pools.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeFeeSwap",
+        "rebalanceSwap",
+        "burn",
+        "mint"
+      ],
+      "affected_contracts": [
+        "FeeAMM.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FeeAMM.sol",
+          "function": "burn"
+        },
+        {
+          "file": "FeeAMM.sol",
+          "function": "executeFeeSwap"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FeeAMM.sol",
+        "lines": "77-80, 121-124, 243-249",
+        "pattern": "Single contract balance shared across all pools; per-pool reserve tracking without global balance validation"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multiple pools exist using the same token (e.g., USDC as validatorToken in Pool-A and Pool-B)",
+        "Pool-A is exploitable via reentrancy or accounting bug (H001-H005)",
+        "Pool-A's exploitation extracts more tokens than Pool-A's legitimate reserves"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "FeeAMM.sol - contract-wide architecture",
+        "vulnerable_pattern": "Shared token balance across pools without global reserve-vs-balance invariant enforcement",
+        "specific_concern": "Over-extraction from one pool silently borrows from another pool's balance; no isolation between pools",
+        "missing_safeguards": "No per-token global reserve tracking; no balance check before/after operations"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How many production pools would share the same validatorToken?",
+          "Can the reentrancy exploits (H001-H004) extract more than the attacked pool's reserves?",
+          "Is there any implicit protection from per-pool reserve checks?"
+        ],
+        "validation_requirements": [
+          "Create two pools sharing USDC as validatorToken",
+          "Execute reentrancy attack on Pool-A to drain more USDC than Pool-A's reserve",
+          "Verify Pool-B's burn reverts due to insufficient contract balance"
+        ]
+      },
+      "preliminary_attack_scenario": "Pool-A (maliciousToken/USDC) and Pool-B (otherToken/USDC) both hold USDC. Attacker performs reentrancy exploit on Pool-A via H001, draining all of Pool-A's USDC reserves plus spilling into Pool-B's USDC. Pool-B's LPs cannot withdraw because the contract's total USDC is depleted.",
+      "prerequisites": [
+        "Multiple pools using same token",
+        "Exploitable vulnerability in one pool (H001-H005)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Cross-pool contagion: exploit in one pool drains funds deposited to other pools using same tokens",
+        "affected_users": "LPs in ALL pools sharing the exploited token, not just the attacked pool",
+        "recovery_possibility": "None - affected pools become permanently insolvent"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "high",
+      "test_coverage_gap": "No multi-pool interaction tests; no cross-pool solvency tests",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Same as underlying reentrancy exploit",
+        "capital_requirements": "Same as underlying exploit",
+        "execution_timing": "Single transaction exploits cross-pool",
+        "detection_analysis": "Detectable by comparing sum of all pool reserves vs contract balance per token"
+      }
+    }
+  ]
+}

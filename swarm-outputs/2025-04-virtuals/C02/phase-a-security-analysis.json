@@ -1,0 +1,246 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T03:18:26.698Z",
+    "duration_ms": 185808
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "User Input (Proposals & Staking)",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "proposeAgent",
+          "initFromToken",
+          "stake",
+          "withdraw",
+          "executeApplication"
+        ],
+        "failure_modes": [
+          "Malicious token addresses passed as custom tokens",
+          "Arbitrary delegation manipulation via stake function",
+          "Front-running pool creation"
+        ],
+        "attack_vectors": [
+          "Passing assetToken as customToken to drain factory funds",
+          "Passing victim address in stake to steal voting power"
+        ]
+      },
+      {
+        "boundary": "Admin/Privileged Operations",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "setApplicationThreshold",
+          "setImplementations",
+          "setTokenSupplyParams",
+          "setTokenTaxParams",
+          "migrateVirtual",
+          "setBlacklist"
+        ],
+        "failure_modes": [
+          "Misconfiguration of parameters leading to broken token economics",
+          "Factory deployment failures due to bad implementation addresses"
+        ],
+        "attack_vectors": [
+          "Compromised admin key could pause contracts, change implementations to malicious ones, or blacklist legitimate agents"
+        ]
+      },
+      {
+        "boundary": "External DEX (Uniswap)",
+        "trust_level": "semi-trusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "_swapTax",
+          "_executeApplication"
+        ],
+        "failure_modes": [
+          "High slippage during tax swaps",
+          "Pool manipulation"
+        ],
+        "attack_vectors": [
+          "Sandwich attacks on _swapTax",
+          "Front-running pool creation to DoS factory execution"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Active",
+        "to_state": "Executed / Withdrawn",
+        "trigger": "executeApplication, executeTokenApplication, withdraw",
+        "conditions": [
+          "Caller is proposer or has WITHDRAW_ROLE",
+          "Status is Active",
+          "Block number > proposalEndBlock (for withdraw)"
+        ],
+        "invariants": [
+          "withdrawableAmount is set to 0 after transition to prevent double withdrawal"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Delegated to A",
+        "to_state": "Delegated to B",
+        "trigger": "stake",
+        "conditions": [
+          "None restricting the receiver parameter"
+        ],
+        "invariants": [
+          "A user's voting power should only be delegated by themselves or an approved operator"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Incorrect Access Control / Arbitrary Delegation Overwrite",
+        "locations": [
+          "AgentVeToken.sol: stake(uint256,address,address)"
+        ],
+        "severity": "critical",
+        "evidence": "_delegate(receiver, delegatee) is called with user-supplied receiver without verifying if msg.sender == receiver.",
+        "exploitation_method": "Attacker calls stake(1, victim, attacker) to change the victim's delegate to the attacker, stealing all voting power.",
+        "affected_assets": [
+          "Voting power (Governance control)"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Unprotected Token Withdrawal / Factory Drain via Custom Token Aliasing",
+        "locations": [
+          "AgentFactoryV4.sol: initFromToken",
+          "AgentFactoryV4.sol: withdraw"
+        ],
+        "severity": "critical",
+        "evidence": "initFromToken allows tokenAddr to be assetToken. withdraw transfers withdrawableAmount of assetToken, then transfers IERC20(customToken).balanceOf(address(this)) of customToken. If customToken == assetToken, it drains all assetToken from the factory.",
+        "exploitation_method": "Attacker creates a proposal with tokenAddr = assetToken, then withdraws it, receiving all assetToken held by the factory.",
+        "affected_assets": [
+          "All assetToken (e.g., WETH/USDC) held in AgentFactoryV4"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Transaction Order Dependence / Unprotected Tax Swap Slippage",
+        "locations": [
+          "AgentToken.sol: _swapTax"
+        ],
+        "severity": "high",
+        "evidence": "_uniswapRouter.swapExactTokensForTokensSupportingFeeOnTransferTokens(swapBalance_, 0, path, ...) uses 0 for amountOutMin.",
+        "exploitation_method": "MEV bot observes the auto-swap transaction, buys pairToken before it, and sells after, causing the contract to receive near-zero pairToken for its tax tokens.",
+        "affected_assets": [
+          "Tax revenue (Project Tax)"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "DoS with Failed Call / Pool Creation Front-running",
+        "locations": [
+          "AgentFactoryV4.sol: _createPair"
+        ],
+        "severity": "medium",
+        "evidence": "require(factory.getPair(tokenAddr, assetToken) == address(0), \"pool already exists\");",
+        "exploitation_method": "Attacker front-runs executeTokenApplication by creating the Uniswap pair directly, causing the factory's _createPair to revert permanently for that token.",
+        "affected_assets": [
+          "Application execution (DoS)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "AgentFactoryV4.sol",
+          "function": "setApplicationThreshold(uint256)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        },
+        {
+          "contract": "AgentFactoryV4.sol",
+          "function": "setVault(address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        },
+        {
+          "contract": "AgentFactoryV4.sol",
+          "function": "setImplementations(address,address,address)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        },
+        {
+          "contract": "AgentFactoryV4.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        },
+        {
+          "contract": "AgentToken.sol",
+          "function": "setProjectTaxRates(uint16,uint16)",
+          "guards": [
+            "onlyOwnerOrFactory"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        },
+        {
+          "contract": "AgentNftV2.sol",
+          "function": "setBlacklist(uint256,bool)",
+          "guards": [
+            "onlyRole(ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Immediate effect"
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Uniswap V2 AMM",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "AgentToken.sol",
+              "lines": "469-480",
+              "function": "_swapTax"
+            }
+          ],
+          "compositional_usage": [
+            "Spot price for tax swaps"
+          ]
+        }
+      ]
+    }
+  }
+}

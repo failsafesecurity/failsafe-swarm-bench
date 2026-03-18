@@ -1,0 +1,396 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T05:23:51.610Z",
+    "duration_ms": 317497
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Bridge.sol",
+        "description": "Message status transitions must follow the valid lifecycle: NEW→{DONE,RETRIABLE,RECALLED}, RETRIABLE→{DONE,FAILED}. Terminal states (DONE, FAILED, RECALLED) must be irreversible.",
+        "attack_scenario": "If a message in DONE state could transition back to NEW or RETRIABLE, an attacker could re-execute a bridge message to double-spend bridged tokens or ETH.",
+        "invariant_logic": "∀ msgHash: (status[msgHash] ∈ {DONE, FAILED, RECALLED}) → ¬∃ function f: f(msgHash) changes status[msgHash]",
+        "solidity_property": "function invariant_terminal_states(bytes32 msgHash) public view { Status s = messageStatus[msgHash]; if (s == Status.DONE || s == Status.FAILED || s == Status.RECALLED) { assert(s == messageStatus[msgHash]); } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "processMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "retryMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "recallMessage"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "Bridge.sol",
+        "description": "suspendMessages can create a non-zero proofReceipt.receivedAt for ANY msgHash (including never-proven messages) when unsuspending. This skips proof verification in processMessage because isMessageProven is checked as receivedAt != 0.",
+        "attack_scenario": "Watchdog suspends then unsuspends a msgHash that was never actually proven on source chain. The unsuspend sets receivedAt=block.timestamp, creating a valid proof receipt. An attacker then calls processMessage with a crafted message matching that hash — proof verification is completely skipped since isMessageProven=true, allowing processing of unproven cross-chain messages.",
+        "invariant_logic": "∀ msgHash: proofReceipt[msgHash].receivedAt != 0 → (msgHash was verified via _proveSignalReceived OR explicitly authorized by watchdog)",
+        "solidity_property": "function invariant_proof_receipt_integrity(bytes32 msgHash) public view { if (proofReceipt[msgHash].receivedAt != 0 && proofReceipt[msgHash].receivedAt != type(uint64).max) { /* must have been either proven or intentionally unsuspended */ } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "suspendMessages"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "processMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "recallMessage"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "Bridge.sol",
+        "description": "nextMessageId must strictly increase with each sendMessage call, ensuring unique message IDs to prevent replay or collision.",
+        "attack_scenario": "If nextMessageId could be decremented or reset, two different messages could share the same ID, producing the same hash and allowing one message's proof to be used for another.",
+        "invariant_logic": "old(nextMessageId) < nextMessageId after each sendMessage call",
+        "solidity_property": "function invariant_messageId_monotonic(uint128 prevId) public view { assert(nextMessageId > prevId); }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "sendMessage"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "SignalService.sol",
+        "description": "topBlockId for each (chainId, kind) pair must only increase, ensuring synced chain data progresses forward and cannot be rolled back to an earlier block.",
+        "attack_scenario": "If topBlockId could decrease, an attacker could roll back to an older state root containing a different account state, enabling replay of old proofs or referencing stale/manipulated data.",
+        "invariant_logic": "∀ chainId, kind: old(topBlockId[chainId][kind]) <= topBlockId[chainId][kind]",
+        "solidity_property": "function invariant_topBlockId_monotonic(uint64 chainId, bytes32 kind, uint64 prevBlockId) public view { assert(topBlockId[chainId][kind] >= prevBlockId); }",
+        "inventory_refs": [
+          {
+            "file": "SignalService.sol",
+            "function": "_syncChainData"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Bridge.sol",
+        "description": "Message.from field is always overwritten to msg.sender in sendMessage, preventing sender spoofing. The _invokeMessageCall asserts from != address(this) to prevent the bridge from being impersonated as a message source.",
+        "attack_scenario": "If an attacker could set message.from to the vault's address on the source chain, they could trick the destination vault's checkProcessMessageContext into accepting a forged message, minting arbitrary bridged tokens.",
+        "invariant_logic": "message_.from == msg.sender (set in sendMessage) AND _message.from != address(bridge) (asserted in _invokeMessageCall)",
+        "solidity_property": "function invariant_from_integrity(address bridge) public pure { /* After sendMessage: message.from == original msg.sender; During _invokeMessageCall: assert(message.from != bridge) */ }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "sendMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "_invokeMessageCall"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "BaseVault.sol",
+        "description": "Vault onMessageInvocation must only be callable by the bridge AND the context.from must equal the same vault name on the source chain. This ensures only legitimate cross-chain vault-to-vault messages are processed.",
+        "attack_scenario": "If context.from verification were missing, an attacker could send a bridge message directly to the vault (msg.sender=bridge) with crafted data specifying arbitrary token transfers, draining the vault.",
+        "invariant_logic": "msg.sender == resolve('bridge') AND IBridge(msg.sender).context().from == resolve(ctx.srcChainId, name())",
+        "solidity_property": "function invariant_vault_context() internal view { IBridge.Context memory ctx = IBridge(msg.sender).context(); assert(msg.sender == resolve('bridge', false)); assert(ctx.from == resolve(ctx.srcChainId, name(), false)); }",
+        "inventory_refs": [
+          {
+            "file": "BaseVault.sol",
+            "function": "checkProcessMessageContext"
+          },
+          {
+            "file": "ERC20Vault.sol",
+            "function": "onMessageInvocation"
+          },
+          {
+            "file": "ERC1155Vault.sol",
+            "function": "onMessageInvocation"
+          },
+          {
+            "file": "ERC721Vault.sol",
+            "function": "onMessageInvocation"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "SignalService.sol",
+        "description": "Only authorized addresses (isAuthorized[msg.sender] == true) can call syncChainData to write chain state/signal roots. Unauthorized writes would poison all proof verification.",
+        "attack_scenario": "If an unauthorized address could call syncChainData, they could write a malicious state root, then provide Merkle proofs against it to forge any cross-chain signal, enabling arbitrary bridge message processing.",
+        "invariant_logic": "syncChainData(chainId, kind, blockId, chainData) requires isAuthorized[msg.sender] == true",
+        "solidity_property": "function invariant_syncChainData_auth() public view { /* Before any syncChainData: assert(isAuthorized[msg.sender]) */ }",
+        "inventory_refs": [
+          {
+            "file": "SignalService.sol",
+            "function": "syncChainData"
+          },
+          {
+            "file": "SignalService.sol",
+            "function": "authorize"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "CRITICAL",
+        "category": "time_resource",
+        "target_contract": "Bridge.sol",
+        "description": "On L1 (chain ID 1), messages must wait at least invocationDelay (1 hour) after proof receipt before execution. Non-preferred executors must wait an additional invocationExtraDelay (384s). This delay window allows watchdogs to suspend malicious messages.",
+        "attack_scenario": "If the invocation delay were bypassed on L1, a forged or manipulated proof could be processed immediately without giving watchdogs time to react, enabling theft of bridged assets before intervention.",
+        "invariant_logic": "block.chainid == 1 → block.timestamp >= proofReceipt[msgHash].receivedAt + 3600 (for preferred) OR + 3984 (for non-preferred)",
+        "solidity_property": "function invariant_invocation_delay(bytes32 msgHash, address sender) public view { if (block.chainid == 1) { uint64 ra = proofReceipt[msgHash].receivedAt; if (ra != 0 && ra != type(uint64).max) { uint256 delay = 3600; if (sender != proofReceipt[msgHash].preferredExecutor) delay += 384; assert(block.timestamp >= ra + delay); } } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "processMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "recallMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "getInvocationDelays"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "ERC20Vault.sol",
+        "description": "In changeBridgedToken, `delete bridgedToCanonical[_btokenNew]` is a no-op (the new token's mapping was verified empty). The intended deletion should be `delete bridgedToCanonical[btokenOld_]` to clean up the old token's canonical mapping, preventing stale mapping state.",
+        "attack_scenario": "After token migration, bridgedToCanonical[btokenOld_] still maps to the canonical token. While btokenOld_ is blacklisted (preventing sendToken), the stale mapping means _handleMessage would still treat btokenOld_ as a valid bridged token. If the blacklist check were ever bypassed or if another code path references bridgedToCanonical without checking the blacklist, tokens could be double-counted.",
+        "invariant_logic": "After changeBridgedToken: bridgedToCanonical[btokenOld_].addr == address(0)",
+        "solidity_property": "function invariant_old_btoken_cleared(address btokenOld) public view { assert(bridgedToCanonical[btokenOld].addr == address(0)); }",
+        "inventory_refs": [
+          {
+            "file": "ERC20Vault.sol",
+            "function": "changeBridgedToken"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "SignalService.sol",
+        "description": "In multi-hop proof verification, the last hop's chainId MUST equal block.chainid, and intermediate hops MUST NOT have chainId==0 or chainId==block.chainid. This ensures the proof path terminates at the current chain.",
+        "attack_scenario": "If an intermediate hop could specify block.chainid, an attacker could create a circular proof path or terminate early with a cached root that doesn't correspond to the actual source chain's state, forging cross-chain signals.",
+        "invariant_logic": "hopProofs[last].chainId == block.chainid AND ∀ i < last: hopProofs[i].chainId != 0 AND hopProofs[i].chainId != block.chainid",
+        "solidity_property": "function invariant_hop_chain_validity(uint64[] memory hopChainIds) public view { uint256 last = hopChainIds.length - 1; assert(hopChainIds[last] == block.chainid); for (uint256 i = 0; i < last; i++) { assert(hopChainIds[i] != 0 && hopChainIds[i] != block.chainid); } }",
+        "inventory_refs": [
+          {
+            "file": "SignalService.sol",
+            "function": "proveSignalReceived"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "BridgedERC20Base.sol",
+        "description": "BridgedERC20 mint is disabled (BB_MINT_DISALLOWED) when migrating outbound. Only the erc20_vault or the migratingAddress (for inbound migration) may mint. Burn during outbound migration is restricted to the token owner (msg.sender == _account).",
+        "attack_scenario": "If mint were allowed during outbound migration, both the old and new token could be minted simultaneously, inflating total supply. If burn during migration didn't restrict to token owner, an attacker could force-migrate others' tokens.",
+        "invariant_logic": "_isMigratingOut() → mint() reverts AND burn() requires msg.sender == _account",
+        "solidity_property": "function invariant_migration_access() public view { if (migratingAddress != address(0) && !migratingInbound) { /* mint must revert, burn only by owner */ } }",
+        "inventory_refs": [
+          {
+            "file": "BridgedERC20Base.sol",
+            "function": "mint"
+          },
+          {
+            "file": "BridgedERC20Base.sol",
+            "function": "burn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Bridge.sol",
+        "description": "When a message target is address(0), the bridge itself, the signal service, or a banned address, processMessage marks it DONE immediately with value refunded but the message invocation never executes. For vault bridge transfers, this means ERC20/721/1155 tokens encoded in the message data are permanently lost on the source chain.",
+        "attack_scenario": "If the bridge watchdog bans a vault address (even temporarily), all in-flight messages targeting that vault are immediately marked DONE. The message status being DONE means recallMessage on the source chain fails (requires FAILED status). The bridged tokens remain locked/burned on source with no way to recover.",
+        "invariant_logic": "addressBanned[_message.to] == true AND _message has token data → tokens in _message are irretrievably lost (DONE prevents recall, invocation never happens)",
+        "solidity_property": "function invariant_banned_vault_token_loss(bytes32 msgHash, address to) public view { if (addressBanned[to] && messageStatus[msgHash] == Status.DONE) { /* tokens encoded in this message are unrecoverable */ } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "processMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "banAddress"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "SignalService.sol",
+        "description": "SignalService._authorizePause always reverts, making SignalService permanently unpausable. This is intentional but means the emergency pause mechanism is unavailable for the signal service.",
+        "attack_scenario": "If a vulnerability is discovered in SignalService's proof verification, there is no way to pause the contract to prevent exploitation. All proof-based operations (bridge messages, recalls) continue to be processable even during an active exploit.",
+        "invariant_logic": "SignalService.pause() always reverts with SS_UNSUPPORTED",
+        "solidity_property": "function invariant_signal_unpausable() public { /* SignalService.pause() should always revert */ }",
+        "inventory_refs": [
+          {
+            "file": "SignalService.sol",
+            "function": "_authorizePause"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Bridge.sol",
+        "description": "When gasLimit==0 for a message, only destOwner can call processMessage for that message. This is the only path for gasLimit-0 messages since _invokeMessageCall reverts on gasLimit==0.",
+        "attack_scenario": "If a non-destOwner could process a gasLimit==0 message, it would always fail in _invokeMessageCall (B_INVALID_GAS_LIMIT), wasting the message's fee and potentially marking it as RETRIABLE without the owner's consent.",
+        "invariant_logic": "_message.gasLimit == 0 → msg.sender == _message.destOwner in processMessage",
+        "solidity_property": "function invariant_zero_gas_owner_only(uint256 gasLimit, address destOwner, address sender) public pure { if (gasLimit == 0) { assert(sender == destOwner); } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "processMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "retryMessage"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-006",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Bridge.sol",
+        "description": "Bridge._invokeMessageCall only allows calls to contracts if the data starts with onMessageInvocation selector. Empty data or non-contract targets bypass this check. This prevents arbitrary function calls through the bridge.",
+        "attack_scenario": "If arbitrary function selectors were allowed, an attacker could craft a bridge message calling any function on any contract through the bridge, potentially exploiting approve() or other sensitive functions on token contracts while the bridge holds ETH value.",
+        "invariant_logic": "_message.data.length >= 4 AND _message.to.isContract() → bytes4(_message.data) == onMessageInvocation.selector",
+        "solidity_property": "function invariant_selector_restriction(bytes calldata data, address to) public view { if (data.length >= 4 && to.isContract()) { assert(bytes4(data) == IMessageInvocable.onMessageInvocation.selector); } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "_invokeMessageCall"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "Bridge.sol",
+        "description": "Suspended messages (proofReceipt.receivedAt == type(uint64).max) must be unprocessable. The arithmetic invocationDelay + type(uint64).max overflows or produces an unreachable future timestamp, effectively blocking execution.",
+        "attack_scenario": "If suspended messages could be processed despite receivedAt==type(uint64).max, an attacker could bypass the watchdog's suspension to process a malicious message that was flagged.",
+        "invariant_logic": "proofReceipt[msgHash].receivedAt == type(uint64).max → block.timestamp < invocationDelay + type(uint64).max (always true, blocks processing)",
+        "solidity_property": "function invariant_suspended_blocked(bytes32 msgHash) public view { if (proofReceipt[msgHash].receivedAt == type(uint64).max) { (uint256 delay,) = getInvocationDelays(); assert(block.timestamp < delay + type(uint64).max); } }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "suspendMessages"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "processMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "recallMessage"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "SignalService.sol",
+        "description": "The final check in proveSignalReceived requires value != 0 AND value == _loadSignalValue(address(this), signal). This ensures the hop proof chain terminates at a locally synced chain data entry. If no data is synced locally for the final hop, the proof fails.",
+        "attack_scenario": "If the final signal value check were missing or allowed zero, an attacker could construct a proof with valid intermediate Merkle proofs but no actual local anchor, proving arbitrary signals against non-existent local state.",
+        "invariant_logic": "After proveSignalReceived loop: value != 0 AND value == storage[getSignalSlot(block.chainid, address(this), signal)]",
+        "solidity_property": "function invariant_proof_anchored(bytes32 value, bytes32 signal) public view { bytes32 stored = _loadSignalValue(address(this), signal); assert(value != 0 && value == stored); }",
+        "inventory_refs": [
+          {
+            "file": "SignalService.sol",
+            "function": "proveSignalReceived"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-007",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "BridgedERC20Base.sol",
+        "description": "changeMigrationStatus can be called by owner OR erc20_vault. The migration creates a bidirectional mint/burn relationship between old and new tokens. If an arbitrary address could set migration status, they could redirect token migration to a malicious contract.",
+        "attack_scenario": "If changeMigrationStatus lacked proper access control, an attacker could point migration to a contract they control, causing all burn() calls on the old token to mint() on the attacker's contract instead of the legitimate new bridged token.",
+        "invariant_logic": "changeMigrationStatus() requires msg.sender == owner() OR msg.sender == resolve('erc20_vault')",
+        "solidity_property": "function invariant_migration_auth(address caller) public view { assert(caller == owner() || caller == resolve('erc20_vault', true)); }",
+        "inventory_refs": [
+          {
+            "file": "BridgedERC20Base.sol",
+            "function": "changeMigrationStatus"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Bridge.sol",
+        "description": "Bridge context (msgHash, from, srcChainId) must be reset after every message invocation. On L1 it uses transient storage (auto-cleared), on L2 it writes PLACEHOLDER values. If context leaks between calls, a subsequent callee could read stale context.",
+        "attack_scenario": "If _resetContext were missing after _invokeMessageCall, a malicious contract called via the bridge could re-enter or a subsequent transaction could read the previous message's context, potentially impersonating a different source chain or sender.",
+        "invariant_logic": "After _invokeMessageCall or onMessageRecalled callback: context().msgHash ∈ {0, PLACEHOLDER}",
+        "solidity_property": "function invariant_context_reset() public view { Context memory ctx = _loadContext(); assert(ctx.msgHash == bytes32(0) || ctx.msgHash == bytes32(PLACEHOLDER)); }",
+        "inventory_refs": [
+          {
+            "file": "Bridge.sol",
+            "function": "_invokeMessageCall"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "recallMessage"
+          },
+          {
+            "file": "Bridge.sol",
+            "function": "_resetContext"
+          }
+        ]
+      }
+    ]
+  }
+}

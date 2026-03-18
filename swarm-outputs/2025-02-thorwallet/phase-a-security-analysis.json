@@ -1,0 +1,246 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T03:26:27.538Z",
+    "duration_ms": 140841
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin/Owner Operations",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "deposit",
+          "withdraw",
+          "setLockedStatus",
+          "setLaunchTime",
+          "setTransferAllowedContract",
+          "setBridgedTokenTransferLocked"
+        ],
+        "failure_modes": [
+          "Owner can drain user funds via withdraw",
+          "Owner can cause underflow in withdrawRemainingTitn by withdrawing TITN",
+          "Owner can permanently lock bridged token transfers"
+        ],
+        "attack_vectors": [
+          "Rug pull via withdraw",
+          "Accidental DoS of withdrawRemainingTitn"
+        ]
+      },
+      {
+        "boundary": "Cross-Chain Messaging (LayerZero)",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "_credit"
+        ],
+        "failure_modes": [
+          "Malicious actor can bridge tokens to arbitrary addresses to taint them"
+        ],
+        "attack_vectors": [
+          "Griefing/DoS attack by bridging dust amounts to victims to lock their transfers"
+        ]
+      },
+      {
+        "boundary": "User Operations",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "onTokenTransfer",
+          "claimTitn",
+          "withdrawRemainingTitn",
+          "transfer",
+          "transferFrom"
+        ],
+        "failure_modes": [
+          "Users claiming early forfeit their proportional share of unclaimed TITN",
+          "Users on Arbitrum cannot transfer tokens at all unless to/from the allowed contract"
+        ],
+        "attack_vectors": [
+          "None directly exploitable by users for profit, but users can be victims of the tainting attack"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "TGT held by user",
+        "to_state": "TITN claimable by user",
+        "trigger": "onTokenTransfer",
+        "conditions": [
+          "lockedStatus != Locked",
+          "launchTime > 0",
+          "time < 360 days",
+          "amount > 0"
+        ],
+        "invariants": [
+          "totalTitnClaimable increases by exact quoteTitn amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "TITN claimable",
+        "to_state": "TITN claimed (before 360 days)",
+        "trigger": "claimTitn",
+        "conditions": [
+          "time < 360 days",
+          "amount <= claimableTitnPerUser"
+        ],
+        "invariants": [
+          "totalTitnClaimable decreases by amount",
+          "claimableTitnPerUser decreases by amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "TITN claimable",
+        "to_state": "TITN claimed + proportional share (after 360 days)",
+        "trigger": "withdrawRemainingTitn",
+        "conditions": [
+          "time >= 360 days",
+          "claimableTitnPerUser > 0"
+        ],
+        "invariants": [
+          "remainingTitnAfter1Year set once",
+          "initialTotalClaimable set once",
+          "claimableTitnPerUser becomes 0"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service / Griefing (Tainting Attack)",
+        "locations": [
+          "Titn.sol: _credit",
+          "Titn.sol: _validateTransfer"
+        ],
+        "severity": "critical",
+        "evidence": "In _credit, isBridgedTokenHolder[_to] is set to true for any recipient. An attacker can bridge a dust amount of TITN to any user's address. This permanently locks the victim's ability to transfer their TITN tokens due to the check in _validateTransfer.",
+        "exploitation_method": "Attacker calls send() on the source chain OFT, specifying the victim's address as the recipient. Once the message is delivered, the victim's address is tainted and their transfers revert.",
+        "affected_assets": [
+          "User TITN tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow / Denial of Service",
+        "locations": [
+          "MergeTgt.sol: withdrawRemainingTitn"
+        ],
+        "severity": "high",
+        "evidence": "The calculation `unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable` will underflow if the contract's TITN balance is less than `totalTitnClaimable`. This can happen if the owner withdraws any TITN using the `withdraw` function.",
+        "exploitation_method": "If the owner calls `withdraw(titn, amount)`, the contract balance drops. When `withdrawRemainingTitn` is called, it initializes `remainingTitnAfter1Year` to the current balance, causing an underflow and permanently locking all remaining claims.",
+        "affected_assets": [
+          "Unclaimed TITN tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-112",
+        "pattern": "Centralization Risk / Unprotected Withdraw",
+        "locations": [
+          "MergeTgt.sol: withdraw"
+        ],
+        "severity": "medium",
+        "evidence": "The `withdraw` function allows the owner to transfer any amount of any ERC20 token out of the contract, including the TITN tokens deposited for users to claim.",
+        "exploitation_method": "The owner can call `withdraw(titn, titn.balanceOf(address(this)))` to drain all TITN from the contract, preventing users from claiming their converted tokens.",
+        "affected_assets": [
+          "All tokens in MergeTgt contract"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Dead Code / Logic Error",
+        "locations": [
+          "Titn.sol: _validateTransfer"
+        ],
+        "severity": "low",
+        "evidence": "The condition `to != lzEndpoint` assumes that bridging tokens calls `transfer` to the endpoint. However, LayerZero OFT V2 uses `_burn` during `send()`, which does not trigger `_validateTransfer`. This makes the condition dead code.",
+        "exploitation_method": "Not directly exploitable, but indicates a misunderstanding of the underlying cross-chain protocol mechanics.",
+        "affected_assets": [
+          "None"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "MergeTgt.sol",
+          "function": "deposit(IERC20,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows owner to deposit TITN"
+        },
+        {
+          "contract": "MergeTgt.sol",
+          "function": "withdraw(IERC20,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows owner to withdraw any token, including user funds"
+        },
+        {
+          "contract": "MergeTgt.sol",
+          "function": "setLockedStatus(LockedStatus)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can pause deposits"
+        },
+        {
+          "contract": "MergeTgt.sol",
+          "function": "setLaunchTime()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets the start time for the 360-day window"
+        },
+        {
+          "contract": "Titn.sol",
+          "function": "setTransferAllowedContract(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets the single address allowed to bypass transfer restrictions"
+        },
+        {
+          "contract": "Titn.sol",
+          "function": "setBridgedTokenTransferLocked(bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Toggles transfer restrictions for bridged tokens"
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

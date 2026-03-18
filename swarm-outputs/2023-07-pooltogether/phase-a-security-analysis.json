@@ -1,0 +1,252 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T17:06:35.606Z",
+    "duration_ms": 192725
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Vault Hooks",
+        "trust_level": "untrusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "Vault.claimPrizes"
+        ],
+        "failure_modes": [
+          "Malicious hook reverts, causing batch claim to fail",
+          "Malicious hook consumes excessive gas"
+        ],
+        "attack_vectors": [
+          "Griefing claimers by reverting during batch processing"
+        ]
+      },
+      {
+        "boundary": "Vault Owner",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "Vault.setClaimer",
+          "Vault.setLiquidationPair",
+          "Vault.setYieldFeePercentage",
+          "Vault.setYieldFeeRecipient"
+        ],
+        "failure_modes": [
+          "Owner sets yield fee to 100%, causing division by zero in liquidate"
+        ],
+        "attack_vectors": [
+          "Denial of Service via invalid fee percentage"
+        ]
+      },
+      {
+        "boundary": "PrizePool Draw Manager",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "PrizePool.closeDraw",
+          "PrizePool.withdrawReserve"
+        ],
+        "failure_modes": [
+          "Draw manager fails to close draws",
+          "Draw manager steals reserve"
+        ],
+        "attack_vectors": [
+          "Centralization risk"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Open Draw",
+        "to_state": "Closed Draw",
+        "trigger": "PrizePool.closeDraw",
+        "conditions": [
+          "block.timestamp >= _openDrawEndsAt()",
+          "winningRandomNumber_ != 0"
+        ],
+        "invariants": [
+          "lastClosedDrawId increments by 1",
+          "reserve is updated correctly"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Idle Assets in Vault",
+        "to_state": "Assets Deposited in YieldVault",
+        "trigger": "Vault.deposit / Vault.mint",
+        "conditions": [
+          "_assets > _vaultAssets"
+        ],
+        "invariants": [
+          "Shares minted equal to assets deposited"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Incorrect Access Control",
+        "locations": [
+          "Vault.sol: mintYieldFee"
+        ],
+        "severity": "critical",
+        "evidence": "The function `mintYieldFee` is external, lacks access control modifiers, and ignores the `_yieldFeeRecipient` state variable, allowing any caller to mint the accrued `_yieldFeeTotalSupply` to any `_recipient`.",
+        "exploitation_method": "An attacker calls `mintYieldFee(yieldFeeTotalSupply(), attackerAddress)` to steal all accrued yield fees.",
+        "affected_assets": [
+          "Yield fees (Vault shares)"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Transaction Order Dependence / Logic Error",
+        "locations": [
+          "Vault.sol: _deposit"
+        ],
+        "severity": "high",
+        "evidence": "In `_deposit`, if `_assets > _vaultAssets`, the contract only transfers `_assets - _vaultAssets` from the caller, but proceeds to mint shares for the full `_assets` amount.",
+        "exploitation_method": "An attacker monitors the Vault for idle assets (e.g., from direct transfers or incomplete sweeps during liquidation). They call `deposit` with an amount greater than the idle assets, receiving shares for the full amount while only paying the difference, effectively stealing the idle assets.",
+        "affected_assets": [
+          "Idle underlying assets in the Vault"
+        ]
+      },
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Logic Error / Griefing",
+        "locations": [
+          "Vault.sol: _sponsor"
+        ],
+        "severity": "high",
+        "evidence": "The `_sponsor` function calls `_twabController.sponsor(_receiver)`, which overwrites the `_receiver`'s delegation to the `SPONSORSHIP_ADDRESS`.",
+        "exploitation_method": "An attacker calls `sponsor(1, victimAddress)`. This deposits 1 wei for the victim but forces their entire TWAB balance to be delegated to the sponsorship address, revoking their eligibility to win prizes.",
+        "affected_assets": [
+          "Victim's prize eligibility"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service",
+        "locations": [
+          "Vault.sol: _setYieldFeePercentage",
+          "Vault.sol: liquidate"
+        ],
+        "severity": "medium",
+        "evidence": "`_setYieldFeePercentage` allows setting the fee to `FEE_PRECISION` (1e9). In `liquidate`, the calculation `(_amountOut * FEE_PRECISION) / (FEE_PRECISION - _yieldFeePercentage)` will result in a division by zero if the fee is 1e9.",
+        "exploitation_method": "If the owner sets the yield fee to 100%, the `liquidate` function will consistently revert, halting the core yield-to-prize conversion mechanism.",
+        "affected_assets": [
+          "Liquidation process"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service",
+        "locations": [
+          "Claimer.sol: claimPrizes",
+          "Vault.sol: _claimPrize"
+        ],
+        "severity": "medium",
+        "evidence": "`Claimer.claimPrizes` processes multiple winners in a single transaction. `Vault._claimPrize` executes external calls to user-defined hooks (`beforeClaimPrize` and `afterClaimPrize`).",
+        "exploitation_method": "A malicious user sets a hook that intentionally reverts. When a claimer attempts to process a batch of claims that includes the malicious user, the entire transaction reverts, causing gas griefing and delaying other users' claims.",
+        "affected_assets": [
+          "Claiming process"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "PrizePool.sol",
+          "function": "setDrawManager(address)",
+          "guards": [],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can be front-run during deployment"
+        },
+        {
+          "contract": "PrizePool.sol",
+          "function": "withdrawReserve(address,uint104)",
+          "guards": [
+            "onlyDrawManager"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "PrizePool.sol",
+          "function": "closeDraw(uint256)",
+          "guards": [
+            "onlyDrawManager"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Vault.sol",
+          "function": "setClaimer(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Vault.sol",
+          "function": "setLiquidationPair(LiquidationPair)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Vault.sol",
+          "function": "setYieldFeePercentage(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Vault.sol",
+          "function": "setYieldFeeRecipient(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "returns_last",
+          "call_sites": [
+            {
+              "file": "TwabController.sol",
+              "lines": "150-160",
+              "function": "getTwabBetween"
+            }
+          ],
+          "compositional_usage": [
+            "TWAB"
+          ]
+        }
+      ]
+    }
+  }
+}

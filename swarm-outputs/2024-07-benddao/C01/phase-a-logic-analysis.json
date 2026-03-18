@@ -1,0 +1,525 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T03:03:47.600Z",
+    "duration_ms": 386655
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User deposits (ERC20/ERC721)",
+        "path": [
+          "User calls Proxy.fallback",
+          "Proxy appends caller address, forwards to PoolManager.dispatch",
+          "PoolManager delegates to module implementation",
+          "Module unpacks trailing msgSender",
+          "ValidateLogic validates params and caps",
+          "InterestLogic.updateInterestIndexs",
+          "VaultLogic.erc20IncreaseCrossSupply (scale by supplyIndex)",
+          "VaultLogic.erc20TransferInLiquidity (actual token transfer)"
+        ],
+        "transformations": [
+          "Amount -> scaledAmount via rayDiv(supplyIndex)",
+          "Actual balance diff checked post-transfer"
+        ],
+        "sinks": [
+          "assetData.totalScaledCrossSupply",
+          "assetData.userScaledCrossSupply",
+          "assetData.availableLiquidity"
+        ],
+        "trust_changes": "User input amount validated; proxy appends authenticated sender; module trusts sender from calldata tail",
+        "validation_points": [
+          "Proxy checks creator",
+          "dispatch checks trustedSenders",
+          "validateDepositERC20 checks caps/pause/active",
+          "erc20TransferInLiquidity checks balance diff"
+        ],
+        "exposure_risks": [
+          "Supply cap check uses potentially stale supplyIndex if called before updateInterestIndexs"
+        ],
+        "manipulation_risks": [
+          "Fee-on-transfer tokens handled via balance checks but could cause revert instead of silent loss"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "Cross-margin borrowing",
+        "path": [
+          "User calls crossBorrowERC20 via Proxy",
+          "InterestLogic.updateInterestIndexs updates all group indices",
+          "ValidateLogic.validateCrossBorrowERC20Basic checks caps",
+          "ValidateLogic.validateCrossBorrowERC20Account checks health factor and per-group collateral",
+          "VaultLogic.erc20IncreaseCrossBorrow scales by borrowIndex",
+          "InterestLogic.updateInterestRates recalculates rates",
+          "VaultLogic.erc20TransferOutLiquidity sends tokens"
+        ],
+        "transformations": [
+          "borrowAmount -> scaledBorrow via rayDiv(groupData.borrowIndex)",
+          "Price oracle converts amounts to baseCurrency for LTV check"
+        ],
+        "sinks": [
+          "groupData.totalScaledCrossBorrow",
+          "groupData.userScaledCrossBorrow",
+          "assetData.availableLiquidity"
+        ],
+        "trust_changes": "Oracle price data trusted for collateral valuation; external IRM trusted for rate calculation",
+        "validation_points": [
+          "Health factor >= 1e18 threshold",
+          "Per-group collateral covers new debt",
+          "Borrow cap not exceeded",
+          "Available liquidity sufficient"
+        ],
+        "exposure_risks": [
+          "Oracle manipulation could inflate collateral value allowing excessive borrowing"
+        ],
+        "manipulation_risks": [
+          "Rounding in _getUserERC20DebtInBaseCurrency can round tiny debts to 0, allowing dust debt accumulation that evades health factor checks"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Yield staking borrow flow",
+        "path": [
+          "YieldStakingBase._stake called",
+          "poolYield.yieldBorrowERC20 -> YieldLogic.executeYieldBorrowERC20",
+          "InterestLogic.updateInterestIndexs",
+          "ValidateLogic.validateYieldBorrowERC20",
+          "Total supply calculated using groupData.borrowIndex (BUG)",
+          "Yield cap checked against inflated total supply",
+          "VaultLogic.erc20IncreaseCrossBorrow",
+          "VaultLogic.erc20TransferOutLiquidity",
+          "protocolDeposit stakes into external protocol",
+          "Yield shares calculated and recorded"
+        ],
+        "transformations": [
+          "borrowAmount -> debtShare via ShareUtils.convertToShares",
+          "borrowAmount -> yieldAmount via external protocol deposit",
+          "yieldAmount -> yieldShare via _convertToYieldSharesWithTotalYield"
+        ],
+        "sinks": [
+          "sd.debtShare",
+          "sd.yieldShare",
+          "totalDebtShare",
+          "accountYieldShares",
+          "External yield protocol"
+        ],
+        "trust_changes": "Pool yield module trusted for borrowing; external yield protocol (Lido/Etherfi/MakerDAO) trusted for deposit/withdraw",
+        "validation_points": [
+          "Yield cap check (USES WRONG INDEX)",
+          "Staker cap check",
+          "Health factor check post-stake"
+        ],
+        "exposure_risks": [
+          "External protocol could fail or return less than expected",
+          "Rebasing token balance changes between operations"
+        ],
+        "manipulation_risks": [
+          "Using borrowIndex instead of supplyIndex inflates calculated total supply, allowing borrowing beyond intended yield cap"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "Isolate loan auction/liquidation",
+        "path": [
+          "Bidder calls isolateAuction with bid amounts",
+          "ValidateLogic checks loan status and health factor",
+          "Bid amount transferred via erc20TransferInBidAmount",
+          "Previous bidder refunded via erc20TransferOutBidAmount",
+          "After auction duration, liquidation can be called",
+          "NFT ownership transferred, debt cleared"
+        ],
+        "transformations": [
+          "loanData.scaledAmount * borrowIndex = actual debt",
+          "NFT price * liquidationThreshold = threshold price",
+          "bidAmount vs debt for surplus/deficit calculation"
+        ],
+        "sinks": [
+          "loanData.bidAmount",
+          "loanData.lastBidder",
+          "assetData.totalBidAmout"
+        ],
+        "trust_changes": "Oracle price trusted for liquidation trigger; auction timing from block.timestamp",
+        "validation_points": [
+          "Health factor below threshold triggers auction",
+          "Bid must exceed minimum",
+          "Auction duration respected"
+        ],
+        "exposure_risks": [
+          "Block timestamp manipulation could affect auction timing",
+          "Oracle delay could trigger unfair liquidations"
+        ],
+        "manipulation_risks": [
+          "Bidder could front-run other bidders",
+          "Auction duration edge cases at boundary timestamps"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Interest index updates",
+        "path": [
+          "Any state-changing operation calls InterestLogic.updateInterestIndexs",
+          "_updateSupplyIndex: linearInterest * prevSupplyIndex",
+          "_updateBorrowIndex: compoundedInterest * prevBorrowIndex (per group)",
+          "_accrueFeeToTreasury: (currBorrow - prevBorrow) * feeFactor -> scaled by supplyIndex -> accruedFee",
+          "updateInterestRates: recalculate utilization, group rates, asset rate"
+        ],
+        "transformations": [
+          "supplyRate -> linearInterest multiplier over time delta",
+          "borrowRate -> compoundedInterest multiplier over time delta (binomial approx)",
+          "New indices stored as uint128"
+        ],
+        "sinks": [
+          "assetData.supplyIndex (uint128)",
+          "groupData.borrowIndex (uint128)",
+          "assetData.accruedFee",
+          "assetData.supplyRate",
+          "groupData.borrowRate"
+        ],
+        "trust_changes": "External IRM trusted for rate calculation; block.timestamp trusted for time delta",
+        "validation_points": [
+          "toUint128() safe cast reverts on overflow",
+          "Only updates once per block"
+        ],
+        "exposure_risks": [
+          "uint128 overflow for indices after extreme long-term operation (unlikely but theoretically possible)",
+          "Compounded interest uses binomial approximation that slightly undercharges"
+        ],
+        "manipulation_risks": [
+          "Manipulating block.timestamp (minor, ±15s) could slightly affect interest calculations"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Proxy dispatch authentication",
+        "path": [
+          "External call -> Proxy.fallback",
+          "Proxy appends msg.sender (20 bytes) to calldata",
+          "Proxy calls PoolManager.dispatch()",
+          "dispatch reads trustedSenders[msg.sender] for moduleId",
+          "dispatch strips 4-byte selector, appends proxy address (20 bytes)",
+          "delegatecall to moduleImpl with augmented calldata",
+          "Module extracts msgSender from last 40 bytes, proxyAddr from last 20 bytes"
+        ],
+        "transformations": [
+          "Original calldata -> prepend dispatch selector -> append caller -> append proxy addr",
+          "calldatasize used to locate trailing params"
+        ],
+        "sinks": [
+          "Module execution with authenticated msgSender"
+        ],
+        "trust_changes": "Trust established via trustedSenders mapping; only proxies created by PoolManager are trusted",
+        "validation_points": [
+          "trustedSenders[msg.sender].moduleId != 0",
+          "calldatasize >= 4 + 4 + 20"
+        ],
+        "exposure_risks": [
+          "If msgDataLength check is insufficient, truncated calldata could lead to incorrect msgSender extraction"
+        ],
+        "manipulation_risks": [
+          "Direct calls to dispatch from non-proxy addresses correctly rejected"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "Fee collection to treasury",
+        "path": [
+          "Admin calls executeCollectFeeToTreasury",
+          "accruedFee read from storage",
+          "accruedFee set to 0",
+          "InterestLogic.updateInterestIndexs (accrues new fee in same call)",
+          "getNormalizedSupplyIncome returns current supplyIndex",
+          "amountToCollect = accruedFee.rayMul(normalizedIncome)",
+          "erc20IncreaseCrossSupply for treasury address"
+        ],
+        "transformations": [
+          "Scaled accruedFee * current supplyIndex = actual fee amount",
+          "Fee amount -> scaled supply tokens for treasury"
+        ],
+        "sinks": [
+          "assetData.userScaledCrossSupply[treasury]",
+          "assetData.totalScaledCrossSupply"
+        ],
+        "trust_changes": "Only pool admin can trigger collection; treasury address from addressProvider",
+        "validation_points": [
+          "Pool admin check",
+          "Treasury not zero",
+          "Pool and asset basic validation"
+        ],
+        "exposure_risks": [
+          "Double-scaling: fee scaled by supplyIndex at accrual, then unscaled by current supplyIndex — correct but any index regression would cause issues"
+        ],
+        "manipulation_risks": [
+          "Fee collection mints supply tokens without actual token transfer — no liquidity impact but inflates supply accounting"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Health factor must be >= 1e18 for cross-margin positions",
+        "Borrowing is per-group: collateral in classGroup X backs debt in borrowGroup X",
+        "Isolate-mode NFTs can only have one loan per token",
+        "Yield borrowing is capped at a percentage of total supply per asset and per staker",
+        "Interest accrues linearly for supply and compounded (binomial approximation) for borrow",
+        "Liquidation requires health factor below threshold with bonus incentive",
+        "Auction-based liquidation for isolated NFT positions with time-bounded bidding"
+      ],
+      "economic_incentives": [
+        "Suppliers earn interest from borrower payments minus protocol fee",
+        "Borrowers pay compounded interest on debt",
+        "Liquidators receive liquidation bonus for clearing bad debt",
+        "Yield stakers earn yield spread (external yield - borrow cost)",
+        "Auction bidders compete for liquidated NFTs",
+        "Protocol collects fee factor percentage of interest spread"
+      ],
+      "governance_mechanisms": [
+        "Pool admin can create/configure pools, assets, groups, and parameters",
+        "Emergency admin can pause/unpause pools and global protocol",
+        "Oracle admin configures price feed sources",
+        "ACL manager uses role-based access control via OpenZeppelin AccessControl",
+        "Bot admin can force-unstake yield positions below health threshold"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "YieldLogic.executeYieldBorrowERC20 uses groupData.borrowIndex instead of assetData.supplyIndex to calculate total supply for yield cap check",
+          "expected_behavior": "Total supply should be calculated as totalScaledCrossSupply.rayMul(assetData.supplyIndex) to get actual deposits",
+          "actual_behavior": "Total supply is calculated as totalScaledCrossSupply.rayMul(groupData.borrowIndex) where groupData is the yield group, inflating the cap",
+          "risk_level": "high",
+          "exploitation_potential": "Since borrowIndex grows faster than supplyIndex (due to protocol fees and rate spread), the yield cap check becomes progressively more permissive over time. Yield managers can borrow more than the intended percentage of actual deposits, potentially draining available liquidity beyond safe levels."
+        },
+        {
+          "scenario": "Tiny debts round to zero in _getUserERC20DebtInBaseCurrency",
+          "expected_behavior": "All debt amounts should be accurately reflected in health factor calculation",
+          "actual_behavior": "Division (assetPrice * userTotalDebt) / (10 ** underlyingDecimals) can truncate to 0 for dust amounts when assetPrice is small relative to decimals",
+          "risk_level": "medium",
+          "exploitation_potential": "An attacker could open many tiny borrow positions across groups/assets that individually round to 0 debt in base currency. Collectively these could accumulate meaningful untracked debt. Health factor would show infinity while actual debt exists."
+        },
+        {
+          "scenario": "totalUnstakeFine is never decremented during _repay",
+          "expected_behavior": "totalUnstakeFine should decrease when a fine is paid during repayment",
+          "actual_behavior": "totalUnstakeFine only increases in _unstake but is never decremented. The fine amount stays in the contract but the global counter monotonically increases.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit, but the totalUnstakeFine variable becomes an inaccurate tracker of outstanding fines over time. Could affect off-chain monitoring or any future logic depending on this value."
+        },
+        {
+          "scenario": "First yield staker share manipulation via interest accrual timing",
+          "expected_behavior": "Debt shares should fairly represent proportional debt obligations",
+          "actual_behavior": "ShareUtils uses +1 virtual offset (totalShares+1, totalAssets+1). If first staker stakes 1 wei, then significant interest accrues before second staker, second staker gets disproportionately fewer shares per unit of debt.",
+          "risk_level": "low",
+          "exploitation_potential": "Limited by the +1 virtual share offset and the fact that interest accrual is bounded. The attacker cannot directly inflate totalDebt (only interest accrual increases it). However, if the first stake is very small and time passes, the share price diverges."
+        },
+        {
+          "scenario": "Bot admin can trigger repay pulling funds from NFT owner",
+          "expected_behavior": "Only NFT owner should authorize token transfers from their wallet",
+          "actual_behavior": "In _repay, if botAdmin calls and extraAmount > 0, safeTransferFrom(vars.nftOwner, ...) attempts to pull from the NFT owner who may have pre-existing approvals",
+          "risk_level": "medium",
+          "exploitation_potential": "If NFT owner has approved the YieldStaking contract for the underlying asset, a malicious or compromised botAdmin could time the repay to maximize extraAmount pulled from the owner (e.g., during low claimed yield). The owner cannot prevent this without revoking approval."
+        },
+        {
+          "scenario": "Rebasing token balance divergence between unstake and claim in Lido/Etherfi",
+          "expected_behavior": "Withdrawal amount should match the value at time of withdrawal request",
+          "actual_behavior": "sd.withdrawAmount is set at unstake time. For stETH/eETH, the actual balance may have changed due to rebasing between unstake and claim. The protocolClaimWithdraw returns actual ETH received which may differ.",
+          "risk_level": "low",
+          "exploitation_potential": "The _repay function handles the difference by computing extraAmount or remainAmount. However, if a negative rebase occurs (slashing), claimed yield could be less than expected, forcing the NFT owner to cover a larger shortfall."
+        },
+        {
+          "scenario": "Health factor check in _stake uses unstakeHeathFactor as minimum",
+          "expected_behavior": "Staking should require a comfortable buffer above liquidation threshold",
+          "actual_behavior": "require(hf >= nc.unstakeHeathFactor) — if unstakeHeathFactor is set close to 1.0, users can stake right at the boundary with no buffer for price movements",
+          "risk_level": "medium",
+          "exploitation_potential": "Misconfigured unstakeHeathFactor could allow positions that are immediately at risk of forced unstaking, causing cascading liquidations during volatility. Admin configuration error could enable this."
+        },
+        {
+          "scenario": "FlashLoan doesn't update availableLiquidity tracking",
+          "expected_behavior": "availableLiquidity should reflect actual token balance during flash loan",
+          "actual_behavior": "erc20TransferOutOnFlashLoan/erc20TransferInOnFlashLoan bypass availableLiquidity accounting. During flash loan callback, availableLiquidity still shows pre-loan amount.",
+          "risk_level": "low",
+          "exploitation_potential": "Protected by nonReentrant guard preventing reentrant borrows during flash loan. If reentrancy guard were bypassed, the stale availableLiquidity could allow double-spending."
+        },
+        {
+          "scenario": "erc20IncreaseCrossSupply in executeCollectFeeToTreasury mints supply without token transfer",
+          "expected_behavior": "Supply increase should correspond to actual token deposits",
+          "actual_behavior": "Treasury supply is increased as accounting entry only — backed by interest already paid by borrowers. No physical token transfer occurs.",
+          "risk_level": "low",
+          "exploitation_potential": "If fee accrual calculation is incorrect, treasury could claim more than actual interest collected, but normal flow is correct. The available liquidity is not increased, maintaining solvency."
+        },
+        {
+          "scenario": "Compounded interest binomial approximation undercharges for very long periods",
+          "expected_behavior": "Interest should accurately reflect time-weighted compounding",
+          "actual_behavior": "3-term binomial approximation (1 + nx + n(n-1)/2 * x^2 + n(n-1)(n-2)/6 * x^3) slightly underestimates true compound interest. Error grows with time gap and rate.",
+          "risk_level": "low",
+          "exploitation_potential": "Attackers could avoid interacting with the protocol for long periods to benefit from the undercharge. The error is typically <0.01% for reasonable rates and weekly updates, but could be significant with extreme rates and long gaps."
+        }
+      ],
+      "assumption_violations": [
+        "Assumes all ERC20 tokens transfer exactly the specified amount (validated by balance checks, but reverts rather than adapting for fee-on-transfer tokens)",
+        "Assumes oracle prices are current and not manipulated — no TWAP or staleness checks beyond basic Chainlink round validation",
+        "Assumes supplyIndex and borrowIndex never overflow uint128 (~3.4e38, starting from 1e27 allows ~3.4e11x growth)",
+        "Assumes external yield protocols (Lido, Etherfi, MakerDAO) behave correctly and don't have exploits",
+        "Assumes WETH contract follows standard WETH9 behavior where transferFrom with src==msg.sender skips allowance check",
+        "Assumes block.timestamp is reasonably accurate (protocol uses it for interest calculations)"
+      ],
+      "game_theory_risks": [
+        "Yield stakers can borrow up to leverageFactor of NFT value — if the external yield protocol suffers losses, the protocol's lending pool bears the risk through increased debt share values",
+        "Auction bidders can wait until the last moment of auctionDuration to bid, potentially using MEV to outbid competitors",
+        "Liquidators choose which collateral to seize — they will always choose the most liquid/valuable collateral, leaving less desirable collateral in the protocol",
+        "Bot admin has significant power over yield positions — can force unstake and set fines up to maxUnstakeFine",
+        "Users can split borrows across many groups with dust amounts to evade accurate health factor computation due to rounding"
+      ],
+      "integration_risks": [
+        "Lido stETH is a rebasing token — balanceOf changes every block, requiring careful accounting in yield share calculations",
+        "EtherFi eETH is also rebasing — same concerns as stETH",
+        "sDAI (Savings DAI) uses ERC4626 vault shares — non-rebasing but exchange rate changes",
+        "Chainlink oracle staleness: only checks answeredInRound >= roundId and updatedAt != 0, no maximum age check",
+        "BendNFTOracle price could lag market conditions, enabling arbitrage against the protocol",
+        "YieldAccount.execute allows arbitrary calls to external contracts — if yield manager logic has flaws, could be exploited",
+        "WETH deposit/withdraw in yield staking creates ETH <-> WETH conversion points that could fail with insufficient gas"
+      ],
+      "calculation_errors": [
+        "CRITICAL: YieldLogic.executeYieldBorrowERC20 line 'vars.totalSupply = VaultLogic.erc20GetTotalCrossSupply(assetData, groupData.borrowIndex)' should use assetData.supplyIndex, not groupData.borrowIndex. This inflates the yield cap check denominator.",
+        "GenericLogic._getUserERC20DebtInBaseCurrency: (assetPrice * userTotalDebt) / (10 ** underlyingDecimals) — for tokens with many decimals and low prices, integer division truncates debt to 0",
+        "GenericLogic._getUserERC20BalanceInBaseCurrency: same truncation issue but for collateral (rounds down collateral which is conservative)",
+        "InterestLogic._accrueFeeToTreasury: applies .toUint128() on fee amount before adding to uint256 accruedFee — unnecessary restriction that could revert for very large fee amounts"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Used as wrappedNativeToken. VaultLogic.wrapNativeTokenInWallet relies on WETH9 transferFrom(self) behavior."
+        },
+        {
+          "address_or_symbol": "stETH",
+          "behaviors": [
+            "rebasing:true",
+            "fee_on_transfer:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Lido staked ETH. Balance changes on every oracle report (rebase). Used in YieldEthStakingLido. Share calculation must account for balance changes between operations."
+        },
+        {
+          "address_or_symbol": "eETH",
+          "behaviors": [
+            "rebasing:true",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "EtherFi eETH. Rebasing token similar to stETH. Used in YieldEthStakingEtherfi."
+        },
+        {
+          "address_or_symbol": "sDAI",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true"
+          ],
+          "decimals": 18,
+          "notes": "ERC4626 vault token. Non-rebasing shares model. Used in YieldSavingsDai. convertToAssets needed for proper valuation."
+        },
+        {
+          "address_or_symbol": "DAI",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Underlying asset for YieldSavingsDai."
+        },
+        {
+          "address_or_symbol": "GENERIC_ERC20",
+          "behaviors": [
+            "fee_on_transfer:possible"
+          ],
+          "decimals": 0,
+          "notes": "VaultLogic uses balance-before/after checks on all transfers, causing reverts for fee-on-transfer tokens rather than silent accounting errors. Decimal varies per asset."
+        },
+        {
+          "address_or_symbol": "GENERIC_ERC721",
+          "behaviors": [],
+          "decimals": 0,
+          "notes": "NFT collateral. Price from BendNFTOracle floor price. Supply tracked by count, no decimal scaling."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation",
+          "state_vars": [
+            "assetData.totalScaledCrossSupply",
+            "sum(assetData.userScaledCrossSupply[*])",
+            "assetData.accruedFee"
+          ]
+        },
+        {
+          "name": "borrow_conservation_per_group",
+          "state_vars": [
+            "groupData.totalScaledCrossBorrow",
+            "sum(groupData.userScaledCrossBorrow[*])"
+          ]
+        },
+        {
+          "name": "isolate_borrow_conservation",
+          "state_vars": [
+            "groupData.totalScaledIsolateBorrow",
+            "sum(groupData.userScaledIsolateBorrow[*])"
+          ]
+        },
+        {
+          "name": "liquidity_solvency",
+          "state_vars": [
+            "assetData.availableLiquidity",
+            "IERC20(asset).balanceOf(poolManager)",
+            "assetData.totalBidAmout"
+          ]
+        },
+        {
+          "name": "erc721_supply_conservation",
+          "state_vars": [
+            "assetData.totalScaledCrossSupply + assetData.totalScaledIsolateSupply",
+            "sum(erc721TokenData where owner != 0)"
+          ]
+        },
+        {
+          "name": "yield_debt_share_conservation",
+          "state_vars": [
+            "totalDebtShare",
+            "sum(stakeDatas[*][*].debtShare)"
+          ]
+        },
+        {
+          "name": "yield_share_conservation",
+          "state_vars": [
+            "accountYieldShares[account]",
+            "sum(stakeDatas[nft][tokenId].yieldShare where yieldAccount == account)"
+          ]
+        },
+        {
+          "name": "health_factor_threshold",
+          "state_vars": [
+            "healthFactor >= 1e18 for all active positions"
+          ]
+        },
+        {
+          "name": "index_monotonicity",
+          "state_vars": [
+            "assetData.supplyIndex only increases",
+            "groupData.borrowIndex only increases"
+          ]
+        }
+      ]
+    }
+  }
+}

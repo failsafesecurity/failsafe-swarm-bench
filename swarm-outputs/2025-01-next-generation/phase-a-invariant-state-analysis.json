@@ -1,0 +1,267 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T03:20:14.153Z",
+    "duration_ms": 337693
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Token.sol",
+        "description": "transferFrom fee deduction causes sender to lose more tokens than the ERC20 allowance permits. The fee is deducted via _payTxFee (calling _update directly from sender to feesFaucet) BEFORE the allowance-checked transfer. The allowance only covers the transfer amount, not the additional fee, violating ERC20 allowance semantics.",
+        "attack_scenario": "Sender approves spender for 100 EURF (sender balance=201, feeRate=1%). Spender calls transferFrom(sender, recipient, 100). Fee of 1 EURF is deducted from sender to feesFaucet via _update (no allowance check). Then 100 EURF is transferred via super.transferFrom (consumes 100 allowance). Sender loses 101 tokens total but only approved 100. At 100% fee rate, a 100-token approval allows extracting 200 tokens from the sender.",
+        "invariant_logic": "For any transferFrom(sender, recipient, amount): total_tokens_deducted_from_sender <= allowance(sender, msg.sender) + amount_already_approved",
+        "solidity_property": "function invariant_transferFromAllowance(address sender, address spender, uint256 amount) public view { uint256 totalDeducted = amount + calculateTxFee(amount); assert(totalDeducted <= allowance(sender, spender) || _txfeeRate == 0); }",
+        "inventory_refs": [
+          {
+            "file": "Token.sol",
+            "function": "transferFrom"
+          },
+          {
+            "file": "Token.sol",
+            "function": "transferSanity"
+          },
+          {
+            "file": "Token.sol",
+            "function": "_payTxFee"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "ERC20ControlerMinterUpgradeable.sol",
+        "description": "mint() bypasses blacklist and pause checks entirely. A minter or master minter can mint tokens to a blacklisted (sanctioned) address and can mint while the contract is paused. For a regulated stablecoin, this breaks compliance invariants. The burn() function similarly bypasses blacklist checks, contradicting its own NatSpec comment which claims 'Validates that sender is not blacklisted'.",
+        "attack_scenario": "Regulator blacklists address X. A compromised or colluding minter calls mint(addressX, 1000000). Tokens are successfully minted to the sanctioned address, violating regulatory compliance. Alternatively, admin pauses the contract for emergency, but minters can still create new tokens.",
+        "invariant_logic": "For mint(to, amount): require(!isBlacklisted(to) && !isBlacklisted(_msgSender()) && !paused()). For burn(amount): require(!isBlacklisted(_msgSender()) && !paused())",
+        "solidity_property": "function invariant_mintRespectsBlacklist(address to) public view { assert(!(isBlacklisted(to) && balanceOf(to) > 0) || /* tokens were minted before blacklisting */); }",
+        "inventory_refs": [
+          {
+            "file": "ERC20ControlerMinterUpgradeable.sol",
+            "function": "mint"
+          },
+          {
+            "file": "ERC20ControlerMinterUpgradeable.sol",
+            "function": "burn"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "ERC20ControlerMinterUpgradeable.sol",
+        "description": "A controller who activated the safety switch can re-enable operations even after being removed from the CONTROLLER role. The re-enable path checks `_operatingController == _msgSender()` but does NOT verify the caller still holds the CONTROLLER role. This means a revoked controller retains the ability to undo the safety switch.",
+        "attack_scenario": "Controller C activates safetySwitch() to halt minting/burning due to an exploit. Owner removes C from CONTROLLER role via removeController(C) because C is compromised. C calls safetySwitch() again. The check `_operatingController != _msgSender()` passes (C == C), so operations are re-enabled. Compromised C can now mint/burn despite role revocation.",
+        "invariant_logic": "safetySwitch re-enable SHOULD require: hasRole(DEFAULT_ADMIN_ROLE, _msgSender()) || (hasRole(CONTROLLER, _msgSender()) && _operatingController == _msgSender())",
+        "solidity_property": "function invariant_safetySwitchReenable() public view { if (!_operating) { /* re-enable should only be possible by active controller or admin */ } }",
+        "inventory_refs": [
+          {
+            "file": "ERC20ControlerMinterUpgradeable.sol",
+            "function": "safetySwitch"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-001",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "ERC20MetaTxUpgradeable.sol",
+        "description": "permit() and transferWithAuthorization() share the same nonce counter (_nonces mapping). A call to one function increments the nonce, invalidating any pending signed authorization for the other function at the same nonce value. An attacker observing a pending permit in the mempool can front-run it by executing a transferWithAuthorization (or vice versa) with the same nonce, permanently invalidating the victim's signature.",
+        "attack_scenario": "User signs permit(owner=user, spender=X, nonce=5) and submits it. Attacker front-runs by executing a previously obtained transferWithAuthorization signed by user with nonce=5 (from a different context). User's nonce advances to 6. The permit transaction reverts because nonce 5 is consumed. The user's approval is denied without their consent.",
+        "invariant_logic": "Nonce consumed by permit at index N implies no transferWithAuthorization can use nonce N, and vice versa. If nonces are shared, operations of one type can invalidate the other.",
+        "solidity_property": "function invariant_nonceMonotonicity(address user) public view { assert(nonce(user) >= 0); /* Nonce strictly increases, but shared counter means cross-function invalidation */ }",
+        "inventory_refs": [
+          {
+            "file": "ERC20MetaTxUpgradeable.sol",
+            "function": "permit"
+          },
+          {
+            "file": "ERC20MetaTxUpgradeable.sol",
+            "function": "transferWithAuthorization"
+          },
+          {
+            "file": "ERC20MetaTxUpgradeable.sol",
+            "function": "_useNonce"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Forwarder.sol",
+        "description": "The Forwarder does not validate the domainSeparator parameter against its own EIP-712 domain separator. Any domain separator is accepted as long as the signature verifies against it. This breaks EIP-712's cross-contract replay protection: a signature intended for a different contract with the same ForwardRequest struct and matching parameters can be replayed on this Forwarder.",
+        "attack_scenario": "User interacts with Forwarder-A (on a testnet or another chain fork) and signs a ForwardRequest with nonce=0, to=EURFAddress, data=transfer(recipient,amount). Attacker takes that signature and replays it on Forwarder-B (production) by passing Forwarder-A's domainSeparator. If the user's nonce on Forwarder-B is also 0 and the EURF address matches, the transfer executes without the user's intent on this specific Forwarder.",
+        "invariant_logic": "domainSeparator parameter MUST equal the Forwarder's own EIP-712 domain separator computed from (name, version, chainId, verifyingContract=address(this))",
+        "solidity_property": "function invariant_domainSeparator(bytes32 domainSeparator) public view { assert(domainSeparator == _computeOwnDomainSeparator()); }",
+        "inventory_refs": [
+          {
+            "file": "Forwarder.sol",
+            "function": "execute"
+          },
+          {
+            "file": "Forwarder.sol",
+            "function": "_verifySig"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Token.sol",
+        "description": "The safety switch (_operating=false) only guards mint() and burn() operations but does NOT guard transfers, transferFrom, or transferWithAuthorization. When a controller activates the safety switch to respond to an exploit, token transfers continue unimpeded. If the exploit involves token movement (not minting), the safety switch provides no protection.",
+        "attack_scenario": "An exploit is draining funds via transfers. A controller activates the safety switch to halt operations. Minting and burning stop, but the attacker continues transferring tokens freely. The safety switch provides false sense of security while the exploit continues.",
+        "invariant_logic": "If !_operating then ALL value-movement operations should be restricted (mint, burn, transfer, transferFrom, transferWithAuthorization), or the safety switch scope should be clearly documented",
+        "solidity_property": "function invariant_safetySwitchScope() public view { if (!_operating) { /* transfers should also be blocked, or pause() should be used instead */ } }",
+        "inventory_refs": [
+          {
+            "file": "ERC20ControlerMinterUpgradeable.sol",
+            "function": "safetySwitch"
+          },
+          {
+            "file": "Token.sol",
+            "function": "transfer"
+          },
+          {
+            "file": "Token.sol",
+            "function": "transferFrom"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "Token.sol",
+        "description": "payGaslessBasefee() uses _update() directly, bypassing adminSanity checks (blacklist, pause). A trusted forwarder can extract gasless base fees from blacklisted addresses and during pause state. While the Forwarder's execute() would fail on the transfer (due to pause/blacklist), a compromised or alternative trusted forwarder contract could call payGaslessBasefee directly to drain tokens from any user at the rate of _gaslessBasefee per call.",
+        "attack_scenario": "Admin compromised or sets malicious address as trustedForwarder. Malicious forwarder repeatedly calls payGaslessBasefee(victim, attacker) to drain victim's balance by _gaslessBasefee per call, bypassing all pause and blacklist protections.",
+        "invariant_logic": "payGaslessBasefee(payer, paymaster) should enforce: !paused() && !isBlacklisted(payer) && !isBlacklisted(paymaster)",
+        "solidity_property": "function invariant_gaslessFeeRespectsPause() public view { /* payGaslessBasefee should not execute when paused() == true */ }",
+        "inventory_refs": [
+          {
+            "file": "Token.sol",
+            "function": "payGaslessBasefee"
+          },
+          {
+            "file": "ERC20MetaTxUpgradeable.sol",
+            "function": "setTrustedForwarder"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "Token.sol",
+        "description": "When _txfeeRate > 0 and _feesFaucet == address(0), _payTxFee requires balanceOf(from) >= txFees + txAmount but never actually deducts the fees (the _update call is skipped). This creates a phantom balance requirement: users with balance >= amount but < amount + fees cannot transfer, even though no fee would be collected. The tokens are effectively frozen above the fee threshold.",
+        "attack_scenario": "Admin sets _txfeeRate to 100 (1%) but forgets to set _feesFaucet. User with exactly 100 EURF tries to transfer 100 EURF. _payTxFee requires balance >= 101 but only 100 exists. Transfer reverts. No fees are actually needed since feesFaucet is address(0), but the check still blocks the transfer.",
+        "invariant_logic": "If _feesFaucet == address(0) then effective fee should be 0, OR _txfeeRate should be forced to 0 when feesFaucet is cleared",
+        "solidity_property": "function invariant_feeConsistency() public view { if (_feesFaucet == address(0)) { assert(_txfeeRate == 0 || /* fee check should not block transfers */); } }",
+        "inventory_refs": [
+          {
+            "file": "Token.sol",
+            "function": "_payTxFee"
+          },
+          {
+            "file": "FeesHandlerUpgradeable.sol",
+            "function": "setFeeFaucet"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "ERC20ControlerMinterUpgradeable.sol",
+        "description": "__ERC20ControlerMinter_init is declared as public instead of internal. While protected by onlyInitializing modifier, during initialization phase any external caller could invoke it, potentially re-initializing ERC20 name/symbol and AccessControlEnumerable state, and re-granting MASTER_MINTER to address(0), disrupting the role hierarchy.",
+        "attack_scenario": "During a complex multi-contract initialization sequence, an attacker calls __ERC20ControlerMinter_init during the initializing phase to reset the MASTER_MINTER to address(0) and re-initialize ERC20 state. This would overwrite the intended MASTER_MINTER assignment and potentially lock minter management.",
+        "invariant_logic": "__ERC20ControlerMinter_init should be internal, not public",
+        "solidity_property": "/* This is a code defect - the function visibility should be internal */",
+        "inventory_refs": [
+          {
+            "file": "ERC20ControlerMinterUpgradeable.sol",
+            "function": "__ERC20ControlerMinter_init"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Token.sol",
+        "description": "setOwner performs a non-atomic two-step role transfer: grantRole(OWNER, newOwner) followed by revokeRole(OWNER, getRoleMember(OWNER, 0)). If additional OWNER members exist due to direct grantRole calls, getRoleMember(OWNER, 0) may not return the intended previous owner, potentially revoking the wrong address. More critically, grantRole does not prevent the newOwner from already having the OWNER role via a direct grantRole call, creating an inconsistent state where setOwner's revoke removes the wrong member.",
+        "attack_scenario": "Current owner A directly calls grantRole(OWNER, B) making both A and B owners. Set = [A, B]. Owner A calls setOwner(C). grantRole adds C: set = [A, B, C]. revokeRole(getRoleMember(OWNER, 0)) revokes A: set = [C, B]. Now there are two owners (C and B) and owner() returns C. B retains full OWNER privileges including upgrade authority, invisible to owner() query.",
+        "invariant_logic": "getRoleMemberCount(OWNER) == 1 must hold at all times after initialization",
+        "solidity_property": "function invariant_singleOwner() public view { assert(getRoleMemberCount(OWNER) == 1); }",
+        "inventory_refs": [
+          {
+            "file": "Token.sol",
+            "function": "setOwner"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-006",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "ERC20AdminUpgradeable.sol",
+        "description": "Admin (ADMIN role holder) is exempt from both pause checks and sender blacklist checks in adminSanity. While forceTransfer is explicitly admin-only, regular transfer() and transferFrom() also route through transferSanity→adminSanity. An admin calling transfer() bypasses pause AND sender blacklist, meaning a blacklisted admin can freely transfer their own tokens even when the contract is paused.",
+        "attack_scenario": "Admin account is compromised. Owner blacklists the admin address and pauses the contract. The blacklisted admin calls transfer() directly - adminSanity exempts them from both pause and sender blacklist checks. The compromised admin can move all their tokens out before the owner can revoke the ADMIN role.",
+        "invariant_logic": "Blacklisted addresses (including admin) should not be able to send tokens even through standard transfer paths. Pause should apply universally except for forceTransfer.",
+        "solidity_property": "function invariant_blacklistEnforced(address account) public view { if (isBlacklisted(account)) { /* account should not be able to initiate any outgoing transfer */ } }",
+        "inventory_refs": [
+          {
+            "file": "ERC20AdminUpgradeable.sol",
+            "function": "adminSanity"
+          },
+          {
+            "file": "Token.sol",
+            "function": "transfer"
+          },
+          {
+            "file": "Token.sol",
+            "function": "transferFrom"
+          }
+        ]
+      },
+      {
+        "id": "INV-MONO-002",
+        "severity": "MEDIUM",
+        "category": "monotonicity",
+        "target_contract": "Forwarder.sol",
+        "description": "Forwarder nonces strictly increment by 1 per execute() call. The verify() function does not update nonces, only execute() does. However, verify() and execute() have inconsistent validation: verify() does not check req.to == _eurfAddress, while execute() does. A request that passes verify() may fail execute(), misleading off-chain systems.",
+        "invariant_logic": "old(nonces[req.from]) + 1 == nonces[req.from] after execute(). verify() acceptance implies execute() acceptance for the same parameters.",
+        "solidity_property": "function invariant_forwarderNonce(address from) public view { /* nonces[from] can only increase by exactly 1 per execution */ }",
+        "inventory_refs": [
+          {
+            "file": "Forwarder.sol",
+            "function": "verify"
+          },
+          {
+            "file": "Forwarder.sol",
+            "function": "execute"
+          },
+          {
+            "file": "Forwarder.sol",
+            "function": "_updateNonce"
+          }
+        ]
+      }
+    ]
+  }
+}

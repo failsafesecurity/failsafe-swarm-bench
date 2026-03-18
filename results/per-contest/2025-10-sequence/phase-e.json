@@ -1,0 +1,100 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Chained Signature linkedPayload Always Uses noChainId=false, Preventing Chain-Agnostic Config Migrations",
+      "severity": "high",
+      "summary": "The chained signature mechanism allows proving a sequence of configuration updates from the current config back to a known historical config. The first sub-signature processes the actual transaction payload and may set noChainId=true (for chain-agnostic signatures). However, all subsequent sub-signatures in the chain use a separately allocated linkedPayload struct (line 149) where noChainId defaults to false.\n\nThis creates an inconsistency: the transaction itself may be chain-agnostic (noChainId",
+      "description": [
+        {
+          "file": "src/modules/auth/BaseSig.sol",
+          "line_start": 149,
+          "line_end": 171,
+          "desc": "In recoverChained, the linkedPayload (used for all chained config update signatures after the first) is initialized on line 149-150 with 'Payload.Decoded memory linkedPayload; linkedPayload.kind = Payload.KIND_CONFIG_UPDATE;'. The noChainId field defaults to false. Although the first sub-signature sets _payload.noChainId from its own flag at line 114, this does NOT propagate to linkedPayload. All subsequent sub-signatures in the chain use linkedPayload with noChainId=false, meaning config update hashes are always chain-bound regardless of the signer's intent."
+        }
+      ],
+      "impact": "Cross-chain chained signatures do not work as expected. Users relying on chained signatures with noChainId=true for cross-chain operations will find their signatures rejected on other chains. In the worst case, if a signer has rotated keys and relies on chained signatures to prove their authority through historical configs, they may be unable to access funds on chains where the chain-bound config update proofs don't match.",
+      "proof_of_concept": "1. A wallet exists on chains A and B with identical configuration history (Config C -> Config B -> Config A)\n2. Signer needs to use a chained signature because their current signing configuration (Config A) is not the latest on-chain (Config C is latest)\n3. Signer creates a chained signature with noChainId=true hoping for cross-chain replay\n4. The first sub-signature (for the transaction) correctly uses noChainId=true\n5. But the config update sub-signatures use noChainId=false, embedding chain A's chainid\n6. On chain B, the config update hashes don't match (wrong chainid), so the chained signature is invalid\n7. The signer must create separate chained signatures for each chain, negating the benefit of noChainId\n8. In cases where the signer has already rotated keys and only has the old key, they may be unable to sign new chained signatures for every chain, potentially locking funds on chains where they can't produce the correct chain-bound config proof",
+      "remediation": "Propagate the noChainId flag from the first sub-signature to the linkedPayload. After the first sub-signature processes, set linkedPayload.noChainId = _payload.noChainId. Alternatively, always use noChainId=false for config update proofs in the chain (treating them as chain-bound) and document this as intended behavior."
+    },
+    {
+      "title": "Session Signer Can Select Among Duplicate SessionPermissions Entries to Use Most Permissive ValueLimit and Deadline",
+      "severity": "high",
+      "summary": "The session configuration is a Merkle tree. The signer provides the signature by revealing some tree nodes as full FLAG_PERMISSIONS data and hashing others as FLAG_NODE (pre-hashed). Both approaches produce valid Merkle tree roots.\n\nWhen the same signer address has multiple SessionPermissions entries in the tree (e.g., in different branches), the signer controls which entries are revealed vs hidden. The linear search in _validateExplicitCall stops at the first match. By choosing which entry appe",
+      "description": [
+        {
+          "file": "src/extensions/sessions/explicit/ExplicitSessionManager.sol",
+          "line_start": 53,
+          "line_end": 58,
+          "desc": "ExplicitSessionManager._validateExplicitCall performs a linear search through allSessionPermissions to find the first entry matching the session signer's address. The session configuration tree structure (in SessionSig.recoverConfiguration) allows the same signer address to appear in multiple FLAG_PERMISSIONS entries across different tree branches. The signer controls which entries are revealed (FLAG_PERMISSIONS) vs hidden (FLAG_NODE) in the signature encoding, thus controlling which entry appears first in the allSessionPermissions array."
+        }
+      ],
+      "impact": "Session signers with duplicate entries can always select the most permissive valueLimit and deadline, potentially exceeding the wallet owner's intended restrictions per-context.",
+      "proof_of_concept": "1. Wallet owner creates session config where signer S has:\n   - Branch A: signer=S, valueLimit=100, deadline=tomorrow, permissions=[transfer to ERC20_X]\n   - Branch B: signer=S, valueLimit=10000, deadline=next_year, permissions=[transfer to ERC20_X, ERC20_Y]\n2. Owner intended Branch A as a limited daily allowance and Branch B as a long-term larger allowance for specific operations\n3. Signer S reveals Branch B first, hashes Branch A as a node\n4. _validateExplicitCall finds Branch B first: valueLimit=10000, deadline=next_year\n5. S uses Branch B's permissions and limits to transfer up to 10000 value to ERC20_X\n6. Even if owner revokes Branch B by updating config, S may still use the old session until deadline (if session remains in the tree)",
+      "remediation": "Either require unique signer addresses across all SessionPermissions entries (validate during configuration setup), or include the specific SessionPermissions entry hash/index in the session call signature so the signer cannot choose which entry is used."
+    },
+    {
+      "title": "Session Attestation Identity Signature Does Not Bind to Wallet Address Enabling Cross-Wallet Attestation Reuse",
+      "severity": "high",
+      "summary": "The implicit session system uses attestations to authorize session signers. The identity signer signs an attestation that includes the session signer's address (approvedSigner) and various metadata. However, the attestation hash does not include the wallet address.\n\nWhen the same identity signer is used across multiple wallets (a common scenario for a single identity service managing multiple wallets), an attestation signed for one wallet's session can be reused on any other wallet that:\n1. Has ",
+      "description": [
+        {
+          "file": "src/extensions/sessions/SessionSig.sol",
+          "line_start": 114,
+          "line_end": 119,
+          "desc": "The attestation identity signature verification at line 115-118 computes attestationHash = att.toHash() and verifies ecrecover(attestationHash, v, r, s) == sig.identitySigner. The attestation hash (from Attestation.toHash -> toPacked in Attestation.sol lines 89-101) includes approvedSigner, identityType, issuerHash, audienceHash, applicationData, and authData, but does NOT include the wallet address. This means an attestation signed by the identity signer for wallet A can be replayed on wallet B if both wallets share the same identity signer and session configuration."
+        }
+      ],
+      "impact": "Attestations can be replayed across wallets sharing the same identity signer. A session signer authorized for one wallet could potentially make implicit calls from other wallets managed by the same identity service, leading to unauthorized transactions.",
+      "proof_of_concept": "1. Identity service creates attestation: approvedSigner=S, identityType=..., for wallet A\n2. Session signer S intercepts this attestation\n3. Wallet B has the same identity signer and compatible session configuration\n4. S uses the same attestation bytes + identity signature to make implicit calls from wallet B\n5. If the target contract's acceptImplicitRequest doesn't wallet-specifically reject this, the call succeeds\n6. S can now make implicit calls from wallet B even though the attestation was only intended for wallet A",
+      "remediation": "Include the wallet address in the attestation hash computation. Modify Attestation.toPacked to include the wallet address, and update the signing process to bind attestations to specific wallets."
+    },
+    {
+      "title": "Implicit Session acceptImplicitRequest External Call Has No Gas Limit Enabling EntryPoint Deposit Drain",
+      "severity": "high",
+      "summary": "During implicit session validation, the SessionManager calls acceptImplicitRequest on the target contract to verify the implicit request. This call is part of the signature validation path, executed during BaseSig.recover → ISapient(sessionManager).recoverSapientSignature → _validateImplicitCall.\n\nThe acceptImplicitRequest call uses all available gas (no gas limit specified). The session signer chooses the target contract (call.to), which determines which contract's acceptImplicitRequest is call",
+      "description": [
+        {
+          "file": "src/extensions/sessions/implicit/ImplicitSessionManager.sol",
+          "line_start": 52,
+          "line_end": 52,
+          "desc": "The _validateImplicitCall function at line 52 calls ISignalsImplicitMode(call.to).acceptImplicitRequest(wallet, attestation, call) with no gas limit. This external view call occurs during signature validation (recoverSapientSignature path). A malicious target contract can consume all available gas in its acceptImplicitRequest implementation while still returning the correct magic value."
+        }
+      ],
+      "impact": "Session signers can drain the wallet's EntryPoint deposit through repeated gas-consuming signature validations. This is a fund-draining attack: the wallet loses its ETH deposit at the EntryPoint, which is real value.",
+      "proof_of_concept": "1. Session signer S has an implicit session with wallet W\n2. S deploys contract GasEater implementing ISignalsImplicitMode.acceptImplicitRequest: consumes 10M gas then returns correct magic\n3. GasEater is NOT on the blacklist (it's a new contract)\n4. S submits UserOps via ERC-4337 targeting GasEater through wallet W\n5. validateUserOp → isValidSignature → BaseSig.recover → SessionManager.recoverSapientSignature → _validateImplicitCall → GasEater.acceptImplicitRequest (consumes 10M gas)\n6. EntryPoint charges wallet W's deposit for the consumed gas\n7. S repeats until wallet W's EntryPoint deposit is drained\n8. Legitimate UserOps for wallet W can no longer be processed (insufficient deposit)",
+      "remediation": "Add a gas limit to the acceptImplicitRequest call: ISignalsImplicitMode(call.to).acceptImplicitRequest{gas: MAX_IMPLICIT_VALIDATION_GAS}(wallet, attestation, call). A reasonable limit (e.g., 100k gas) would prevent excessive consumption while allowing normal validation logic."
+    },
+    {
+      "title": "Chained Signature Snapshot Checkpoint Floor Is Disabled After ImageHash Match, Allowing Arbitrarily Deep Historical Chains",
+      "severity": "high",
+      "summary": "The checkpointer/snapshot mechanism validates chained signatures against known on-chain state. A checkpointer returns a Snapshot containing (imageHash, checkpoint). The non-chained path (line 136-140) uses this as: 'either your imageHash matches the snapshot OR your checkpoint exceeds the snapshot checkpoint.' This creates a floor: if your config doesn't match the known good config, your checkpoint must be newer.\n\nIn the chained path, the intent is similar: the chain must include the snapshot's ",
+      "description": [
+        {
+          "file": "src/modules/auth/BaseSig.sol",
+          "line_start": 179,
+          "line_end": 193,
+          "desc": "In recoverChained, the snapshot imageHash is matched during iteration (line 179-181: if _snapshot.imageHash == imageHash, set to bytes32(0)). The final validation (line 191-193) only checks the snapshot if it wasn't matched. Once the snapshot is matched (cleared), no further checkpoint validation occurs. The chain can include arbitrarily old configurations below the snapshot's checkpoint."
+        }
+      ],
+      "impact": "The checkpointer's intended checkpoint floor is bypassed for configurations appearing after the snapshot match in the chain. This undermines the security assumption that checkpointers can limit chain depth. The practical impact depends on the checkpointer's specific use case and whether deep historical chains interact with other mechanisms.",
+      "proof_of_concept": "1. Wallet has config chain: D(cp=200) -> C(cp=150) -> B(cp=100) -> A(cp=50)\n2. Checkpointer snapshot: imageHash=hash(C), checkpoint=150\n3. Signer constructs chain: [D, cp=200] -> [C, cp=150] (snapshot matches, cleared) -> [B, cp=100] -> [A, cp=50]\n4. Final check skipped because snapshot was already matched\n5. Chain includes configs B and A, both below the snapshot checkpoint 150\n6. The chain is accepted, including the deep historical configs that the checkpointer may have intended to exclude\n7. While signing authority comes from Config D, the inclusion of old configs (A, B) in the chain may have implications for specific checkpointer use cases",
+      "remediation": "After the loop, verify that prevCheckpoint (the final/oldest checkpoint) >= _snapshot.checkpoint, regardless of whether the snapshot was matched. This ensures the chain cannot extend below the checkpoint floor."
+    },
+    {
+      "title": "ExplicitSessionManager Defers Function Selector Validation for SessionManager Self-Calls Creating Split Validation Gap",
+      "severity": "high",
+      "summary": "In _validateExplicitCall, when a call targets the SessionManager at index 0, the function returns immediately (line 89) with only checks that callIdx == 0, call.value == 0, and call.to == address(this). No check on the function selector or call data is performed.\n\nThe deferred validation in _validateLimitUsageIncrement (lines 128-168) reconstructs the expected incrementUsageLimit calldata and compares hashes. This currently catches any mismatch.\n\nHowever, the split creates two specific risks:\n\n1",
+      "description": [
+        {
+          "file": "src/extensions/sessions/explicit/ExplicitSessionManager.sol",
+          "line_start": 79,
+          "line_end": 89,
+          "desc": "The _validateExplicitCall function returns early without any permission validation when call.to == address(this) && callIdx == 0. The actual function selector and full calldata are only validated later in _validateLimitUsageIncrement via a calldata hash comparison. This split validation pattern creates a gap where call[0] targeting the SessionManager passes _validateExplicitCall with zero checks on the call content."
+        }
+      ],
+      "impact": "Currently mitigated by the calldata hash check. The split validation pattern is a defense-in-depth concern that could become exploitable if the SessionManager's contract surface changes.",
+      "proof_of_concept": "Current code is safe. The theoretical risk materializes if:\n1. A new external state-modifying function is added to SessionManager's inheritance chain\n2. Session signer crafts call[0] targeting SessionManager with the new function's selector\n3. _validateExplicitCall returns early (no permission check)\n4. The calldata hash comparison in _validateLimitUsageIncrement must also fail to catch it (extremely unlikely)\n5. The call executes without any permission validation",
+      "remediation": "Validate the function selector in _validateExplicitCall itself: require(call.data.length >= 4 && bytes4(call.data[:4]) == this.incrementUsageLimit.selector) when call.to == address(this). This provides defense-in-depth alongside the deferred hash check."
+    }
+  ]
+}

@@ -1,0 +1,684 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator_2",
+    "llm_model": null,
+    "llm_provider": "gemini",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "WildcatMarket.sol",
+      "WildcatMarketBase.sol",
+      "WildcatMarketWithdrawals.sol",
+      "WildcatMarketConfig.sol",
+      "WildcatMarketToken.sol",
+      "HooksFactory.sol",
+      "WildcatArchController.sol",
+      "WildcatSanctionsSentinel.sol",
+      "WildcatSanctionsEscrow.sol",
+      "HooksConfig.sol",
+      "MarketState.sol",
+      "ReentrancyGuard.sol",
+      "TransientBytesArray.sol",
+      "LibStoredInitCode.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T00:15:58.530Z",
+    "duration_ms": 233364
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS2-H001",
+      "title": "Market Closure Blocked by Arithmetic Underflow from Rounding Dust",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The closeMarket function can revert due to an arithmetic underflow when subtracting normalizedAmountPaid from availableLiquidity, permanently preventing the borrower from closing the market.",
+      "investigation_rationale": "The _applyWithdrawalBatchPayment function uses rayDiv (which rounds to nearest) to calculate scaledAvailableLiquidity, but mulDiv (which rounds down) to calculate normalizedAmountPaid. When the market's scaleFactor is large (e.g., > 2.5e27), this mismatch can cause normalizedAmountPaid to be strictly greater than the input availableLiquidity by 1 wei, causing an unchecked underflow in closeMarket.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "closeMarket",
+        "_applyWithdrawalBatchPayment"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "WildcatMarketBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        },
+        {
+          "file": "WildcatMarketBase.sol",
+          "function": "_applyWithdrawalBatchPayment"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "219",
+        "pattern": "availableLiquidity -= normalizedAmountPaid; executes without satSub, risking underflow from rounding discrepancy"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market has unpaid withdrawal batches",
+        "scaleFactor is sufficiently large (e.g., > 2.5e27) due to accumulated interest",
+        "availableLiquidity is a small dust amount"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "closeMarket uses unchecked subtraction for availableLiquidity, unlike repayAndProcessUnpaidWithdrawalBatches which uses satSub",
+        "admin_dependency": "Borrower relies on this function to stop interest accrual and terminate the market",
+        "exploitation_window": "Any time after significant interest has accrued and dust remains in batches"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can an attacker intentionally create dust batches to trigger this underflow?",
+          "What is the exact scaleFactor threshold where rayDiv rounding causes normalizedAmountPaid > availableLiquidity?"
+        ],
+        "validation_requirements": [
+          "Write a Foundry test setting scaleFactor to 3e27 and availableLiquidity to 4 wei",
+          "Verify if closeMarket reverts with an arithmetic panic"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Wait for market scaleFactor to grow via interest accrual",
+        "phase_2": "Queue a tiny withdrawal to create a dust batch",
+        "phase_3": "When borrower calls closeMarket, the rounding discrepancy causes an underflow",
+        "phase_4": "Borrower transaction reverts, forcing them to continue paying interest",
+        "coordination_requirements": "None, can occur naturally or be forced with minimal capital"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Borrower is permanently unable to close the market",
+        "recovery_difficulty": "High - requires a protocol upgrade or complex state manipulation to clear the dust",
+        "affected_operations": "Market termination and final debt settlement"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Basic understanding of EVM math",
+        "operational_timing": "Executed before borrower attempts to close market"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Failed closeMarket transactions with Panic(0x11)",
+        "operational_anomalies": "Markets with 0 APR but isClosed == false",
+        "behavioral_patterns": "Tiny withdrawal batches queued right before market closure",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H002",
+      "title": "Massive Fake Transfer Event Spoofing via Ray Math Overflow",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "An attacker can pass a massive amount to transfer() or queueWithdrawal() that silently overflows during scaling, resulting in a tiny actual deduction but emitting an event with the massive original amount.",
+      "investigation_rationale": "The rayDiv function in MathUtils uses unchecked assembly `mul(a, RAY)` which silently wraps around modulo 2^256. If a user passes an amount like ~1.15e50, `amount * RAY` overflows and results in a tiny scaledAmount (e.g., 1 wei). The transfer succeeds, deducting only 1 wei from the user, but emits a Transfer event with the massive original amount.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "transfer",
+        "transferFrom",
+        "queueWithdrawal"
+      ],
+      "affected_contracts": [
+        "WildcatMarketToken.sol",
+        "WildcatMarketWithdrawals.sol",
+        "MathUtils.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarketToken.sol",
+          "function": "_transfer"
+        },
+        {
+          "file": "MathUtils.sol",
+          "function": "rayDiv"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MathUtils.sol",
+        "lines": "55",
+        "pattern": "c := div(add(mul(a, RAY), halfB), b) executes in unchecked assembly, allowing mul(a, RAY) to wrap"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Attacker has at least 1 wei of scaled balance in the market"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "amount is not capped before being passed to scaleAmount in _transfer and queueWithdrawal",
+        "admin_dependency": "None",
+        "exploitation_window": "Always open"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Do off-chain indexers or portfolio trackers rely on the Transfer event amount?",
+          "Can this be used to spoof deposits on centralized exchanges if they list market tokens?"
+        ],
+        "validation_requirements": [
+          "Calculate exact uint256 amount that wraps to 1 scaled token",
+          "Execute transfer with this amount and verify event emission vs actual balance change"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Deposit a tiny amount of underlying asset to get 1 scaled token",
+        "phase_2": "Calculate overflow amount X such that (X * 1e27) % 2^256 results in a value yielding 1 scaled token",
+        "phase_3": "Call transfer(recipient, X)",
+        "phase_4": "Transaction succeeds, emitting Transfer(attacker, recipient, X) while only moving 1 wei",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Corruption of off-chain analytics, potential exchange spoofing",
+        "recovery_difficulty": "Low - on-chain state is intact, but off-chain data is poisoned",
+        "affected_operations": "Token tracking and indexing"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Modular arithmetic calculation",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Transfer events with unusually large amounts (e.g., > 1e40)",
+        "operational_anomalies": "Mismatch between Transfer event sums and actual token total supply",
+        "behavioral_patterns": "Users transferring massive amounts despite having tiny balances",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H003",
+      "title": "Block Gas Limit DoS on Market Closure via Unpaid Batch Spam",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "A malicious lender can queue thousands of tiny withdrawals to bloat the unpaidBatches array, causing the borrower's closeMarket transaction to exceed the block gas limit.",
+      "investigation_rationale": "The closeMarket function iterates over all unpaid batches using an unbounded for loop. If a market has a short withdrawalBatchDuration, an attacker can queue 1-wei withdrawals across many blocks. Each becomes a separate expired batch in the unpaidBatches array. The borrower must process all of them in a single transaction to close the market.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "withdrawalBatchDuration is configured to a short duration (e.g., 0 or a few hours)"
+      ],
+      "config_evidence": "HooksFactory.sol TmpMarketParameterStorage allows any withdrawalBatchDuration including 0",
+      "affected_functions": [
+        "closeMarket"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "217-221",
+        "pattern": "for (uint256 i; i < numBatches; i++) iterates over entire unpaidBatches array without pagination"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "COROLLARY"
+      },
+      "preconditions": [
+        "Market has a short withdrawalBatchDuration",
+        "Attacker has sufficient funds to queue many tiny withdrawals"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "closeMarket requires processing all unpaid batches in one transaction, unlike repayAndProcessUnpaidWithdrawalBatches which allows pagination",
+        "admin_dependency": "Borrower relies on this to close the market",
+        "exploitation_window": "Any time before market closure"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "How many batches are required to hit the 30M gas limit?",
+          "Is it economically viable for an attacker to queue that many batches?"
+        ],
+        "validation_requirements": [
+          "Simulate closeMarket with 1,000 unpaid batches and measure gas consumption"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Deposit a small amount of underlying asset",
+        "phase_2": "Call queueWithdrawal(1 wei) repeatedly across different blocks/cycles",
+        "phase_3": "Accumulate thousands of unpaid batches",
+        "phase_4": "Borrower attempts to call closeMarket and transaction runs out of gas",
+        "coordination_requirements": "Requires automated script to queue withdrawals over time"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Borrower cannot close market, forced to pay interest",
+        "recovery_difficulty": "Medium - borrower must manually clear batches using repayAndProcessUnpaidWithdrawalBatches before calling closeMarket",
+        "affected_operations": "Market termination"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Basic scripting",
+        "operational_timing": "Continuous execution over days/weeks"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "High frequency of queueWithdrawal calls with dust amounts",
+        "operational_anomalies": "unpaidBatches array length exceeding 500",
+        "behavioral_patterns": "Single user creating hundreds of distinct batches",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H004",
+      "title": "Batch Protocol Fee Updates Blocked by Single Closed Market",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The ArchController admin's batch transaction to update protocol fees across multiple markets will revert entirely if even one market in the batch has been closed by its borrower.",
+      "investigation_rationale": "HooksFactory.pushProtocolFeeBipsUpdates iterates over an array of markets and calls setProtocolFeeBips. If a market is closed, setProtocolFeeBips reverts. The factory uses an assembly call and explicitly reverts the entire transaction if the call fails, breaking the batch update.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "pushProtocolFeeBipsUpdates"
+      ],
+      "affected_contracts": [
+        "HooksFactory.sol",
+        "WildcatMarketConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksFactory.sol",
+          "function": "pushProtocolFeeBipsUpdates"
+        },
+        {
+          "file": "WildcatMarketConfig.sol",
+          "function": "setProtocolFeeBips"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksFactory.sol",
+        "lines": "385-389",
+        "pattern": "if iszero(call(...)) { revert(...) } inside a loop over markets"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "At least one market using the target hooks template has been closed"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Batch update function does not gracefully handle expected failures (closed markets)",
+        "admin_dependency": "ArchController admin relies on this to sync fee changes",
+        "exploitation_window": "Any time after a market closes"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "How frequently does the admin update protocol fees?",
+          "Is the manual pagination workaround acceptable for operations?"
+        ],
+        "validation_requirements": [
+          "Test pushProtocolFeeBipsUpdates with an array containing one closed market"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Borrower legitimately closes their market",
+        "phase_2": "Admin attempts to update protocol fees for the template",
+        "phase_3": "Transaction reverts due to the closed market",
+        "phase_4": "Admin must manually identify the closed market and send multiple paginated transactions",
+        "coordination_requirements": "None, occurs naturally"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Increased operational overhead for protocol admins",
+        "recovery_difficulty": "Low - can be bypassed using startIndex and endIndex parameters",
+        "affected_operations": "Protocol fee management"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "None",
+        "operational_timing": "N/A"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Failed pushProtocolFeeBipsUpdates transactions",
+        "operational_anomalies": "Admin sending multiple paginated fee update transactions",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H005",
+      "title": "Keeper Automation Breakage via Reverting Debt Repayment",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Automated keeper scripts calling repayOutstandingDebt or repayDelinquentDebt will revert if the market is fully collateralized, breaking automation pipelines.",
+      "investigation_rationale": "These functions calculate the required repayment amount and pass it to _repay. If the debt is 0, _repay explicitly reverts with NullRepayAmount. Keepers that blindly call these functions periodically to ensure market health will experience transaction failures instead of graceful no-ops.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "repayOutstandingDebt",
+        "repayDelinquentDebt",
+        "_repay"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "repayOutstandingDebt"
+        },
+        {
+          "file": "WildcatMarket.sol",
+          "function": "_repay"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "128",
+        "pattern": "if (amount == 0) revert_NullRepayAmount(); triggers when calculated debt is 0"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Market is fully collateralized (totalAssets >= totalDebts or liquidityRequired)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Helper functions for debt repayment do not handle the 0-debt case gracefully",
+        "admin_dependency": "Borrowers relying on automated keepers for market maintenance",
+        "exploitation_window": "When market is healthy"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Do borrowers use automated keepers to manage delinquency?",
+          "Will reverting transactions cause keeper infrastructure to disable the task?"
+        ],
+        "validation_requirements": [
+          "Call repayOutstandingDebt on a fully collateralized market and verify revert"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Borrower sets up Gelato or Chainlink Keepers to call repayDelinquentDebt",
+        "phase_2": "Market becomes fully collateralized",
+        "phase_3": "Keeper calls function, transaction reverts",
+        "phase_4": "Keeper network flags task as failing and potentially pauses it, leaving market vulnerable to future delinquency",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Automated market maintenance pipelines break",
+        "recovery_difficulty": "Low - requires updating keeper logic to check debt off-chain before calling",
+        "affected_operations": "Delinquency management"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "None",
+        "operational_timing": "N/A"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Failed repayOutstandingDebt transactions",
+        "operational_anomalies": "Keepers pausing automation tasks",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H006",
+      "title": "Systemic Insolvency via Fee-on-Transfer Token Accounting Discrepancy",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "If a market is deployed with a fee-on-transfer token, the internal accounting will credit users for more tokens than the market actually receives, leading to systemic insolvency.",
+      "investigation_rationale": "The _depositUpTo function uses safeTransferFrom to pull amount tokens, but credits the user's scaledBalance based on the pre-fee amount. The protocol relies on an admin blacklist rather than a whitelist, meaning a borrower can deploy a market with a fee-on-transfer token unless the admin explicitly blacklists it first.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "ArchController admin has not blacklisted the specific fee-on-transfer token",
+        "Borrower deploys a market using this token"
+      ],
+      "config_evidence": "WildcatArchController uses a blacklist (_assetBlacklist) rather than a whitelist for allowed assets",
+      "affected_functions": [
+        "_depositUpTo"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "_depositUpTo"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "80-82",
+        "pattern": "asset.safeTransferFrom(...) followed by account.scaledBalance += scaledAmount; without checking balance delta"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Underlying asset is a fee-on-transfer token",
+        "Token is not on the ArchController blacklist"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Missing balance before/after checks during deposit",
+        "admin_dependency": "Relies entirely on admin proactively blacklisting bad tokens",
+        "exploitation_window": "Any time after market deployment"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the admin actively monitoring and blacklisting all fee-on-transfer tokens?",
+          "Can a malicious borrower deploy a custom FoT token to steal from lenders?"
+        ],
+        "validation_requirements": [
+          "Deploy market with a mock FoT token",
+          "Perform deposit and verify totalAssets() < state.totalSupply()"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Malicious borrower creates a custom ERC20 with a 10% transfer fee",
+        "phase_2": "Borrower deploys a Wildcat market using this token",
+        "phase_3": "Lenders deposit 100 tokens. Market receives 90, but lenders are credited 100",
+        "phase_4": "Borrower deposits 100 tokens, gets credited 100. Borrower withdraws 100, draining the 90 tokens from lenders",
+        "coordination_requirements": "Requires borrower privilege to deploy market"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Market becomes permanently insolvent",
+        "recovery_difficulty": "High - lost funds cannot be recovered",
+        "affected_operations": "Withdrawals"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium",
+        "technical_skills": "Token deployment and market creation",
+        "operational_timing": "Executed immediately after market deployment"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Markets deployed with unknown or unverified ERC20 tokens",
+        "operational_anomalies": "totalAssets() significantly lower than expected based on totalSupply()",
+        "behavioral_patterns": "Borrower deploying market and immediately depositing/withdrawing",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H007",
+      "title": "Protocol Fee Collection Panic via Unclaimed Withdrawals Underflow",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If the market's total underlying asset balance drops below the amount reserved for unclaimed withdrawals, the collectFees function will revert with an arithmetic panic.",
+      "investigation_rationale": "The withdrawableProtocolFees calculation subtracts normalizedUnclaimedWithdrawals from totalAssets(). If totalAssets is less than normalizedUnclaimedWithdrawals (e.g., due to token slashing, fee-on-transfer mechanics, or direct transfers out if the token is upgradeable), this subtraction underflows, preventing the fee recipient from collecting any fees.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "collectFees",
+        "withdrawableProtocolFees"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "MarketState.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarketState.sol",
+          "function": "withdrawableProtocolFees"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarketState.sol",
+        "lines": "67",
+        "pattern": "uint256 totalAvailableAssets = totalAssets - state.normalizedUnclaimedWithdrawals; executes without underflow protection"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-011",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "totalAssets() < normalizedUnclaimedWithdrawals",
+        "accruedProtocolFees > 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Unprotected subtraction in a view function used by state-modifying fee collection",
+        "admin_dependency": "Fee recipient relies on this to extract revenue",
+        "exploitation_window": "When market experiences asset loss"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What happens to protocol fees if a market suffers a slashing event?",
+          "Should fee collection gracefully return 0 instead of panicking?"
+        ],
+        "validation_requirements": [
+          "Simulate asset loss in a market with unclaimed withdrawals",
+          "Call collectFees and verify Panic(0x11)"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Market operates normally, accumulating unclaimed withdrawals and protocol fees",
+        "phase_2": "Underlying asset experiences a slashing event or balance reduction",
+        "phase_3": "totalAssets drops below normalizedUnclaimedWithdrawals",
+        "phase_4": "Fee recipient calls collectFees, transaction reverts",
+        "coordination_requirements": "Requires external token event"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Protocol revenue cannot be collected",
+        "recovery_difficulty": "Medium - requires borrower to deposit funds to restore totalAssets",
+        "affected_operations": "Fee collection"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "High",
+        "technical_skills": "None",
+        "operational_timing": "Post-slashing event"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Failed collectFees transactions with Panic(0x11)",
+        "operational_anomalies": "totalAssets < normalizedUnclaimedWithdrawals",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS2-H008",
+      "title": "Sanctioned Funds Permanently Trapped if Sentinel Oracle Dependency Fails",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Funds routed to a WildcatSanctionsEscrow contract may be permanently trapped if the ArchController upgrades to a new sentinel or if the old sentinel's Chainalysis oracle breaks.",
+      "investigation_rationale": "The escrow contract relies on an immutable sentinel address to check canReleaseEscrow(). If the protocol operations replace the sentinel, the old sentinel remains hardcoded in existing escrows. If the old sentinel's oracle dependency (Chainalysis) is deprecated or breaks, the isSanctioned call will revert, permanently locking the escrowed funds.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Protocol operations eventually upgrade or replace the WildcatSanctionsSentinel",
+        "Old sentinel's oracle dependency becomes unmaintained"
+      ],
+      "config_evidence": "WildcatSanctionsEscrow.sol constructor sets sentinel = msg.sender immutably",
+      "affected_functions": [
+        "canReleaseEscrow",
+        "releaseEscrow"
+      ],
+      "affected_contracts": [
+        "WildcatSanctionsEscrow.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatSanctionsEscrow.sol",
+          "function": "canReleaseEscrow"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatSanctionsEscrow.sol",
+        "lines": "23",
+        "pattern": "return !IWildcatSanctionsSentinel(sentinel).isSanctioned(borrower, account); relies on immutable sentinel"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-016",
+        "relationship": "COROLLARY"
+      },
+      "preconditions": [
+        "User funds are held in an escrow contract",
+        "Sentinel contract is replaced or its oracle breaks"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Escrow contracts are permanently bound to a specific sentinel instance rather than querying the ArchController for the current sentinel",
+        "admin_dependency": "Relies on continuous maintenance of the specific sentinel instance",
+        "exploitation_window": "After sentinel deprecation"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the protocol's upgrade path for the sanctions sentinel?",
+          "Will old sentinels be maintained indefinitely?"
+        ],
+        "validation_requirements": [
+          "Simulate oracle failure on the sentinel",
+          "Attempt to call releaseEscrow and verify revert"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Sanctioned user funds are routed to escrow",
+        "phase_2": "Protocol admins deploy a new sentinel and update the ArchController",
+        "phase_3": "Old sentinel's Chainalysis oracle is deprecated and begins reverting",
+        "phase_4": "User is removed from sanctions list, but releaseEscrow reverts due to broken oracle",
+        "coordination_requirements": "None, environmental failure"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Legitimate users cannot recover funds after sanctions are lifted",
+        "recovery_difficulty": "Impossible - escrow contracts are non-upgradeable and immutable",
+        "affected_operations": "Escrow release"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "None",
+        "operational_timing": "N/A"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Failed releaseEscrow transactions",
+        "operational_anomalies": "Escrows pointing to deprecated sentinels",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

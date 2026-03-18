@@ -1,0 +1,890 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "MergeTgt.sol",
+      "Titn.sol",
+      "IMerge.sol",
+      "IERC677Receiver.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T03:36:33.862Z",
+    "duration_ms": 429790
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS-H001",
+      "title": "Unbounded TGT Deposits Cause TITN Insolvency: totalTitnClaimable Exceeds Contract Balance",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The onTokenTransfer function accepts unlimited TGT deposits without enforcing a cumulative cap against TGT_TO_EXCHANGE or verifying that totalTitnClaimable does not exceed the TITN balance. If total TGT deposited exceeds TGT_TO_EXCHANGE (579M TGT), the cumulative claimable TITN exceeds TITN_ARB (173.7M TITN), making the contract insolvent. TGT total supply is 1B; at full rate in the first 90 days, depositing all TGT would allocate ~300M TITN against only 173.7M available. Early claimers drain the pool; later users' claimTitn calls revert on safeTransfer. This also cascades into withdrawRemainingTitn underflow (OPS-H002).",
+      "investigation_rationale": "The quoteTitn function calculates per-deposit TITN output without checking cumulative allocation. No state variable tracks total TGT deposited or enforces totalTitnClaimable <= TITN_ARB. This is exploitable by any TGT holder through normal on-chain operations.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onTokenTransfer",
+        "quoteTitn",
+        "claimTitn",
+        "withdrawRemainingTitn"
+      ],
+      "affected_contracts": [
+        "MergeTgt.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MergeTgt.sol",
+          "function": "onTokenTransfer"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "quoteTitn"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "claimTitn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MergeTgt.sol",
+        "lines": "68-84",
+        "pattern": "onTokenTransfer computes titnOut via quoteTitn and increments claimableTitnPerUser and totalTitnClaimable without any cumulative cap check against TITN_ARB or contract TITN balance"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Total TGT supply exceeds TGT_TO_EXCHANGE (579M TGT)",
+        "lockedStatus != Locked and launchTime set",
+        "Within 360-day window",
+        "TGT implements ERC677 transferAndCall calling onTokenTransfer"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "quoteTitn calculates per-deposit output but no accumulator verifies total allocation stays within TITN_ARB budget",
+        "admin_dependency": "No admin intervention needed; any TGT holder can trigger insolvency by depositing",
+        "exploitation_window": "Full 360-day merge window; most damaging in first 90 days at full conversion rate"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the total circulating supply of TGT that could be deposited?",
+          "What percentage of TGT holders are likely to participate in the merge?",
+          "At what deposit volume does totalTitnClaimable exceed actual TITN balance?"
+        ],
+        "validation_requirements": [
+          "Verify TGT total supply and distribution",
+          "Simulate totalTitnClaimable growth vs TITN_ARB with varying deposit volumes",
+          "Confirm no off-chain mechanism prevents over-deposit"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Acquire TGT tokens on Arbitrum (market purchase or existing holdings)",
+        "phase_2": "Deposit TGT via transferAndCall during first 90 days at full rate, pushing totalTitnClaimable above TITN_ARB",
+        "phase_3": "Immediately call claimTitn to extract allocated TITN before other users",
+        "phase_4": "Later depositors and claimers find safeTransfer reverts due to insufficient TITN balance",
+        "coordination_requirements": "None - single attacker with sufficient TGT can trigger insolvency"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "No admin compromise needed",
+        "operational_disruption": "Complete insolvency of merge contract; late claimers permanently locked out of TITN",
+        "recovery_difficulty": "Owner must deposit additional TITN to cover deficit; no on-chain recovery mechanism",
+        "affected_operations": "claimTitn and withdrawRemainingTitn for all users who haven't claimed"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "TGT tokens exceeding TGT_TO_EXCHANGE collectively (579M+ TGT across all depositors)",
+        "coordination_complexity": "Low - natural market participation can trigger this without malicious intent",
+        "technical_skills": "Basic - standard ERC677 transferAndCall interaction",
+        "operational_timing": "Most effective in first 90 days at full conversion rate"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Monitor totalTitnClaimable approaching or exceeding TITN_ARB",
+        "operational_anomalies": "Large TGT deposits in rapid succession",
+        "behavioral_patterns": "Immediate claimTitn calls after large deposits (bank-run behavior)",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H002",
+      "title": "withdrawRemainingTitn Arithmetic Underflow Permanently DoSes All Post-Year Claims",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In withdrawRemainingTitn, the expression `unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable` underflows (reverts in Solidity 0.8+) when the contract's TITN balance at the 360-day snapshot is less than totalTitnClaimable. This occurs when TGT deposits exceed TGT_TO_EXCHANGE (OPS-H001) or if the owner has withdrawn TITN. Since remainingTitnAfter1Year is initialized by the first caller and re-initialized on every call when it equals 0, if the balance is 0 the function permanently reverts for all users.",
+      "investigation_rationale": "The subtraction has no underflow guard and depends on the invariant that contract balance >= totalTitnClaimable, which is not enforced anywhere in the code.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "withdrawRemainingTitn"
+      ],
+      "affected_contracts": [
+        "MergeTgt.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MergeTgt.sol",
+          "function": "withdrawRemainingTitn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MergeTgt.sol",
+        "lines": "108-115",
+        "pattern": "unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable performs unchecked subtraction; if remainingTitnAfter1Year < initialTotalClaimable, Solidity 0.8 reverts with arithmetic underflow"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "360 days have elapsed since launchTime",
+        "Contract TITN balance < totalTitnClaimable at time of first withdrawRemainingTitn call",
+        "At least one user has claimableTitnPerUser > 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "First withdrawRemainingTitn caller snapshots balance that may be below totalTitnClaimable, causing all subsequent calls to revert",
+        "admin_dependency": "Can occur without admin action if TGT over-deposit (OPS-H001) occurs; also triggered by owner withdraw",
+        "exploitation_window": "Permanent after 360 days if insolvency conditions exist"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Under what realistic scenarios does contract balance fall below totalTitnClaimable?",
+          "Is there any fallback mechanism to recover from this permanent DoS?",
+          "Can the owner deposit additional TITN after 360 days to fix the underflow?"
+        ],
+        "validation_requirements": [
+          "Simulate withdrawRemainingTitn with balance < totalTitnClaimable",
+          "Verify that the function permanently reverts once remainingTitnAfter1Year is set to 0",
+          "Test edge case: balance == 0 causing perpetual re-initialization loop"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Trigger insolvency via OPS-H001 (over-deposit of TGT) during the 360-day window",
+        "phase_2": "Claim own TITN via claimTitn before 360 days",
+        "phase_3": "After 360 days, all remaining users cannot call withdrawRemainingTitn due to underflow",
+        "phase_4": "Remaining TITN in contract (if any) is permanently locked",
+        "coordination_requirements": "None beyond causing insolvency condition"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None required",
+        "operational_disruption": "All post-year claims permanently DoSed; users cannot retrieve their allocated TITN",
+        "recovery_difficulty": "Owner may attempt to deposit TITN to increase balance above totalTitnClaimable before first call, but if first call already failed with balance=0, remainingTitnAfter1Year stays 0 and re-initializes each time",
+        "affected_operations": "withdrawRemainingTitn for all users with unclaimed TITN"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None directly; insolvency is the precondition",
+        "coordination_complexity": "Low",
+        "technical_skills": "Basic - just call withdrawRemainingTitn after 360 days",
+        "operational_timing": "After 360-day mark"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Compare titn.balanceOf(MergeTgt) with totalTitnClaimable after 360 days",
+        "operational_anomalies": "withdrawRemainingTitn consistently reverting",
+        "behavioral_patterns": "N/A - affects all users equally",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H003",
+      "title": "Cross-Chain Dust Bridging Permanently Restricts Arbitrary Addresses on Base",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The _credit function in Titn.sol permanently sets isBridgedTokenHolder[_to] = true for any address receiving bridged tokens. An attacker can bridge a dust amount (e.g., 1 wei) of TITN from Arbitrum to any victim address on Base via LayerZero OFT. Once flagged, the victim cannot transfer their TITN on Base (when isBridgedTokensTransferLocked is true) except to the owner, transferAllowedContract, or lzEndpoint. No function exists to clear this flag. The attack cost is only the LayerZero bridging fee (~$0.10-$1).",
+      "investigation_rationale": "isBridgedTokenHolder is a one-way flag set in _credit with no clearing mechanism. _validateTransfer enforces restrictions based on this flag. On Base (chainId != 42161), only flagged addresses are restricted, making the griefing attack targeted.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_credit",
+        "_validateTransfer",
+        "transfer",
+        "transferFrom"
+      ],
+      "affected_contracts": [
+        "Titn.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Titn.sol",
+          "function": "_credit"
+        },
+        {
+          "file": "Titn.sol",
+          "function": "_validateTransfer"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Titn.sol",
+        "lines": "96-103",
+        "pattern": "_credit unconditionally sets isBridgedTokenHolder[_to] = true for any recipient; no minimum amount check; no mechanism to clear flag"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker holds any amount of TITN on a source chain",
+        "isBridgedTokensTransferLocked is true on Base",
+        "LayerZero cross-chain messaging is operational",
+        "Victim has TITN holdings on Base or will acquire TITN on Base in the future"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "_credit marks recipient without any validation of amount or recipient consent; flag is permanent with no admin override",
+        "admin_dependency": "None - attacker acts independently; admin cannot clear per-address flags",
+        "exploitation_window": "Permanent - as long as cross-chain bridging is operational"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can the owner mitigate this by setting isBridgedTokensTransferLocked = false?",
+          "Is there a practical cost threshold that makes this attack uneconomical at scale?",
+          "What downstream protocols on Base would be affected by users unable to transfer TITN?"
+        ],
+        "validation_requirements": [
+          "Test bridging 1 wei to arbitrary address on Base and confirm flag is set",
+          "Verify no function exists to clear isBridgedTokenHolder",
+          "Confirm _validateTransfer blocks flagged addresses from all transfers except exempted destinations"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Acquire minimal TITN on Arbitrum (via TGT merge or market purchase)",
+        "phase_2": "Call OFT.send() with victim's address as recipient, bridging dust amount to Base",
+        "phase_3": "LayerZero delivers message; _credit on Base mints dust to victim and sets isBridgedTokenHolder[victim] = true",
+        "phase_4": "Victim's TITN transfers on Base permanently revert unless to/from transferAllowedContract or owner",
+        "coordination_requirements": "None - single transaction per victim"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None needed",
+        "operational_disruption": "Targeted users permanently unable to trade/transfer TITN on Base; could target DEX LPs, stakers, or key holders",
+        "recovery_difficulty": "Only global mitigation: owner sets isBridgedTokensTransferLocked = false, removing restrictions for ALL bridged holders",
+        "affected_operations": "All transfer and transferFrom calls by flagged addresses on Base"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Minimal TITN (1 wei per victim)",
+        "coordination_complexity": "Very low - automated script can flag thousands of addresses",
+        "technical_skills": "Basic - standard OFT.send() call",
+        "operational_timing": "Any time while cross-chain bridging is live"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Small cross-chain transfers to many distinct addresses from single source",
+        "operational_anomalies": "Addresses flagged as bridged holders who never initiated bridging",
+        "behavioral_patterns": "Batch bridging of dust amounts",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H004",
+      "title": "Off-By-One at Exactly 360 Days: TGT Deposited for Zero TITN Output",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "At exactly block.timestamp - launchTime == 360 days, onTokenTransfer allows a deposit (since the check `> 360 days` is false), but quoteTitn returns 0 (since timeSinceLaunch is not `< 90 days` and not `< 360 days`, falling to the else branch). The user's TGT is irrevocably transferred into the contract while claimableTitnPerUser gains 0. Furthermore, claimTitn immediately reverts (block.timestamp - launchTime >= 360 days), and withdrawRemainingTitn requires claimableTitn > 0 which is also 0. The user permanently loses their TGT with no recovery path.",
+      "investigation_rationale": "Boundary inconsistency between onTokenTransfer's > check and quoteTitn's < check at exactly 360 days. No minimum output validation exists in onTokenTransfer.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onTokenTransfer",
+        "quoteTitn",
+        "claimTitn"
+      ],
+      "affected_contracts": [
+        "MergeTgt.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MergeTgt.sol",
+          "function": "onTokenTransfer"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "quoteTitn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MergeTgt.sol",
+        "lines": "75-79,131-141",
+        "pattern": "onTokenTransfer uses `block.timestamp - launchTime > 360 days` (strict greater-than) while quoteTitn uses `timeSinceLaunch < 360 days` (strict less-than); at exactly 360 days neither condition catches the edge case"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "block.timestamp - launchTime == 360 days exactly",
+        "lockedStatus != Locked",
+        "User calls TGT.transferAndCall with amount > 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Deposit accepted with zero output; no minimum output check exists in onTokenTransfer",
+        "admin_dependency": "None",
+        "exploitation_window": "Single block at exactly 360-day mark"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "How likely is a natural deposit at the exact 360-day block timestamp?",
+          "Could a user be guided to deposit at this exact time by a malicious frontend?",
+          "Is there any mechanism to recover TGT from the contract for zero-output deposits?"
+        ],
+        "validation_requirements": [
+          "Simulate onTokenTransfer at block.timestamp - launchTime == 360 days",
+          "Confirm quoteTitn returns 0 at this boundary",
+          "Verify no claim path exists for 0-TITN deposits"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Wait for block.timestamp - launchTime == 360 days",
+        "phase_2": "Deposit TGT via transferAndCall - deposit succeeds but titnOut = 0",
+        "phase_3": "User's TGT is locked in contract with 0 claimable TITN",
+        "phase_4": "No claim function accepts the user's call (claimTitn reverts, withdrawRemainingTitn requires claimableTitn > 0)",
+        "coordination_requirements": "Timing to exact block"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Permanent loss of deposited TGT for affected users",
+        "recovery_difficulty": "Only owner withdraw can return TGT; no automated recovery path",
+        "affected_operations": "Any user depositing at the exact 360-day boundary"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "Any TGT amount",
+        "coordination_complexity": "Medium - requires precise timing",
+        "technical_skills": "Basic",
+        "operational_timing": "Exactly at 360-day mark"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "onTokenTransfer event with titnOut = 0",
+        "operational_anomalies": "Deposit at exact 360-day boundary timestamp",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "lzEndpoint Transfer Exemption Is Dead Code That Creates Permanent Token Loss Vector",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "The _validateTransfer function exempts transfers where `to == lzEndpoint`, ostensibly to allow bridging. However, OFT v2's send() function uses internal _burn which bypasses the transfer/transferFrom overrides entirely. The exemption serves no purpose for actual bridging. Instead, it creates a dangerous token loss vector: on Arbitrum where all other transfers are restricted, users may attempt to bridge by calling transfer(lzEndpoint, amount) directly. This sends tokens to the endpoint contract address where they are permanently stuck - no bridging occurs and no recovery mechanism exists.",
+      "investigation_rationale": "The protocol documentation states users on Arbitrum should transfer to the LayerZero endpoint. But the actual OFT bridging mechanism uses _burn, making the transfer exemption misleading dead code that enables permanent token loss.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_validateTransfer",
+        "transfer",
+        "transferFrom"
+      ],
+      "affected_contracts": [
+        "Titn.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Titn.sol",
+          "function": "_validateTransfer"
+        },
+        {
+          "file": "Titn.sol",
+          "function": "transfer"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Titn.sol",
+        "lines": "79-80",
+        "pattern": "_validateTransfer exempts `to != lzEndpoint` — allows ERC20 transfer to endpoint address which does NOT trigger cross-chain bridging; OFT._debit() uses _burn() which completely bypasses transfer() override"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User is on Arbitrum (all transfers restricted)",
+        "User calls transfer(lzEndpoint, amount) instead of OFT.send()",
+        "Tokens transferred to endpoint address have no recovery mechanism"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Transfer to lzEndpoint succeeds but tokens are not bridged; they are stuck at the endpoint address",
+        "admin_dependency": "None",
+        "exploitation_window": "Any time while contract is active on Arbitrum"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can any tokens sent to the lzEndpoint address be recovered?",
+          "Does the LayerZero endpoint contract have a sweep function?",
+          "How many users might attempt direct transfer to lzEndpoint instead of OFT.send()?"
+        ],
+        "validation_requirements": [
+          "Confirm OFT._debit uses _burn (bypasses transfer override)",
+          "Verify transfer(lzEndpoint, amount) succeeds on Arbitrum but does not bridge",
+          "Check if lzEndpoint contract has any token recovery mechanism"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "User on Arbitrum attempts to bridge TITN by calling transfer(lzEndpoint, amount)",
+        "phase_2": "Transfer succeeds (exempted by _validateTransfer)",
+        "phase_3": "Tokens now sit at the endpoint contract address - no cross-chain message is generated",
+        "phase_4": "Tokens are permanently lost with no recovery path",
+        "coordination_requirements": "None - user error facilitated by misleading code"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Permanent token loss for affected users",
+        "recovery_difficulty": "Likely unrecoverable - depends on LayerZero endpoint contract",
+        "affected_operations": "Any user who calls transfer to lzEndpoint directly"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "N/A",
+        "coordination_complexity": "None",
+        "technical_skills": "None - basic transfer call",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "ERC20 Transfer events to lzEndpoint address",
+        "operational_anomalies": "TITN accumulating at the endpoint address",
+        "behavioral_patterns": "Users transferring to lzEndpoint without corresponding bridge events",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H006",
+      "title": "Irreversible isBridgedTokenHolder Flag Prevents Granular Admin Remediation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The isBridgedTokenHolder mapping can only transition from false to true (in _credit) and has no setter function for the owner to clear it per-address. If the owner temporarily sets isBridgedTokensTransferLocked = false to allow transfers and then re-enables it, ALL previously flagged addresses (including legitimately unflagged ones from OPS-H003 griefing) are restricted again. The only admin remediation is the global toggle, which removes restrictions for all bridged holders simultaneously - there is no granular per-address override.",
+      "investigation_rationale": "Missing admin function to clear isBridgedTokenHolder for specific addresses. Combined with the griefing vector (OPS-H003), this means the owner cannot selectively remediate affected addresses without removing all transfer restrictions globally.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_credit",
+        "_validateTransfer"
+      ],
+      "affected_contracts": [
+        "Titn.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Titn.sol",
+          "function": "_credit"
+        },
+        {
+          "file": "Titn.sol",
+          "function": "_validateTransfer"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Titn.sol",
+        "lines": "98-100",
+        "pattern": "isBridgedTokenHolder[_to] set to true in _credit; no function exists in the contract to set it back to false; owner has no per-address override capability"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "At least one address has been griefed via OPS-H003 or legitimately unflagged",
+        "Owner wishes to selectively allow transfers for specific addresses",
+        "isBridgedTokensTransferLocked is true"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No setter for isBridgedTokenHolder exists in the contract; Ownable inheritance does not provide mapping overrides",
+        "admin_dependency": "Admin WANTS to help but lacks the tool to do so per-address",
+        "exploitation_window": "Permanent - structural limitation of the contract"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is there a planned mechanism to clear bridged holder flags?",
+          "Would a proxy upgrade be needed to add this capability?",
+          "What is the operational impact of only having a global toggle?"
+        ],
+        "validation_requirements": [
+          "Confirm no function in Titn.sol or inherited contracts can modify isBridgedTokenHolder",
+          "Verify that the contract is not upgradeable"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Attacker griefs multiple addresses via OPS-H003",
+        "phase_2": "Affected users request admin help",
+        "phase_3": "Admin can only set isBridgedTokensTransferLocked = false globally (removing ALL restrictions)",
+        "phase_4": "If admin re-enables lock, all griefed addresses are restricted again",
+        "coordination_requirements": "None for the attacker; admin is structurally unable to remediate"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None needed",
+        "operational_disruption": "Admin forced into all-or-nothing transfer restriction management",
+        "recovery_difficulty": "Requires contract upgrade or migration to fix structurally",
+        "affected_operations": "All transfer operations for flagged addresses on non-Arbitrum chains"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "N/A",
+        "coordination_complexity": "None",
+        "technical_skills": "None",
+        "operational_timing": "N/A - structural issue"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "N/A - absence of functionality",
+        "operational_anomalies": "N/A",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "TwoWay LockedStatus Enum Defined But Functionally Identical to OneWay - Missing Reverse Functionality",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The IMerge interface defines three LockedStatus values: Locked, OneWay, and TwoWay. However, the onTokenTransfer function only checks `lockedStatus == LockedStatus.Locked`, treating OneWay and TwoWay identically. No code path exists that differentiates TwoWay from OneWay. If TwoWay was intended to enable reversible deposits (returning TGT to depositors in exchange for TITN), this functionality is completely missing. Users or governance processes expecting a TwoWay mode to provide deposit reversal have no recourse.",
+      "investigation_rationale": "The enum explicitly names a TwoWay state suggesting bidirectional exchange was planned. The absence of any differentiating code means this is either dead code or missing functionality.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onTokenTransfer",
+        "setLockedStatus"
+      ],
+      "affected_contracts": [
+        "MergeTgt.sol",
+        "IMerge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MergeTgt.sol",
+          "function": "onTokenTransfer"
+        },
+        {
+          "file": "IMerge.sol",
+          "function": "LockedStatus"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MergeTgt.sol",
+        "lines": "73-74",
+        "pattern": "onTokenTransfer only checks `lockedStatus == LockedStatus.Locked`; no code anywhere differentiates TwoWay from OneWay; no reverse exchange function exists"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner sets lockedStatus to TwoWay",
+        "Users expect TwoWay to enable deposit reversal"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "TwoWay enum value exists but has zero functional differentiation from OneWay",
+        "admin_dependency": "Owner can set TwoWay but it has no unique effect",
+        "exploitation_window": "Permanent design gap"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Was TwoWay intended to enable reverse exchanges (TITN → TGT)?",
+          "Are users or documentation referencing TwoWay functionality?",
+          "Is there a planned upgrade to implement TwoWay?"
+        ],
+        "validation_requirements": [
+          "Confirm no code path differentiates TwoWay from OneWay",
+          "Search for any reverse exchange function in the contract"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Users deposit TGT expecting TwoWay mode to allow reversal",
+        "phase_2": "No reversal function exists - TGT is permanently locked",
+        "phase_3": "Users are misled by the TwoWay status into irrevocable deposits",
+        "phase_4": "Only owner withdraw() can return TGT",
+        "coordination_requirements": "None"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None",
+        "operational_disruption": "Users may irreversibly deposit TGT under false TwoWay expectations",
+        "recovery_difficulty": "Only owner can return TGT via withdraw()",
+        "affected_operations": "Deposit flow when lockedStatus == TwoWay"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "N/A",
+        "coordination_complexity": "None",
+        "technical_skills": "None",
+        "operational_timing": "When owner sets TwoWay status"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "setLockedStatus event with TwoWay value",
+        "operational_anomalies": "N/A",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H008",
+      "title": "Owner Can Drain All TITN From MergeTgt Via Unrestricted withdraw() Including User-Allocated Amounts",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The withdraw() function allows the owner to transfer any amount of any ERC20 token from the MergeTgt contract, including the TITN allocated to users via claimableTitnPerUser. There is no check that the withdrawal preserves solvency (titn.balanceOf >= totalTitnClaimable). The owner can drain all TITN, permanently blocking all claimTitn and withdrawRemainingTitn calls which rely on safeTransfer that would revert with insufficient balance. This also corrupts the withdrawRemainingTitn snapshot if called before the 360-day mark.",
+      "investigation_rationale": "The withdraw function has no restrictions on token type or amount. It accepts TITN as the token parameter and can transfer user-allocated funds to the owner. The solvency invariant (INV-ECON-001) is directly violated.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "withdraw",
+        "claimTitn",
+        "withdrawRemainingTitn"
+      ],
+      "affected_contracts": [
+        "MergeTgt.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MergeTgt.sol",
+          "function": "withdraw"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "claimTitn"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "withdrawRemainingTitn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MergeTgt.sol",
+        "lines": "57-60",
+        "pattern": "withdraw(IERC20 token, uint256 amount) performs safeTransfer to owner() with no validation that token != titn or that amount preserves solvency"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner account is compromised or acts maliciously",
+        "MergeTgt holds TITN balance > 0",
+        "Users have claimableTitnPerUser > 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "withdraw accepts titn as token parameter with no solvency check; same function used for legitimate TGT recovery and malicious TITN extraction",
+        "admin_dependency": "Requires owner action - this IS the admin rug pull vector",
+        "exploitation_window": "Any time MergeTgt holds TITN"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the owner a multisig or EOA?",
+          "Are there any off-chain safeguards monitoring withdraw calls?",
+          "Is ownership transferred to a governance contract post-deployment?"
+        ],
+        "validation_requirements": [
+          "Verify withdraw(titn, titn.balanceOf(MergeTgt)) succeeds",
+          "Confirm subsequent claimTitn calls revert"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Owner (or compromised owner key) calls withdraw(titn, titn.balanceOf(address(this)))",
+        "phase_2": "All TITN transferred to owner address",
+        "phase_3": "All user claimTitn and withdrawRemainingTitn calls revert due to insufficient balance",
+        "phase_4": "No on-chain recovery mechanism exists",
+        "coordination_requirements": "Owner key access only"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Complete fund extraction",
+        "operational_disruption": "All user claims permanently blocked",
+        "recovery_difficulty": "Requires owner to re-deposit voluntarily",
+        "affected_operations": "claimTitn, withdrawRemainingTitn for all users"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None - owner privilege only",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Withdraw events for TITN token from MergeTgt",
+        "operational_anomalies": "Large TITN withdrawal by owner",
+        "behavioral_patterns": "Owner withdraw followed by user claim reverts",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "Owner Changing transferAllowedContract Permanently Blocks MergeTgt TITN Distributions",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "On Arbitrum, all TITN transfers are restricted by the chain ID check in _validateTransfer. MergeTgt distributes TITN to users via safeTransfer (which calls transfer()). This only works because MergeTgt is set as transferAllowedContract in the deployment script. If the Titn owner calls setTransferAllowedContract(otherAddress), MergeTgt's transfers would be blocked by _validateTransfer (since from == MergeTgt is no longer exempted and block.chainid == 42161). All claimTitn and withdrawRemainingTitn calls would permanently revert.",
+      "investigation_rationale": "The deployment script sets transferAllowedContract to MergeTgt. But this can be changed at any time by the Titn owner. There's no immutability guarantee, and Titn owner and MergeTgt owner may be the same or different entities.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "arbitrumSetup.ts line: await titn.setTransferAllowedContract(deploymentMergeTgt.address)",
+      "affected_functions": [
+        "setTransferAllowedContract",
+        "claimTitn",
+        "withdrawRemainingTitn"
+      ],
+      "affected_contracts": [
+        "Titn.sol",
+        "MergeTgt.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Titn.sol",
+          "function": "setTransferAllowedContract"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "claimTitn"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "withdrawRemainingTitn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Titn.sol",
+        "lines": "33-36,70-82",
+        "pattern": "setTransferAllowedContract can change the single exempted address at any time; _validateTransfer on Arbitrum blocks all transfers not from/to this address; MergeTgt's safeTransfer(user) calls would fail if MergeTgt is no longer the exempted address"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Deployment on Arbitrum (chainId 42161)",
+        "Titn owner changes transferAllowedContract to any address other than MergeTgt",
+        "MergeTgt holds TITN and users have claimable balances"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Single transferAllowedContract means only one contract can be exempted at a time; changing it breaks existing integrations",
+        "admin_dependency": "Requires Titn owner action",
+        "exploitation_window": "Any time after transferAllowedContract is changed away from MergeTgt"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are Titn owner and MergeTgt owner the same entity?",
+          "Is there a planned change of transferAllowedContract?",
+          "Could this happen accidentally during operational updates?"
+        ],
+        "validation_requirements": [
+          "Verify MergeTgt claimTitn reverts after transferAllowedContract is changed",
+          "Confirm only one address can be exempted at a time"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Titn owner calls setTransferAllowedContract(newAddress)",
+        "phase_2": "MergeTgt is no longer the exempted contract",
+        "phase_3": "All MergeTgt → user TITN transfers revert on Arbitrum",
+        "phase_4": "All user claims permanently blocked until transferAllowedContract is restored",
+        "coordination_requirements": "Titn owner action only"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "No compromise needed - operational error suffices",
+        "operational_disruption": "All MergeTgt claims blocked until transferAllowedContract restored",
+        "recovery_difficulty": "Recoverable by setting transferAllowedContract back to MergeTgt",
+        "affected_operations": "claimTitn, withdrawRemainingTitn"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic",
+        "operational_timing": "Any time"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "TransferAllowedContractUpdated event with address != MergeTgt",
+        "operational_anomalies": "User claim reverts after transferAllowedContract change",
+        "behavioral_patterns": "N/A",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "Owner Pre-Snapshot TITN Withdrawal Corrupts withdrawRemainingTitn Proportional Distribution",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The withdrawRemainingTitn function takes a one-time snapshot of the contract's TITN balance (remainingTitnAfter1Year) on the first post-360-day call. If the owner calls withdraw(titn, amount) before this snapshot, the snapshotted balance is reduced. The proportional bonus calculation uses this reduced snapshot: unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable. If the owner extracts only the surplus (TITN_ARB - totalTitnClaimable), unclaimedTitn becomes 0 and no user receives a bonus. If the owner extracts more, it causes the arithmetic underflow in OPS-H002.",
+      "investigation_rationale": "The snapshot mechanism trusts that the TITN balance at the 360-day mark accurately reflects the pool available for distribution. Owner withdrawal before the snapshot silently reduces all users' proportional bonus.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "withdraw",
+        "withdrawRemainingTitn"
+      ],
+      "affected_contracts": [
+        "MergeTgt.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MergeTgt.sol",
+          "function": "withdrawRemainingTitn"
+        },
+        {
+          "file": "MergeTgt.sol",
+          "function": "withdraw"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MergeTgt.sol",
+        "lines": "99-106",
+        "pattern": "remainingTitnAfter1Year = titn.balanceOf(address(this)) on first call; no protection against owner having already reduced this balance via withdraw()"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner calls withdraw(titn, amount) before the 360-day mark",
+        "withdrawRemainingTitn has not yet been called (remainingTitnAfter1Year == 0)",
+        "Users have unclaimed TITN balances"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Owner withdrawal of TITN before snapshot reduces proportional bonus for all users; no event or guard prevents this",
+        "admin_dependency": "Requires owner action",
+        "exploitation_window": "Between deposit and first withdrawRemainingTitn call (up to 360 days)"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does the owner have legitimate reasons to withdraw TITN before 360 days?",
+          "Is there monitoring for owner withdrawal of TITN from MergeTgt?",
+          "What is the expected surplus TITN amount?"
+        ],
+        "validation_requirements": [
+          "Calculate expected remainingTitnAfter1Year under normal conditions vs after owner withdrawal",
+          "Simulate proportional distribution with reduced snapshot"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Owner calls withdraw(titn, surplus) extracting excess TITN before 360 days",
+        "phase_2": "After 360 days, first user calls withdrawRemainingTitn",
+        "phase_3": "remainingTitnAfter1Year is snapshotted at reduced value",
+        "phase_4": "All users receive reduced or zero proportional bonus",
+        "coordination_requirements": "Owner action before 360-day snapshot"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Stealth value extraction by owner",
+        "operational_disruption": "Users receive less than expected proportional bonus; complete DoS if underflow occurs",
+        "recovery_difficulty": "Snapshot is permanent once set; cannot be re-initialized",
+        "affected_operations": "withdrawRemainingTitn for all remaining users"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None - owner privilege",
+        "coordination_complexity": "None",
+        "technical_skills": "Basic",
+        "operational_timing": "Before 360-day mark and before first withdrawRemainingTitn call"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Withdraw events for TITN from MergeTgt before 360-day mark",
+        "operational_anomalies": "TITN balance decreasing without corresponding user claims",
+        "behavioral_patterns": "Owner withdrawal near 360-day boundary",
+        "detection_difficulty": "medium"
+      }
+    }
+  ]
+}

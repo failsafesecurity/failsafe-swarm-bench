@@ -1,0 +1,431 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T07:46:43.273Z",
+    "duration_ms": 363960
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "deposit_flow",
+        "source": "User (msg.sender) via requestDeposit()",
+        "path": [
+          "requestDeposit: user transfers underlying tokens to vault",
+          "queuedDeposit[user][depositEpoch] incremented",
+          "depositEpochState[depositEpoch].assetsDeposited incremented",
+          "fulfillDeposits: manager computes NAV, mints shares proportionally to totalSupply",
+          "depositEpoch incremented, unfulfilled remainder rolled to next epoch",
+          "executeDeposit: user's pro-rata share of fulfilled deposits calculated",
+          "_mintVirtual: shares credited to user",
+          "userBasis[user] updated with cost basis",
+          "unfulfilled remainder rolled to epoch+1"
+        ],
+        "transformations": [
+          "assets -> pro-rata fulfilled assets via mulDiv(queuedAmount, assetsFulfilled, assetsDeposited)",
+          "fulfilled assets -> shares via mulDiv(userAssets, sharesReceived, assetsFulfilled)",
+          "NAV + 1 - assetsDeposited - reservedWithdrawalAssets = totalAssets",
+          "assetsToFulfill * totalSupply / totalAssets = sharesReceived"
+        ],
+        "sinks": [
+          "balanceOf[user]",
+          "userBasis[user]",
+          "totalSupply"
+        ],
+        "trust_changes": "User trusts manager to fulfill honestly; manager controls NAV input and fulfillment amounts; accountant is trusted for NAV computation",
+        "validation_points": [
+          "epoch >= depositEpoch check in executeDeposit",
+          "Solidity overflow checks prevent assetsToFulfill > assetsDeposited"
+        ],
+        "exposure_risks": [
+          "Manager sees all pending deposits and can front-run or selectively fulfill",
+          "managerInput to accountant is manager-controlled"
+        ],
+        "manipulation_risks": [
+          "Manager can manipulate NAV via managerInput to accountant, inflating/deflating share price",
+          "Fee-on-transfer tokens would cause assetsDeposited to overstate actual vault balance",
+          "Double rounding in executeDeposit (two consecutive mulDiv) systematically shorts users on shares"
+        ]
+      },
+      {
+        "flow_id": "withdrawal_flow",
+        "source": "User (msg.sender) via requestWithdrawal()",
+        "path": [
+          "requestWithdrawal: compute proportional basis from userBasis",
+          "_burnVirtual: decrement balanceOf[user] without touching totalSupply",
+          "withdrawalEpochState[withdrawalEpoch].sharesWithdrawn incremented",
+          "fulfillWithdrawals: manager computes NAV, calculates assets per share",
+          "withdrawalEpoch incremented, unfulfilled shares rolled to next epoch",
+          "reservedWithdrawalAssets incremented",
+          "executeWithdrawal: pro-rata assets and basis calculated",
+          "performance fee on profit deducted",
+          "assets transferred to user and fee to feeWallet"
+        ],
+        "transformations": [
+          "shares -> basis via (previousBasis * shares) / userBalance",
+          "sharesToFulfill * totalAssets / totalSupply = assetsReceived",
+          "pro-rata: pendingWithdrawal.amount * sharesFulfilled / sharesWithdrawn = sharesToFulfill",
+          "sharesToFulfill * assetsReceived / sharesFulfilled = assetsToWithdraw",
+          "max(0, assetsToWithdraw - withdrawnBasis) * performanceFeeBps / 10000 = performanceFee"
+        ],
+        "sinks": [
+          "user (underlying tokens)",
+          "feeWallet (performance fee)",
+          "reservedWithdrawalAssets"
+        ],
+        "trust_changes": "User trusts manager for NAV accuracy; manager controls maxAssetsReceived cap; accountant trusted for NAV",
+        "validation_points": [
+          "epoch >= withdrawalEpoch check in executeWithdrawal",
+          "assetsReceived > maxAssetsReceived reverts",
+          "Solidity overflow on sharesToFulfill > sharesWithdrawn"
+        ],
+        "exposure_risks": [
+          "reservedWithdrawalAssets decremented before external transfer (potential reentrancy window)",
+          "Rollover to epoch+1 before external call allows re-entrant execution of epoch+1 if already fulfilled"
+        ],
+        "manipulation_risks": [
+          "Manager can manipulate NAV to underprice shares during withdrawal",
+          "Performance fee bypass if user acquires shares without basis tracking (unlikely due to _transferBasis)",
+          "Manager can cancel any user's withdrawal unilaterally"
+        ]
+      },
+      {
+        "flow_id": "nav_computation",
+        "source": "Manager-provided managerInput (ManagerPrices, PoolInfo, TokenIds)",
+        "path": [
+          "Decode managerInput into prices, pool info, and token IDs",
+          "Validate pools hash against stored vaultPools[vault]",
+          "For each pool: validate TWAP deviation from manager poolPrice",
+          "Fetch accumulated premiums and position balances from PanopticPool",
+          "Calculate liquidity amounts for each leg at manager-provided price",
+          "Add/subtract based on long/short, add exercised amounts",
+          "Add wallet balances and collateral token positions",
+          "Convert non-underlying token exposures using TWAP oracles",
+          "Clamp per-pool exposure to zero minimum",
+          "Sum across pools, add underlying balance if not already counted"
+        ],
+        "transformations": [
+          "Manager tick prices -> sqrtRatio for liquidity computation",
+          "Position balances -> (amount0, amount1) via getAmountsForLiquidity",
+          "Premium: token0 = short - long (rightSlot), token1 = long - short (leftSlot) [ASYMMETRIC]",
+          "Cross-token conversion via TWAP-derived sqrtRatio",
+          "Per-pool clamping: max(exposure0 + exposure1, 0)"
+        ],
+        "sinks": [
+          "nav return value used in fulfillDeposits and fulfillWithdrawals"
+        ],
+        "trust_changes": "Manager prices validated against TWAP within maxPriceDeviation; pool configuration trusted via hash; TWAP oracle trusted for staleness check",
+        "validation_points": [
+          "keccak256(abi.encode(pools)) == vaultPools[vault]",
+          "abs(managerPrice - TWAP) <= maxPriceDeviation for pool and token oracles",
+          "numLegs == pools[i].pool.numberOfLegs(vault)",
+          "positionBalanceArray[j][1] != 0"
+        ],
+        "exposure_risks": [
+          "Manager controls tick prices used for liquidity valuation within deviation band",
+          "maxPriceDeviation window allows manager to systematically bias NAV",
+          "TWAP can be manipulated with sufficient capital"
+        ],
+        "manipulation_risks": [
+          "Manager can pick tick prices at the extreme of the deviation band to inflate/deflate NAV",
+          "Per-pool clamping to 0 overstates NAV when some pools are underwater",
+          "Token1 premium sign appears inverted, causing incorrect NAV for positions with premium"
+        ]
+      },
+      {
+        "flow_id": "share_transfer_basis",
+        "source": "User calling transfer() or transferFrom()",
+        "path": [
+          "_transferBasis: compute proportional basis from fromBalance",
+          "Deduct basisToTransfer from userBasis[from]",
+          "Add basisToTransfer to userBasis[to]",
+          "ERC20Minimal.transfer/transferFrom: move shares"
+        ],
+        "transformations": [
+          "basisToTransfer = (fromBasis * amount) / fromBalance"
+        ],
+        "sinks": [
+          "userBasis[from]",
+          "userBasis[to]",
+          "balanceOf[from]",
+          "balanceOf[to]"
+        ],
+        "trust_changes": "No external trust change; internal accounting only",
+        "validation_points": [
+          "fromBalance == 0 returns early (prevents division by zero)",
+          "super.transfer checks sufficient balance"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If fromBalance < amount, _transferBasis computes inflated basisToTransfer (more than total basis) before super.transfer reverts - but since it reverts, no issue",
+          "Basis is rounded down on transfer, so splitting shares across accounts slowly erodes aggregate basis, reducing performance fees"
+        ]
+      },
+      {
+        "flow_id": "manager_arbitrary_calls",
+        "source": "Manager via manage()",
+        "path": [
+          "Manager calls manage(target, data, value)",
+          "functionCallWithValue executes arbitrary call from vault",
+          "Return data passed back to manager"
+        ],
+        "transformations": [
+          "Arbitrary - depends on target contract"
+        ],
+        "sinks": [
+          "Any external contract, vault state via self-calls"
+        ],
+        "trust_changes": "Full trust in manager; can execute any action as the vault",
+        "validation_points": [
+          "onlyManager modifier"
+        ],
+        "exposure_risks": [
+          "Manager can transfer all vault assets including reservedWithdrawalAssets",
+          "Manager can approve arbitrary spenders for vault tokens",
+          "Manager can call vault's own functions bypassing normal restrictions"
+        ],
+        "manipulation_risks": [
+          "Manager can drain all assets rendering withdrawals insolvent",
+          "Manager can manipulate vault token balances to affect NAV",
+          "Manager can call setManager/setAccountant if owner == vault (self-owned)"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Deposits and withdrawals are queued and fulfilled asynchronously by the manager",
+        "Share pricing is based on NAV computed by the accountant with manager-provided auxiliary data",
+        "Partially fulfilled epochs roll unfulfilled amounts to the next epoch",
+        "Performance fees are charged only on profitable withdrawals relative to cost basis",
+        "Cost basis tracks proportionally through share transfers",
+        "Phantom shares (1M totalSupply at construction) provide inflation attack protection",
+        "reservedWithdrawalAssets are segregated from manager-deployable capital"
+      ],
+      "economic_incentives": [
+        "Performance fee incentivizes vault to generate returns for depositors",
+        "Manager has discretion over fulfillment timing and amounts - misaligned with user interests",
+        "Users cannot force withdrawal - must wait for manager fulfillment",
+        "No management fee, only performance fee on profits"
+      ],
+      "governance_mechanisms": [
+        "Owner sets manager, accountant, and fee wallet with no timelock",
+        "Accountant owner controls pool configurations with lock mechanism",
+        "Manager has unilateral power to cancel any user's deposit or withdrawal",
+        "No mechanism for users to vote or influence vault operations"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Per-pool NAV clamping to zero instead of aggregate clamping",
+          "expected_behavior": "NAV should reflect true net value: sum all pool exposures then clamp to zero if negative",
+          "actual_behavior": "Each pool's exposure is individually clamped to zero via Math.max(poolExposure0 + poolExposure1, 0), then summed. If Pool A = +100 and Pool B = -200, NAV = 100 instead of 0",
+          "risk_level": "high",
+          "exploitation_potential": "Manager can structure positions to have underwater pools (ignored in NAV) alongside profitable pools, overstating NAV. This inflates share prices, allowing manager or colluding depositors to extract value from existing shareholders during withdrawal fulfillment"
+        },
+        {
+          "scenario": "Token1 premium sign inversion in PanopticVaultAccountant",
+          "expected_behavior": "Net premium for token1 should be shortPremium.leftSlot() - longPremium.leftSlot() (same sign convention as token0)",
+          "actual_behavior": "Code computes poolExposure1 = longPremium.leftSlot() - shortPremium.leftSlot(), which inverts the sign relative to token0's treatment",
+          "risk_level": "high",
+          "exploitation_potential": "Incorrect premium accounting leads to systematic NAV miscalculation. If the vault is net short on token1, premium earned is subtracted from NAV instead of added, understating NAV and allowing manager to buy shares cheaply during deposits or extract value during withdrawals"
+        },
+        {
+          "scenario": "Fee-on-transfer token as underlying",
+          "expected_behavior": "Vault should account for actual tokens received after transfer fees",
+          "actual_behavior": "requestDeposit records `assets` parameter directly into queuedDeposit and depositEpochState, but vault receives fewer tokens due to transfer fee. This creates a shortfall.",
+          "risk_level": "high",
+          "exploitation_potential": "If underlying is fee-on-transfer, the vault has fewer tokens than accounted for. Last withdrawers are unable to withdraw their full entitlement, as the vault's actual balance is less than the recorded deposits. Effectively, early withdrawers extract value at the expense of later ones."
+        },
+        {
+          "scenario": "Double rounding in executeDeposit pro-rata share calculation",
+          "expected_behavior": "User receives shares proportional to their deposit",
+          "actual_behavior": "Two consecutive mulDiv operations (assets fulfilled, then shares received) each round down independently. This compounds rounding error, causing users to receive fewer shares than a single-step calculation would yield",
+          "risk_level": "medium",
+          "exploitation_potential": "Systematic extraction of dust amounts from depositors. Over many users and epochs, the unclaimed shares accumulate in the contract, permanently locked since no one can claim them"
+        },
+        {
+          "scenario": "fulfillDeposits when NAV + 1 < assetsDeposited + reservedWithdrawalAssets",
+          "expected_behavior": "Graceful handling when vault is underwater",
+          "actual_behavior": "totalAssets calculation underflows, causing revert. Manager cannot fulfill any deposits, effectively locking deposited funds",
+          "risk_level": "medium",
+          "exploitation_potential": "If vault takes losses, deposit fulfillment becomes impossible until NAV recovers. Users' deposited funds are stuck with no withdrawal path since they haven't received shares yet. Only cancelDeposit (manager-only) can return funds."
+        },
+        {
+          "scenario": "First depositor dilution from phantom 1M totalSupply + 1 offset",
+          "expected_behavior": "First depositor receives shares at fair value",
+          "actual_behavior": "With totalAssets = 1 (from +1 offset) and totalSupply = 1_000_000, the first depositor gets assetsToFulfill * 1_000_000 shares. Their proportional claim is assets / (assets + 1), losing approximately 1/assets of their deposit to the phantom shares permanently",
+          "risk_level": "low",
+          "exploitation_potential": "For small initial deposits, the loss is material (e.g., 1% for 100-unit deposit). An attacker could front-run the first real deposit with a tiny deposit to set unfavorable share pricing. However, since the manager controls fulfillment, this is mitigated."
+        },
+        {
+          "scenario": "Manager provides maxPriceDeviation-edge tick prices to bias NAV",
+          "expected_behavior": "NAV should reflect fair market value within the deviation tolerance",
+          "actual_behavior": "Manager can consistently choose tick prices at the extreme of the allowed deviation band, systematically overstating or understating NAV by up to the full maxPriceDeviation in each direction",
+          "risk_level": "high",
+          "exploitation_potential": "Manager can inflate NAV during deposit fulfillment (diluting new depositors' shares) or deflate NAV during withdrawal fulfillment (underpaying withdrawers). The deviation band creates a consistent extraction opportunity."
+        },
+        {
+          "scenario": "Reentrancy in executeWithdrawal with multi-epoch rollover",
+          "expected_behavior": "Each epoch's withdrawal is executed independently and correctly",
+          "actual_behavior": "executeWithdrawal rolls unfulfilled shares to epoch+1 BEFORE external token transfers. If epoch+1 is already fulfilled, a reentrant call via token transfer callback could execute epoch+1 with the inflated queuedWithdrawal amount. The user's combined share of epoch+1 would include both original and rolled-over amounts.",
+          "risk_level": "medium",
+          "exploitation_potential": "Requires underlying token with callbacks AND epoch+1 already fulfilled. The user's pro-rata share increases at the expense of other withdrawers in epoch+1 who haven't executed yet. However, total distributed cannot exceed reservedWithdrawalAssets for that epoch."
+        },
+        {
+          "scenario": "fulfillDeposits or fulfillWithdrawals with zero amount",
+          "expected_behavior": "No-op or revert",
+          "actual_behavior": "fulfillDeposits(0, ...) creates epoch state with 0 assetsFulfilled and 0 sharesReceived, increments depositEpoch. executeDeposit for this epoch would compute sharesReceived = mulDiv(X, 0, 0) which reverts (division by zero). All deposits roll over but cannot be executed.",
+          "risk_level": "medium",
+          "exploitation_potential": "Manager (accidentally or maliciously) calling fulfillDeposits(0, ...) creates an unexecutable epoch. Users' deposits in that epoch are trapped until rollover through executeDeposit, which will revert due to division by zero on assetsFulfilled. Only the manager calling cancelDeposit from the NEXT epoch could help, but the user's deposit is no longer tracked in the current epoch."
+        },
+        {
+          "scenario": "executeDeposit called after epoch+1 is also fulfilled with zero assetsFulfilled",
+          "expected_behavior": "Unfulfilled amounts keep rolling forward correctly",
+          "actual_behavior": "If executeDeposit for epoch N rolls remainder to N+1, and epoch N+1 has assetsDeposited but was fulfilled with 0 assetsFulfilled, the user's rolled-over amount is now in a broken epoch where executeDeposit would revert with division by zero",
+          "risk_level": "medium",
+          "exploitation_potential": "Chain of zero-fulfillment epochs permanently locks user deposits"
+        },
+        {
+          "scenario": "requestWithdrawal with shares equal to total balance, followed by transfer of basis-bearing shares to same user",
+          "expected_behavior": "Basis tracking remains consistent",
+          "actual_behavior": "After requestWithdrawal, userBasis[msg.sender] is reduced proportionally. If user then receives shares via transfer, they get new basis. On withdrawal execution, the old basis is used for performance fee calculation. The new shares have separate tracking since they're in the user's balance. No exploit since basis is correctly tracked.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit, but complex interactions between pending withdrawals and new share acquisitions could confuse off-chain accounting"
+        },
+        {
+          "scenario": "Collateral tokens counted per pool but underlying wallet balance counted only once",
+          "expected_behavior": "Each asset source counted exactly once",
+          "actual_behavior": "The skipToken0/skipToken1 mechanism prevents double-counting wallet balances, but collateral token positions (collateralToken0/collateralToken1) are counted for EVERY pool. If a vault has positions in multiple pools sharing the same underlying token, the collateral in each pool's CollateralTracker is correctly counted separately since they are different contracts. However, the wallet balance for the same token is only counted once.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit - collateral trackers are separate contracts so their balances are independent"
+        },
+        {
+          "scenario": "Manager calls manage() to transfer underlying tokens, draining reservedWithdrawalAssets",
+          "expected_behavior": "reservedWithdrawalAssets should always be backed by actual token balance",
+          "actual_behavior": "manage() can execute arbitrary calls including transferring the underlying token. There is no check that the vault retains at least reservedWithdrawalAssets worth of underlying tokens. Subsequent executeWithdrawal calls would fail due to insufficient balance.",
+          "risk_level": "high",
+          "exploitation_potential": "Malicious or compromised manager can drain reserved withdrawal assets, making fulfilled withdrawals unexecutable. Users who burned shares for withdrawal requests lose their shares permanently."
+        }
+      ],
+      "assumption_violations": [
+        "Assumes underlying token is standard ERC20 with no transfer fees, rebasing, or callback hooks",
+        "Assumes manager acts honestly in NAV computation, fulfillment amounts, and capital deployment",
+        "Assumes accountant correctly computes NAV and is not compromised",
+        "Assumes TWAP oracles cannot be manipulated beyond maxPriceDeviation during fulfillment",
+        "Assumes per-pool NAV clamping is equivalent to aggregate NAV clamping (it is not)",
+        "Assumes premium sign convention is intentionally asymmetric for token0 vs token1",
+        "Assumes vault will never be underwater (NAV < deposits + reserved) or fulfillment becomes impossible",
+        "Assumes all positions are reported in tokenIds array (validated by numberOfLegs check)"
+      ],
+      "game_theory_risks": [
+        "Manager can time fulfillments to maximize/minimize NAV for personal benefit",
+        "Manager can selectively cancel deposits/withdrawals to disadvantage specific users",
+        "Information asymmetry: manager sees all pending deposits/withdrawals and NAV in real-time, users do not",
+        "Users have no recourse if manager delays fulfillment indefinitely",
+        "Basis erosion through repeated transfers allows gradual performance fee reduction via dust rounding",
+        "If multiple users have pending withdrawals, early executors get exact pro-rata share; late executors may find reservedWithdrawalAssets slightly short due to rounding"
+      ],
+      "integration_risks": [
+        "PanopticPool.getAccumulatedFeesAndPositionsData must return correct premium data - any bug propagates to NAV",
+        "CollateralTracker.previewRedeem must accurately reflect redeemable value",
+        "TWAP oracle manipulation via flash loans or multi-block MEV could bias NAV within deviation band",
+        "ERC20Minimal lacks SafeERC20 pattern - non-compliant tokens could silently fail transfers (mitigated by SafeTransferLib)",
+        "Panoptic v1.1 upgrade or migration could break accountant assumptions",
+        "IV3CompatibleOracle staleness is only checked against manager price, not against time-based freshness"
+      ],
+      "calculation_errors": [
+        "Token1 premium uses long - short instead of short - long, inverting the contribution to NAV relative to token0",
+        "Per-pool Math.max(exposure, 0) clamping overstates aggregate NAV when any pool is underwater",
+        "Double mulDiv in executeDeposit compounds rounding: first (queuedAmount * assetsFulfilled / assetsDeposited), then (result * sharesReceived / assetsFulfilled). Single-step mulDiv(queuedAmount, sharesReceived, assetsDeposited) would be more precise",
+        "The +1 in totalAssets = NAV + 1 - deposits - reserved creates asymmetric pricing: during deposits it deflates share price slightly (fewer shares per asset), during withdrawals it inflates share price slightly (fewer assets per share withdrawn). This systematically extracts value from users.",
+        "int256 cast of uint256 in performance fee calculation (int256(assetsToWithdraw) - int256(withdrawnBasis)) could overflow for values > type(int256).max, though practically unlikely"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "underlyingToken",
+          "behaviors": [
+            "rebasing:false",
+            "fee_on_transfer:incompatible",
+            "permit:unknown"
+          ],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Vault assumes standard ERC20 behavior. Fee-on-transfer tokens cause accounting mismatch between recorded deposits and actual balance. Rebasing tokens would similarly break NAV accounting. No received-amount validation on transfers."
+        },
+        {
+          "address_or_symbol": "HypoVault (shares)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "ERC20Minimal-based vault shares. Virtual mint/burn used for async deposit/withdrawal. totalSupply initialized to 1_000_000 phantom shares as inflation protection. No permit support. Basis tracking on transfer/transferFrom."
+        },
+        {
+          "address_or_symbol": "CollateralTracker (token0/token1)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": -1,
+          "accounting_model": "shares_indexed",
+          "notes": "Panoptic CollateralTracker uses share-based accounting. previewRedeem used to convert shares to underlying. Assumed to be standard ERC4626-like."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation",
+          "state_vars": [
+            "totalSupply",
+            "sum(balanceOf[*])"
+          ],
+          "notes": "totalSupply should equal sum of all balanceOf PLUS shares in pending withdrawals (virtually burned from balanceOf but still in totalSupply until fulfillment). Constructor initializes totalSupply=1_000_000 with no corresponding balanceOf entries."
+        },
+        {
+          "name": "reserved_assets_backing",
+          "state_vars": [
+            "reservedWithdrawalAssets",
+            "IERC20(underlyingToken).balanceOf(vault)"
+          ],
+          "notes": "reservedWithdrawalAssets should always be <= vault's underlying token balance. Violated if manager uses manage() to transfer underlying tokens out."
+        },
+        {
+          "name": "epoch_deposit_consistency",
+          "state_vars": [
+            "depositEpochState[e].assetsDeposited",
+            "sum(queuedDeposit[*][e])"
+          ],
+          "notes": "Sum of all users' queued deposits in epoch e should equal depositEpochState[e].assetsDeposited. Rollovers maintain this because aggregate rollover is set in fulfillDeposits and per-user rollover in executeDeposit. Rounding may cause slight discrepancy."
+        },
+        {
+          "name": "epoch_withdrawal_consistency",
+          "state_vars": [
+            "withdrawalEpochState[e].sharesWithdrawn",
+            "sum(queuedWithdrawal[*][e].amount)"
+          ],
+          "notes": "Sum of all users' queued withdrawal amounts in epoch e should equal withdrawalEpochState[e].sharesWithdrawn. Same rounding caveat as deposits."
+        },
+        {
+          "name": "basis_conservation",
+          "state_vars": [
+            "sum(userBasis[*])",
+            "sum(queuedWithdrawal[*][*].basis)"
+          ],
+          "notes": "Total basis in active balances plus basis in pending withdrawals should be conserved. Rounding in _transferBasis and proportional calculations causes slow erosion."
+        }
+      ]
+    }
+  }
+}

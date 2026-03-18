@@ -1,0 +1,239 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-07T21:22:07.473Z",
+    "duration_ms": 185970
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LandManager.sol",
+        "description": "transferToUnoccupiedPlot never updates toilerState[tokenId].plotId, leaving it pointing to the old (now-cleared) plot. This causes subsequent unstakeMunchable to clear the wrong plotOccupied entry, permanently locking the new plot as occupied.",
+        "attack_scenario": "1) Rentor stakes tokenId=1 on landlord's plotId=0. toilerState[1].plotId = 0, plotOccupied[landlord][0] = occupied. 2) Rentor calls transferToUnoccupiedPlot(1, 3). plotOccupied[landlord][0] is cleared, plotOccupied[landlord][3] is set occupied. But toilerState[1].plotId remains 0. 3) Rentor calls unstakeMunchable(1). It reads _toiler.plotId = 0, clears plotOccupied[landlord][0] (already empty). plotOccupied[landlord][3] remains permanently occupied with no way to clear it. No one can ever stake on that plot again.",
+        "invariant_logic": "After transferToUnoccupiedPlot(tokenId, newPlotId): toilerState[tokenId].plotId == newPlotId",
+        "solidity_property": "function invariant_plotIdConsistency(uint256 tokenId) public view { ToilerState memory t = toilerState[tokenId]; if (t.landlord != address(0)) { assert(plotOccupied[t.landlord][t.plotId].occupied == true); assert(plotOccupied[t.landlord][t.plotId].tokenId == tokenId); } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "transferToUnoccupiedPlot"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "unstakeMunchable"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LandManager.sol",
+        "description": "The dirty flag boundary check uses strict less-than (_getNumPlots(landlord) < _toiler.plotId) when it should use less-than-or-equal. Since plotId is 0-indexed and _getNumPlots returns count, a toiler on plotId N remains considered valid when the landlord reduces to exactly N plots (valid range 0..N-1), causing rewards to accrue on a plot that no longer exists.",
+        "attack_scenario": "Landlord has 5 plots (0-4). Rentor stakes on plotId 4. Landlord withdraws locked value reducing to 4 plots (valid 0-3). _getNumPlots returns 4. Check: 4 < 4 is false, so dirty flag is NOT set. Rentor continues earning full rewards on non-existent plot 4 indefinitely without the dirty timestamp cap.",
+        "invariant_logic": "In _farmPlots: if _getNumPlots(landlord) <= _toiler.plotId then the plot is invalid and dirty flag should trigger",
+        "solidity_property": "function invariant_plotIdBound(uint256 tokenId) public view { ToilerState memory t = toilerState[tokenId]; if (t.landlord != address(0) && !t.dirty) { assert(t.plotId < _getNumPlots(t.landlord)); } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "LandManager.sol",
+        "description": "The schnibbles reward calculation casts a potentially negative int256 to uint256 without checking for negativity. If REALM_BONUSES contains values such that finalBonus < -1, the expression (schnibblesTotal + schnibblesTotal * finalBonus) becomes negative and wrapping to uint256 yields an astronomically large reward.",
+        "attack_scenario": "Config sets a REALM_BONUSES entry to -10 (negative cross-realm penalty). finalBonus = -10 + 0 = -10. schnibblesTotal = 1000. Calculation: (1000 + 1000 * -10) / 100 = (1000 - 10000) / 100 = -9000 / 100 = -90 as int256. Cast to uint256 wraps to ~2^256 - 90. Rentor receives near-infinite schnibbles. Similarly, RARITY_BONUSES uint8 values 128-255 reinterpret as int8 -128 to -1, amplifying the issue.",
+        "invariant_logic": "Before uint256 cast: (int256(schnibblesTotal) + (int256(schnibblesTotal) * finalBonus)) / 100 >= 0",
+        "solidity_property": "function invariant_noNegativeSchnibbles(uint256 schnibblesTotal, int256 finalBonus) public pure { int256 result = (int256(schnibblesTotal) + (int256(schnibblesTotal) * finalBonus)) / 100; assert(result >= 0); }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LandManager.sol",
+        "description": "updateTaxRate does not farm existing stakers first. While each toiler stores latestTaxRate, a landlord can change the tax rate and the NEW rate will apply from the next farm call onwards for the period AFTER the renter's last farm. However, if a landlord front-runs a renter's farmPlots call to lower the rate to zero, then immediately raises it back, the renter gets zero landlord tax for that entire unfamed period. Conversely, a landlord could spike the rate just before a rentor farms.",
+        "attack_scenario": "Rentor hasn't farmed for 7 days with latestTaxRate = 10%. Landlord front-runs rentor's farmPlots: calls updateTaxRate(MAX_TAX_RATE). Rentor's farmPlots uses the OLD latestTaxRate stored in toilerState (10%), so immediate front-run of updateTaxRate doesn't affect current period. BUT: the toilerState.latestTaxRate is then set to MAX_TAX_RATE for the NEXT period. Landlord can then immediately set it back. The rentor is stuck with high tax for the next period with no way to retroactively farm at the old rate.",
+        "invariant_logic": "Tax rate changes should only apply to future reward periods; all stakers should be farmed before rate change takes effect. Formally: for all tokenId staked with landlord L, after updateTaxRate, toilerState[tokenId].latestTaxRate should reflect the rate for the already-elapsed period, not the new one",
+        "solidity_property": "function invariant_taxRateTransition(address landlord) public view { /* updateTaxRate should call _farmPlots for all stakers on this landlord before changing rate */ }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "updateTaxRate"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LandManager.sol",
+        "description": "The dirty flag mechanism uses plotMetadata[landlord].lastUpdated as the timestamp cutoff for reward calculation when a plot becomes invalid. If the landlord's metadata was updated multiple times after the plot became invalid, lastUpdated reflects the LATEST update, not the time the plot first became invalid. This grants the rentor rewards for a period they should not have received them.",
+        "attack_scenario": "Rentor stakes on plotId 5, doesn't farm for 30 days. On day 10, landlord's plots reduce to 5 (plotId 5 invalid). On day 25, landlord's metadata is updated for an unrelated reason (e.g., another lock), setting lastUpdated to day 25. Rentor farms on day 30. Dirty triggers with timestamp = day 25 (lastUpdated). Rentor gets 25 days of rewards instead of 10 days (when plot was last valid).",
+        "invariant_logic": "When dirty flag triggers, the timestamp used should equal the time the plot first became invalid, not the landlord's latest metadata update",
+        "solidity_property": "function invariant_dirtyTimestamp(uint256 tokenId) public view { ToilerState memory t = toilerState[tokenId]; if (t.dirty) { /* timestamp used for reward calc should be <= time when _getNumPlots(landlord) first dropped below plotId */ } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "updatePlotMetadata"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "LandManager.sol",
+        "description": "Once a toilerState is marked dirty=true, the staker can never farm that token again (the `if (_toiler.dirty) continue;` skips it), but the token is also NOT automatically unstaked. The token remains staked indefinitely earning zero rewards with no mechanism to clear the dirty flag except unstaking. The rentor must notice and manually unstake, losing potential yield from the gap period.",
+        "invariant_logic": "A dirty-flagged token should either be auto-unstaked or provide a mechanism to re-validate (e.g., transfer to a valid plot). dirty == true implies the token is in a dead state with no reward accrual but still custody-locked in the contract.",
+        "solidity_property": "function invariant_dirtyTokenRecoverable(uint256 tokenId) public view { ToilerState memory t = toilerState[tokenId]; if (t.dirty) { /* user should have a clear path to recover this token or clear dirty */ } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "unstakeMunchable"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LandManager.sol",
+        "description": "The schnibbles formula appears mathematically incorrect. The expression (schnibblesTotal + schnibblesTotal * finalBonus) / 100 computes schnibblesTotal * (1 + finalBonus) / 100. If finalBonus=5 (intended as 5% bonus), result is schnibblesTotal * 6/100 = 6% of base, rather than the expected 105% of base. The correct formula should be schnibblesTotal + (schnibblesTotal * finalBonus / 100) = schnibblesTotal * (100 + finalBonus) / 100.",
+        "attack_scenario": "With finalBonus=0 (no bonus), rentor receives schnibblesTotal * 1 / 100 = 1% of the expected base rewards. All users systematically receive ~100x fewer rewards than intended. If finalBonus=99, users get schnibblesTotal * 100 / 100 = exactly the base rate, meaning a +99% bonus yields the same as no bonus should.",
+        "invariant_logic": "When finalBonus == 0: effectiveSchnibbles == schnibblesTotal (no bonus should mean 100% of base)",
+        "solidity_property": "function invariant_zeroBonusMeansBaseRate(uint256 schnibblesTotal) public pure { int256 finalBonus = 0; uint256 result = uint256((int256(schnibblesTotal) + (int256(schnibblesTotal) * finalBonus)) / 100); assert(result == schnibblesTotal); }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LandManager.sol",
+        "description": "plotOccupied and toilerState must be bidirectionally consistent: if plotOccupied[landlord][plotId] says occupied with tokenId T, then toilerState[T] must point back to that landlord and plotId. The transferToUnoccupiedPlot bug (INV-STATE-001) breaks this invariant, but even without it, there is no atomic enforcement.",
+        "invariant_logic": "For all landlord L, plotId P: if plotOccupied[L][P].occupied then toilerState[plotOccupied[L][P].tokenId].landlord == L AND toilerState[plotOccupied[L][P].tokenId].plotId == P",
+        "solidity_property": "function invariant_bidirectionalConsistency(address landlord, uint256 plotId) public view { Plot memory p = plotOccupied[landlord][plotId]; if (p.occupied) { ToilerState memory t = toilerState[p.tokenId]; assert(t.landlord == landlord); assert(t.plotId == plotId); } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "stakeMunchable"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "unstakeMunchable"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "transferToUnoccupiedPlot"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "LandManager.sol",
+        "description": "The staking limit check uses `> 10` instead of `>= 10`, allowing a user to have 11 staked munchables (they can enter when length is 10, then push makes it 11). If the intended max is 10, this is an off-by-one.",
+        "invariant_logic": "munchablesStaked[account].length <= MAX_STAKED (where MAX_STAKED is the intended limit, likely 10)",
+        "solidity_property": "function invariant_stakingLimit(address account) public view { assert(munchablesStaked[account].length <= 10); }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "stakeMunchable"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LandManager.sol",
+        "description": "The _reconfigure function loads MIN_TAX_RATE, MAX_TAX_RATE, DEFAULT_TAX_RATE, BASE_SCHNIBBLE_RATE, and PRICE_PER_PLOT using StorageKeys that appear to be contract address keys (LockManager, AccountManager, ClaimManager, MigrationManager, NFTOverlord) rather than dedicated numeric config keys. This suggests either a key reuse pattern or a misconfiguration that loads incorrect values.",
+        "attack_scenario": "If ConfigStorage maps these keys to address-type values, the getUint call may return the address as a uint256. MIN_TAX_RATE could become a large address-derived number, making all tax rate updates revert (always > MAX_TAX_RATE). Or PRICE_PER_PLOT could be 0, causing division by zero in _getNumPlots, bricking all staking operations.",
+        "invariant_logic": "PRICE_PER_PLOT > 0 AND MIN_TAX_RATE <= MAX_TAX_RATE AND DEFAULT_TAX_RATE >= MIN_TAX_RATE AND DEFAULT_TAX_RATE <= MAX_TAX_RATE",
+        "solidity_property": "function invariant_configSanity() public view { assert(PRICE_PER_PLOT > 0); assert(MIN_TAX_RATE <= MAX_TAX_RATE); assert(DEFAULT_TAX_RATE >= MIN_TAX_RATE && DEFAULT_TAX_RATE <= MAX_TAX_RATE); }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_reconfigure"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "LandManager.sol",
+        "description": "NFT custody invariant: any tokenId held by the LandManager contract must have a corresponding munchableOwner mapping and toilerState with a non-zero landlord. If these mappings become desynchronized (e.g., via the transferToUnoccupiedPlot bug leading to failed unstake paths), NFTs could become permanently locked.",
+        "invariant_logic": "For all tokenId where munchNFT.ownerOf(tokenId) == address(this): munchableOwner[tokenId] != address(0) AND toilerState[tokenId].landlord != address(0)",
+        "solidity_property": "function invariant_nftCustody(uint256 tokenId) public view { if (munchNFT.ownerOf(tokenId) == address(this)) { assert(munchableOwner[tokenId] != address(0)); assert(toilerState[tokenId].landlord != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "stakeMunchable"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "unstakeMunchable"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LandManager.sol",
+        "description": "lastToilDate must always be <= block.timestamp for any active toiler, and must be > 0 for any staked token. If dirty flag sets timestamp to plotMetadata[landlord].lastUpdated which could theoretically be in the future (if block.timestamp manipulation or misconfigured updatePlotMetadata), reward calculation could underflow on (timestamp - _toiler.lastToilDate).",
+        "invariant_logic": "For all active toilerState[tokenId]: 0 < lastToilDate <= block.timestamp",
+        "solidity_property": "function invariant_toilDateBound(uint256 tokenId) public view { ToilerState memory t = toilerState[tokenId]; if (t.landlord != address(0)) { assert(t.lastToilDate > 0); assert(t.lastToilDate <= block.timestamp); } }",
+        "inventory_refs": [
+          {
+            "file": "LandManager.sol",
+            "function": "_farmPlots"
+          },
+          {
+            "file": "LandManager.sol",
+            "function": "stakeMunchable"
+          }
+        ]
+      }
+    ]
+  }
+}

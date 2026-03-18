@@ -1,0 +1,508 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T00:25:26.217Z",
+    "duration_ms": 373935
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-buy",
+        "source": "msg.sender (buyer) sends ETH via buyCurvesToken / buyCurvesTokenWithName / buyCurvesTokenForPresale / buyCurvesTokenWhitelisted",
+        "path": [
+          "buyCurvesToken validates presale timing",
+          "_buyCurvesToken validates supply > 0 or msg.sender == subject",
+          "getPrice computes bonding curve price",
+          "getFees computes fee breakdown",
+          "Require msg.value >= price + totalFee",
+          "Update curvesTokenBalance and curvesTokenSupply",
+          "_transferFees distributes fees via .call",
+          "feeRedistributor.onBalanceChange resets buyer offset (LOSES accumulated fees)",
+          "feeRedistributor.addFees distributes holder fee",
+          "_addOwnedCurvesTokenSubject tracks ownership"
+        ],
+        "transformations": [
+          "supply → bonding curve price via quadratic sum formula",
+          "price → fee amounts via percentage multiplication / 1 ether",
+          "buyer balance += amount, supply += amount"
+        ],
+        "sinks": [
+          "protocolFeeDestination receives protocolFee (+ referralFee if no referral)",
+          "curvesTokenSubject receives subjectFee via .call",
+          "referralFeeDestination receives referralFee (if defined)",
+          "FeeSplitter receives holderFee",
+          "Curves contract retains price portion of ETH",
+          "EXCESS ETH from overpayment stays LOCKED in contract (never refunded)"
+        ],
+        "trust_changes": "User ETH → contract custody; external .call transfers give execution to arbitrary addresses",
+        "validation_points": [
+          "supply > 0 || subject == msg.sender",
+          "msg.value >= price + totalFee",
+          "Presale: startTime check, merkle proof, maxBuy check"
+        ],
+        "exposure_risks": [
+          "Reentrancy via .call to protocolFeeDestination, curvesTokenSubject, or referralFeeDestination",
+          "Front-running: attacker can see pending buy and buy first to increase price"
+        ],
+        "manipulation_risks": [
+          "Excess ETH never refunded — MEV bots/users lose overpayments permanently",
+          "Anyone can set fee parameters due to broken Security.sol modifiers",
+          "getPrice reverts for supply=0 and amount>1, limiting initial buy to 1 token"
+        ]
+      },
+      {
+        "flow_id": "DF-002-sell",
+        "source": "msg.sender (seller) calls sellCurvesToken",
+        "path": [
+          "Validate supply > amount (last token cannot be sold)",
+          "Validate curvesTokenBalance >= amount",
+          "getPrice computes sell price at (supply - amount, amount)",
+          "Decrease curvesTokenBalance and curvesTokenSupply",
+          "_transferFees for sell: compute fees, distribute"
+        ],
+        "transformations": [
+          "supply - amount → price via bonding curve",
+          "price → fee breakdown",
+          "sellValue = price - protocolFee - subjectFee - referralFee - holderFee"
+        ],
+        "sinks": [
+          "msg.sender receives sellValue (price minus ALL fees)",
+          "curvesTokenSubject receives subjectFee",
+          "referralFeeDestination receives referralFee IF defined",
+          "FeeSplitter receives holderFee",
+          "CRITICAL: protocolFee stays in contract — NEVER sent to protocolFeeDestination",
+          "CRITICAL: referralFee stays in contract if no referral defined"
+        ],
+        "trust_changes": "Contract ETH → user custody via .call",
+        "validation_points": [
+          "supply > amount",
+          "curvesTokenBalance >= amount"
+        ],
+        "exposure_risks": [
+          "Reentrancy after state update — msg.sender receives ETH first, could re-enter"
+        ],
+        "manipulation_risks": [
+          "Protocol fee on sells is permanently locked in contract, never reaches protocolFeeDestination",
+          "Referral fee on sells locked if no referral set — seller loses this fee amount",
+          "onBalanceChange called for seller resets offset without crediting accumulated fees — seller loses unclaimed holder fees"
+        ]
+      },
+      {
+        "flow_id": "DF-003-withdraw-deposit",
+        "source": "msg.sender calls withdraw(curvesTokenSubject, amount) or deposit(curvesTokenSubject, amount)",
+        "path": [
+          "Withdraw: validate balance, deploy ERC20 if needed, _transfer internal tokens to contract, mint ERC20 tokens",
+          "Deposit: validate amount % 1 ether == 0, validate ERC20 balance, burn ERC20 tokens, _transfer internal tokens from contract to user"
+        ],
+        "transformations": [
+          "Withdraw: internal balance (0 decimals) → ERC20 (18 decimals) via amount * 1 ether",
+          "Deposit: ERC20 amount (18 decimals) → internal balance (0 decimals) via amount / 1 ether"
+        ],
+        "sinks": [
+          "Withdraw: ERC20 tokens minted to msg.sender, internal tokens held by Curves contract",
+          "Deposit: ERC20 tokens burned, internal tokens transferred to msg.sender"
+        ],
+        "trust_changes": "Internal token custody changes between user and Curves contract; ERC20 representation created/destroyed",
+        "validation_points": [
+          "Withdraw: balance check",
+          "Deposit: amount % 1 ether == 0, ERC20 balance check, contract internal balance check"
+        ],
+        "exposure_risks": [
+          "Withdraw bypasses onlyTokenSubject for ERC20 deployment — any holder can trigger deployment with default name",
+          "No FeeSplitter notification (onBalanceChange not called) — fee distribution becomes inaccurate"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: Withdraw/deposit cycle can steal holder fees — user withdraws (balance drops, offset unchanged), fees distributed to fewer holders at higher rate, user deposits back (balance restored), claims fees at full balance retroactively covering the high-rate period",
+          "FeeSplitter totalSupply changes on withdraw/deposit but no offset updates — fee accounting desynchronized"
+        ]
+      },
+      {
+        "flow_id": "DF-004-fee-distribution",
+        "source": "Holder fees from _transferFees in Curves → FeeSplitter.addFees",
+        "path": [
+          "Curves._transferFees calls feeRedistributor.onBalanceChange(subject, buyer)",
+          "onBalanceChange resets buyer's userFeeOffset to cumulativeFeePerToken (WITHOUT crediting existing owed fees)",
+          "onBalanceChange pushes token to userTokens (even duplicates)",
+          "Curves._transferFees calls feeRedistributor.addFees with holderFee ETH",
+          "addFees increments cumulativeFeePerToken by msg.value * PRECISION / totalSupply_"
+        ],
+        "transformations": [
+          "ETH fee → cumulative per-token fee tracker",
+          "Per-user: (cumulativeFeePerToken - userFeeOffset) * balance → claimable amount"
+        ],
+        "sinks": [
+          "User claims via claimFees or batchClaiming → ETH transferred via .transfer()"
+        ],
+        "trust_changes": "ETH moves from Curves → FeeSplitter → individual claimants",
+        "validation_points": [
+          "totalSupply > 0 in addFees",
+          "claimable > 0 in claimFees"
+        ],
+        "exposure_risks": [
+          "payable(msg.sender).transfer() limited to 2300 gas — fails for smart contract wallets",
+          "batchClaiming could run out of gas with large tokenList"
+        ],
+        "manipulation_risks": [
+          "onBalanceChange DESTROYS accumulated unclaimed fees by resetting offset without crediting",
+          "userTokens array grows with duplicates on every buy → gas griefing",
+          "No onBalanceChange on sells, transfers, withdrawals, or deposits → fee misallocation",
+          "Withdraw-deposit cycle exploits stale offsets for fee theft",
+          "Anyone can call onBalanceChange and addFees due to broken Security.sol modifiers"
+        ]
+      },
+      {
+        "flow_id": "DF-005-access-control",
+        "source": "Any external caller",
+        "path": [
+          "Caller invokes onlyOwner or onlyManager protected function",
+          "Security.sol modifier evaluates comparison expression without require/revert",
+          "Function body executes regardless of caller identity"
+        ],
+        "transformations": [
+          "No transformation — access control is completely bypassed"
+        ],
+        "sinks": [
+          "Any state protected by onlyOwner or onlyManager can be modified by anyone"
+        ],
+        "trust_changes": "CRITICAL: Trust model is completely broken — no privileged operations exist",
+        "validation_points": [
+          "NONE — modifiers are no-ops"
+        ],
+        "exposure_risks": [
+          "Owner/manager can be changed by anyone",
+          "Fee parameters can be changed by anyone",
+          "feeRedistributor and curvesERC20Factory can be changed by anyone",
+          "setCurves in FeeSplitter has no modifier at all",
+          "addFees and onBalanceChange callable by anyone"
+        ],
+        "manipulation_risks": [
+          "Attacker takes ownership, changes all fee destinations to themselves",
+          "Attacker sets malicious FeeSplitter to steal fees",
+          "Attacker sets malicious ERC20Factory to deploy trojan tokens",
+          "Attacker calls setCurves on FeeSplitter pointing to malicious contract, then manipulates fee claims",
+          "Attacker calls onBalanceChange to reset victims' fee offsets, stealing their accumulated fees"
+        ]
+      },
+      {
+        "flow_id": "DF-006-presale",
+        "source": "Token subject calls buyCurvesTokenForPresale, whitelisted users call buyCurvesTokenWhitelisted",
+        "path": [
+          "Subject sets startTime > block.timestamp, merkleRoot, maxBuy",
+          "Whitelisted users buy during presale (block.timestamp < startTime)",
+          "Public users buy after startTime via buyCurvesToken"
+        ],
+        "transformations": [
+          "merkle leaf = keccak256(abi.encodePacked(caller))",
+          "presalesBuys accumulates per-user buy count"
+        ],
+        "sinks": [
+          "Same as DF-001 buy flow"
+        ],
+        "trust_changes": "Merkle root trusted from subject; MerkleProof.verify validates inclusion",
+        "validation_points": [
+          "startTime > block.timestamp on setup",
+          "Merkle proof verification",
+          "presalesBuys <= maxBuy"
+        ],
+        "exposure_risks": [
+          "setWhitelist can be called when supply <= 1 — subject can change whitelist after presale starts"
+        ],
+        "manipulation_risks": [
+          "Subject can set merkleRoot to 0x0 which may allow any proof to pass depending on MerkleProof implementation",
+          "Subject can set maxBuy to 0 which becomes type(uint256).max — effectively unlimited buys"
+        ]
+      },
+      {
+        "flow_id": "DF-007-transfer",
+        "source": "msg.sender calls transferCurvesToken or transferAllCurvesTokens",
+        "path": [
+          "Validate not transferring to Curves contract",
+          "_transfer: validate balance, update balances, add to ownedCurvesTokenSubjects",
+          "Emit Transfer event"
+        ],
+        "transformations": [
+          "from.balance -= amount, to.balance += amount"
+        ],
+        "sinks": [
+          "Recipient's curvesTokenBalance updated"
+        ],
+        "trust_changes": "Token ownership moves from sender to receiver",
+        "validation_points": [
+          "to != address(this)",
+          "balance >= amount"
+        ],
+        "exposure_risks": [
+          "transferAllCurvesTokens iterates ownedCurvesTokenSubjects — gas griefing if array is large",
+          "ownedCurvesTokenSubjects never removes entries — unbounded array growth"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: No FeeSplitter notification on transfer — sender continues to accrue fees on transferred tokens until next onBalanceChange, receiver doesn't get fees until next onBalanceChange",
+          "Sender can transfer tokens, claim accumulated fees based on old balance, then tokens are effectively double-counted in fee distribution"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Bonding curve: price = sum of squares formula, first token is free (price=0 at supply=0, amount=1)",
+        "First token must be bought by the subject (supply=0 requires msg.sender==subject)",
+        "Last token cannot be sold (supply must be > amount after sell)",
+        "Internal tokens use 0 decimals, ERC20 uses 18 decimals (1:1e18 mapping)",
+        "Fees split between protocol, subject, referral, holders with configurable percentages",
+        "ERC20 tokens are backed 1:1 by internal tokens locked in Curves contract",
+        "Presale period: only whitelisted users can buy before startTime, public after"
+      ],
+      "economic_incentives": [
+        "Token holders earn proportional share of holderFee from every trade",
+        "Subject earns subjectFee from every trade of their token",
+        "Protocol earns protocolFee from buys only (sell protocol fees stuck in contract)",
+        "Referrals earn referralFee if set, otherwise fee is absorbed by protocol on buys or lost on sells",
+        "Bonding curve creates increasing buy cost and decreasing sell value — early buyers benefit"
+      ],
+      "governance_mechanisms": [
+        "Owner can set fee parameters, fee redistributor, ERC20 factory",
+        "Managers can set max fee percent and external fee percents",
+        "Token subjects can set referral destination, name/symbol, whitelist, deploy ERC20",
+        "BROKEN: All owner/manager restrictions are non-functional due to Security.sol bug"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Security.sol onlyOwner and onlyManager modifiers do not revert — they evaluate a boolean expression as a statement with no effect",
+          "expected_behavior": "Only owner/manager should be able to call protected functions",
+          "actual_behavior": "Anyone can call all protected functions including setManager, transferOwnership, setProtocolFeePercent, setFeeRedistributor, setERC20Factory, addFees, onBalanceChange",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker calls transferOwnership to become owner, changes all fee destinations, sets malicious FeeSplitter/Factory, calls onBalanceChange to reset victims' fee offsets stealing their fees, calls setCurves to point to malicious contract"
+        },
+        {
+          "scenario": "FeeSplitter.setCurves() has no access control modifier at all",
+          "expected_behavior": "Only authorized caller should set the curves contract",
+          "actual_behavior": "Anyone can call setCurves to point FeeSplitter to any address, enabling manipulation of balanceOf/totalSupply reads",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker deploys malicious contract returning arbitrary balances, calls setCurves to point to it, then claims all ETH in FeeSplitter"
+        },
+        {
+          "scenario": "onBalanceChange resets userFeeOffset without first crediting accumulated unclaimed fees via updateFeeCredit",
+          "expected_behavior": "User's accumulated fees should be preserved when their offset is updated",
+          "actual_behavior": "Accumulated fees since last onBalanceChange are permanently lost; buying more tokens erases unclaimed holder fees",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker (or anyone via broken access control) calls onBalanceChange for a victim, resetting their offset and destroying their accumulated fees"
+        },
+        {
+          "scenario": "Withdraw/deposit cycle exploits stale fee offsets for fee theft",
+          "expected_behavior": "Fee distribution should accurately reflect token holding periods",
+          "actual_behavior": "User can withdraw tokens (lowering effective supply for fee calc), wait for fees to be distributed at higher per-token rate, deposit back, then claim at full balance retroactively capturing the higher-rate fees",
+          "risk_level": "high",
+          "exploitation_potential": "1) Hold N tokens with offset at C0. 2) Withdraw N tokens (no FeeSplitter update). 3) Wait for holderFees to be distributed — goes to fewer holders at higher rate, cumulativeFeePerToken increases by more per ETH. 4) Deposit N tokens back (no FeeSplitter update). 5) Claim fees — owed calculated as (C_current - C0) * N, capturing fees from period when user held 0 internal tokens."
+        },
+        {
+          "scenario": "No FeeSplitter notification on internal transfers (transferCurvesToken, transferAllCurvesTokens)",
+          "expected_behavior": "Fee offsets should be updated for both sender and receiver on transfer",
+          "actual_behavior": "Sender's offset remains stale — can continue claiming fees on tokens they no longer hold. Receiver's offset is stale — may not receive fees for newly received tokens, or may receive backdated fees.",
+          "risk_level": "high",
+          "exploitation_potential": "Transfer tokens to another address controlled by attacker, claim fees from both addresses before offsets get updated via future buy"
+        },
+        {
+          "scenario": "protocolFee on sells is never sent to protocolFeeDestination — stays locked in Curves contract",
+          "expected_behavior": "Protocol should receive protocolFee on both buys and sells",
+          "actual_behavior": "For sells, sellValue = price - all fees sent to seller, subjectFee sent to subject, referralFee sent to referral (if defined), holderFee to FeeSplitter — but protocolFee is deducted from seller payout without being sent anywhere",
+          "risk_level": "high",
+          "exploitation_potential": "Protocol loses revenue from all sell transactions; accumulated stuck ETH grows over time; no mechanism to extract it"
+        },
+        {
+          "scenario": "Referral fee on sells lost when no referral defined",
+          "expected_behavior": "If no referral, the referral fee portion should go to protocol or back to seller",
+          "actual_behavior": "On sells: sellValue deducts referralFee, but if no referral defined, the referralFee ETH stays in the contract (referral .call is skipped with (true, bytes('')))",
+          "risk_level": "medium",
+          "exploitation_potential": "Sellers lose the referral fee portion of their proceeds when no referral is set for the token"
+        },
+        {
+          "scenario": "Excess ETH from buy overpayment is never refunded",
+          "expected_behavior": "Excess msg.value should be refunded to buyer",
+          "actual_behavior": "Only checks msg.value >= price + totalFee — any excess stays in Curves contract permanently",
+          "risk_level": "medium",
+          "exploitation_potential": "Users or contracts that send more than exact price+fees lose the difference; especially dangerous for contracts that estimate gas"
+        },
+        {
+          "scenario": "getPrice(supply=0, amount>1) causes arithmetic underflow revert",
+          "expected_behavior": "Should calculate price for buying multiple tokens starting from supply 0",
+          "actual_behavior": "The sum2 calculation contains 'supply - 1 + amount' which underflows when supply=0 and amount>1 in Solidity 0.8.7 checked arithmetic: (0 - 1) reverts before adding amount",
+          "risk_level": "medium",
+          "exploitation_potential": "Subject is forced to buy exactly 1 token initially; cannot buy multiple tokens when creating curve. This is a design constraint but could be an unintended limitation."
+        },
+        {
+          "scenario": "withdraw() can deploy ERC20 for any subject, bypassing onlyTokenSubject check on _mint",
+          "expected_behavior": "Only the token subject should control ERC20 deployment and naming",
+          "actual_behavior": "Any holder of a curves token can call withdraw() which calls _deployERC20 directly (not through _mint which has onlyTokenSubject), deploying the ERC20 with default name/symbol or whatever was pre-set",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker buys 1 token for a subject, immediately withdraws — ERC20 deploys with default name, locking out subject from choosing custom name/symbol"
+        },
+        {
+          "scenario": "userTokens array in FeeSplitter accumulates duplicates",
+          "expected_behavior": "Each token should appear once in userTokens",
+          "actual_behavior": "onBalanceChange pushes token to userTokens every time balance > 0, without checking for duplicates. Every buy adds a duplicate entry.",
+          "risk_level": "medium",
+          "exploitation_potential": "Array grows unbounded, increasing gas costs for getUserTokensAndClaimable and batchClaiming. Buying 0 tokens repeatedly costs minimal ETH but grows arrays arbitrarily."
+        },
+        {
+          "scenario": "Buying 0 tokens is not prevented",
+          "expected_behavior": "Buying 0 tokens should be rejected as it has no economic purpose",
+          "actual_behavior": "getPrice(supply, 0) returns 0 for supply > 0. _buyCurvesToken succeeds with 0 ETH, calling _transferFees with price=0, triggering onBalanceChange which pushes duplicate to userTokens, adds to ownedCurvesTokenSubjects",
+          "risk_level": "medium",
+          "exploitation_potential": "Gas griefing: attacker calls buyCurvesToken with amount=0 repeatedly to grow userTokens and ownedCurvesTokenSubjects arrays for victim addresses (via cross-effects if applicable)"
+        },
+        {
+          "scenario": "FeeSplitter.addFees precision loss when msg.value is small relative to totalSupply",
+          "expected_behavior": "All fees should be accurately tracked",
+          "actual_behavior": "cumulativeFeePerToken += (msg.value * PRECISION) / totalSupply_. Since totalSupply_ = (supply - locked) * PRECISION, this simplifies to msg.value / (supply - locked). For msg.value < (supply - locked), the increment rounds to 0 — fees are lost.",
+          "risk_level": "low",
+          "exploitation_potential": "Small fee amounts from low-value trades are permanently lost. Not directly exploitable but results in accounting dust."
+        },
+        {
+          "scenario": "maxFeePercent has no upper bound",
+          "expected_behavior": "Total fees should never exceed 100% of price to prevent sell underflow",
+          "actual_behavior": "setMaxFeePercent only checks existing fees <= new max. If max >= 1 ether (100%), fees could equal or exceed price, causing sellValue underflow and making sells impossible.",
+          "risk_level": "medium",
+          "exploitation_potential": "With broken access control, anyone can set maxFeePercent >= 1 ether, then set fee percents to sum > price, breaking all sells (underflow revert) and trapping user funds"
+        },
+        {
+          "scenario": "ownedCurvesTokenSubjects array never removes entries even when balance reaches 0",
+          "expected_behavior": "Sold-out positions should be removed from tracking",
+          "actual_behavior": "After selling all tokens, the subject remains in ownedCurvesTokenSubjects. transferAllCurvesTokens iterates entire array including zero-balance entries.",
+          "risk_level": "low",
+          "exploitation_potential": "Gas griefing for transferAllCurvesTokens — unbounded iteration over stale entries"
+        },
+        {
+          "scenario": "FeeSplitter.claimFees uses .transfer() with 2300 gas stipend",
+          "expected_behavior": "All users including smart contract wallets should be able to claim",
+          "actual_behavior": ".transfer() limits gas to 2300, which is insufficient for contracts with receive() logic or on chains where gas costs differ. Claims revert for such users.",
+          "risk_level": "medium",
+          "exploitation_potential": "Smart contract wallets or multisigs cannot claim fees. Not exploitable but causes permanent fee loss for affected users."
+        },
+        {
+          "scenario": "Front-running buy transactions on bonding curve",
+          "expected_behavior": "Users should pay fair price",
+          "actual_behavior": "Attacker sees pending buy in mempool, front-runs with own buy (increasing price), victim buys at higher price, attacker back-runs with sell at profit",
+          "risk_level": "medium",
+          "exploitation_potential": "Classic sandwich attack — bonding curve has no slippage protection or deadline parameter"
+        }
+      ],
+      "assumption_violations": [
+        "CRITICAL: Security.sol assumes `msg.sender == owner;` enforces access control — it's a no-op expression statement, not a require",
+        "FeeSplitter assumes onBalanceChange is called for ALL balance changes — it's only called for buyers during buy, not for sellers, transfers, withdrawals, or deposits",
+        "FeeSplitter.onBalanceChange assumes setting offset without crediting owed fees is safe — it destroys accumulated fees",
+        "Protocol assumes protocolFee is collected on sells — it is deducted from seller but never forwarded",
+        "Bonding curve assumes contract ETH balance equals sum of all positions' values — stuck fees break this assumption",
+        "withdraw() assumes only subjects deploy ERC20 tokens — any holder can trigger deployment",
+        "getPrice assumes supply >= 1 for amounts > 1 — underflows for supply=0, amount>1",
+        "Fee calculation assumes sum of individual fee percentages / 1 ether < 1 — no hard cap enforcement"
+      ],
+      "game_theory_risks": [
+        "Fee theft via withdraw-deposit cycle: rational actors can extract disproportionate holder fees by temporarily reducing their internal balance during fee distribution periods",
+        "Sandwich attacks on bonding curve buys with no slippage protection",
+        "With broken access control, any actor can become owner and extract all protocol value",
+        "Subject can front-run their own token by setting fees to maximum before anticipated high-value trades",
+        "Rational subjects have no referral set, causing referral fee on sells to be lost — misaligned with user expectations",
+        "Early token holders can withdraw to ERC20, reducing FeeSplitter totalSupply, concentrating all future holder fees to remaining internal holders"
+      ],
+      "integration_risks": [
+        "CurvesERC20 is owned by Curves contract — if Curves address changes or is compromised, ERC20 mint/burn becomes exploitable",
+        "FeeSplitter reads live balance from Curves — any desynchronization (e.g., via broken setCurves) allows fee manipulation",
+        "OpenZeppelin MerkleProof dependency — standard and safe, but merkleRoot of bytes32(0) with empty proof returns true for leaf hash matching 0x0",
+        "External .call for ETH transfers can fail for contracts that reject ETH or require more gas — breaking buy/sell flows"
+      ],
+      "calculation_errors": [
+        "getPrice: sum2 underflows when supply=0 and amount>1 due to unchecked supply-1 in Solidity 0.8.7",
+        "sell _transferFees: sellValue = price - protocolFee - subjectFee - referralFee - holderFee deducts protocolFee from seller but never sends it to protocol",
+        "FeeSplitter.addFees: cumulativeFeePerToken increment = msg.value/(supply-locked) loses precision via integer division for small fees",
+        "FeeSplitter.onBalanceChange: missing updateFeeCredit call means owed = (cumulativeFeePerToken - oldOffset) * balance is discarded when offset is reset"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "CurvesERC20",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "mint_burn_restricted",
+            "pausable:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Standard ERC20 with mint/burn restricted to owner (Curves contract). No hooks or callbacks. Ownable via OpenZeppelin. Each CurvesERC20 instance is deployed per curvesTokenSubject via CurvesERC20Factory."
+        },
+        {
+          "address_or_symbol": "InternalCurvesToken",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 0,
+          "approval_model": "unknown",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "Internal accounting in Curves.sol via curvesTokenBalance mapping. No ERC20 interface. Whole units only. 1 internal token = 1e18 ERC20 tokens on withdraw."
+        },
+        {
+          "address_or_symbol": "ETH",
+          "behaviors": [],
+          "decimals": 18,
+          "notes": "Native ETH used for bonding curve purchases, fee distribution, and seller payouts. Transferred via .call{value:} in Curves and .transfer() in FeeSplitter."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation",
+          "state_vars": [
+            "curvesTokenSupply[subject]",
+            "sum(curvesTokenBalance[subject][all_holders])"
+          ],
+          "notes": "Total supply should equal sum of all holder balances including address(this). Maintained by _buyCurvesToken, sellCurvesToken, _transfer."
+        },
+        {
+          "name": "erc20_backing",
+          "state_vars": [
+            "CurvesERC20.totalSupply()",
+            "curvesTokenBalance[subject][address(curves)] * 1e18"
+          ],
+          "notes": "ERC20 total supply should equal internal tokens locked in Curves contract * 1e18. Maintained by withdraw (mint) and deposit (burn)."
+        },
+        {
+          "name": "eth_solvency_intended",
+          "state_vars": [
+            "address(curves).balance",
+            "sum(getPrice(0, curvesTokenSupply[subject]) for all subjects)"
+          ],
+          "notes": "VIOLATED: Contract accumulates extra ETH from (1) stuck protocolFee on sells, (2) stuck referralFee on sells without referral, (3) excess ETH from buy overpayments. Contract balance > theoretical bonding curve backing."
+        },
+        {
+          "name": "fee_offset_consistency",
+          "state_vars": [
+            "tokensData[token].userFeeOffset[user]",
+            "tokensData[token].unclaimedFees[user]",
+            "tokensData[token].cumulativeFeePerToken"
+          ],
+          "notes": "VIOLATED: onBalanceChange resets offset without crediting owed fees. Transfers/withdrawals/deposits don't update offsets at all. Fee distribution is inaccurate."
+        },
+        {
+          "name": "access_control_integrity",
+          "state_vars": [
+            "owner",
+            "managers"
+          ],
+          "notes": "VIOLATED: Security.sol modifiers are no-ops. Any address can modify owner and managers state."
+        }
+      ]
+    }
+  }
+}

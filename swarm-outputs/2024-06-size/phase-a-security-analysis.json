@@ -1,0 +1,271 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T04:46:06.500Z",
+    "duration_ms": 161766
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Protocol Administration",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "updateConfig",
+          "setVariablePoolBorrowRate",
+          "pause",
+          "unpause",
+          "initialize"
+        ],
+        "failure_modes": [
+          "Admin private key compromise",
+          "Misconfiguration of risk parameters (e.g., crOpening <= crLiquidation)",
+          "Setting stale rate interval to 0, causing DoS on market rates"
+        ],
+        "attack_vectors": [
+          "Privilege escalation",
+          "Malicious parameter updates leading to protocol insolvency"
+        ]
+      },
+      {
+        "boundary": "User Operations (Borrowers/Lenders)",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "deposit",
+          "withdraw",
+          "buyCreditMarket",
+          "sellCreditMarket",
+          "buyCreditLimit",
+          "sellCreditLimit",
+          "repay",
+          "claim",
+          "compensate",
+          "liquidate",
+          "selfLiquidate",
+          "multicall"
+        ],
+        "failure_modes": [
+          "Insufficient collateral leading to bad debt",
+          "Exploitation of rounding errors in fee calculations",
+          "Bypassing deposit caps via multicall"
+        ],
+        "attack_vectors": [
+          "Flash loan attacks",
+          "Precision loss exploitation",
+          "Multicall state inconsistency exploitation"
+        ]
+      },
+      {
+        "boundary": "Oracle Data Feeds",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "present",
+        "entry_functions": [
+          "getPrice",
+          "getAPR"
+        ],
+        "failure_modes": [
+          "Stale prices from Chainlink",
+          "Sequencer downtime on L2s",
+          "Variable pool borrow rate manipulation"
+        ],
+        "attack_vectors": [
+          "Oracle manipulation to force unfair liquidations",
+          "Exploiting stale rates to borrow at below-market APRs"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "NULL",
+        "to_state": "ACTIVE",
+        "trigger": "buyCreditMarket or sellCreditMarket",
+        "conditions": [
+          "Borrower has sufficient collateral (CR >= crOpening)",
+          "Tenor is within [minTenor, maxTenor]",
+          "Credit amount >= minimumCreditBorrowAToken"
+        ],
+        "invariants": [
+          "Sum of credit positions equals debt position futureValue"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "ACTIVE",
+        "to_state": "REPAID",
+        "trigger": "repay, liquidate, or selfLiquidate",
+        "conditions": [
+          "Loan is active",
+          "For liquidations: CR < crLiquidation or loan is OVERDUE"
+        ],
+        "invariants": [
+          "Debt futureValue is reduced to 0",
+          "Lenders can claim their exact credit amount scaled by liquidity index"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "ACTIVE",
+        "to_state": "ACTIVE (Fractionalized)",
+        "trigger": "buyCreditMarket, sellCreditMarket, or compensate",
+        "conditions": [
+          "Credit position is transferrable",
+          "Remaining credit >= minimumCreditBorrowAToken"
+        ],
+        "invariants": [
+          "Sum of split credit positions equals original credit amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Precision/Unit Mismatch in Liquidation Reward",
+        "locations": [
+          "Liquidate.sol: executeLiquidate"
+        ],
+        "severity": "critical",
+        "evidence": "`liquidatorReward` is calculated using `debtPosition.futureValue` (which is in borrow token decimals, e.g., 6 for USDC) but is added directly to `debtInCollateralToken` (which is in collateral token decimals, e.g., 18 for WETH).",
+        "exploitation_method": "Because of the decimal difference, the calculated reward is orders of magnitude smaller than intended (e.g., 50 wei of WETH instead of 0.05 WETH). Liquidators receive practically zero reward, removing the economic incentive to liquidate underwater positions and leaving the protocol with bad debt.",
+        "affected_assets": [
+          "Protocol Solvency",
+          "Collateral Tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Cap Bypass",
+        "locations": [
+          "Multicall.sol: multicall",
+          "CapsLibrary.sol: validateBorrowATokenIncreaseLteDebtTokenDecrease"
+        ],
+        "severity": "high",
+        "evidence": "In `Multicall.sol`, `borrowATokenSupplyBefore` and `borrowATokenSupplyAfter` are calculated using `state.data.borrowAToken.balanceOf(address(this))` instead of `totalSupply()`. These values are then passed to `validateBorrowATokenIncreaseLteDebtTokenDecrease` where they are compared against `state.riskConfig.borrowATokenCap`.",
+        "exploitation_method": "An attacker can use the `multicall` function to batch deposits. Since `balanceOf(address(this))` is typically 0 (or very small), the check `borrowATokenSupplyAfter > cap` evaluates to false. This completely bypasses the protocol's risk cap, allowing infinite deposits of borrow tokens.",
+        "affected_assets": [
+          "Borrow aTokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Incorrect Fund Routing",
+        "locations": [
+          "LiquidateWithReplacement.sol: executeLiquidateWithReplacement"
+        ],
+        "severity": "high",
+        "evidence": "The function calculates `liquidatorProfitBorrowToken` (the upfront interest paid by the new borrower) but transfers it to `state.feeConfig.feeRecipient` instead of `msg.sender` (the liquidator).",
+        "exploitation_method": "Keepers executing `liquidateWithReplacement` do not receive their expected profit in borrow tokens. The profit is mistakenly sent to the protocol fee recipient, severely disincentivizing this liquidation method.",
+        "affected_assets": [
+          "Liquidator Rewards",
+          "Borrow aTokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (DoS) via Strict Equality / Slippage",
+        "locations": [
+          "AccountingLibrary.sol: getCreditAmountOut",
+          "BuyCreditMarket.sol: executeBuyCreditMarket"
+        ],
+        "severity": "medium",
+        "evidence": "In `getCreditAmountOut`, if `cashAmountIn` is even 1 wei less than `maxCashAmountIn`, the protocol charges a fixed `fragmentationFee`. If `cashAmountIn < fragmentationFee`, the transaction reverts.",
+        "exploitation_method": "Users submitting exact amount limit orders may experience unexpected reverts or disproportionate fee deductions due to minor off-chain calculation differences or oracle rate updates that slightly change `maxCashAmountIn`.",
+        "affected_assets": [
+          "User Funds (Fees)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Size.sol",
+          "function": "updateConfig(UpdateConfigParams)",
+          "guards": [
+            "onlyRole(DEFAULT_ADMIN_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Updates critical risk and fee parameters."
+        },
+        {
+          "contract": "Size.sol",
+          "function": "setVariablePoolBorrowRate(uint128)",
+          "guards": [
+            "onlyRole(BORROW_RATE_UPDATER_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Updates the off-chain variable pool borrow rate."
+        },
+        {
+          "contract": "Size.sol",
+          "function": "pause()",
+          "guards": [
+            "onlyRole(PAUSER_ROLE)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Pauses protocol operations."
+        },
+        {
+          "contract": "Size.sol",
+          "function": "liquidateWithReplacement(LiquidateWithReplacementParams)",
+          "guards": [
+            "onlyRole(KEEPER_ROLE)",
+            "whenNotPaused"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Restricted liquidation method."
+        }
+      ],
+      "oracle_dependencies": [
+        {
+          "source": "Chainlink",
+          "freshness_min_sec": 3600,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "PriceFeed.sol",
+              "lines": "62-79",
+              "function": "getPrice"
+            }
+          ],
+          "compositional_usage": [
+            "base / quote"
+          ]
+        },
+        {
+          "source": "Custom",
+          "freshness_min_sec": 0,
+          "stale_behavior": "revert",
+          "call_sites": [
+            {
+              "file": "YieldCurveLibrary.sol",
+              "lines": "65-79",
+              "function": "getAdjustedAPR"
+            }
+          ],
+          "compositional_usage": [
+            "variablePoolBorrowRate"
+          ]
+        }
+      ]
+    }
+  }
+}

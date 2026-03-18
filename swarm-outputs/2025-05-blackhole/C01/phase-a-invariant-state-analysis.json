@@ -1,0 +1,316 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T03:56:36.905Z",
+    "duration_ms": 549424
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "Bribes.sol",
+        "description": "Bribe rewards for AVM-delegated tokens are sent to AutoVotingEscrow contract (not AVM manager) and permanently locked. In getReward(), ownerOf(tokenId) returns the AutoVotingEscrow address, not the AVM manager, so the check `_owner == avm` is false, and rewards are sent to the AVE contract which has no token recovery function.",
+        "attack_scenario": "A user delegates their veNFT to AVM via enableAutoVoting. The token is transferred to an AutoVotingEscrow contract instance. When bribe rewards are claimed via getReward(), ownerOf returns the AVE address, which != avm (the manager address). Rewards are sent to the AVE contract with no recovery mechanism. All bribe rewards for AVM-delegated tokens are permanently lost.",
+        "invariant_logic": "For any tokenId in AVM: Bribe.getReward(tokenId) MUST route rewards to the original token depositor, not to intermediate custody contracts",
+        "solidity_property": "function invariant_bribe_rewards_recoverable(uint256 tokenId) public view { address owner = IVotingEscrow(ve).ownerOf(tokenId); if(owner != address(0) && owner != avm) { /* rewards go to owner which may be AVE contract with no recovery */ assert(IERC20(token).balanceOf(owner) == 0 || owner.code.length == 0); } }",
+        "inventory_refs": [
+          {
+            "file": "Bribes.sol",
+            "function": "getReward"
+          },
+          {
+            "file": "AutoVotingEscrowManager.sol",
+            "function": "enableAutoVoting"
+          },
+          {
+            "file": "AutoVotingEscrow.sol",
+            "function": "acceptLock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "AutoVotingEscrowManager.sol",
+        "description": "setOriginalOwner is a no-op function (empty body). The originalOwner mapping is declared but never written to, always returning address(0). Additionally, VotingEscrow._transferFrom checks `_to == avm` but the actual transfer destination is the AutoVotingEscrow instance (not the manager), so setOriginalOwner is never even called.",
+        "attack_scenario": "Any external contract calling IAutomatedVotingManager(avm).originalOwner(tokenId) receives address(0). In Bribe.getReward(), if the owner check happened to match avm, rewards would be sent to address(0) causing either revert or permanent loss. The double failure (never called + no-op) ensures originalOwner is always zero for all tokens.",
+        "invariant_logic": "For every tokenId in AVM: originalOwner[tokenId] MUST equal the address that deposited the token into AVM",
+        "solidity_property": "function invariant_original_owner_set(uint256 tokenId) public view { if(tokenIdToAVMId[tokenId] > 0) { assert(originalOwner[tokenId] != address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "AutoVotingEscrowManager.sol",
+            "function": "setOriginalOwner"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_transferFrom"
+          },
+          {
+            "file": "Bribes.sol",
+            "function": "getReward"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VoterV3.sol",
+        "description": "When _vote is called (via vote or poke) and all voted gauges are killed, _reset clears vote weights but voted[tokenId] remains true since IVotingEscrow.voting() is only called when _usedWeight > 0. The token becomes stuck: cannot transfer or withdraw (require !voted), must wait for next epoch to call reset().",
+        "attack_scenario": "1) User votes for gauges in epoch N. 2) All voted gauges are killed. 3) User calls poke or vote - _reset clears weights but voted flag stays true. 4) User cannot transfer or withdraw their veNFT until they call reset() in epoch N+1. A malicious governance actor could kill gauges to temporarily lock veNFTs from being transferred.",
+        "invariant_logic": "After _vote completes: (usedWeights[tokenId] == 0) implies (voted[tokenId] == false)",
+        "solidity_property": "function invariant_voted_consistency(uint256 tokenId) public view { if(usedWeights[tokenId] == 0) { assert(!IVotingEscrow(_ve).voted(tokenId)); } }",
+        "inventory_refs": [
+          {
+            "file": "VoterV3.sol",
+            "function": "_vote"
+          },
+          {
+            "file": "VoterV3.sol",
+            "function": "poke"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_transferFrom"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "RewardsDistributor.sol",
+        "description": "claim_many does not check AVM ownership for expired locks, sending rebase rewards directly to ownerOf(tokenId) which is the AutoVotingEscrow contract. The single claim() function correctly resolves via avm.getOriginalOwner(), but claim_many bypasses this check entirely.",
+        "attack_scenario": "AVM-delegated veNFTs with expired locks (non-permanent, non-smNFT) accumulate rebase rewards. Anyone calls claim_many with these tokenIds. Rewards are sent to the AutoVotingEscrow contract address (ownerOf returns AVE). These tokens are permanently locked in the AVE contract with no recovery function.",
+        "invariant_logic": "claim_many(tokenIds) MUST produce the same reward routing as calling claim(tokenId) individually for each token",
+        "solidity_property": "function invariant_claim_many_routing(uint256 tokenId) public view { address singleClaimRecipient = resolveClaimRecipient(tokenId); address manyClaimRecipient = IVotingEscrow(voting_escrow).ownerOf(tokenId); assert(singleClaimRecipient == manyClaimRecipient); }",
+        "inventory_refs": [
+          {
+            "file": "RewardsDistributor.sol",
+            "function": "claim"
+          },
+          {
+            "file": "RewardsDistributor.sol",
+            "function": "claim_many"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "VotingEscrow.sol",
+        "description": "Changing SMNFT_BONUS via setSmNFTBonus retroactively affects _checkpoint calculations for all smNFTs. The global point uses calculate_sm_nft_bonus(smNFTBalance) with the NEW rate, while individual token checkpoints retain their OLD stored values. This breaks the invariant that totalSupply equals the sum of individual balanceOfNFT values.",
+        "attack_scenario": "Team increases SMNFT_BONUS from 10% to 50%. The global point_history immediately reflects higher smNFTBonus for all smNFTBalance. But individual smNFT checkpoints still store old bonus values until each token is individually checkpointed. Governance proposals using totalSupply as quorum see inflated total, while individual voting power remains at old levels, making quorum harder to reach.",
+        "invariant_logic": "totalSupply() == sum(balanceOfNFT(i) for all i where ownerOf(i) != address(0))",
+        "solidity_property": "function invariant_total_supply_consistency() public view { uint256 total = 0; for(uint i = 1; i <= tokenId; i++) { if(idToOwner[i] != address(0)) { total += balanceOfNFT(i); } } assert(total == totalSupply()); }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "setSmNFTBonus"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_checkpoint"
+          },
+          {
+            "file": "VotingBalanceLogic.sol",
+            "function": "_supply_at"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "When splitting an smNFT, smNFTBalance (the global tracker) is never adjusted, but individual locked amounts are recalculated using the current SMNFT_BONUS rate. If the bonus has changed since creation, the sum of the two new tokens' real amounts (calculated via calculate_original_sm_nft_amount) will differ from the original real amount.",
+        "attack_scenario": "smNFT created with SMNFT_BONUS=1000: real=100, bonus=10, locked=110. Team changes SMNFT_BONUS to 2000. User splits with _amount=50. _splitAmount = 50 + 10 = 60. Token1 locked=50, Token2 locked=60. The smNFTBalance still reflects 100 real tokens, but the two tokens' 'original amounts' sum to 50*10000/12000 + 60*10000/12000 ≈ 91.67, not 100. Global and individual accounting diverge.",
+        "invariant_logic": "smNFTBalance == sum(calculate_original_sm_nft_amount(locked[i].amount) for all smNFT tokens i)",
+        "solidity_property": "function invariant_smnft_balance_consistency() public view { uint256 total = 0; for(uint i = 1; i <= tokenId; i++) { if(locked[i].isSMNFT && idToOwner[i] != address(0)) { total += calculate_original_sm_nft_amount(uint256(int256(locked[i].amount))); } } assert(total == smNFTBalance); }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "split"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_checkpoint"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "VotingEscrow.sol",
+        "description": "delegateBySig signatures remain valid after the signatory calls delegate() directly, because delegate() does not increment the nonce. An attacker who received a signed delegation can submit it at any time to override the signatory's subsequent direct delegate() calls.",
+        "attack_scenario": "Alice signs a delegation to Charlie (nonce=0). Alice changes her mind and calls delegate(Bob) directly—nonce stays at 0. Charlie submits the old signature: nonce=0 matches nonces[Alice]=0. Alice's delegation is changed from Bob to Charlie without her current consent. All of Alice's veNFT voting power is redirected.",
+        "invariant_logic": "After delegate(delegatee) is called, all previously signed but unsubmitted delegateBySig messages MUST be invalidated",
+        "solidity_property": "function invariant_delegation_nonce_freshness(address delegator) public view { /* nonce should increment on ANY delegation change, not just delegateBySig */ }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "delegate"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "delegateBySig"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "PermissionsRegistry.sol",
+        "description": "removeRole corrupts _addressToRoles mapping by replacing the removed role with _roles[_roles.length-1] (a role from the global roles array) instead of _addressToRoles[user][lastIndex]. Additionally, the loop doesn't break after pop, potentially causing further corruption or out-of-bounds access.",
+        "attack_scenario": "Admin removes role 'GAUGE_ADMIN'. For each address that had GAUGE_ADMIN, the code replaces their role entry with the last element of the global _roles array (e.g., 'EPOCH_MANAGER'). Now those addresses appear to have EPOCH_MANAGER in their roles list without it being properly assigned, corrupting role tracking data used by off-chain systems.",
+        "invariant_logic": "For all addresses a and roles r: (r in _addressToRoles[a]) iff hasRole[r][a] == true",
+        "solidity_property": "function invariant_role_consistency(address user, bytes memory role) public view { bool inArray = false; for(uint i = 0; i < _addressToRoles[user].length; i++) { if(keccak256(_addressToRoles[user][i]) == keccak256(role)) inArray = true; } assert(inArray == hasRole[role][user]); }",
+        "inventory_refs": [
+          {
+            "file": "PermissionsRegistry.sol",
+            "function": "removeRole"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "AutoVotingEscrow.sol",
+        "description": "lockOwner returns wrong owner for tokens never added to the AVM due to tokenIdIndex defaulting to 0. If locks[0] exists, querying any non-existent tokenId returns the owner of the first lock. This also applies to tokens that were released (index deleted, defaults back to 0).",
+        "attack_scenario": "Token A is at index 0 in an AVM. Token B was never in this AVM. Calling lockOwner(B) returns locks[0].owner (token A's owner). If this is used for authorization checks outside the manager's tokenIdToAVMId guard, an attacker could claim ownership of token A by presenting token B's ID.",
+        "invariant_logic": "lockOwner(tokenId) MUST revert for tokenIds not actively stored in the AVM's locks array",
+        "solidity_property": "function invariant_lock_owner_validity(uint256 tokenId) public view { uint256 idx = tokenIdIndex[tokenId]; if(idx < locks.length) { assert(locks[idx].tokenId == tokenId); } }",
+        "inventory_refs": [
+          {
+            "file": "AutoVotingEscrow.sol",
+            "function": "lockOwner"
+          },
+          {
+            "file": "AutoVotingEscrow.sol",
+            "function": "releaseLock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "Bribes.sol",
+        "description": "The earned() function iterates through every epoch since lastEarn without any iteration cap. With WEEK=1800 seconds (30 minutes), epochs accumulate rapidly. A user who hasn't claimed for even a few days could face hundreds of iterations, causing out-of-gas reverts and permanently locking their bribe rewards.",
+        "attack_scenario": "With WEEK=1800s, after 7 real days there are 336 epochs. A user who hasn't claimed bribes for 7 days calls getReward. The earned() loop iterates 336 times, each reading two storage slots from checkpoints and supply. This easily exceeds block gas limits, making rewards unclaimable. The user's rewards are permanently locked.",
+        "invariant_logic": "earned(tokenId, rewardToken) MUST be computable within block gas limit for any valid tokenId and lastEarn timestamp",
+        "solidity_property": "function invariant_earned_gas_bounded(uint256 tokenId, address rewardToken) public view { uint256 _currTs = BlackTimeLibrary.epochStart(lastEarn[rewardToken][tokenId]); uint256 numEpochs = (BlackTimeLibrary.epochStart(block.timestamp) - _currTs) / WEEK; assert(numEpochs <= 500); }",
+        "inventory_refs": [
+          {
+            "file": "Bribes.sol",
+            "function": "earned"
+          },
+          {
+            "file": "Bribes.sol",
+            "function": "getReward"
+          },
+          {
+            "file": "BlackTimeLibrary.sol",
+            "function": "epochStart"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "The supply variable is not decremented when tokens are burned during smNFT conversion (updateToSMNFT) or merge into smNFT. When a regular lock is converted to smNFT, _black.burn burns tokens from VE's balance but supply remains inflated. While supply is only used for events, this breaks the invariant that supply tracks the total locked token value.",
+        "invariant_logic": "supply == IERC20(token).balanceOf(address(this)) + sum(burned_for_smnft_tokens)",
+        "solidity_property": "function invariant_supply_accuracy() public view { /* supply should reflect actual held tokens for non-smNFT locks */ }",
+        "attack_scenario": "After multiple conversions to smNFT, the supply variable becomes significantly larger than the actual token balance held by VE. While not directly exploitable since supply isn't used in core calculations, any future integration relying on supply for solvency checks would be misled.",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "updateToSMNFT"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "merge"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "create_lock and create_lock_for allow any caller to create smNFT locks for arbitrary addresses. The isSMNFT parameter is user-controlled with no role restriction. Since smNFTs permanently burn tokens and grant permanent non-decaying voting power with bonus, this allows unrestricted creation of permanent voting positions.",
+        "attack_scenario": "An attacker creates smNFTs for many addresses they control, each with minimal value but permanent voting power. Since smNFTs cannot be withdrawn (isPermanent=true, isSMNFT=true), this permanently inflates smNFTBalance and voting supply. If the attacker controls a large share of smNFT voting power, they dominate governance and gauge voting permanently.",
+        "invariant_logic": "smNFT creation SHOULD be restricted to authorized roles or require minimum lock conditions beyond the isSMNFT boolean",
+        "solidity_property": "function invariant_smnft_creation_restricted(bool isSMNFT) public view { if(isSMNFT) { /* Should verify caller has appropriate role or meets stricter conditions */ } }",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "create_lock"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "create_lock_for"
+          },
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_create_lock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "VotingEscrow.sol",
+        "description": "The _checkpoint function's weekly iteration loop is capped at 255 iterations. With WEEK=1800 seconds, this covers only 255*1800=459000 seconds (~5.3 days). If no checkpoint is called for more than 5.3 days, the global point_history becomes stale and voting power calculations break.",
+        "invariant_logic": "block.timestamp - last_checkpoint_ts <= 255 * WEEK for accurate voting power",
+        "solidity_property": "function invariant_checkpoint_freshness() public view { uint256 lastTs = votingBalanceLogicData.point_history[epoch].ts; assert(block.timestamp - lastTs <= 255 * WEEK); }",
+        "attack_scenario": "During a period of low activity (no deposits, withdrawals, or explicit checkpoints for 6 days), the checkpoint loop cannot catch up. The global slope/bias tracking becomes incorrect, inflating or deflating totalSupply. An attacker triggers a checkpoint after the gap, then exploits the stale totalSupply for governance quorum manipulation.",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "_checkpoint"
+          },
+          {
+            "file": "BlackTimeLibrary.sol",
+            "function": "WEEK"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "VotingEscrow.sol",
+        "description": "The merge function does not check that the source token (_from) has an active lock (end > block.timestamp) for non-permanent sources. Only the target (_to) is checked. An expired non-permanent source can be merged into an smNFT target, burning its tokens and granting bonus voting power for tokens the user could have simply withdrawn.",
+        "invariant_logic": "merge(from, to) where !locked[from].isPermanent requires locked[from].end > block.timestamp",
+        "solidity_property": "function invariant_merge_source_active(uint256 _from) public view { IVotingEscrow.LockedBalance memory _locked = locked[_from]; if(!_locked.isPermanent) { assert(_locked.end > block.timestamp); } }",
+        "attack_scenario": "User has an expired non-permanent lock with 1000 tokens. Instead of withdrawing, they merge into their smNFT. The tokens are burned and they receive smNFT bonus (e.g., +10%). They effectively convert 1000 withdrawable tokens into 1100 permanent smNFT voting power, gaining 100 units of free voting power.",
+        "inventory_refs": [
+          {
+            "file": "VotingEscrow.sol",
+            "function": "merge"
+          }
+        ]
+      }
+    ]
+  }
+}

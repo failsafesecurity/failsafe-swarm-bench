@@ -1,0 +1,829 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "architecture_entry_points",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.1 Asset Inventory - Financial assets, state assets, privilege assets, reputation assets",
+      "1.3 System Architecture Mapping - Contract hierarchies, dependencies, upgrade patterns, access control",
+      "2.1 Entry Point Enumeration - Public/external functions, callbacks, parameter analysis"
+    ],
+    "timestamp": "2026-03-09T02:46:18.894Z",
+    "duration_ms": 97174
+  },
+  "analysis": {
+    "asset_inventory": {
+      "financial_assets": [
+        "Native RON held transiently in LiquidRon and LiquidProxy (during WRON unwrap/withdraw and staking interactions)",
+        "WRON (wrapped RON) ERC20 held by LiquidRon (ERC4626 underlying asset) and Escrow (custody/approval source)",
+        "LRON ERC20 share token (ERC4626 vault shares) minted/burned by LiquidRon",
+        "Staked RON positions in Ronin staking contract, attributed to each LiquidProxy address (delegations per validator)",
+        "Unclaimed staking rewards in Ronin staking contract, claimable by each LiquidProxy address",
+        "Operator fee accrual tracked as operatorFeeAmount (claimable by feeRecipient)",
+        "Escrow-held WRON balance intended to back pending withdrawals / prevent share-mint miscalculation"
+      ],
+      "state_assets": [
+        "operator[address] allowlist (governs staking/reward operations)",
+        "stakingProxies[index] registry and stakingProxyCount (controls delegation granularity and where funds are sent)",
+        "roninStaking address (integration endpoint for staking/rewards reads/writes)",
+        "wron address stored in RonHelper (WRON token used for wrap/unwrap and transfers)",
+        "escrow address (Escrow contract instance controlling deposit path + WRON allowance)",
+        "feeRecipient address (recipient of operator fees)",
+        "operatorFee (BIPS-based fee rate) and operatorFeeAmount (accumulated fees awaiting withdrawal)",
+        "withdrawalEpoch (current epoch index for request-based withdrawals)",
+        "withdrawalRequestsPerEpoch[epoch][user] => { fulfilled, shares } (claims accounting)",
+        "lockedSharesPerEpoch[epoch] (aggregate shares locked for epoch)",
+        "statusPerEpoch[epoch] (STANDBY/FINALISED gate for claims)",
+        "lockedPricePerSharePerEpoch[epoch] => { shareSupply, assetSupply } (epoch settlement rate)",
+        "ValidatorTracker: validators[] list, validatorCount, validatorStakeActive, validatorIndex (set maintenance for reward/stake queries)"
+      ],
+      "privilege_assets": [
+        "Owner (Ownable): can pause/unpause, update operators, set fees, deploy proxies, update feeRecipient",
+        "Operator role set: intended to control harvesting and staking actions (harvest/delegate/undelegate/finalise epoch)",
+        "Pause authority (Pausable.pause/unpause) stopping most user/operator flows guarded by whenNotPaused",
+        "Escrow vault binding: Escrow._vault immutable to creator (LiquidRon) and unlimited WRON approval to vault",
+        "Staking proxy vault binding: LiquidProxy.vault immutable to creator (LiquidRon) and onlyVault modifier"
+      ],
+      "reputation_assets": [
+        "LRON share supply and implied price-per-share (sensitive to accounting correctness and fee settings)",
+        "Withdrawal epoch settlement correctness (lockedPricePerSharePerEpoch) affecting user trust and solvency perception",
+        "Validator set tracking correctness (validators list/pruning) impacting gas costs and reward visibility",
+        "Governance/centralization perception based on owner/operator controls and feeRecipient withdrawals"
+      ]
+    },
+    "system_architecture": {
+      "contracts_analyzed": [
+        "LiquidRon.sol",
+        "LiquidProxy.sol",
+        "ValidatorTracker.sol",
+        "RonHelper.sol",
+        "Pausable.sol",
+        "Escrow.sol"
+      ],
+      "inheritance_hierarchy": "LiquidRon inherits ERC4626 (and ERC20 via ERC4626), RonHelper (WRON wrapping helpers), Pausable (custom Ownable-based pause), and ValidatorTracker (validator list management). Pausable itself inherits OpenZeppelin Ownable. LiquidProxy inherits RonHelper and implements ILiquidProxy. ValidatorTracker and RonHelper are abstract helper bases. Escrow is standalone and authorizes only its deploying vault.",
+      "external_dependencies": [
+        "OpenZeppelin: ERC4626, ERC20, IERC20, Ownable, Math (mulDiv)",
+        "Ronin staking integration via IRoninValidator interface (claimRewards/delegate/redelegate/bulkUndelegate, reward/stake view methods)",
+        "WRON token integration via IWRON interface (deposit/withdraw/transfer)",
+        "ILiquidProxy interface (vault-to-proxy calls)"
+      ],
+      "upgrade_patterns": "None. All contracts are deployed as regular implementations with constructors; no proxy/diamond patterns present.",
+      "access_control_structure": "Centralized control via Ownable owner plus a custom operator allowlist. Owner can configure operators, fees, feeRecipient, deploy new staking proxies, and pause/unpause. Operator-only functions are intended to manage staking/reward harvesting and epoch finalization; however onlyOperator modifier appears logically inverted (see entry_points notes). Escrow and LiquidProxy enforce strict caller checks (only vault)."
+    },
+    "entry_points": [
+      {
+        "contract": "LiquidRon.sol",
+        "function": "constructor(address _roninStaking, address _wron, uint256 _operatorFee, address _feeRecipient, string _name, string _symbol)",
+        "visibility": "public",
+        "parameters": [
+          "_roninStaking: address",
+          "_wron: address",
+          "_operatorFee: uint256",
+          "_feeRecipient: address",
+          "_name: string",
+          "_symbol: string"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "roninStaking",
+          "escrow (deploys new Escrow)",
+          "operatorFee",
+          "feeRecipient",
+          "ERC20 name/symbol",
+          "ERC4626 asset reference",
+          "Ownable owner",
+          "WRON approval to self: IERC20(_wron).approve(address(this), max)"
+        ],
+        "external_calls": [
+          "new Escrow(_wron)",
+          "IERC20(_wron).approve(address(this), type(uint256).max)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "updateFeeRecipient(address _feeRecipient)",
+        "visibility": "external",
+        "parameters": [
+          "_feeRecipient: address"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "feeRecipient"
+        ],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "updateOperator(address _operator, bool _value)",
+        "visibility": "external",
+        "parameters": [
+          "_operator: address",
+          "_value: bool"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "operator[_operator]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "setOperatorFee(uint256 _fee)",
+        "visibility": "external",
+        "parameters": [
+          "_fee: uint256"
+        ],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "operatorFee"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "deployStakingProxy()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "stakingProxies[stakingProxyCount]",
+          "stakingProxyCount"
+        ],
+        "external_calls": [
+          "new LiquidProxy(roninStaking, asset(), address(this))"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "fetchOperatorFee()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "operatorFeeAmount (set to 0)"
+        ],
+        "external_calls": [
+          "IWRON(wron).withdraw(amount) via _withdrawRONTo",
+          "native call to feeRecipient via _withdrawRONTo"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "harvest(uint256 _proxyIndex, address[] _consensusAddrs)",
+        "visibility": "external",
+        "parameters": [
+          "_proxyIndex: uint256",
+          "_consensusAddrs: address[]"
+        ],
+        "modifiers": [
+          "onlyOperator",
+          "whenNotPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "operatorFeeAmount (+= harvestedAmount * operatorFee / BIPS)"
+        ],
+        "external_calls": [
+          "ILiquidProxy(stakingProxies[_proxyIndex]).harvest(_consensusAddrs)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "harvestAndDelegateRewards(uint256 _proxyIndex, address[] _consensusAddrs, address _consensusAddrDst)",
+        "visibility": "external",
+        "parameters": [
+          "_proxyIndex: uint256",
+          "_consensusAddrs: address[]",
+          "_consensusAddrDst: address"
+        ],
+        "modifiers": [
+          "onlyOperator",
+          "whenNotPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "ValidatorTracker (may add _consensusAddrDst to validators list)",
+          "operatorFeeAmount (+= harvestedAmount * operatorFee / BIPS)"
+        ],
+        "external_calls": [
+          "ILiquidProxy(stakingProxies[_proxyIndex]).harvestAndDelegateRewards(_consensusAddrs, _consensusAddrDst)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "delegateAmount(uint256 _proxyIndex, uint256[] _amounts, address[] _consensusAddrs)",
+        "visibility": "external",
+        "parameters": [
+          "_proxyIndex: uint256",
+          "_amounts: uint256[]",
+          "_consensusAddrs: address[]"
+        ],
+        "modifiers": [
+          "onlyOperator",
+          "whenNotPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "ValidatorTracker (may add consensus addrs to validators list)"
+        ],
+        "external_calls": [
+          "IWRON(wron).withdraw(total) + native call? (via _withdrawRONTo to proxy) [NOTE: _withdrawRONTo unwraps WRON then sends native]",
+          "ILiquidProxy(stakingProxy).delegateAmount(_amounts, _consensusAddrs)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "redelegateAmount(uint256 _proxyIndex, uint256[] _amounts, address[] _consensusAddrsSrc, address[] _consensusAddrsDst)",
+        "visibility": "external",
+        "parameters": [
+          "_proxyIndex: uint256",
+          "_amounts: uint256[]",
+          "_consensusAddrsSrc: address[]",
+          "_consensusAddrsDst: address[]"
+        ],
+        "modifiers": [
+          "onlyOperator",
+          "whenNotPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "ValidatorTracker (may add destination consensus addrs to validators list)"
+        ],
+        "external_calls": [
+          "ILiquidProxy(stakingProxies[_proxyIndex]).redelegateAmount(_amounts, _consensusAddrsSrc, _consensusAddrsDst)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "undelegateAmount(uint256 _proxyIndex, uint256[] _amounts, address[] _consensusAddrs)",
+        "visibility": "external",
+        "parameters": [
+          "_proxyIndex: uint256",
+          "_amounts: uint256[]",
+          "_consensusAddrs: address[]"
+        ],
+        "modifiers": [
+          "onlyOperator",
+          "whenNotPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [],
+        "external_calls": [
+          "ILiquidProxy(stakingProxies[_proxyIndex]).undelegateAmount(_amounts, _consensusAddrs)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "pruneValidatorList()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ValidatorTracker: validators[], validatorCount, validatorStakeActive, validatorIndex (removals possible)"
+        ],
+        "external_calls": [
+          "IRoninValidator(roninStaking).getReward(vali, proxy)",
+          "IRoninValidator(roninStaking).getManyStakingAmounts(valis, proxies)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "finaliseRonRewardsForEpoch()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "onlyOperator",
+          "whenNotPaused"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "statusPerEpoch[epoch] (set FINALISED)",
+          "withdrawalEpoch (increment)",
+          "lockedPricePerSharePerEpoch[epoch] (set shareSupply/assetSupply)",
+          "escrow WRON balance increases via ERC4626 withdraw to escrow",
+          "vault share supply decreases via _withdraw burn (shares locked in vault are burned from vault address)"
+        ],
+        "external_calls": [
+          "ERC4626.previewRedeem(lockedShares)",
+          "SafeERC20.safeTransfer(IERC20(asset()), escrow, assets) via internal _withdraw override"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "getTotalStaked()",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "IRoninValidator(roninStaking).getManyStakingAmounts(...) (via _getTotalStakedInProxy)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "getTotalRewards()",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "IRoninValidator(roninStaking).getRewards(proxy, validators) (via _getTotalRewardsInProxy)"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "getAssetsInVault()",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "IERC20(asset()).balanceOf(address(this))"
+        ],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "totalAssets()",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [
+          "ERC4626.totalAssets() (super)",
+          "getTotalStaked()",
+          "getTotalRewards()"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "withdraw(uint256 _assets, address _receiver, address _owner)",
+        "visibility": "public",
+        "parameters": [
+          "_assets: uint256",
+          "_receiver: address",
+          "_owner: address"
+        ],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC4626/ER20 allowance (if caller != owner)",
+          "LRON share balance/supply (burn)",
+          "vault WRON balance decreases (transfer to self then unwrap)",
+          "native RON transferred to _receiver"
+        ],
+        "external_calls": [
+          "ERC4626.withdraw(_assets, address(this), _owner)",
+          "IWRON(wron).withdraw(_assets) via _withdrawRONTo",
+          "native call to _receiver via _withdrawRONTo"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "redeem(uint256 _shares, address _receiver, address _owner)",
+        "visibility": "public",
+        "parameters": [
+          "_shares: uint256",
+          "_receiver: address",
+          "_owner: address"
+        ],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC4626/ER20 allowance (if caller != owner)",
+          "LRON share balance/supply (burn)",
+          "vault WRON balance decreases (transfer to self then unwrap)",
+          "native RON transferred to _receiver"
+        ],
+        "external_calls": [
+          "ERC4626.redeem(_shares, address(this), _owner)",
+          "IWRON(wron).withdraw(assets) via _withdrawRONTo",
+          "native call to _receiver via _withdrawRONTo"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "deposit(uint256 _assets, address _receiver)",
+        "visibility": "public",
+        "parameters": [
+          "_assets: uint256",
+          "_receiver: address"
+        ],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "LRON share balance/supply (mint)",
+          "vault WRON balance increases (transferFrom caller)"
+        ],
+        "external_calls": [
+          "ERC4626.deposit(_assets, _receiver)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "mint(uint256 _assets, address _receiver)",
+        "visibility": "public",
+        "parameters": [
+          "_assets: uint256",
+          "_receiver: address"
+        ],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "LRON share balance/supply (mint)",
+          "vault WRON balance increases (transferFrom caller)"
+        ],
+        "external_calls": [
+          "ERC4626.mint(_assets, _receiver)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "deposit()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "Escrow WRON balance increases (wrap and transfer)",
+          "LRON share balance/supply changes via Escrow->Vault deposit path"
+        ],
+        "external_calls": [
+          "IWRON(wron).deposit{value: msg.value}() via _depositRONTo",
+          "IWRON(wron).transfer(escrow, msg.value) via _depositRONTo",
+          "Escrow(escrow).deposit(msg.value, msg.sender)",
+          "IVault(_vault).deposit(_amount, _receiver) (called by Escrow back into LiquidRon.deposit(uint256,address))"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "requestWithdrawal(uint256 _shares)",
+        "visibility": "external",
+        "parameters": [
+          "_shares: uint256"
+        ],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "withdrawalRequestsPerEpoch[currentEpoch][msg.sender].shares (+= _shares)",
+          "lockedSharesPerEpoch[currentEpoch] (+= _shares)",
+          "LRON balances: transfer from user to vault"
+        ],
+        "external_calls": [
+          "native 0-value call to msg.sender via _checkUserCanReceiveRon"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "redeem(uint256 _epoch)",
+        "visibility": "external",
+        "parameters": [
+          "_epoch: uint256"
+        ],
+        "modifiers": [
+          "whenNotPaused"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "withdrawalRequestsPerEpoch[_epoch][msg.sender].fulfilled (set true)",
+          "vault WRON balance increases transiently (transferFrom escrow to vault)",
+          "native RON transferred to msg.sender"
+        ],
+        "external_calls": [
+          "IERC20(asset()).transferFrom(escrow, address(this), assets)",
+          "IWRON(wron).withdraw(assets) via _withdrawRONTo",
+          "native call to msg.sender via _withdrawRONTo"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidRon.sol",
+        "function": "receive()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "If sender != WRON: Escrow WRON balance increases; LRON minted via escrow->vault deposit path"
+        ],
+        "external_calls": [
+          "IWRON(wron).deposit{value: msg.value}() via _depositRONTo (if msg.sender != asset())",
+          "IWRON(wron).transfer(escrow, msg.value) via _depositRONTo (if msg.sender != asset())",
+          "Escrow(escrow).deposit(msg.value, msg.sender) (if msg.sender != asset())"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "constructor(address _roninStaking, address _wron, address _vault)",
+        "visibility": "public",
+        "parameters": [
+          "_roninStaking: address",
+          "_wron: address",
+          "_vault: address"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "vault",
+          "roninStaking",
+          "wron (in RonHelper)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "harvest(address[] _consensusAddrs)",
+        "visibility": "external",
+        "parameters": [
+          "_consensusAddrs: address[]"
+        ],
+        "modifiers": [
+          "onlyVault"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "proxy native RON balance decreases (wrapped and transferred to vault)",
+          "vault WRON balance increases"
+        ],
+        "external_calls": [
+          "IRoninValidator(roninStaking).claimRewards(_consensusAddrs) [NOTE: called in a loop but passes full array each time per code]",
+          "IWRON(wron).deposit{value: claimedAmount}() via _depositRONTo",
+          "IWRON(wron).transfer(vault, claimedAmount) via _depositRONTo"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "harvestAndDelegateRewards(address[] _consensusAddrs, address _consensusAddrDst)",
+        "visibility": "external",
+        "parameters": [
+          "_consensusAddrs: address[]",
+          "_consensusAddrDst: address"
+        ],
+        "modifiers": [
+          "onlyVault"
+        ],
+        "authentication_required": true,
+        "state_changes": [],
+        "external_calls": [
+          "IRoninValidator(roninStaking).delegateRewards(_consensusAddrs, _consensusAddrDst)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "delegateAmount(uint256[] _amounts, address[] _consensusAddrs)",
+        "visibility": "external",
+        "parameters": [
+          "_amounts: uint256[]",
+          "_consensusAddrs: address[]"
+        ],
+        "modifiers": [
+          "onlyVault"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "proxy native RON balance decreases (sent as msg.value to staking)"
+        ],
+        "external_calls": [
+          "IRoninValidator(roninStaking).delegate{value: _amounts[i]}(_consensusAddrs[i])"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "redelegateAmount(uint256[] _amounts, address[] _consensusAddrsSrc, address[] _consensusAddrsDst)",
+        "visibility": "external",
+        "parameters": [
+          "_amounts: uint256[]",
+          "_consensusAddrsSrc: address[]",
+          "_consensusAddrsDst: address[]"
+        ],
+        "modifiers": [
+          "onlyVault"
+        ],
+        "authentication_required": true,
+        "state_changes": [],
+        "external_calls": [
+          "IRoninValidator(roninStaking).redelegate(_consensusAddrsSrc[i], _consensusAddrsDst[i], _amounts[i])"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "undelegateAmount(uint256[] _amounts, address[] _consensusAddrs)",
+        "visibility": "external",
+        "parameters": [
+          "_amounts: uint256[]",
+          "_consensusAddrs: address[]"
+        ],
+        "modifiers": [
+          "onlyVault"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "vault WRON balance increases (wrap+transfer) in amount totalUndelegated"
+        ],
+        "external_calls": [
+          "IRoninValidator(roninStaking).bulkUndelegate(_consensusAddrs, _amounts)",
+          "IWRON(wron).deposit{value: totalUndelegated}() via _depositRONTo",
+          "IWRON(wron).transfer(vault, totalUndelegated) via _depositRONTo"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidProxy.sol",
+        "function": "receive()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "proxy native RON balance increases"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "ValidatorTracker.sol",
+        "function": "getValidators()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "Pausable.sol",
+        "function": "pause()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "paused (set true)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Pausable.sol",
+        "function": "unpause()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "onlyOwner"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "paused (set false)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Escrow.sol",
+        "function": "constructor(address _token)",
+        "visibility": "public",
+        "parameters": [
+          "_token: address"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "_vault (set to msg.sender)",
+          "IERC20(_token) allowance: approve(_vault, max)"
+        ],
+        "external_calls": [
+          "IERC20(_token).approve(msg.sender, type(uint256).max)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "Escrow.sol",
+        "function": "deposit(uint256 _amount, address _receiver)",
+        "visibility": "external",
+        "parameters": [
+          "_amount: uint256",
+          "_receiver: address"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "vault WRON balance increases via transferFrom (performed inside LiquidRon.deposit)",
+          "LRON minted to _receiver (performed inside LiquidRon.deposit)"
+        ],
+        "external_calls": [
+          "IVault(_vault).deposit(_amount, _receiver)"
+        ],
+        "risk_assessment": "high"
+      }
+    ],
+    "inventories": {
+      "upgradeability_surface": [
+        {
+          "contract": "LiquidRon.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Constructor-based deployment; no proxy/initializer usage detected."
+        },
+        {
+          "contract": "LiquidProxy.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Standalone per-proxy deployment via constructor; onlyVault gating."
+        },
+        {
+          "contract": "Escrow.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Standalone escrow deployed from LiquidRon constructor; immutable vault binding."
+        },
+        {
+          "contract": "Pausable.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Abstract helper; exposes pause/unpause externally (owner-only) when inherited."
+        },
+        {
+          "contract": "ValidatorTracker.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Abstract storage helper; state lives in inheriting contract."
+        },
+        {
+          "contract": "RonHelper.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Abstract helper with wron address stored in inheriting contract; constructor sets WRON address."
+        }
+      ]
+    }
+  }
+}

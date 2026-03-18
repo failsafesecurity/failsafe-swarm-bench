@@ -1,0 +1,295 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T00:03:45.695Z",
+    "duration_ms": 195995
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "EntryPoint to Smart Wallet",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "validateUserOp",
+          "execute",
+          "executeBatch",
+          "executeWithoutChainIdValidation"
+        ],
+        "failure_modes": [
+          "Malicious bundler manipulating gas limits",
+          "Replay of UserOperations across chains"
+        ],
+        "attack_vectors": [
+          "Cross-chain replay attacks via executeWithoutChainIdValidation",
+          "Signature malleability bypass"
+        ]
+      },
+      {
+        "boundary": "EntryPoint to Paymaster (MagicSpend)",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "validatePaymasterUserOp",
+          "postOp"
+        ],
+        "failure_modes": [
+          "postOp reverting due to out-of-gas",
+          "Insufficient contract balance to cover requested withdrawAmount"
+        ],
+        "attack_vectors": [
+          "Bundler gas griefing causing postOp to revert and user to lose gas refund",
+          "Replay of withdraw requests (mitigated by nonce tracking)"
+        ]
+      },
+      {
+        "boundary": "Owner to Smart Wallet",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "addOwnerAddress",
+          "addOwnerPublicKey",
+          "removeOwnerAtIndex",
+          "upgradeToAndCall"
+        ],
+        "failure_modes": [
+          "Owner private key compromise",
+          "Accidental removal of all owners"
+        ],
+        "attack_vectors": [
+          "Phishing attacks tricking owners into signing malicious UserOps",
+          "Cross-chain replay of owner management or upgrade functions"
+        ]
+      },
+      {
+        "boundary": "Admin to MagicSpend",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "ownerWithdraw",
+          "entryPointDeposit",
+          "entryPointWithdraw",
+          "entryPointAddStake",
+          "entryPointUnlockStake",
+          "entryPointWithdrawStake"
+        ],
+        "failure_modes": [
+          "Admin withdrawing funds allocated to users' withdrawableETH",
+          "Admin key compromise"
+        ],
+        "attack_vectors": [
+          "Denial of Service for users attempting to withdraw excess gas if admin drains contract balance"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Uninitialized Wallet",
+        "to_state": "Initialized Wallet",
+        "trigger": "initialize(bytes[])",
+        "conditions": [
+          "nextOwnerIndex == 0"
+        ],
+        "invariants": [
+          "Wallet cannot be initialized more than once",
+          "nextOwnerIndex strictly increases"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Unused MagicSpend Nonce",
+        "to_state": "Used MagicSpend Nonce",
+        "trigger": "_validateRequest(address,WithdrawRequest)",
+        "conditions": [
+          "_nonceUsed[withdrawRequest.nonce][account] == false"
+        ],
+        "invariants": [
+          "A withdraw request nonce can only be used once per account"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Pending Gas Refund",
+        "to_state": "Refunded Gas",
+        "trigger": "postOp(PostOpMode,bytes,uint256)",
+        "conditions": [
+          "mode != PostOpMode.postOpReverted"
+        ],
+        "invariants": [
+          "User receives withdrawableETH plus unspent gas refund",
+          "_withdrawableETH[account] is reset to 0"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-121",
+        "pattern": "Signature Replay / Cross-chain Replay of Implementation Upgrade",
+        "locations": [
+          "CoinbaseSmartWallet.sol: canSkipChainIdValidation",
+          "CoinbaseSmartWallet.sol: executeWithoutChainIdValidation"
+        ],
+        "severity": "critical",
+        "evidence": "The function `canSkipChainIdValidation` returns true for `UUPSUpgradeable.upgradeToAndCall.selector`. This allows a UserOperation containing an implementation upgrade to be executed via `executeWithoutChainIdValidation`, making it replayable across all chains.",
+        "exploitation_method": "An attacker observes a legitimate wallet upgrade transaction on Chain A. They deploy a malicious implementation contract at the exact same address on Chain B (e.g., using CREATE2 or an EOA). They then replay the user's upgrade UserOperation on Chain B, upgrading the wallet to the malicious implementation and gaining full control to steal all assets.",
+        "affected_assets": [
+          "All assets held by the CoinbaseSmartWallet on any chain where the replay occurs"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "DoS with Failed Call / Loss of Gas Refund on postOp Revert",
+        "locations": [
+          "MagicSpend.sol: postOp"
+        ],
+        "severity": "medium",
+        "evidence": "In `postOp`, the unspent gas refund `(maxGasCost - actualGasCost)` is added to `withdrawable` in memory, and `_withdrawableETH[account]` is deleted. If the subsequent `forceSafeTransferETH` reverts (e.g., due to an out-of-gas error), the entire `postOp` reverts.",
+        "exploitation_method": "A malicious bundler can restrict the gas limit provided to `postOp` such that it has enough gas to start but not enough to complete the `forceSafeTransferETH` fallback mechanism. This causes `postOp` to revert. The EntryPoint catches the revert, but the paymaster's state changes are undone. The user's gas refund is never added to their `_withdrawableETH` balance, resulting in a permanent loss of the refund which remains stuck in the paymaster.",
+        "affected_assets": [
+          "User's unspent gas refund (ETH)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "CoinbaseSmartWallet.sol",
+          "function": "execute(address,uint256,bytes)",
+          "guards": [
+            "onlyEntryPointOrOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows wallet owners or EntryPoint to execute arbitrary calls"
+        },
+        {
+          "contract": "CoinbaseSmartWallet.sol",
+          "function": "executeBatch(Call[])",
+          "guards": [
+            "onlyEntryPointOrOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows wallet owners or EntryPoint to execute batch calls"
+        },
+        {
+          "contract": "MultiOwnable.sol",
+          "function": "addOwnerAddress(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds a new Ethereum address owner"
+        },
+        {
+          "contract": "MultiOwnable.sol",
+          "function": "addOwnerPublicKey(bytes32,bytes32)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds a new Passkey/WebAuthn owner"
+        },
+        {
+          "contract": "MultiOwnable.sol",
+          "function": "removeOwnerAtIndex(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Removes an existing owner"
+        },
+        {
+          "contract": "CoinbaseSmartWallet.sol",
+          "function": "_authorizeUpgrade(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Authorizes UUPS implementation upgrades"
+        },
+        {
+          "contract": "MagicSpend.sol",
+          "function": "ownerWithdraw(address,address,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows MagicSpend admin to withdraw any asset"
+        },
+        {
+          "contract": "MagicSpend.sol",
+          "function": "entryPointDeposit(uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Deposits ETH to EntryPoint"
+        },
+        {
+          "contract": "MagicSpend.sol",
+          "function": "entryPointWithdraw(address,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Withdraws ETH from EntryPoint"
+        },
+        {
+          "contract": "MagicSpend.sol",
+          "function": "entryPointAddStake(uint256,uint32)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds stake to EntryPoint"
+        },
+        {
+          "contract": "MagicSpend.sol",
+          "function": "entryPointUnlockStake()",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Unlocks stake in EntryPoint"
+        },
+        {
+          "contract": "MagicSpend.sol",
+          "function": "entryPointWithdrawStake(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Withdraws stake from EntryPoint"
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

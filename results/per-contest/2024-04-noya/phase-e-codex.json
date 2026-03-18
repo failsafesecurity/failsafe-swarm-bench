@@ -1,0 +1,132 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "ERC4626 Donation Inflation Lets Early Shareholder Steal Later Deposits",
+      "severity": "high",
+      "summary": "The vault mints shares from queued deposits in calculateDepositShares using previewDeposit(data.amount). totalAssets is TVL(), which includes baseToken.balanceOf(this) minus only queued deposit accounting. Direct base-token transfers to the vault are therefore treated as assets backing existing shares even though no new shares are minted. After an attacker becomes an early shareholder, they can donate base tokens to inflate share price and force later depositors to receive almost no shares. The ",
+      "description": [
+        {
+          "file": "contracts/accountingManager/AccountingManager.sol",
+          "line_start": 200,
+          "line_end": 219,
+          "desc": "Deposit share pricing uses previewDeposit(totalAssets) where totalAssets includes arbitrary baseToken donations, and deposits have no min-shares protection. An attacker can inflate price via donation so later deposits mint near-zero shares."
+        }
+      ],
+      "impact": "Direct theft from later depositors through severe share dilution and extraction by earlier shareholders.",
+      "proof_of_concept": "1. Attacker deposits a tiny amount when supply is low and gets initial shares. 2. Attacker transfers a large amount of base token directly to AccountingManager (not via deposit queue). 3. Victim deposits through deposit(); their amount is queued. 4. Keeper calls calculateDepositShares; previewDeposit uses inflated TVL from attacker donation, so victim receives near-zero shares. 5. Attacker withdraws their shares and captures almost all assets, including victim deposit value.",
+      "remediation": "Exclude unsolicited base-token donations from share pricing by using internally accounted assets only; add user-specified min-shares checks for queued deposits; optionally seed immutable initial shares/assets to neutralize first-depositor inflation dynamics."
+    },
+    {
+      "title": "SiloConnector TVL Treats Share Tokens as Underlying Amounts, Misstating Assets and Debt",
+      "severity": "high",
+      "summary": "Silo v2 uses share tokens for collateral and debt positions. In _getPositionTVL, the connector reads share balances and multiplies by spot prices as if balances were underlying token amounts. This breaks accounting as share-to-asset exchange rates drift with interest and utilization. The same repository's SolvencyV2 library explicitly converts share balances to real amounts using totalDeposits/totalBorrowAmount and totalSupply. Because connector TVL skips this conversion, vault NAV can materiall",
+      "description": [
+        {
+          "file": "contracts/connectors/SiloConnector.sol",
+          "line_start": 109,
+          "line_end": 127,
+          "desc": "_getPositionTVL values collateralToken/collateralOnlyToken/debtToken balances directly as asset amounts, but these are Silo share tokens that must be converted to underlying amounts using pool totals and interest accrual."
+        }
+      ],
+      "impact": "Protocol insolvency risk and unfair value transfer between users due persistent NAV mispricing in Silo-backed positions.",
+      "proof_of_concept": "1. Vault opens a leveraged Silo position (collateral + debt). 2. Over time, Silo debt grows via interest while debt-share balances remain unchanged. 3. _getPositionTVL continues subtracting raw debt-share balances instead of true debt amount, overstating NAV. 4. Users redeem shares against inflated NAV and extract excess assets. 5. Remaining users face insolvency/shortfall and can be left with undercollateralized residual positions.",
+      "remediation": "Convert Silo share balances to underlying amounts before valuation (e.g., via Silo conversion functions or SolvencyV2-style toAmount/toAmountRoundUp math with current totals and accrued interest), then compute net collateral minus debt from converted amounts."
+    },
+    {
+      "title": "SNXv3Connector Ignores Minted sUSD Debt in TVL, Overstating Vault Equity",
+      "severity": "high",
+      "summary": "The connector supports debt creation via SNXCoreProxy.mintUsd in mintOrBurnSUSD, but _getPositionTVL only reads getAccountCollateral and reports collateral value. No debt component is subtracted. This means leveraged/minted SNX positions are valued as if they were unlevered assets. In addition, minted sUSD can be tracked as a positive token balance, compounding overstatement while liability remains unaccounted. The result is systematic NAV inflation for SNX-backed strategies.",
+      "description": [
+        {
+          "file": "contracts/connectors/SNXConnector.sol",
+          "line_start": 102,
+          "line_end": 125,
+          "desc": "mintOrBurnSUSD can create debt, but _getPositionTVL only values collateral and never subtracts SNX position debt (despite debt-query APIs existing in IV3CoreProxy)."
+        }
+      ],
+      "impact": "Material overstatement of vault assets, enabling value extraction and eventual insolvency/withdrawal shortfalls when SNX debt-backed positions are used.",
+      "proof_of_concept": "1. Vault strategy opens SNX account, delegates collateral, and mints sUSD debt. 2. Connector TVL path reports collateral value but ignores outstanding debt. 3. Vault share price is inflated versus real net assets. 4. Users redeem at inflated pricing (or deposits are mispriced), transferring value out of the vault and pushing remaining users into deficit.",
+      "remediation": "Include SNX debt in _getPositionTVL (e.g., query getPosition/getPositionDebt per delegated pool and subtract liabilities from collateral value). Ensure minted USD token balances are not treated as free equity without corresponding liability netting."
+    },
+    {
+      "title": "Maverick Reward Claims Leave Newly Received Tokens Invisible to TVL",
+      "severity": "high",
+      "summary": "claimBoostedPositionRewards iterates over earned reward tokens and claims them, but does not register claimed tokens in the holding-token registry. TVLHelper only values registered holding positions, so newly claimed rewards can remain excluded from NAV until a manual registry update happens. This creates a persistent underreporting window and can permanently strand value from pricing if operators miss manual updates.",
+      "description": [
+        {
+          "file": "contracts/connectors/MaverickConnector.sol",
+          "line_start": 137,
+          "line_end": 146,
+          "desc": "claimBoostedPositionRewards claims arbitrary rewardToken assets but never calls _updateTokenInRegistry for those tokens."
+        }
+      ],
+      "impact": "Share mispricing and value leakage from existing holders; can lead to economically significant dilution/theft during reward-claim windows.",
+      "proof_of_concept": "1. Strategy accrues significant Maverick rewards in non-pool tokens. 2. Keeper claims rewards via claimBoostedPositionRewards. 3. Claimed tokens remain untracked in registry, so vault TVL is understated. 4. An attacker deposits while NAV is understated and receives too many shares. 5. Once rewards are eventually realized in NAV (manual update/swap), attacker redeems disproportionate value, diluting existing users.",
+      "remediation": "After each successful reward claim, call _updateTokenInRegistry for every claimed reward token (or for all tokens in earnedInfo regardless of nonzero amount) so TVL immediately reflects newly held assets."
+    },
+    {
+      "title": "MorphoBlue Collateral Withdrawals Skip minimumHealthFactor Enforcement",
+      "severity": "high",
+      "summary": "The connector exposes a configurable minimumHealthFactor safety margin, and borrow() enforces it. However, withdraw() can remove collateral without checking the resulting health factor against this minimum. Morpho protocol-level checks only enforce liquidation threshold constraints, not this stricter vault policy. As a result, normal manager rebalancing can unintentionally move positions into a fragile state where minor price moves trigger liquidation.",
+      "description": [
+        {
+          "file": "contracts/connectors/MorphoBlueConnector.sol",
+          "line_start": 58,
+          "line_end": 73,
+          "desc": "borrow() enforces minimumHealthFactor, but withdraw() (including withdrawCollateral path) performs no post-withdraw health-factor check."
+        }
+      ],
+      "impact": "Elevated liquidation risk and potential collateral loss due to missing enforcement of vault-defined safety constraints.",
+      "proof_of_concept": "1. Vault has an active Morpho borrow position. 2. Keeper withdraws collateral via withdraw(..., sOrC=false) during routine rebalancing. 3. Position health factor drops below connector.minimumHealthFactor but remains above protocol hard minimum, so transaction succeeds. 4. Market moves slightly; position crosses liquidation threshold. 5. External liquidators seize collateral, causing realized vault losses.",
+      "remediation": "After any collateral-reducing operation (withdrawCollateral path), recompute health factor and revert if it is below minimumHealthFactor, matching borrow() behavior."
+    },
+    {
+      "title": "SNX Reward Claims Register Collateral Token Instead of Actual Reward Asset",
+      "severity": "high",
+      "summary": "SNXV3Connector.claimRewards invokes SNXCoreProxy.claimRewards(...) and then calls _updateTokenInRegistry(collateralType). This assumes rewards are paid in the collateral token, which is not generally true for SNX reward distributors. When reward token differs, newly claimed assets stay unregistered and excluded from TVL, causing systematic NAV underreporting until manually corrected.",
+      "description": [
+        {
+          "file": "contracts/connectors/SNXConnector.sol",
+          "line_start": 94,
+          "line_end": 100,
+          "desc": "claimRewards updates registry for collateralType, but claimed rewards come from distributor and can be a different token."
+        }
+      ],
+      "impact": "Economic dilution/theft via share mispricing and hidden assets after SNX reward claims.",
+      "proof_of_concept": "1. SNX position accrues rewards in a token different from collateralType. 2. Keeper calls claimRewards. 3. Connector registers collateralType (wrong asset), while actual reward token remains untracked. 4. TVL is understated and shares are mispriced. 5. Attackers deposit during understatement and later redeem after value is realized, diluting existing holders.",
+      "remediation": "Resolve and register the actual reward token emitted by the specified distributor (or maintain a distributor->rewardToken mapping) and call _updateTokenInRegistry on that token after each claim."
+    },
+    {
+      "title": "Prisma closeTrove Leaves Returned Collateral Invisible to TVL",
+      "severity": "high",
+      "summary": "When closeTrove is called, collateral is returned to the connector and debt is repaid/burned at protocol level. The function only removes the holding position from registry, but does not call _updateTokenInRegistry for the collateral token (or debt token). If collateral token was previously removed from token registry while staked in trove, the returned balance becomes untracked and excluded from TVL, creating NAV understatement and mispriced shares.",
+      "description": [
+        {
+          "file": "contracts/connectors/PrismaConnector.sol",
+          "line_start": 129,
+          "line_end": 136,
+          "desc": "closeTrove removes the Prisma position but never refreshes token registry for collateral/debt tokens after assets move back to connector balances."
+        }
+      ],
+      "impact": "Hidden assets and share mispricing leading to dilution/theft from existing holders.",
+      "proof_of_concept": "1. Vault opens a Prisma trove; collateral token registry entry is removed as balance is deposited. 2. Keeper closes trove; collateral returns to connector wallet. 3. Because closeTrove does not update token registry, returned collateral remains untracked in TVL. 4. Attacker deposits while NAV is understated and receives excess shares. 5. After token registry is eventually corrected or collateral is swapped, attacker redeems disproportionate value.",
+      "remediation": "After closeTrove, explicitly call _updateTokenInRegistry for both collateral token and trove debt token so post-close balances are immediately reflected in TVL."
+    },
+    {
+      "title": "Curve Gauge Harvesting Tracks Only CRV and Omits Additional Reward Tokens",
+      "severity": "high",
+      "summary": "Curve gauges can distribute multiple reward tokens. harvestRewards() claims rewards from each gauge but only calls _updateTokenInRegistry(CRV). Any additional reward tokens claimed remain invisible to TVL. This creates NAV understatement windows and can permanently hide value from share pricing if operators do not manually register those tokens.",
+      "description": [
+        {
+          "file": "contracts/connectors/CurveConnector.sol",
+          "line_start": 221,
+          "line_end": 227,
+          "desc": "harvestRewards claims all gauge rewards but only updates CRV in registry, leaving non-CRV reward assets untracked."
+        }
+      ],
+      "impact": "Economic dilution/theft through underreported TVL and mispriced share minting/redemption.",
+      "proof_of_concept": "1. Strategy accrues non-CRV gauge rewards. 2. Keeper calls harvestRewards; extra tokens are transferred to connector. 3. Connector registers only CRV, so additional rewards are omitted from TVL. 4. Attacker deposits during understatement and receives excess shares. 5. When hidden rewards are later realized, attacker redeems disproportionate value.",
+      "remediation": "After claiming from each gauge, detect all reward tokens (or track expected reward tokens per gauge) and call _updateTokenInRegistry for every token with positive received balance."
+    }
+  ]
+}

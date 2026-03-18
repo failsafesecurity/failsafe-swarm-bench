@@ -1,0 +1,116 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Isolate liquidation transfers auctioned NFT to arbitrary caller instead of highest bidder",
+      "severity": "high",
+      "summary": "In isolate auctions, bidders lock funds in `totalBidAmout` escrow. During finalization, the contract uses bid escrow to repay debt and then transfers NFT collateral to `params.msgSender` (the liquidation caller), not to `loanData.lastBidder` (the auction winner). Because no authorization ties liquidation execution to the highest bidder, any external caller can finalize an ended auction and receive the NFT while the winner's escrow is spent.",
+      "description": [
+        {
+          "file": "src/libraries/logic/IsolateLogic.sol",
+          "line_start": 421,
+          "line_end": 478,
+          "desc": "`executeIsolateLiquidate` never checks that the caller is `loanData.lastBidder` and always transfers the NFT to `params.msgSender` after consuming the bidder's escrowed funds to settle debt."
+        }
+      ],
+      "impact": "Direct theft of auctioned NFTs and bidder value. Winning bidders can lose their entire escrow while attackers obtain collateral for free (or by paying only any debt shortfall).",
+      "proof_of_concept": "1. A borrower NFT enters isolate auction and an honest bidder becomes `lastBidder` with a valid bid in escrow. 2. After auction duration ends, an attacker calls `isolateLiquidate` before the winner. 3. The protocol uses escrowed bid funds to repay debt (and possibly pays borrower surplus). 4. The NFT is transferred to the attacker because recipient is `params.msgSender`. 5. The highest bidder loses funds and receives no collateral.",
+      "remediation": "Bind liquidation settlement to the recorded winner: require `params.msgSender == loanData.lastBidder` or transfer NFT to `loanData.lastBidder` regardless of caller. Preserve `lastBidder` in memory before deleting loan state."
+    },
+    {
+      "title": "Bot liquidation path in yield staking uses the wrong yield account and reverts",
+      "severity": "high",
+      "summary": "Forced liquidation for unhealthy yield positions is intended to be executed by `botAdmin` (`vars.nftOwner == msg.sender || botAdmin == msg.sender`). But `_unstake`/`_repay` load `yieldAccounts[msg.sender]`. When called by bot admin, this points to the bot's account (or zero), not the NFT owner's yield account where assets/shares actually live. Subsequent accounting (`accountYieldShares[...] -= sd.yieldShare`, withdrawal request/claim, in-withdraw tracking) is applied to the wrong account and rev",
+      "description": [
+        {
+          "file": "src/yield/YieldStakingBase.sol",
+          "line_start": 312,
+          "line_end": 347,
+          "desc": "`_unstake` and `_repay` resolve `yieldAccounts[msg.sender]` instead of the staked position's account (`sd.yieldAccount`/owner account), so bot-admin forced flows operate on the wrong account and underflow/revert."
+        }
+      ],
+      "impact": "Unhealthy leveraged yield positions can become unliquidatable, allowing debt accumulation and eventual protocol insolvency.",
+      "proof_of_concept": "1. Attacker opens a yield-staked position and lets it become unhealthy. 2. Protocol bot calls `unstake` to force liquidation. 3. Contract uses `yieldAccounts[botAdmin]` instead of the position's yield account. 4. Unstake/repay flow reverts (missing account or share underflow/wrong-account withdrawal). 5. Position remains unhealthy and cannot be force-closed. 6. Debt continues to grow into bad debt.",
+      "remediation": "Use the position-bound account (`sd.yieldAccount`, or `yieldAccounts[vars.nftOwner]`) for all unstake/repay accounting and protocol withdrawal calls, regardless of caller. Do not key liquidation accounting off `msg.sender`."
+    },
+    {
+      "title": "Borrowers can block forced yield liquidation by revoking ERC20 allowance for repay deficit",
+      "severity": "high",
+      "summary": "In forced repay, any shortfall (`extraAmount`) is collected from the borrower's wallet (`underlyingAsset.safeTransferFrom(vars.nftOwner, address(this), vars.extraAmount)`). For unhealthy users, this creates a hard dependency on borrower cooperation even when `botAdmin` is executing liquidation. A borrower can revoke allowance or hold insufficient balance, causing forced repay to revert and preventing protocol debt recovery.",
+      "description": [
+        {
+          "file": "src/yield/YieldStakingBase.sol",
+          "line_start": 417,
+          "line_end": 419,
+          "desc": "When claimed yield is below debt+fine, `_repay` unconditionally pulls `extraAmount` from `vars.nftOwner` via `safeTransferFrom`; bot-admin liquidation therefore depends on borrower approval and wallet balance."
+        }
+      ],
+      "impact": "Users can make unhealthy positions non-liquidatable and leave growing bad debt in the pool, threatening solvency.",
+      "proof_of_concept": "1. User opens a leveraged yield position. 2. Position becomes unhealthy and accrued debt exceeds withdrawable yield (so `extraAmount > 0`). 3. User revokes allowance to the staking manager and/or empties ERC20 balance. 4. Bot admin calls `repay` during liquidation flow. 5. `safeTransferFrom(vars.nftOwner, ...)` reverts. 6. Position cannot be force-repaid and debt remains outstanding.",
+      "remediation": "Do not require borrower wallet pull in forced liquidation path. Cover deficits via collateral seizure/auction flow, dedicated insurance/treasury path, or explicit third-party liquidator funding with incentive; keep bot liquidation independent from borrower allowance."
+    },
+    {
+      "title": "Oracle accepts indefinitely stale Chainlink prices",
+      "severity": "high",
+      "summary": "If a Chainlink feed stops updating, the last non-zero answer remains valid forever under current checks. Lending and liquidation logic then uses stale collateral/debt prices for borrow limits and health factors. Attackers can exploit stale overvalued collateral to over-borrow and leave bad debt once markets move but oracle data is frozen.",
+      "description": [
+        {
+          "file": "src/PriceOracle.sol",
+          "line_start": 122,
+          "line_end": 126,
+          "desc": "`getAssetPriceFromChainlink` checks `updatedAt != 0` and `answeredInRound >= roundId` but never enforces a maximum staleness window against `block.timestamp`."
+        }
+      ],
+      "impact": "Protocol can become undercollateralized and insolvent due to stale-price over-borrowing and delayed liquidations.",
+      "proof_of_concept": "1. An asset feed halts with a stale high price. 2. Market price drops materially but protocol still reads stale value. 3. Attacker supplies collateral priced at stale value and borrows near max limits. 4. Real market value is insufficient to back debt. 5. When feed resumes/corrects, position is deeply underwater and protocol absorbs losses.",
+      "remediation": "Add per-asset heartbeat/staleness thresholds and require `block.timestamp - updatedAt <= maxDelay` before accepting Chainlink prices."
+    },
+    {
+      "title": "Yield borrow cap enforcement uses borrow index instead of supply index",
+      "severity": "high",
+      "summary": "Yield borrow limits are supposed to be bounded by configured percentages of total supplied liquidity. In `executeYieldBorrowERC20`, both asset-level and staker-level cap checks use a supply value normalized with `groupData.borrowIndex` rather than `assetData.supplyIndex`. Since borrow index generally increases faster than supply index, computed `totalSupply` is overstated, allowing more uncollateralized yield debt than configured by governance risk limits.",
+      "description": [
+        {
+          "file": "src/libraries/logic/YieldLogic.sol",
+          "line_start": 50,
+          "line_end": 64,
+          "desc": "Cap calculations derive `totalSupply` via `erc20GetTotalCrossSupply(assetData, groupData.borrowIndex)` instead of the asset supply index, inflating cap headroom as borrow index outgrows supply index."
+        }
+      ],
+      "impact": "Risk controls are bypassed, allowing materially higher yield exposure than configured and increasing insolvency blast radius when positions unwind poorly.",
+      "proof_of_concept": "1. Time passes and borrow index significantly exceeds supply index for a yield-enabled asset. 2. Attacker repeatedly opens leveraged yield positions through an authorized yield manager. 3. Cap checks accept additional borrowing because `totalSupply` is overstated by wrong indexing. 4. Aggregate yield debt exceeds intended cap. 5. In adverse market/strategy conditions, excess debt converts into larger-than-configured protocol losses.",
+      "remediation": "Use `assetData.supplyIndex` for supply-side cap normalization (`erc20GetTotalCrossSupply(assetData, assetData.supplyIndex)`), then re-evaluate both asset and manager cap checks with the corrected value."
+    },
+    {
+      "title": "Isolate liquidation leaves stale locker flag, which can lock later ERC721 deposits",
+      "severity": "high",
+      "summary": "Isolate borrows set `lockerAddr = address(this)` on the NFT token record. Full repay clears it, but isolate liquidation paths do not. `erc721DecreaseIsolateSupplyOnLiquidate` and `erc721TransferIsolateSupplyOnLiquidate` leave locker state untouched even after deleting the loan. If such an NFT is later deposited in cross mode, withdrawals fail permanently because `validateWithdrawERC721` enforces `tokenData.lockerAddr == address(0)` and no cross-mode path clears stale locker flags.",
+      "description": [
+        {
+          "file": "src/libraries/logic/VaultLogic.sol",
+          "line_start": 627,
+          "line_end": 642,
+          "desc": "Liquidation-specific ERC721 supply update functions clear `owner`/`supplyMode` but never clear `lockerAddr`, while withdrawals require `lockerAddr == address(0)`."
+        }
+      ],
+      "impact": "User ERC721 collateral can become non-withdrawable (permanent lock for affected cross-mode deposits), causing direct loss of access to deposited NFTs.",
+      "proof_of_concept": "1. NFT is liquidated from an isolate loan, leaving `lockerAddr` stale on token metadata. 2. A user later acquires that NFT and deposits it in cross mode as collateral. 3. User attempts to withdraw; `validateWithdrawERC721` reverts due to non-zero `lockerAddr`. 4. Cross-mode user cannot clear locker via mode switch (also requires locker==0), so collateral remains trapped.",
+      "remediation": "During isolate liquidation, explicitly clear locker state (`lockerAddr = address(0)`) for all liquidated token IDs when associated loan state is removed. Ensure all NFT state transitions that end loan usage reset lock metadata."
+    },
+    {
+      "title": "Isolate repay decreases arbitrary account debt instead of the loan owner's debt",
+      "severity": "high",
+      "summary": "Isolate repay updates two linked states: loan-level debt (`loanData.scaledAmount`) and user-level debt (`groupData.userScaledIsolateBorrow`). The loan is correctly reduced for the target NFT, but user debt is reduced for arbitrary `onBehalf`. `validateIsolateRepayBasic` only checks `onBehalf != 0`, and `validateIsolateRepayLoan` does not verify owner identity. This allows debt-accounting desynchronization between loan records and borrower balances.",
+      "description": [
+        {
+          "file": "src/libraries/logic/IsolateLogic.sol",
+          "line_start": 129,
+          "line_end": 152,
+          "desc": "`executeIsolateRepay` burns loan principal from `loanData` but decrements `userScaledIsolateBorrow` for caller-chosen `params.onBehalf`; validation never enforces that `onBehalf` matches the NFT loan owner."
+        }
+      ],
+      "impact": "Attackers can corrupt isolate debt accounting and make auctioned loans unliquidatable, enabling persistent bad debt accumulation and insolvency risk.",
+      "proof_of_concept": "1. Attacker has an isolate loan `A` that is already in auction (or near liquidation) in debt asset/group `G`. 2. Attacker (or a controlled second account) has another active isolate loan `B` in the same debt asset/group `G`. 3. Attacker calls `isolateRepay` on loan `B` with `onBehalf = attacker`. 4. Loan `B` debt is reduced/deleted, but attacker user-debt in `G` is reduced instead of `B` owner's debt, desynchronizing state. 5. When liquidation tries to settle loan `A`, `erc20DecreaseIsolateScaledBorrow(..., tokenData.owner, loanData.scaledAmount)` underflows and reverts because attacker user-debt is now below `A`'s scaled debt. 6. Auction cannot be finalized and bad debt remains.",
+      "remediation": "In isolate repay, always decrement isolate borrow for the actual loan owner (`tokenData.owner` / loan owner), or require `params.onBehalf` to equal that owner before state updates. Add invariant checks to keep `loanData.scaledAmount` and user/group isolate debt in sync."
+    }
+  ]
+}

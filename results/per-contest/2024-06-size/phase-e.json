@@ -1,0 +1,84 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "SellCreditMarket exactAmountIn=false computes swap fee on fee-adjusted base, causing systematic fee under-collection",
+      "severity": "high",
+      "summary": "In SellCreditMarket.sol, the exactAmountIn=false path for existing credit positions (non-RESERVED_ID) calculates maxCashAmountOut as `credit * (PERCENT - swapFeePercent) / (PERCENT + ratePerTenor)`, which is the present value MINUS the swap fee already deducted. When getCreditAmountIn (AccountingLibrary.sol line 249) then computes fees on this value, it applies the swap fee percentage to an already-fee-reduced base. In contrast, the exactAmountIn=true path via getCashAmountOut correctly computes",
+      "description": [
+        {
+          "file": "src/libraries/actions/SellCreditMarket.sol",
+          "line_start": 173,
+          "line_end": 175,
+          "desc": "When selling an existing credit position with exactAmountIn=false, the maxCashAmountOut parameter passed to getCreditAmountIn already embeds the swap fee deduction: `Math.mulDivDown(creditPosition.credit, PERCENT - getSwapFeePercent(tenor), PERCENT + ratePerTenor)`. Then getCreditAmountIn's no-fractionalization branch recomputes fees as `mulDivUp(cashAmountOut, swapFeePercent, PERCENT)` on this already-reduced base. The fee is applied to a fee-adjusted value rather than the raw present value, resulting in fee = PV*(P-k)*k/P^2 instead of PV*k/P."
+        }
+      ],
+      "impact": "The fee recipient (protocol) receives less fees than intended. The magnitude is swapFeePercent^2 / PERCENT * presentValue per transaction. For a 0.5% swap fee and a $100,000 loan, this is approximately $0.025 per transaction. While individually small, this represents a systematic accounting discrepancy between the two code paths. The lender benefits from the under-collected fee. No user loses funds directly - only the protocol fee recipient is affected.",
+      "proof_of_concept": "1. Alice holds a credit position worth 120e6 on a 1-year loan with ratePerTenor = 0.5e18 and swapFeeAPR = 0.01e18. 2. She calls sellCreditMarket with exactAmountIn=false, requesting cashAmountOut = maxCashAmountOut (the no-fractionalization path). 3. The raw present value is 80e6. The correct fee should be 80e6 * 0.01e18 / 1e18 = 800000 (0.8 USDC). 4. Instead, maxCashAmountOut = 120e6 * 0.99e18 / 1.5e18 = 79200000. The actual fee computed = 79200000 * 0.01e18 / 1e18 = 792000 (0.792 USDC). 5. The fee recipient receives 8000 less (0.008 USDC) per transaction. 6. Over many transactions, this fee leakage accumulates. The relative shortfall equals swapFeePercent itself (1% of the fee in this example).",
+      "remediation": "Compute maxCashAmountOut as the raw present value `mulDivDown(credit, PERCENT, PERCENT + ratePerTenor)` without embedding the fee, and let getCreditAmountIn handle fee computation internally. Alternatively, in the no-fractionalization branch of getCreditAmountIn, compute fees on the raw present value `mulDivUp(maxCredit * PERCENT / (PERCENT + ratePerTenor), swapFeePercent, PERCENT)` instead of on the passed-in cashAmountOut."
+    },
+    {
+      "title": "getCreditAmountIn fractionalization branch can produce creditAmountIn exceeding available credit due to rounding, causing unexpected reverts",
+      "severity": "high",
+      "summary": "The getCreditAmountIn function in AccountingLibrary.sol has a fractionalization branch (line 250-256) that computes creditAmountIn using mulDivUp rounding. When this function is called from SellCreditMarket for existing credit positions with exactAmountIn=false, the maxCashAmountOut and maxCredit parameters are derived from creditPosition.credit. Due to the mulDivDown/mulDivUp rounding asymmetry, for cashAmountOut values very close to (but below) maxCashAmountOutFragmentation, the computed credi",
+      "description": [
+        {
+          "file": "src/libraries/AccountingLibrary.sol",
+          "line_start": 250,
+          "line_end": 256,
+          "desc": "In getCreditAmountIn's fractionalization branch, creditAmountIn = mulDivUp((cashAmountOut + fragmentationFee), (PERCENT + ratePerTenor), (PERCENT - swapFeePercent)). There is no check that creditAmountIn <= maxCredit. When cashAmountOut approaches the boundary value (maxCashAmountOutFragmentation), the round-trip through mulDivDown (in maxCashAmountOut computation) and mulDivUp (in creditAmountIn computation) can produce creditAmountIn equal to or exceeding creditPosition.credit, which then triggers the no-fractionalization path in createCreditPosition but with fractionalization fees charged."
+        }
+      ],
+      "impact": "Two impacts: (1) For cashAmountOut values near the boundary, the seller receives up to fragmentationFee less cash than expected, while the lender buys the same amount of credit. The fragmentation fee is charged despite no actual credit fractionalization occurring. (2) For specific cashAmountOut values that trigger the 1-wei rounding overflow, the transaction reverts with an arithmetic underflow, creating a denial-of-service. The workaround is to adjust cashAmountOut slightly, but the boundary behavior is unintuitive and can lead to value loss for uninformed users.",
+      "proof_of_concept": "1. Bob holds a credit position with credit = 100e6, on a loan with ratePerTenor = 0.1e18, swapFeePercent = 0.005e18. 2. maxCashAmountOut = mulDivDown(100e6, 0.995e18, 1.1e18) = 90454545. fragmentationFee = 5e6. maxCashAmountOutFragmentation = 85454545. 3. Bob calls sellCreditMarket with exactAmountIn=false, cashAmountOut = 85454544 (just below boundary). 4. He enters the fractionalization branch. creditAmountIn = mulDivUp(90454544, 1.1e18, 0.995e18) which rounds up close to 100e6. 5. Fees include the 5 USDC fragmentation fee. Bob receives 85454544 instead of the ~90454545 he would have received in the no-fractionalization path, a difference of ~5 USDC for buying the exact same amount of credit. 6. If the rounding produces creditAmountIn = 100e6 + 1, the transaction reverts entirely.",
+      "remediation": "Add a check in getCreditAmountIn's fractionalization branch: if creditAmountIn >= maxCredit, clamp it to maxCredit and recalculate fees using the no-fractionalization formula. Alternatively, add `if (creditAmountIn > maxCredit) { revert Errors.NOT_ENOUGH_CREDIT(creditAmountIn, maxCredit); }` to give a clear error."
+    },
+    {
+      "title": "Liquidation reward unit mismatch creates near-zero liquidation incentive, risking bad debt accumulation",
+      "severity": "high",
+      "summary": "While the unit mismatch in the liquidation reward calculation has been identified (Swarm finding), the full systemic impact warrants separate analysis. The liquidator reward is capped by `mulDivUp(futureValue, liquidationRewardPercent, PERCENT)`. For a typical USDC/WETH market: futureValue = 10000e6 (10,000 USDC), liquidationRewardPercent = 5e16 (5%), yielding a cap of 500000000000 wei = 0.0000005 ETH (worth ~$0.0015). The correct cap should be 5% of the collateral value of the debt, which would",
+      "description": [
+        {
+          "file": "src/libraries/actions/Liquidate.sol",
+          "line_start": 96,
+          "line_end": 99,
+          "desc": "The liquidator reward cap is computed as `mulDivUp(debtPosition.futureValue, liquidationRewardPercent, PERCENT)`. futureValue is in borrow token decimals (e.g., 6 for USDC), while the result is compared against `assignedCollateral - debtInCollateralToken` which is in collateral token decimals (e.g., 18 for WETH). When borrow token has fewer decimals than collateral token, the reward cap is effectively scaled down by 10^(18-6) = 10^12, making it negligibly small."
+        }
+      ],
+      "impact": "Protocol-wide systemic risk of bad debt accumulation during market downturns. The liquidation incentive mechanism is functionally broken for any market where the borrow token has fewer decimals than the collateral token (the typical case of USDC/WETH). Profitable positions will go unliquidated, and only become liquidated when they are already underwater (unprofitable liquidation), at which point lenders have already suffered permanent loss of funds. The magnitude of potential loss is bounded by the total value locked in the protocol.",
+      "proof_of_concept": "1. Market conditions: ETH/USDC at $3000. Borrower has $30,000 worth of ETH collateral backing $20,000 USDC debt (CR = 150%, just above crLiquidation of 130%). 2. ETH price drops 15% to $2550. Borrower's collateral is now $25,500 against $20,000 debt (CR = 127.5%, below crLiquidation of 130%). Position is liquidatable. 3. Liquidator calculates: assignedCollateral = 11.76 ETH ($30,000 at new price), debtInCollateralToken = 7.84 ETH ($20,000). Surplus = 3.92 ETH. 4. But the reward cap = mulDivUp(20000e6, 5e16, 1e18) = 1000000000000 wei = 0.000001 ETH ≈ $0.003. 5. The liquidator would receive only 7.84 ETH + 0.000001 ETH ≈ $20,000.003 for paying $20,000 in USDC. Profit: $0.003 before gas costs. 6. No rational liquidator will execute this. The position remains unliquidated. 7. If ETH drops another 30% to $1785, the position becomes underwater: collateral = $21,000 < debt = $20,000 (accounting for the broader position). 8. Lenders suffer losses on their credit positions because the collateral no longer covers the debt.",
+      "remediation": "Replace the reward cap calculation with one that operates in collateral token units: `Math.mulDivUp(debtInCollateralToken, liquidationRewardPercent, PERCENT)`. This correctly computes 5% of the debt's collateral value as the reward cap, denominated in the same units as the surplus calculation."
+    },
+    {
+      "title": "BuyCreditMarket for existing credit positions prices trade using lender's borrow offer, enabling unfavorable pricing for lenders exiting positions",
+      "severity": "high",
+      "summary": "In BuyCreditMarket, when buying an existing credit position, the protocol uses the current credit holder's (lender's) borrowOffer to determine the rate (lines 83-88 in validate, 144 in execute). The borrowOffer reflects the rate at which the lender would accept borrowing, not the rate at which they want to sell their credit position. The lender's borrowOffer may have been set for a completely different purpose (e.g., to borrow on their own behalf) and does not necessarily reflect fair pricing fo",
+      "description": [
+        {
+          "file": "src/libraries/actions/BuyCreditMarket.sol",
+          "line_start": 79,
+          "line_end": 88,
+          "desc": "When buying an existing credit position (creditPositionId != RESERVED_ID), the borrower is set to creditPosition.lender (line 79/140), and the rate is derived from that lender's borrowOffer (line 83-88/144). The lender's borrow offer reflects their willingness to BORROW, not to SELL credit. This means the buyer gets a rate determined by how much the current lender would want to borrow, which may be significantly different from the credit position's market value."
+        }
+      ],
+      "impact": "Lenders who have active borrowOffers and haven't disabled forSale on their credit positions can have their credit bought at rates that may not reflect market conditions. While the lender's borrowOffer does provide SOME pricing, the semantic mismatch (borrow rate vs. credit sale rate) means the pricing may not represent the lender's true willingness to sell. The default forSale=true means all lenders are exposed unless they proactively call setUserConfiguration. The economic impact depends on the divergence between the lender's borrowOffer rate and the fair market rate for the credit.",
+      "proof_of_concept": "1. Alice is a lender who has a credit position worth 100e6 with dueDate in 6 months. She also has a borrowOffer set for a different purpose (e.g., she wanted to borrow at a 2% APR for short-term needs). 2. Market rates for 6-month credit are at 8% APR, meaning Alice's credit is worth roughly 96 USDC in present value at market rates. 3. Bob calls buyCreditMarket targeting Alice's credit position. The rate is derived from Alice's borrowOffer (2% APR), not the market rate. At 2% APR for 6 months, the present value is approximately 99 USDC. 4. Bob pays ~99 USDC for credit that the market values at ~96 USDC, which seems like overpaying. But from Alice's perspective, she receives cash based on her borrow curve, not based on the credit's market value. 5. Alternatively, if Alice's borrowOffer has a high rate (e.g., 20% APR because she wanted to borrow when rates were high), Bob can buy her credit cheaply: paying ~91 USDC for credit worth ~96 USDC at market rates. Alice is forced to sell at an unfavorable rate. 6. The minAPR check (line 109) only protects the buyer, not the seller.",
+      "remediation": "Consider using a dedicated sell offer (separate from borrowOffer) for pricing existing credit sales, or default forSale to false so lenders must explicitly opt into having their credit positions be purchasable. At minimum, document clearly that the borrowOffer is also used to price credit position exits."
+    },
+    {
+      "title": "Compensate fragmentation fee can be zeroed by underwater borrowers with no collateral",
+      "severity": "high",
+      "summary": "In executeCompensate, the fragmentation fee charged in collateral tokens is capped by the borrower's collateral balance (line 148-150). If a borrower has zero collateral (possible after partial liquidation or in an underwater position), the fee becomes zero. The compensate post-condition only checks `validateUserIsNotUnderwater` (CR >= crLiquidation), which passes if compensate reduces all remaining debt to zero (making CR = type(uint256).max). While not a profitable attack (the borrower has alr",
+      "description": [
+        {
+          "file": "src/libraries/actions/Compensate.sol",
+          "line_start": 148,
+          "line_end": 150,
+          "desc": "The fragmentation fee is capped by `state.data.collateralToken.balanceOf(msg.sender)`. A borrower who has been partially liquidated may have zero collateral remaining but still have outstanding debt. Such a borrower can call compensate to restructure their debt while paying zero fragmentation fee."
+        }
+      ],
+      "impact": "Protocol fee recipient does not receive fragmentation fee in edge cases where borrowers have zero collateral. The economic impact is limited to the fragmentation fee amount (typically 5 USDC equivalent) per occurrence, and only applies to borrowers who are already underwater - not a profitable attack vector.",
+      "proof_of_concept": "1. Borrower has 50e6 debtTokens, zero collateral (was partially liquidated). They also hold a credit position of 50e6 on another debt position as lender. 2. Borrower calls compensate with creditPositionToCompensateId pointing to their credit position. amountToCompensate = 50e6 (the smaller of their debt's credit and their credit position). 3. The fragmentation fee = min(debtTokenAmountToCollateralTokenAmount(5e6), 0) = 0. 4. Borrower restructures debt without paying any fragmentation fee. Post-condition passes because debt is fully offset.",
+      "remediation": "Consider charging the fragmentation fee in borrow tokens (borrowAToken) instead of or in addition to collateral tokens, to ensure it is collected regardless of the borrower's collateral position. Alternatively, document this as accepted behavior for underwater borrowers."
+    }
+  ]
+}

@@ -1,0 +1,259 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T21:41:27.856Z",
+    "duration_ms": 130145
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin Functions (Owner)",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "approveHolder",
+          "disapproveHolder",
+          "mint",
+          "addManagedNFT",
+          "releaseManagedNFT",
+          "setDistributableERC20s"
+        ],
+        "failure_modes": [
+          "Admin changing distributable ERC20s during an active distribution causes array out-of-bounds",
+          "Admin adding a non-compliant ERC20 (e.g., USDT) causes distribution to revert and lock contract"
+        ],
+        "attack_vectors": [
+          "Privilege escalation if owner key is compromised",
+          "Accidental DoS by modifying state during locked periods"
+        ]
+      },
+      {
+        "boundary": "User Token Transfers",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "transfer",
+          "transferFrom",
+          "burn",
+          "burnFrom"
+        ],
+        "failure_modes": [
+          "Zero-value transfers bypass balance checks",
+          "Duplicate entries in holders array"
+        ],
+        "attack_vectors": [
+          "Sybil/duplicate holder attack to drain rewards",
+          "Gas exhaustion DoS by inflating holders array"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unlocked (LockedForDistribution = false)",
+        "to_state": "Locked (LockedForDistribution = true)",
+        "trigger": "_beginDistribution()",
+        "conditions": [
+          "MinDistributionPeriod has elapsed",
+          "totalSupply > 0",
+          "holders.length > 0"
+        ],
+        "invariants": [
+          "No token transfers, mints, or burns can occur while locked",
+          "erc20EntitlementPerUnit length must match distributableERC20s length"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Locked (LockedForDistribution = true)",
+        "to_state": "Unlocked (LockedForDistribution = false)",
+        "trigger": "_endDistribution()",
+        "conditions": [
+          "nextDistributionRecipient == holders.length"
+        ],
+        "invariants": [
+          "LastDistribution is updated to current block",
+          "erc20EntitlementPerUnit is cleared"
+        ],
+        "atomicity_required": false,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-114",
+        "pattern": "Logic Error / Reward Drain",
+        "locations": [
+          "LiquidInfrastructureERC20._beforeTokenTransfer"
+        ],
+        "severity": "critical",
+        "evidence": "Zero-value transfers to an address with 0 balance bypass the `exists` check (`this.balanceOf(to) != 0` is false), pushing the address to `holders` multiple times.",
+        "exploitation_method": "An attacker sends 0 tokens to an approved address multiple times, adding it to `holders` repeatedly. They then transfer a large balance to that address. During distribution, the address receives its entitlement multiplied by its occurrences in the array, draining the reward pool.",
+        "affected_assets": [
+          "All distributable ERC20 reward tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow / Precision Loss",
+        "locations": [
+          "LiquidInfrastructureERC20._beginDistribution"
+        ],
+        "severity": "critical",
+        "evidence": "`uint256 entitlement = balance / supply;`",
+        "exploitation_method": "If the reward token has fewer decimals (e.g., USDC with 6) than the supply (e.g., 18 decimals), or if the balance is smaller than the supply, `entitlement` rounds down to 0. Rewards are permanently locked in the contract.",
+        "affected_assets": [
+          "Low-decimal ERC20 reward tokens (e.g., USDC, USDT)"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service / State Inconsistency",
+        "locations": [
+          "LiquidInfrastructureERC20.setDistributableERC20s",
+          "LiquidInfrastructureERC20.distribute"
+        ],
+        "severity": "high",
+        "evidence": "`setDistributableERC20s` can be called while `LockedForDistribution` is true. This changes `distributableERC20s.length`.",
+        "exploitation_method": "If the admin updates the distributable ERC20s during an active distribution, the next call to `distribute` will iterate over the new length but access `erc20EntitlementPerUnit` which was sized during `_beginDistribution`. This causes an out-of-bounds revert, permanently locking the contract.",
+        "affected_assets": [
+          "LiquidInfrastructureERC20 token (permanently locked transfers)"
+        ]
+      },
+      {
+        "swc_id": "SWC-104",
+        "pattern": "Unchecked Call Return Value / Unsafe ERC20 Transfer",
+        "locations": [
+          "LiquidInfrastructureERC20.distribute",
+          "LiquidInfrastructureNFT._withdrawBalancesTo"
+        ],
+        "severity": "high",
+        "evidence": "Uses `toDistribute.transfer(recipient, entitlement)` and `IERC20(erc20).transfer(destination, balance)` instead of SafeERC20.",
+        "exploitation_method": "Tokens like USDT do not return a boolean on transfer. Calling `transfer` on them will revert. In `distribute`, this revert will permanently lock the contract in the distribution state.",
+        "affected_assets": [
+          "LiquidInfrastructureERC20 token, Reward tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Error / Array Removal Bug",
+        "locations": [
+          "LiquidInfrastructureERC20._afterTokenTransfer"
+        ],
+        "severity": "medium",
+        "evidence": "When removing an element from `holders`, it swaps with the last element and pops, but does not decrement `i`.",
+        "exploitation_method": "If an address is in the array multiple times (e.g., via the 0-value transfer bug), removing it will skip the swapped element if it is also the target address, leaving duplicates in the array even after the balance reaches 0.",
+        "affected_assets": [
+          "Reward tokens (potential misallocation)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "approveHolder(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds an address to the KYC allowlist"
+        },
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "disapproveHolder(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Removes an address from the KYC allowlist"
+        },
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "mint(address,uint256)",
+          "guards": [
+            "onlyOwner",
+            "nonReentrant"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Mints new tokens, restricted by MinDistributionPeriod"
+        },
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "mintAndDistribute(address,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Convenience function to distribute and mint"
+        },
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "addManagedNFT(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds a new NFT to the managed portfolio"
+        },
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "releaseManagedNFT(address,address)",
+          "guards": [
+            "onlyOwner",
+            "nonReentrant"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Transfers an NFT out of the protocol"
+        },
+        {
+          "contract": "LiquidInfrastructureERC20.sol",
+          "function": "setDistributableERC20s(address[])",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets the list of reward tokens. Vulnerable to breaking active distributions."
+        },
+        {
+          "contract": "LiquidInfrastructureNFT.sol",
+          "function": "setThresholds(address[],uint256[])",
+          "guards": [
+            "onlyOwnerOrApproved(AccountId)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Sets operating balance thresholds for the Cosmos module"
+        },
+        {
+          "contract": "LiquidInfrastructureNFT.sol",
+          "function": "recoverAccount()",
+          "guards": [
+            "onlyOwner(AccountId)"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Triggers account recovery via Cosmos module"
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

@@ -1,0 +1,260 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Bridge processMessage Marks Banned-Target Messages as DONE Instead of FAILED, Preventing Recall and Permanently Locking Bridged Tokens",
+      "severity": "high",
+      "summary": "In processMessage(), when _message.to is banned or a special address, the code sets `refundAmount = _message.value` and marks the message DONE. The ETH value goes to refundTo/destOwner, but if this was a vault message carrying token bridging data, the vault's `onMessageInvocation` is never executed. The tokens that were locked/burned on the source chain have no corresponding mint/transfer on the destination chain.\n\nSince the message is DONE (not FAILED), the `signalForFailedMessage` is never sen",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/bridge/Bridge.sol",
+          "line_start": 269,
+          "line_end": 276,
+          "desc": "When processMessage encounters a message targeting a banned address (or address(0), address(this), signalService), it sets the status to DONE and refunds message.value to refundTo, but the vault invocation never fires. Since the status is DONE (not FAILED), the sender cannot recall the message on the source chain."
+        }
+      ],
+      "impact": "Permanent loss of bridged tokens for any in-flight messages when their target address gets banned. No recovery mechanism exists because the DONE status is terminal and no failed signal is emitted.",
+      "proof_of_concept": "1. User bridges 100 tokens from L1 to L2 via ERC20Vault\n2. message.to = address(ERC20Vault on L2)\n3. Bridge watchdog bans the vault address on L2 (mistake or temporary security measure)\n4. Relayer processes the message on L2\n5. Since the vault is banned, message marked DONE, message.value ETH sent to refundTo\n6. Vault's onMessageInvocation never fires, tokens never minted on L2\n7. User cannot recall on L1 because message status is DONE (not FAILED) — no failed signal was emitted\n8. 100 tokens permanently locked in source vault with no recovery path",
+      "remediation": "Mark messages targeting banned addresses as FAILED instead of DONE. This enables the sender to recall the message on the source chain and recover their tokens."
+    },
+    {
+      "title": "Bridge suspendMessages Unsuspend Creates Fake Proof Receipt for Never-Proven Messages, Bypassing All Proof Verification",
+      "severity": "high",
+      "summary": "The `suspendMessages` function allows the bridge_watchdog (or owner) to suspend and unsuspend messages by setting `proofReceipt[msgHash].receivedAt`. When unsuspending (`_suspend = false`), it sets receivedAt to `uint64(block.timestamp)` for ANY message hash, including hashes that were never actually proven via `_proveSignalReceived`.\n\nIn `processMessage` (lines 230-247):\n```solidity\nuint64 receivedAt = proofReceipt[msgHash].receivedAt;\nbool isMessageProven = receivedAt != 0;\nif (!isMessageProve",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/bridge/Bridge.sol",
+          "line_start": 82,
+          "line_end": 95,
+          "desc": "suspendMessages sets proofReceipt[msgHash].receivedAt = uint64(block.timestamp) when unsuspending. In processMessage (line 231), isMessageProven = receivedAt != 0 skips the entire _proveSignalReceived check. A message that was never proven via Merkle proof becomes processable."
+        }
+      ],
+      "impact": "Complete bypass of cross-chain proof verification. A compromised bridge_watchdog (an operational hot key) can drain ALL bridge and vault funds by processing fabricated messages without any cryptographic proof. This elevates bridge_watchdog from a defensive-only role to one that can create arbitrary cross-chain messages.",
+      "proof_of_concept": "1. Attacker compromises the bridge_watchdog key (which is a hot key used for monitoring)\n2. Attacker constructs a fake bridge message: {from: ERC20Vault, to: ERC20Vault, value: 0, data: [mint 1M tokens to attacker]}\n3. Attacker computes msgHash = hashMessage(fakeMessage)\n4. Attacker calls suspendMessages([msgHash], false)\n5. proofReceipt[msgHash].receivedAt = block.timestamp\n6. After 1 hour invocation delay, attacker calls processMessage(fakeMessage, '')\n7. processMessage sees receivedAt != 0, skips _proveSignalReceived\n8. Message is processed: vault mints 1M tokens to attacker\n9. No Merkle proof was ever verified",
+      "remediation": "Separate the 'proven' and 'suspended' concepts. Use a separate mapping for suspension status (e.g., `mapping(bytes32 => bool) public messageSuspended`). Only set `proofReceipt[msgHash].receivedAt` when `_proveSignalReceived` actually succeeds. In processMessage, check suspension status separately from proof status."
+    },
+    {
+      "title": "ERC20Vault changeBridgedToken Deletes Wrong Mapping Entry, Leaving Stale bridgedToCanonical for Old Token",
+      "severity": "high",
+      "summary": "When `changeBridgedToken()` migrates from an old bridged token to a new one, line 180 deletes the wrong mapping entry:\n```solidity\ndelete bridgedToCanonical[_btokenNew]; // BUG: _btokenNew is guaranteed empty\n```\n\nThe correct operation should be:\n```solidity\ndelete bridgedToCanonical[btokenOld_]; // Remove stale old token mapping\n```\n\nConsequence: `bridgedToCanonical[btokenOld_]` persists after migration. The old token still appears as a valid bridged token in the mapping. While `btokenBlacklist",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/tokenvault/ERC20Vault.sol",
+          "line_start": 180,
+          "line_end": 180,
+          "desc": "Line 180 executes `delete bridgedToCanonical[_btokenNew]` but _btokenNew has no entry (verified empty on line 158). Should be `delete bridgedToCanonical[btokenOld_]`."
+        }
+      ],
+      "impact": "State corruption in the bridgedToCanonical mapping. The old bridged token retains its canonical mapping indefinitely, creating a one-to-many relationship that violates the expected bijection between canonical and bridged tokens.",
+      "proof_of_concept": "1. Owner calls changeBridgedToken(ctoken, btokenNew) to migrate\n2. bridgedToCanonical[btokenOld_] is NOT deleted (delete targets empty btokenNew)\n3. canonicalToBridged[ctoken.chainId][ctoken.addr] = btokenNew (correct)\n4. bridgedToCanonical[btokenOld_] still points to ctoken (stale)\n5. bridgedToCanonical[btokenNew] points to ctoken (correct)\n6. Two addresses now claim to be the bridged version of ctoken",
+      "remediation": "Change line 180 from `delete bridgedToCanonical[_btokenNew]` to `delete bridgedToCanonical[btokenOld_]`."
+    },
+    {
+      "title": "Bridge getInvocationDelays Returns Zero for All Unlisted Chain IDs, Removing Watchdog Safety Window on L2/L3 Deployments",
+      "severity": "high",
+      "summary": "The Bridge's `getInvocationDelays` function hardcodes specific chain IDs:\n- Ethereum mainnet (1): 1 hour + 384s\n- Testnets (2,4,5,42,17000,11155111): 30 min + 384s  \n- Devnets (32300-32400): 5 min + 384s\n- Everything else: (0, 0)\n\nOn Taiko L2 and any L3 inception layer, chain IDs won't match these hardcoded values, resulting in zero delay. This means:\n1. Messages can be proven AND processed in the same transaction\n2. The bridge_watchdog has zero time to detect and suspend fraudulent messages\n3. ",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/bridge/Bridge.sol",
+          "line_start": 439,
+          "line_end": 445,
+          "desc": "getInvocationDelays() returns (0, 0) for any chain ID not in the hardcoded list (mainnet, testnets, devnets). On Taiko L2/L3, messages can be processed immediately after proving with no watchdog reaction window."
+        }
+      ],
+      "impact": "Complete loss of the watchdog safety window on any non-standard chain deployment. Removes a critical defense-in-depth layer from bridge security.",
+      "proof_of_concept": "1. Bridge is deployed on a custom L3 (chain ID not in hardcoded list)\n2. getInvocationDelays returns (0, 0)\n3. Attacker finds a proof verification bug (e.g., in SignalService or MerkleTrie)\n4. Attacker submits fraudulent proof and processes message in same transaction\n5. Watchdog has zero time to react (delay = 0)\n6. Funds drained before anyone can intervene",
+      "remediation": "Make invocation delays configurable via storage variables (set during init or by owner) rather than hardcoding chain IDs. Default to a non-zero delay for unknown chains."
+    },
+    {
+      "title": "SgxVerifier _replaceInstance Fails to Update addressRegistered, Enabling Duplicate SGX Instance Registration",
+      "severity": "high",
+      "summary": "When `verifyProof` succeeds, it calls `_replaceInstance(id, oldInstance, newInstance)`. This function:\n1. Emits InstanceDeleted for the old instance\n2. Writes `instances[id] = Instance(newInstance, block.timestamp)` \n3. Emits InstanceAdded for the new instance\n\nCritically missing:\n- `addressRegistered[newInstance] = true` — so newInstance can be re-registered\n- `delete addressRegistered[oldInstance]` — so oldInstance is permanently blocked (actually desirable for security)\n\nSince `addressRegiste",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/verifiers/SgxVerifier.sol",
+          "line_start": 226,
+          "line_end": 231,
+          "desc": "_replaceInstance writes new Instance to instances[id] but does not set addressRegistered[newInstance] = true. The new address can be re-registered via registerInstance, creating a duplicate across two instance IDs."
+        }
+      ],
+      "impact": "Bypass of SGX key rotation requirement. An SGX instance can persist the same key across multiple proofs by registering under multiple instance IDs, increasing the attack window for side-channel key extraction.",
+      "proof_of_concept": "1. SGX enclave registers address A → instanceId 0, addressRegistered[A] = true\n2. Enclave proves block, _replaceInstance(0, A, B) → instances[0] = (B, ts)\n3. addressRegistered[B] is still false\n4. Attacker generates new attestation for address B  \n5. registerInstance succeeds → instances[1] = (B, ts), addressRegistered[B] = true\n6. B exists as both instanceId 0 and instanceId 1\n7. B can prove two consecutive blocks without key rotation",
+      "remediation": "Add `addressRegistered[newInstance] = true;` in _replaceInstance (line ~230)."
+    },
+    {
+      "title": "GuardianProver Approval Hash Excludes proof.data, Allowing Last Guardian to Unilaterally Control Liveness Bond Return",
+      "severity": "high",
+      "summary": "In `GuardianProver.approve()`, the approval hash that guardians agree on is:\n```solidity\nbytes32 hash = keccak256(abi.encode(_meta, _tran));\n```\n\nThis deliberately excludes `_proof`. When the minimum number of guardians approve the same `(meta, tran)` hash, the last guardian's `_proof` parameter is forwarded to `TaikoL1.proveBlock()`.\n\nIn LibProving (lines 192-198), the top-tier guardian proof can trigger liveness bond return:\n```solidity\nbool returnLivenessBond = blk.livenessBond > 0 && _proof.",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L1/provers/GuardianProver.sol",
+          "line_start": 46,
+          "line_end": 46,
+          "desc": "Approval hash = keccak256(abi.encode(_meta, _tran)) excludes _proof. The last guardian to trigger threshold provides _proof.data used in proveBlock, including the RETURN_LIVENESS_BOND sentinel."
+        }
+      ],
+      "impact": "A single guardian can control 250 TKO per block by deciding whether liveness bonds are returned. Systematic collusion enables significant economic extraction from the protocol.",
+      "proof_of_concept": "1. Block N proposed with assignedProver = Alice (livenessBond = 250 TKO)\n2. Alice fails to prove within her window\n3. Another prover proves it, so normally Alice should lose half her bond\n4. Guardians approve the transition: guardians 1-(minGuardians-1) approve\n5. Last guardian (colluding with Alice) sets _proof.data = RETURN_LIVENESS_BOND\n6. Threshold met → proveBlock called with RETURN_LIVENESS_BOND\n7. 250 TKO returned to Alice despite her failure to prove\n8. Over 1000 blocks: 250,000 TKO improperly returned",
+      "remediation": "Include _proof in the approval hash: `bytes32 hash = keccak256(abi.encode(_meta, _tran, _proof));`"
+    },
+    {
+      "title": "LibProposing Sends Entire TaikoL1 ETH Balance to Proposer's Hook, Enabling Theft of Residual/Accumulated ETH",
+      "severity": "high",
+      "summary": "In `LibProposing.proposeBlock()`, line 253:\n```solidity\nIHook(params.hookCalls[i].hook).onBlockProposed{ value: address(this).balance }(blk, meta_, params.hookCalls[i].data);\n```\n\nThis sends the entire TaikoL1 contract balance to the hook. The TaikoL1 contract's `receive()` function (in TaikoL1.sol line 42) accepts ETH when `_inNonReentrant()` is true (which is true during proposeBlock execution). So the contract can accumulate ETH from:\n- Hooks returning partial ETH to the contract\n- Any extern",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L1/libs/LibProposing.sol",
+          "line_start": 253,
+          "line_end": 253,
+          "desc": "Hook call forwards address(this).balance (the entire contract ETH balance) to the hook, not just the proposer's msg.value."
+        }
+      ],
+      "impact": "Any ETH that accumulates in TaikoL1 can be stolen by any block proposer through a malicious hook.",
+      "proof_of_concept": "1. TaikoL1 has 1 ETH residual balance (from any source)\n2. Attacker calls proposeBlock with msg.value = 0.1 ETH and a malicious hook\n3. Hook receives address(this).balance = 1.1 ETH\n4. Hook keeps all 1.1 ETH, doesn't return any\n5. Refund logic finds 0 balance remaining\n6. Attacker profits 1 ETH that was not theirs",
+      "remediation": "Track the proposer's available ETH and only forward that amount: `uint256 ethToSend = msg.value; ... IHook(hook).onBlockProposed{ value: ethToSend }(...)`"
+    },
+    {
+      "title": "Bridge Failed retryMessage Leaves ETH Stranded on Destination Chain, Creating Systematic Cross-Chain Balance Imbalance",
+      "severity": "high",
+      "summary": "Complete flow analysis showing the ETH imbalance:\n\n1. **processMessage**: Destination Bridge receives `message.value + message.fee` ETH. Sends `message.fee` to relayer. Calls `_invokeMessageCall` which tries to send `message.value` via `excessivelySafeCall` to `_message.to`.\n\n2. **If invocation fails**: `excessivelySafeCall` returns false, ETH stays in Bridge. Status = RETRIABLE.\n\n3. **retryMessage(_isLastAttempt=true)**: Calls `_invokeMessageCall` again (tries to send message.value). If fails a",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/bridge/Bridge.sol",
+          "line_start": 309,
+          "line_end": 337,
+          "desc": "When retryMessage with _isLastAttempt=true fails, message transitions to FAILED and failedSignal enables recall on source chain. But message.value ETH (which failed to transfer to the target in both attempts) remains stranded in the destination Bridge. The source Bridge then pays out the recall from its own reserves."
+        }
+      ],
+      "impact": "Systematic source Bridge insolvency. Each failed-then-recalled message permanently transfers ETH from the source Bridge's reserves to the (unreachable) destination Bridge balance.",
+      "proof_of_concept": "1. Attacker creates a contract that always reverts on receiving ETH\n2. Attacker bridges 100 ETH to this contract via the Bridge\n3. processMessage fails (target reverts), status = RETRIABLE\n4. destOwner calls retryMessage with _isLastAttempt=true, still fails → status = FAILED\n5. 100 ETH sits in destination Bridge (from step 1, never delivered)\n6. Attacker recalls on source chain, getting 100 ETH from source Bridge\n7. Repeat 10x: destination Bridge holds 1000 ETH, source Bridge depleted by 1000 ETH\n8. Legitimate users' recalls start failing due to insufficient source Bridge balance",
+      "remediation": "When retryMessage transitions to FAILED, send the stranded message.value to destOwner or a recovery address on the destination chain. Alternatively, implement a cross-chain ETH rebalancing mechanism."
+    },
+    {
+      "title": "TimelockTokenPool Cost Calculation Divides Before Multiplying, Systematically Undercharging Recipients",
+      "severity": "high",
+      "summary": "In `getMyGrantSummary()` (called by `withdraw()`), the cost calculation on lines 197-198:\n```solidity\nuint128 _amountUnlocked = amountUnlocked / 1e18;\ncostToWithdraw = _amountUnlocked * r.grant.costPerToken - r.costPaid;\n```\n\nThe issue: `amountUnlocked / 1e18` truncates sub-token amounts, but `amountToWithdraw` (line 191-192) is based on the FULL precision `amountOwned - amountUnlocked` calculation that includes the fractional part.\n\nExample:\n- amountUnlocked = 999.99e18 (just under 1000 tokens)",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/team/TimelockTokenPool.sol",
+          "line_start": 197,
+          "line_end": 198,
+          "desc": "costToWithdraw = (amountUnlocked / 1e18) * costPerToken - costPaid. Division by 1e18 first truncates fractional tokens, but the recipient receives the full (non-truncated) amountToWithdraw."
+        }
+      ],
+      "impact": "Systematic cost token shortfall in the shared vault. Recipients receive tokens without paying the full proportional cost, creating a deficit that grows with the number of recipients and withdrawal frequency.",
+      "proof_of_concept": "1. Grant pool has 1000 recipients, each with 10,000 TKO grants at costPerToken = 1e6\n2. Each recipient makes 10 partial withdrawals timed to maximize truncation\n3. Per withdrawal: up to ~1 USDC underpayment\n4. Per recipient (10 withdrawals): up to ~10 USDC underpayment\n5. Total across 1000 recipients: up to ~10,000 USDC shortfall in the shared vault",
+      "remediation": "Calculate cost based on actual withdrawal amount: `costToWithdraw = amountToWithdraw * costPerToken / 1e18`."
+    },
+    {
+      "title": "Vault onMessageRecalled ETH Push to srcOwner Blocks Recall When srcOwner Cannot Receive ETH",
+      "severity": "high",
+      "summary": "When a bridge message containing a token transfer is recalled, the Bridge calls `vault.onMessageRecalled{value: message.value}(message, msgHash)`. Inside ERC20Vault (line 304), ERC721Vault (line 129), and ERC1155Vault (similar):\n\n```solidity\n_message.srcOwner.sendEther(_message.value);\n```\n\nThe `sendEther` function (from LibAddress) performs a low-level call with ETH. If `srcOwner` is a contract that cannot receive ETH (no receive/fallback, or one that reverts), the entire recall transaction rev",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/tokenvault/ERC20Vault.sol",
+          "line_start": 304,
+          "line_end": 304,
+          "desc": "onMessageRecalled sends message.value ETH to srcOwner via sendEther (push pattern). If srcOwner is a contract without receive/fallback, the ETH transfer reverts, rolling back the entire recall including the token return."
+        }
+      ],
+      "impact": "Permanent loss of tokens AND ETH for messages sent from contracts that cannot receive ETH. Affects multisig wallets, DAOs, aggregators, and any non-ETH-receiving smart contracts.",
+      "proof_of_concept": "1. Multisig wallet (without receive()) calls ERC20Vault.sendToken with extra ETH (msg.value > fee)\n2. message.value = msg.value - fee > 0, srcOwner = multisig\n3. Message fails on destination → status FAILED\n4. Anyone calls recallMessage on source chain\n5. Bridge calls ERC20Vault.onMessageRecalled with message.value ETH\n6. Vault tries sendEther(message.value) to multisig → REVERT (no receive)\n7. Entire recall reverts, status stays NEW\n8. Retry always fails → tokens and ETH permanently locked",
+      "remediation": "Use WETH wrapping for ETH refunds, or implement a pull-based pattern where owed ETH is tracked in a mapping and claimable separately."
+    },
+    {
+      "title": "Bridge _proveSignalReceived Uses staticcall, Preventing Multi-Hop Proof Intermediate State Caching",
+      "severity": "high",
+      "summary": "The Bridge's `_proveSignalReceived` uses staticcall:\n```solidity\n(success_,) = _signalService.staticcall(data);\n```\n\nInside SignalService, `proveSignalReceived` iterates through hop proofs and calls `_cacheChainData` which writes state roots to storage for future proof verifications. In a staticcall context, all `sstore` operations silently fail — no revert, just no effect.\n\nThis means:\n1. Intermediate chain state roots from multi-hop proofs are never persisted\n2. If hop N depends on data cached",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/bridge/Bridge.sol",
+          "line_start": 587,
+          "line_end": 591,
+          "desc": "Bridge calls SignalService.proveSignalReceived via staticcall. SignalService's _cacheChainData writes to storage (via sstore) which silently fails in staticcall context. Multi-hop proofs that require caching intermediate state roots during verification fail."
+        }
+      ],
+      "impact": "Bridged funds can be permanently locked if multi-hop proof paths require intermediate state root caching that doesn't already exist locally.",
+      "proof_of_concept": "1. Bridge message needs 3-hop proof: ChainA → ChainB → ChainC → local\n2. ChainB's state root not previously synced to local chain\n3. Hop 1 proof includes ChainB state root, should cache it\n4. staticcall prevents caching → ChainB root not stored\n5. Hop 2 needs ChainB root but can't find it → proof fails\n6. Message unprocessable, funds locked until admin manually syncs ChainB data",
+      "remediation": "Change from staticcall to a regular call. The proof verification's state-modifying nature (caching) is an intended feature, not a side effect."
+    },
+    {
+      "title": "LibVerifying Verification Loop Reverts on Ring Buffer Slot Collision, Enabling Adversarial Throughput Degradation",
+      "severity": "high",
+      "summary": "In `verifyBlocks()`, the loop iterates through blocks starting from lastVerifiedBlockId+1:\n```solidity\nwhile (blockId < b.numBlocks && numBlocksVerified < _maxBlocksToVerify) {\n    slot = blockId % _config.blockRingBufferSize;\n    blk = _state.blocks[slot];\n    if (blk.blockId != blockId) revert L1_BLOCK_MISMATCH();\n    ...\n}\n```\n\nWhen the ring buffer is near capacity (numBlocks - lastVerifiedBlockId ≈ blockMaxProposals), each verified block frees a slot. If a proposer immediately proposes a new",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L1/libs/LibVerifying.sol",
+          "line_start": 127,
+          "line_end": 131,
+          "desc": "The verification loop checks blk.blockId != blockId and reverts with L1_BLOCK_MISMATCH. When ring buffer is near capacity and a new proposal overwrites a freed slot, the revert prevents batch verification."
+        }
+      ],
+      "impact": "Verification throughput can be degraded from 10 blocks/tx to 0-1 blocks/tx under adversarial conditions. This slows finality and increases gas costs for provers, potentially causing the verification backlog to grow.",
+      "proof_of_concept": "1. Ring buffer at ~99% capacity, many unverified blocks\n2. Prover triggers verifyBlocks (expects to verify 10 blocks)\n3. Block N verified, frees slot S\n4. Adversarial proposer frontrunning: proposes new block into slot S\n5. Verification loop tries block N+1, finds new block in slot → REVERT\n6. Prover wasted gas, 0 blocks verified\n7. Must retry, now verifying only block N (careful to avoid proposer frontrunning)\n8. Throughput: 1 block/tx instead of 10 blocks/tx",
+      "remediation": "Replace `revert L1_BLOCK_MISMATCH()` with `break` inside the verification while-loop. This allows partial verification to succeed and be committed."
+    },
+    {
+      "title": "LibDepositing processDeposits Re-Enters Fee Deposit Into Ring Buffer, Creating Recursive Fee Chain and Buffer Pollution",
+      "severity": "high",
+      "summary": "In `processDeposits()`, after processing the current batch of deposits:\n```solidity\n_state.ethDeposits[_state.slotA.numEthDeposits % _config.ethDepositRingBufferSize] = \n    _encodeEthDeposit(_feeRecipient, uint96(totalFee));\n++_state.slotA.numEthDeposits;\n```\n\nThis creates a new deposit of `totalFee` ETH. This deposit will be processed in a future block, where:\n1. A fee is deducted from it (fee = min(basefee * ethDepositGas, deposit_amount))\n2. The remaining amount goes to feeRecipient\n3. A NEW",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L1/libs/LibDepositing.sol",
+          "line_start": 108,
+          "line_end": 117,
+          "desc": "After processing deposits and collecting fees, a NEW deposit entry for totalFee is added to the ring buffer. This fee deposit is processed in a future block with its own fee deducted, creating an infinite geometric series of ever-smaller deposits."
+        }
+      ],
+      "impact": "Ring buffer pollution with recursive dust fee deposits. Under sustained high activity, this can reduce effective ring buffer capacity for legitimate deposits.",
+      "proof_of_concept": "1. In one block, 64 deposits of 1 ETH each are processed\n2. Fee per deposit: 0.005 ETH, totalFee = 0.32 ETH → new deposit entry\n3. Next block: 0.32 ETH deposit processed, fee = 0.005 ETH → 0.315 ETH to recipient, 0.005 ETH new deposit\n4. Next block: 0.005 ETH deposit → fee could be 0.005 (capped to deposit amount)\n5. Continues until amounts become 0 due to rounding\n6. Each step consumes a ring buffer slot\n7. Under sustained high activity, dust deposits accumulate faster than they're processed",
+      "remediation": "Skip creating the fee deposit entry if totalFee is below ethDepositMinAmount. Or transfer fees directly without going through the ring buffer."
+    },
+    {
+      "title": "CrossChainOwned Self-Call Bypasses Reentrancy Guard and Enables Arbitrary Function Execution with msg.sender = address(this)",
+      "severity": "high",
+      "summary": "CrossChainOwned.onMessageInvocation() executes arbitrary calldata via `address(this).call(txdata)`. Key security implications:\n\n1. **msg.sender = address(this)**: Inside the called function, msg.sender is the contract itself. If TaikoL2's address is registered as any named role in AddressManager, access controls checking for that role will pass.\n\n2. **No reentrancy guard**: The comment explicitly says 'Do not guard with nonReentrant as this function will re-enter the contract.' This means the se",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L2/CrossChainOwned.sol",
+          "line_start": 36,
+          "line_end": 52,
+          "desc": "onMessageInvocation executes address(this).call(txdata) without nonReentrant guard. The self-call makes msg.sender = address(this), which may pass access controls that check for the contract's own address."
+        }
+      ],
+      "impact": "If TaikoL2's address is inadvertently registered as any named role, cross-chain owner messages can execute role-gated functions without proper authorization. The deliberate absence of reentrancy protection amplifies the risk.",
+      "proof_of_concept": "1. TaikoL2 contract address registered as 'withdrawer' in AddressManager (configuration error)\n2. Cross-chain owner message sent with txdata = withdraw(token, attackerAddress)\n3. onMessageInvocation self-calls TaikoL2\n4. Inside withdraw: msg.sender = address(this) = TaikoL2\n5. onlyFromOwnerOrNamed('withdrawer') check: TaikoL2 IS the 'withdrawer' → passes\n6. All tokens withdrawn to attacker",
+      "remediation": "Whitelist allowed function selectors for cross-chain execution. Ensure TaikoL2's address is never registered as a named role in AddressManager. Add reentrancy protection around the self-call."
+    },
+    {
+      "title": "AssignmentHook Allows Proposer-Controlled coinbase to Receive Prover Fee, Enabling Fee Theft",
+      "severity": "high",
+      "summary": "In `AssignmentHook.onBlockProposed()`, when the assigned prover IS the proposer (lines 102-104):\n```solidity\nif (input.tip != 0 && block.coinbase != address(0)) {\n    address(block.coinbase).sendEther(input.tip);\n}\n```\n\nThe `input.tip` is the TKO fee that the prover should receive for their proving services. When the proposer is also the prover, the tip goes to `block.coinbase` (the actual L1 block builder). But the proposer also controls `meta_.coinbase` in BlockParams, which is the L2 coinbase",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L1/hooks/AssignmentHook.sol",
+          "line_start": 102,
+          "line_end": 104,
+          "desc": "When the assignedProver is the same as msg.sender (proposer), the ERC20 tip fee is sent to meta.coinbase which is controlled by the proposer in BlockParams. The proposer can set coinbase to any address, receiving both the proposer's and prover's share of fees."
+        }
+      ],
+      "impact": "Proposers can extract excess TKO by setting themselves as assigned provers with inflated fees, then intentionally failing to prove.",
+      "proof_of_concept": "1. Proposer sets themselves as assignedProver\n2. Proposer crafts assignment with inflated prover fee in TKO\n3. TKO fee transferred from TaikoL1 to assignedProver (the proposer)\n4. Proposer never actually proves the block\n5. Proposer loses livenessBond (250 TKO) but may profit if prover fee > 250 TKO\n6. Net profit = prover fee - 250 TKO",
+      "remediation": "Cap the prover fee to be less than or equal to the livenessBond to ensure the assignment is economically rational."
+    },
+    {
+      "title": "LibProving Higher-Tier Provers Can Frontrun Assigned Prover During Exclusive Window, Stealing Liveness Bond",
+      "severity": "high",
+      "summary": "In `_checkProverPermission()`, for the first transition (tid == 1), the exclusive window check only applies when `_proof.tier == ts.tier` (contesting at the same tier). A non-assigned prover submitting a higher-tier proof bypasses this window entirely.\n\nConsequences:\n1. Any prover with a higher-tier proof can prove the block during the assigned prover's exclusive window\n2. The assigned prover's transition is overridden\n3. At verification time (LibVerifying line 184-186), `ts.prover != blk.assign",
+      "description": [
+        {
+          "file": "packages/protocol/contracts/L1/libs/LibProving.sol",
+          "line_start": 399,
+          "line_end": 420,
+          "desc": "_checkProverPermission only protects the assigned prover's window for same-tier proofs. Higher-tier provers can submit proofs at any time, including during the exclusive window, causing the assigned prover to lose half their liveness bond."
+        }
+      ],
+      "impact": "Assigned provers can lose 125 TKO per block (half livenessBond) when frontrun by higher-tier provers during their exclusive window. Degrades the prover assignment economic model.",
+      "proof_of_concept": "1. Alice is assigned prover for block N, stakes 250 TKO livenessBond\n2. Alice's proving window: block.timestamp to proposedAt + provingWindow\n3. Within the window, Bob submits a guardian proof (top tier)\n4. Guardian proofs bypass the window check (higher tier)\n5. ts.prover = Bob, not Alice\n6. Block verified: ts.prover != assignedProver → bondToReturn -= 125 TKO\n7. Alice loses 125 TKO despite being ready to prove within her window",
+      "remediation": "Extend the exclusive window protection to block ALL provers (including higher tiers) during the assigned prover's window, or don't penalize the assigned prover when overridden by a higher-tier proof submitted during their window."
+    }
+  ]
+}

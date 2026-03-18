@@ -1,0 +1,302 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-09T00:08:37.045Z",
+    "duration_ms": 255079
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-ACCESS-001",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "AccessControlHooks.onQueueWithdrawal lacks the isHooked market validation check present in onDeposit and onTransfer. Any external contract can call onQueueWithdrawal, triggering stateful credential validation (validateCredential) on role providers and updating _lenderStatus storage.",
+        "attack_scenario": "An attacker deploys a contract that calls AccessControlHooks.onQueueWithdrawal(victim, 0, 0, fakeState, maliciousHooksData). The hooksData points to a role provider and contains the victim's one-time-use credential. _tryValidateCredential calls the provider's validateCredential with a stateful CALL (not staticcall), burning the credential. Since msg.sender is not a real market, isKnownLenderOnMarket is false, so _tryValidateAccess is always invoked. The victim's credential is consumed without any actual withdrawal occurring.",
+        "invariant_logic": "onQueueWithdrawal SHOULD revert if _hookedMarkets[msg.sender].isHooked == false",
+        "solidity_property": "function invariant_queueWithdrawalRequiresHookedMarket() public view { /* For AccessControlHooks: any call to onQueueWithdrawal from address X where _hookedMarkets[X].isHooked == false should revert */ }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "onQueueWithdrawal"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "onQueueWithdrawal"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "FixedTermLoanHooks.sol",
+        "description": "fixedTermEndTime for a hooked market must only decrease (or stay the same) after creation. If it could increase, the borrower would extend lenders' lockup period beyond what they agreed to at deposit time, trapping their funds.",
+        "attack_scenario": "If fixedTermEndTime could increase, a borrower creates a market with a 30-day term, lenders deposit, then the borrower extends to 365 days, locking lender funds for an additional 335 days against their will.",
+        "invariant_logic": "forall market: hookedMarkets[market].fixedTermEndTime_new <= hookedMarkets[market].fixedTermEndTime_old",
+        "solidity_property": "function invariant_fixedTermOnlyDecreases(address market) public view { uint32 current = _hookedMarkets[market].fixedTermEndTime; /* after setFixedTermEndTime: */ assert(newValue <= current); }",
+        "inventory_refs": [
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "setFixedTermEndTime"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_onCreateMarket"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "FixedTermLoanHooks.sol",
+        "description": "No withdrawal can be queued while block.timestamp < fixedTermEndTime. This is the core invariant protecting the borrower's fixed-term guarantee that funds remain available until the term expires.",
+        "attack_scenario": "If a lender could queue a withdrawal before the fixed term ends, the borrower would face unexpected liquidity demands, potentially causing delinquency. The entire fixed-term loan product becomes meaningless.",
+        "invariant_logic": "onQueueWithdrawal(market) succeeds implies block.timestamp >= hookedMarkets[market].fixedTermEndTime",
+        "solidity_property": "function invariant_noWithdrawBeforeTerm(address market) public view { if (_hookedMarkets[market].fixedTermEndTime > block.timestamp) { /* onQueueWithdrawal must revert */ } }",
+        "inventory_refs": [
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "onQueueWithdrawal"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "isKnownLenderOnMarket is a one-way flag: once set to true, there is no function that resets it to false. This guarantees that any lender who has deposited (or received tokens while credentialed) permanently retains withdrawal access for that market, even if their credential is later revoked or they are blocked from deposits.",
+        "attack_scenario": "If isKnownLenderOnMarket could be reset, a borrower could block existing lenders from withdrawing their already-deposited funds by revoking their known-lender status, effectively stealing deposits.",
+        "invariant_logic": "forall lender, market: isKnownLenderOnMarket[lender][market] == true implies isKnownLenderOnMarket[lender][market] is always true in all future states",
+        "solidity_property": "function invariant_knownLenderIrreversible(address lender, address market) public view { /* if isKnownLenderOnMarket[lender][market] was ever true, assert it is still true */ }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "_writeLenderStatus"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_writeLenderStatus"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-002",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "A credential can only be replaced by a new provider if: (a) the old provider is no longer registered, OR (b) the caller IS the old provider, OR (c) the new credential's expiry exceeds the old credential's expiry. This prevents a lower-privilege or malicious provider from downgrading a lender's credential duration.",
+        "attack_scenario": "Without this invariant, a malicious newly-added role provider could overwrite a lender's long-lived credential (e.g., 1 year TTL) with a short-lived one (e.g., 1 hour TTL), causing the lender to lose access unexpectedly mid-position and be unable to manage their funds.",
+        "invariant_logic": "_grantRole succeeds AND status.hasCredential() AND !_roleProviders[status.lastProvider].isNull() implies (status.lastProvider == msg.sender) OR (newExpiry > oldExpiry)",
+        "solidity_property": "function invariant_credentialOnlyUpgradeable(address account) public view { LenderStatus memory s = _lenderStatus[account]; RoleProvider p = _roleProviders[s.lastProvider]; if (s.hasCredential() && !p.isNull()) { /* new credential expiry must exceed old, or same provider */ } }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "_grantRole"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_grantRole"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MarketConstraintHooks.sol",
+        "description": "Temporary reserve ratio state machine: when temporaryExcessReserveRatio[market].expiry > 0, the market is in a temporary elevated reserve state. The originalAnnualInterestBips stored must be >= the market's current annualInterestBips (since the temporary was triggered by a reduction). Cancellation requires APR to be raised back to or above the original. Expiry requires the timer to pass AND no further APR reduction.",
+        "attack_scenario": "If the state machine allowed bypassing the temporary reserve ratio, a borrower could dramatically slash the APR (e.g., from 100% to 1%), immediately borrow all available assets against the old reserve ratio, and leave lenders with near-zero yield and no reserve buffer.",
+        "invariant_logic": "temporaryExcessReserveRatio[market].expiry > 0 implies temporaryExcessReserveRatio[market].originalAnnualInterestBips >= market.annualInterestBips",
+        "solidity_property": "function invariant_tempReserveConsistency(address market) public view { TemporaryReserveRatio memory tmp = temporaryExcessReserveRatio[market]; if (tmp.expiry > 0) { assert(tmp.originalAnnualInterestBips >= MarketState(market).annualInterestBips); } }",
+        "inventory_refs": [
+          {
+            "file": "MarketConstraintHooks.sol",
+            "function": "onSetAnnualInterestAndReserveRatioBips"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-003",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "MarketConstraintHooks.sol",
+        "description": "The borrower's requested reserveRatioBips parameter is always ignored by onSetAnnualInterestAndReserveRatioBips. The reserve ratio is exclusively controlled by the hook's APR-change logic. This prevents borrowers from unilaterally reducing reserve ratios to drain market liquidity.",
+        "invariant_logic": "onSetAnnualInterestAndReserveRatioBips return value newReserveRatioBips is NEVER derived from the reserveRatioBips input parameter; it is always derived from intermediateState.reserveRatioBips or the temporary reserve ratio calculation",
+        "solidity_property": "function invariant_reserveRatioNotBorrowerControlled() public view { /* newReserveRatioBips must equal intermediateState.reserveRatioBips OR _calculateTemporaryReserveRatioBips result OR tmp.originalReserveRatioBips */ }",
+        "inventory_refs": [
+          {
+            "file": "MarketConstraintHooks.sol",
+            "function": "onSetAnnualInterestAndReserveRatioBips"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "Pull provider array index consistency: for every entry _pullProviders[i], the corresponding _roleProviders[addr].pullProviderIndex must equal i, and vice versa. If _removePullProvider swaps incorrectly, a provider could become unreachable or point to the wrong entry, breaking credential refresh loops.",
+        "attack_scenario": "If the pull provider index becomes inconsistent after removal, _loopTryGetCredential could skip a valid provider or query the wrong one. A lender with a valid credential from the misindexed provider would be denied access, potentially locking their funds in the market.",
+        "invariant_logic": "forall i in [0, _pullProviders.length): _roleProviders[_pullProviders[i].providerAddress()].pullProviderIndex() == i",
+        "solidity_property": "function invariant_pullProviderIndexConsistency() public view { for (uint i = 0; i < _pullProviders.length; i++) { RoleProvider p = _pullProviders[i]; assert(_roleProviders[p.providerAddress()].pullProviderIndex() == i); } }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "_removePullProvider"
+          },
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "addRoleProvider"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_removePullProvider"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-004",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "A lender blocked from deposits (isBlockedFromDeposits == true) must be unable to deposit or receive market tokens via transfer, regardless of credential status. However, a blocked lender who is a known lender on a market can still queue withdrawals, since the withdrawal path checks isKnownLenderOnMarket before credential validation and does not check isBlockedFromDeposits.",
+        "attack_scenario": "If the deposit/transfer block could be bypassed, the borrower's ability to enforce compliance (e.g., sanctions, KYC revocation) would be undermined. A blocked user could continue acquiring market tokens and earning yield despite being blocked.",
+        "invariant_logic": "onDeposit(lender, ...) reverts if _lenderStatus[lender].isBlockedFromDeposits == true; onTransfer(_, _, to, ...) reverts if _lenderStatus[to].isBlockedFromDeposits == true AND !isKnownLenderOnMarket[to][market]",
+        "solidity_property": "function invariant_blockedCannotDeposit(address lender) public view { if (_lenderStatus[lender].isBlockedFromDeposits) { /* onDeposit must always revert for this lender */ } }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "onDeposit"
+          },
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "onTransfer"
+          },
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "blockFromDeposits"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-001",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "MarketConstraintHooks.sol",
+        "description": "The temporary excess reserve ratio has a 2-week duration. When a new APR reduction is made during an active temporary period but the new APR is still higher than the current market APR, the timer should NOT reset (preserving the original expiry). The timer only resets when the APR is reduced below the current market rate, protecting lenders from indefinite timer extension by tiny reductions.",
+        "attack_scenario": "If the timer always reset on any APR change during the temporary period, a borrower could keep the APR low while repeatedly making small increases to perpetually reset the 2-week timer, preventing the temporary reserve ratio from ever expiring and never having to restore the original reserve ratio.",
+        "invariant_logic": "When tmp.expiry > 0 AND annualInterestBips < tmp.originalAnnualInterestBips AND annualInterestBips >= intermediateState.annualInterestBips: new_expiry == tmp.expiry (timer preserved, not reset)",
+        "solidity_property": "function invariant_timerNotResetOnPartialRecovery() public view { /* If borrower partially raises APR during temp period, old expiry is kept */ }",
+        "inventory_refs": [
+          {
+            "file": "MarketConstraintHooks.sol",
+            "function": "onSetAnnualInterestAndReserveRatioBips"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "FixedTermLoanHooks.sol",
+        "description": "At market creation, fixedTermEndTime must be in the future and at most MaximumLoanTerm (365 days) from block.timestamp. This prevents creation of markets with already-expired terms (meaningless restriction) or excessively long terms that could trap lender funds.",
+        "invariant_logic": "At _onCreateMarket: fixedTermEndTime >= block.timestamp AND (fixedTermEndTime - block.timestamp) <= MaximumLoanTerm",
+        "solidity_property": "function invariant_validInitialTerm(address market) public view { HookedMarket memory m = _hookedMarkets[market]; if (m.isHooked && m.fixedTermEndTime > 0) { /* was validated at creation */ } }",
+        "inventory_refs": [
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_onCreateMarket"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-005",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "Only the role provider that last granted a credential to a lender can revoke it. This prevents one provider from revoking another provider's credential, maintaining separation of authority between providers.",
+        "invariant_logic": "revokeRole(account) succeeds implies _lenderStatus[account].lastProvider == msg.sender",
+        "solidity_property": "function invariant_onlyLastProviderRevokes(address account) public view { /* revokeRole must revert if msg.sender != _lenderStatus[account].lastProvider */ }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "revokeRole"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "revokeRole"
+          }
+        ]
+      },
+      {
+        "id": "INV-TIME-002",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "AccessControlHooks.sol",
+        "description": "Accepted credential timestamps must be non-zero and not in the future (credentialTimestamp > 0 && credentialTimestamp <= block.timestamp). A future-dated credential must be rejected to prevent pre-authorization attacks where a provider issues credentials valid from a future date.",
+        "invariant_logic": "In _tryGetCredential and _tryValidateCredential: credentialTimestamp == 0 || credentialTimestamp > block.timestamp implies return false",
+        "solidity_property": "function invariant_noFutureCredentials(address account) public view { LenderStatus memory s = _lenderStatus[account]; if (s.lastApprovalTimestamp > 0) { assert(s.lastApprovalTimestamp <= block.timestamp); } }",
+        "inventory_refs": [
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "_tryGetCredential"
+          },
+          {
+            "file": "AccessControlHooks.sol",
+            "function": "_tryValidateCredential"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_tryGetCredential"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "MarketConstraintHooks.sol",
+        "description": "When a temporary excess reserve ratio is active and the borrower raises APR back to or above the original APR (canCancel), the temporary must be fully deleted and the ORIGINAL reserve ratio (not the inflated temporary one) must be restored. Failing to restore the original would permanently inflate the reserve ratio.",
+        "invariant_logic": "canCancel == true implies delete temporaryExcessReserveRatio[market] AND return (newAPR, tmp.originalReserveRatioBips)",
+        "solidity_property": "function invariant_cancelRestoresOriginal(address market) public view { /* After cancellation, temporaryExcessReserveRatio[market].expiry == 0 AND market reserve ratio == original */ }",
+        "inventory_refs": [
+          {
+            "file": "MarketConstraintHooks.sol",
+            "function": "onSetAnnualInterestAndReserveRatioBips"
+          }
+        ]
+      },
+      {
+        "id": "INV-ACCESS-006",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "FixedTermLoanHooks.sol",
+        "description": "FixedTermLoanHooks sets QueueWithdrawal as a required hook flag, but withdrawalRequiresAccess is derived from the market deployer's original parameters.hooks.useOnQueueWithdrawal flag BEFORE merging. If the deployer sets useOnQueueWithdrawal=false in parameters, the hook is still called (required flag), but withdrawalRequiresAccess=false, meaning after the fixed term ends ANY token holder can queue withdrawals without credential validation. This decouples the fixed-term enforcement from withdrawal access control.",
+        "invariant_logic": "In FixedTermLoanHooks: after fixedTermEndTime, if withdrawalRequiresAccess == false, any address holding market tokens can queue withdrawals without credential checks",
+        "solidity_property": "function invariant_withdrawalAccessMismatch(address market) public view { HookedMarket memory m = _hookedMarkets[market]; /* withdrawalRequiresAccess may be false even though onQueueWithdrawal hook is always enabled */ }",
+        "inventory_refs": [
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "_onCreateMarket"
+          },
+          {
+            "file": "FixedTermLoanHooks.sol",
+            "function": "onQueueWithdrawal"
+          }
+        ]
+      }
+    ]
+  }
+}

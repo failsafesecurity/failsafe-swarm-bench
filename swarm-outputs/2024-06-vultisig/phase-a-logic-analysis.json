@@ -1,0 +1,445 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T07:55:03.349Z",
+    "duration_ms": 327384
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-buy",
+        "source": "Investor (msg.sender) providing RAISE_TOKEN",
+        "path": [
+          "ILOPool.buy() called with raiseAmount and recipient",
+          "Whitelist check on recipient via _isWhitelisted",
+          "Hard cap check: saleInfo.hardCap - totalRaised >= raiseAmount",
+          "totalRaised incremented, totalSold() checked against maxSaleAmount",
+          "Mint new NFT or retrieve existing tokenId for recipient",
+          "Per-user cap check: raiseAmount <= maxCapPerUser - _position.raiseAmount",
+          "Liquidity calculation via LiquidityAmounts.getLiquidityForAmount0/1",
+          "Liquidity scaled by _vestingConfigs[0].shares / BPS",
+          "Position state updated (raiseAmount, liquidity, totalLiquidity)",
+          "RAISE_TOKEN transferred from msg.sender to ILOPool"
+        ],
+        "transformations": [
+          "raiseAmount → liquidityDelta via LiquidityAmounts (floor division)",
+          "liquidityDelta scaled by investor shares: liquidityDelta * shares / BPS (floor division)",
+          "Position vesting totalLiquidity set to cumulative position.liquidity"
+        ],
+        "sinks": [
+          "ILOPool contract balance (RAISE_TOKEN)",
+          "Position storage mapping",
+          "_positionVests mapping"
+        ],
+        "trust_changes": "msg.sender trusted as payer, recipient validated via whitelist only",
+        "validation_points": [
+          "Whitelist check on recipient",
+          "Sale time window",
+          "Hard cap",
+          "Max sale amount",
+          "Per-user cap",
+          "Liquidity > 0"
+        ],
+        "exposure_risks": [
+          "msg.sender != recipient allows third-party purchases on behalf of whitelisted users"
+        ],
+        "manipulation_risks": [
+          "Griefing: attacker fills a whitelisted user's cap by buying on their behalf without consent",
+          "Rounding loss: individual liquidityDelta calculations via floor division systematically undercount total liquidity vs launch-time calculation"
+        ]
+      },
+      {
+        "flow_id": "DF-002-launch",
+        "source": "ILOManager.launch() called by anyone after launchTime",
+        "path": [
+          "ILOManager.launch() validates launchTime, pool price, and pool count",
+          "ILOPool.launch() called via OnlyManager modifier",
+          "Total liquidity calculated from totalRaised via _saleAmountNeeded",
+          "addLiquidity() mints position on Uniswap V3 pool",
+          "Project vesting NFTs minted with liquidity shares from total liquidity",
+          "_refundProject sends remaining SALE_TOKEN to project admin",
+          "_launchSucceeded set to true"
+        ],
+        "transformations": [
+          "totalRaised → (saleAmountNeeded, totalLiquidity) via _saleAmountNeeded",
+          "totalLiquidity → per-project-config shares: liquidity * config.shares / BPS",
+          "Leftover SALE_TOKEN balance → project admin refund"
+        ],
+        "sinks": [
+          "Uniswap V3 pool (liquidity position)",
+          "Project admin (leftover SALE_TOKEN)",
+          "Project vesting NFTs"
+        ],
+        "trust_changes": "Permissionless launch after launchTime; manager is trusted intermediary",
+        "validation_points": [
+          "Not already launched",
+          "Not refund triggered",
+          "Soft cap met",
+          "Price slippage check in addLiquidity (RAISE_TOKEN side only)"
+        ],
+        "exposure_risks": [
+          "_launchSucceeded set AFTER _refundProject external call - potential reentrancy window"
+        ],
+        "manipulation_risks": [
+          "SALE_TOKEN side of addLiquidity has amount0Min/amount1Min = 0, allowing value extraction if pool price shifts",
+          "Sum of individual investor liquidities ≠ total launch liquidity * investorShares / BPS due to accumulated rounding errors"
+        ]
+      },
+      {
+        "flow_id": "DF-003-claim",
+        "source": "Position holder calls claim(tokenId)",
+        "path": [
+          "Verify _launchSucceeded",
+          "Calculate claimable liquidity via _claimableLiquidity (vesting schedule)",
+          "pool.burn(TICK_LOWER, TICK_UPPER, liquidity2Claim) removes liquidity from shared Uniswap position",
+          "Read feeGrowthInside from Uniswap pool position",
+          "Calculate user's fee share using their positionLiquidity",
+          "Deduct platform fee from burn amounts, performance fee from trading fees",
+          "pool.collect(type(uint128).max) sweeps ALL owed tokens from the shared position",
+          "Transfer amount0/amount1 to token owner",
+          "Transfer amountCollected - amount to FEE_TAKER"
+        ],
+        "transformations": [
+          "liquidity2Claim → (amount0, amount1) via Uniswap burn",
+          "Fees calculated: (feeGrowthDelta * positionLiquidity) / Q128",
+          "Platform fee deduction: amount * (1 - platformFee/BPS)",
+          "Performance fee deduction: fees * (1 - performanceFee/BPS)",
+          "Fee taker receives: amountCollected - userAmount (includes OTHER users' uncollected fees)"
+        ],
+        "sinks": [
+          "Token owner (claimed tokens)",
+          "FEE_TAKER (fees + stolen user fees)"
+        ],
+        "trust_changes": "FEE_TAKER receives tokens belonging to non-claiming users",
+        "validation_points": [
+          "Launch succeeded",
+          "Token ownership/approval",
+          "positionLiquidity >= liquidity2Claim"
+        ],
+        "exposure_risks": [
+          "CRITICAL: collect(type(uint128).max) sweeps ALL owed tokens for the entire shared Uniswap position, not just the claiming user's portion",
+          "Other users' accumulated trading fees are sent to FEE_TAKER instead of being preserved"
+        ],
+        "manipulation_risks": [
+          "First claimer steals proportionally more fees from other users - incentive to claim first",
+          "Fee taker receives windfall from other users' uncollected fees"
+        ]
+      },
+      {
+        "flow_id": "DF-004-whitelist-check",
+        "source": "VultisigWhitelisted._beforeTokenTransfer hook",
+        "path": [
+          "Transfer triggers _beforeTokenTransfer",
+          "If _whitelistContract != address(0), calls checkWhitelist(from, to, amount)",
+          "Checks if from == _pool and to != owner (buy from pool)",
+          "If locked, revert",
+          "Check blacklist, whitelist index, allowed index",
+          "Query oracle for ETH estimate: IOracle(_oracle).peek(amount)",
+          "Check _contributed[to] + estimatedETH <= _maxAddressCap",
+          "Update _contributed[to]"
+        ],
+        "transformations": [
+          "VULT amount → estimated ETH via UniswapV3Oracle.peek()",
+          "Oracle: TWAP tick → quotedWETHAmount → scaled by baseAmount * 95 / 1e20"
+        ],
+        "sinks": [
+          "_contributed mapping updated with estimated ETH value"
+        ],
+        "trust_changes": "Oracle trusted for price estimation; TWAP integrity depends on pool observation history",
+        "validation_points": [
+          "Locked check",
+          "Blacklist check",
+          "Whitelist index check",
+          "Cap check via oracle"
+        ],
+        "exposure_risks": [
+          "Oracle returns stale/manipulable price if observation history is short",
+          "If oracle pool just created, getOldestObservationSecondsAgo returns 0, period=0, consult reverts - DoS on all transfers"
+        ],
+        "manipulation_risks": [
+          "TWAP manipulation with sustained capital over 30 minutes to lower price estimate and bypass cap",
+          "If longestPeriod < PERIOD, TWAP window shortens to spot-like price, easier to manipulate"
+        ]
+      },
+      {
+        "flow_id": "DF-005-refund",
+        "source": "Token holder or project admin initiating refund",
+        "path": [
+          "claimRefund(tokenId): verify refund conditions (not launched, past deadline)",
+          "Set _refundTriggered on first call",
+          "Read position.raiseAmount, delete position data, burn NFT",
+          "Transfer RAISE_TOKEN to token owner",
+          "claimProjectRefund: transfer all SALE_TOKEN balance to project admin"
+        ],
+        "transformations": [
+          "Position deletion → RAISE_TOKEN refund at recorded raiseAmount"
+        ],
+        "sinks": [
+          "Token owner (RAISE_TOKEN)",
+          "Project admin (SALE_TOKEN)"
+        ],
+        "trust_changes": "Once refund triggered, launch permanently blocked",
+        "validation_points": [
+          "Not launched",
+          "Past refund deadline (or already triggered)",
+          "Token ownership"
+        ],
+        "exposure_risks": [
+          "Refund amount is the original raiseAmount, not current token balance - assumes sufficient balance"
+        ],
+        "manipulation_risks": [
+          "If RAISE_TOKEN is fee-on-transfer, actual balance < sum of raiseAmounts, last refunder cannot claim"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Launch and refund are mutually exclusive states (_launchSucceeded vs _refundTriggered)",
+        "Total vesting config shares must equal 10000 BPS exactly",
+        "Each vest schedule's shares must equal 10000 BPS exactly",
+        "First vesting config (index 0) is for investors (recipient=address(0)), rest for project",
+        "Sale token amount needed is calculated from raise amount at fixed price (SQRT_RATIO_X96)",
+        "Hard cap limits total raise, per-user cap limits individual contribution",
+        "Soft cap must be met for launch to succeed",
+        "Uniswap V3 pool price must match initialPoolPriceX96 at launch time"
+      ],
+      "economic_incentives": [
+        "Platform fee (BPS) deducted from claimed liquidity amounts",
+        "Performance fee (BPS) deducted from accumulated trading fees",
+        "Investors receive vested liquidity positions that unlock linearly over schedule",
+        "Project recipients receive liquidity shares that vest on separate schedules"
+      ],
+      "governance_mechanisms": [
+        "ILOManager owner sets fees, refund deadlines, pool implementation",
+        "Project admin creates pools, manages whitelist, transfers admin role",
+        "Refund deadline can be changed by ILOManager owner at any time (no timelock)",
+        "Platform/performance fees are snapshot at project creation but fee taker address is read dynamically"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "collect(type(uint128).max) in claim() sweeps ALL owed tokens from the shared Uniswap V3 position, including fees belonging to other users who haven't claimed yet",
+          "expected_behavior": "Each user should receive only their proportional share of trading fees; unclaimed fees should remain available for other users",
+          "actual_behavior": "First claimer's collect() sweeps all accumulated fees. Their calculated fee portion goes to user, the remainder (other users' fees) goes to FEE_TAKER. Subsequent claimers receive zero historical fees.",
+          "risk_level": "high",
+          "exploitation_potential": "FEE_TAKER systematically receives fees belonging to all non-claiming users. Race condition incentivizes early claims. Over time, significant value is siphoned from users to fee taker. Protocol could intentionally exploit this by being the first to claim a project vesting position."
+        },
+        {
+          "scenario": "Missing check that initialPoolPriceX96 < sqrtRatioUpperX96 in ILOManager.initILOPool",
+          "expected_behavior": "Price range should fully contain the initial price for both RAISE and SALE tokens to be required",
+          "actual_behavior": "Only checks sqrtRatioLowerX96 < initialPoolPriceX96. If price >= upper bound, liquidity calculations produce incorrect results - getLiquidityForAmount0/1 would use price outside the intended range",
+          "risk_level": "high",
+          "exploitation_potential": "Project admin sets tick range where price is at or above upper tick. This breaks the raise-to-liquidity math, potentially allowing purchase of positions at wrong prices or causing launch to fail unexpectedly."
+        },
+        {
+          "scenario": "Overflow in _unlockedLiquidity: vest.shares * totalLiquidity computed as uint128",
+          "expected_behavior": "Safe multiplication with proper widening to uint256 before potential overflow",
+          "actual_behavior": "vest.shares (uint16, max 10000) * totalLiquidity (uint128) is computed in uint128 arithmetic in Solidity 0.7.6. If totalLiquidity > 2^128 / 10000 ≈ 3.4e34, this silently overflows, producing wrong unlocked amount",
+          "risk_level": "medium",
+          "exploitation_potential": "For very large liquidity positions, overflow causes incorrect vesting calculations, potentially unlocking more or less liquidity than intended. While extreme values are needed, the overflow is silent in Solidity 0.7.6."
+        },
+        {
+          "scenario": "Liquidity accounting mismatch between individual buy() calculations and aggregate launch() calculation",
+          "expected_behavior": "Sum of individual position liquidities should equal the total position liquidity allocated for investors",
+          "actual_behavior": "buy() calculates per-user: getLiquidity(raiseAmount_i) * shares / BPS (floor division each step). launch() calculates total: getLiquidity(totalRaised) * shares / BPS. Due to non-linearity of getLiquidity and accumulated rounding, sum(individual) ≠ total. This means some liquidity in Uniswap has no claimant, or claims exceed available.",
+          "risk_level": "medium",
+          "exploitation_potential": "If sum of tracked liquidities exceeds actual Uniswap position liquidity, late claimers' burn() calls will revert. Locked liquidity represents permanent value loss."
+        },
+        {
+          "scenario": "Vest schedule with start == end (zero duration)",
+          "expected_behavior": "Should be fully unlocked at start time or rejected during validation",
+          "actual_behavior": "_validateVestSchedule does not check start < end. In _unlockedLiquidity, when block.timestamp == start == end, the else branch executes with denominator (end - start) * BPS = 0, causing FullMath.mulDiv to revert on division by zero. Claims are permanently DOSed.",
+          "risk_level": "medium",
+          "exploitation_potential": "Malicious project admin creates pool with zero-duration vest, permanently locking investor funds since claim() always reverts."
+        },
+        {
+          "scenario": "UniswapV3Oracle.peek() with newly created pool (insufficient observation history)",
+          "expected_behavior": "Oracle should gracefully handle pools with short history",
+          "actual_behavior": "If getOldestObservationSecondsAgo returns 0, period becomes 0, OracleLibrary.consult reverts with 'BP'. This DoSes all token transfers through VultisigWhitelisted during the whitelist period.",
+          "risk_level": "medium",
+          "exploitation_potential": "If oracle is set before pool has any observation history, all buys from Uniswap pool are blocked. Could delay token distribution."
+        },
+        {
+          "scenario": "Fee-on-transfer RAISE_TOKEN used in ILO",
+          "expected_behavior": "Contract should track actual received amounts",
+          "actual_behavior": "buy() records raiseAmount as deposited but actual received amount is less due to transfer fee. On refund, contract may not have sufficient balance to cover all refunds. Last refunder loses funds.",
+          "risk_level": "medium",
+          "exploitation_potential": "If RAISE_TOKEN charges transfer fees, the pool becomes underfunded. During refund, the last users cannot withdraw their full raiseAmount."
+        },
+        {
+          "scenario": "totalRaised exactly equals softCap but less than hardCap; raiseAmount = 0 passed to buy()",
+          "expected_behavior": "Zero-amount buy should be rejected",
+          "actual_behavior": "raiseAmount=0 passes the HC check and UC check. getLiquidity returns 0, which is caught by require(liquidityDelta > 0, 'ZA'). But if _vestingConfigs[0].shares < BPS, a non-zero liquidityDelta could become 0 after mulDiv, also caught. So zero buys are prevented.",
+          "risk_level": "low",
+          "exploitation_potential": "Minimal - the ZA check handles this."
+        },
+        {
+          "scenario": "ILOManager owner changes refund deadline to past timestamp while ILO is ongoing",
+          "expected_behavior": "Should have safeguards to prevent premature refund",
+          "actual_behavior": "setRefundDeadlineForProject has no constraints. Owner can set refundDeadline to 0, immediately enabling refund via the refundable() modifier, even during active sale.",
+          "risk_level": "high",
+          "exploitation_potential": "Malicious or compromised ILOManager owner can trigger premature refund, disrupting active ILO sales and preventing launch even if demand exists."
+        },
+        {
+          "scenario": "Platform/performance fee set to 10000 BPS (100%)",
+          "expected_behavior": "Fees should be bounded to reasonable limits",
+          "actual_behavior": "No upper bound check on PLATFORM_FEE or PERFORMANCE_FEE. If set to 10000 BPS, users receive 0 tokens on claim. All value goes to FEE_TAKER.",
+          "risk_level": "medium",
+          "exploitation_potential": "ILOManager owner sets 100% fees after project initialization. Fees are snapshot at project creation in _cachedProject, so only affects new projects. But no bound validation exists."
+        },
+        {
+          "scenario": "Multiple buy() calls for same recipient accumulate liquidity but vesting totalLiquidity is overwritten each time",
+          "expected_behavior": "totalLiquidity should be properly accumulated",
+          "actual_behavior": "_positionVests[tokenId].totalLiquidity = _position.liquidity, which IS cumulative since _position.liquidity += liquidityDelta. So totalLiquidity is correctly updated. No issue.",
+          "risk_level": "low",
+          "exploitation_potential": "None - correctly handled."
+        }
+      ],
+      "assumption_violations": [
+        "Assumes single Uniswap V3 position's fees can be correctly distributed across multiple virtual sub-positions via collect(max) - this is INCORRECT",
+        "Assumes sum of individually calculated liquidities equals total calculated liquidity - violated by rounding",
+        "Assumes RAISE_TOKEN and SALE_TOKEN are standard ERC20 without transfer fees or rebasing",
+        "Assumes initialPoolPriceX96 is between SQRT_RATIO_LOWER_X96 and SQRT_RATIO_UPPER_X96 - only lower bound checked",
+        "Assumes vest schedule entries have start < end - not validated",
+        "Assumes oracle pool has sufficient observation history - not guaranteed",
+        "Assumes Uniswap V3 pool price cannot be manipulated between ILOManager.launch price check and ILOPool.launch addLiquidity"
+      ],
+      "game_theory_risks": [
+        "Race to claim first: earlier claimers capture a larger share of accumulated trading fees due to the collect(max) bug",
+        "FEE_TAKER benefits from users NOT claiming - more uncollected fees are swept to feeTaker when someone eventually claims",
+        "Project admin can manipulate whitelist to front-run their own purchases then remove whitelist",
+        "ILOManager owner has unilateral control over refund deadlines - can force refund or prevent it",
+        "Permissionless launch() allows anyone to trigger launch at launchTime - project admin cannot delay if conditions are unfavorable"
+      ],
+      "integration_risks": [
+        "Uniswap V3 pool.burn() + pool.collect() pattern assumes exclusive position ownership - violated by shared virtual positions",
+        "Uniswap V3 pool price check in ILOManager.launch() can be sandwiched if pool already has liquidity from other sources",
+        "External oracle dependency for whitelist cap enforcement - oracle failure blocks all transfers",
+        "Clones.cloneDeterministic uses fixed implementation - if implementation has bugs, all cloned pools are affected",
+        "ILOPool relies on MANAGER for project data - if MANAGER is upgraded or state corrupted, pools break"
+      ],
+      "calculation_errors": [
+        "In _unlockedLiquidity: vest.shares (uint16) * totalLiquidity (uint128) computed in uint128, overflow possible for large totalLiquidity values",
+        "In _unlockedLiquidity: (vest.end - vest.start) * BPS computed in uint64 space, theoretically overflowable for very long vest durations though practically unlikely",
+        "In buy(): liquidityDelta calculated per-user then scaled; sum of per-user values ≠ aggregate calculation due to floor division rounding",
+        "In claim(): fee calculation for individual user correct in isolation, but collect(max) collects fees for entire shared position - mathematical inconsistency"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "VULT (Vultisig)",
+          "behaviors": [
+            "permit:false",
+            "rebasing:false",
+            "callback_onTransfer",
+            "pausable"
+          ],
+          "decimals": 18,
+          "transfer_model": "hooks",
+          "accounting_model": "balanceOf",
+          "notes": "VultisigWhitelisted._beforeTokenTransfer calls Whitelist.checkWhitelist on every transfer when whitelist contract is set. Owner can disable by setting whitelist to address(0). Fixed supply of 100M tokens. Has approveAndCall for arbitrary external contract calls.",
+          "approval_model": "infinite_ok"
+        },
+        {
+          "address_or_symbol": "RAISE_TOKEN",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": -1,
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Assumed standard ERC20. If fee_on_transfer or rebasing, refund accounting breaks (balance < sum of raiseAmounts). TransferHelper.safeTransferFrom used. Decimals unknown - depends on deployment.",
+          "approval_model": "unknown"
+        },
+        {
+          "address_or_symbol": "SALE_TOKEN",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": -1,
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Assumed standard ERC20. _refundProject uses balanceOf(address(this)) which is correct for standard tokens but would include unexpected amounts for rebasing tokens. Used as Uniswap V3 concentrated liquidity pairing.",
+          "approval_model": "unknown"
+        },
+        {
+          "address_or_symbol": "WETH9",
+          "behaviors": [
+            "permit:false",
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Standard WETH. PeripheryPayments.pay handles ETH↔WETH wrapping. receive() restricted to WETH9 only."
+        },
+        {
+          "address_or_symbol": "ILOPool NFT (ERC721)",
+          "behaviors": [
+            "mint_burn_restricted"
+          ],
+          "decimals": 0,
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "ERC721 with enumerable. Each investor has at most 1 NFT per pool (checked via balanceOf(recipient)==0). Burned on refund. Position data stored separately in _positions mapping."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "launch_refund_exclusivity",
+          "state_vars": [
+            "_launchSucceeded",
+            "_refundTriggered"
+          ],
+          "description": "At most one of _launchSucceeded and _refundTriggered can be true. Both start false. Once one is set, the other is permanently blocked."
+        },
+        {
+          "name": "total_raised_consistency",
+          "state_vars": [
+            "totalRaised",
+            "sum(_positions[*].raiseAmount)"
+          ],
+          "description": "totalRaised should equal sum of all position raiseAmounts. Maintained by buy() incrementing both. Broken if raiseAmount tracking is incorrect."
+        },
+        {
+          "name": "vesting_shares_total_BPS",
+          "state_vars": [
+            "_vestingConfigs[*].shares"
+          ],
+          "description": "Sum of all vesting config shares must equal 10000 BPS exactly. Validated in _validateSharesAndVests."
+        },
+        {
+          "name": "vest_schedule_shares_total_BPS",
+          "state_vars": [
+            "vestingConfig.schedule[*].shares"
+          ],
+          "description": "For each vesting config, sum of schedule shares must equal 10000 BPS. Validated in _validateVestSchedule."
+        },
+        {
+          "name": "position_liquidity_conservation_VIOLATED",
+          "state_vars": [
+            "sum(all_position_liquidities)",
+            "uniswap_position_liquidity"
+          ],
+          "description": "INVARIANT VIOLATED: Sum of individual position liquidities (investors + project) may not equal actual Uniswap position liquidity due to rounding in per-user calculations vs aggregate calculation."
+        },
+        {
+          "name": "fee_distribution_fairness_VIOLATED",
+          "state_vars": [
+            "amountCollected",
+            "user_amount",
+            "feeTaker_amount"
+          ],
+          "description": "INVARIANT VIOLATED: collect(type(uint128).max) sweeps all owed tokens from shared Uniswap position. Fees belonging to non-claiming users are redirected to FEE_TAKER instead of being preserved."
+        }
+      ]
+    }
+  }
+}

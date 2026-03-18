@@ -1,0 +1,875 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "operational_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "FixedTermLoanHooks.sol",
+      "AccessControlHooks.sol",
+      "MarketConstraintHooks.sol",
+      "RoleProvider.sol",
+      "LenderStatus.sol",
+      "LibDeployment.sol",
+      "HooksConfig.sol",
+      "MarketState.sol",
+      "LibStoredInitCode.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T00:30:34.120Z",
+    "duration_ms": 500191
+  },
+  "threats": [
+    {
+      "hypothesis_id": "OPS-H001",
+      "title": "AccessControlHooks.onQueueWithdrawal Missing isHooked Check Allows Unauthorized Credential State Manipulation",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "AccessControlHooks.onQueueWithdrawal does not validate that msg.sender is a registered hooked market (no `_hookedMarkets[msg.sender].isHooked` check), unlike onDeposit and onTransfer. Any external address can call this function, triggering `_tryValidateAccess` which writes to `_lenderStatus` storage and makes stateful external calls to role providers via `_tryValidateCredential`. An attacker can call `onQueueWithdrawal(victim, 0, 0, fakeState, craftedHooksData)` to manipulate any lender's credential state. When `_tryValidateAccess` returns true (valid credential found via hooksData), the function completes successfully, persisting storage writes including provider state changes from `validateCredential` calls.",
+      "investigation_rationale": "This is a missing access control check on a state-changing function. FixedTermLoanHooks correctly includes `if (!market.isHooked) revert NotHookedMarket();` at the start of onQueueWithdrawal, but AccessControlHooks omits it entirely. This allows any caller to trigger credential validation flows and persist storage changes.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onQueueWithdrawal",
+        "_tryValidateAccess",
+        "_tryValidateAccessInner",
+        "_handleHooksData",
+        "_tryValidateCredential",
+        "_writeLenderStatus"
+      ],
+      "affected_contracts": [
+        "AccessControlHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "onQueueWithdrawal"
+        },
+        {
+          "file": "FixedTermLoanHooks.sol",
+          "function": "onQueueWithdrawal"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "AccessControlHooks.sol",
+        "lines": "onQueueWithdrawal function body",
+        "pattern": "Missing `HookedMarket memory market = _hookedMarkets[msg.sender]; if (!market.isHooked) revert NotHookedMarket();` that exists in onDeposit (same file) and in FixedTermLoanHooks.onQueueWithdrawal"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Target lender must exist in _lenderStatus (has or had a credential)",
+        "Attacker provides hooksData with >20 bytes pointing to a valid role provider for validateCredential path, or lender has expired credential that gets cleared"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "onQueueWithdrawal in AccessControlHooks has no msg.sender validation, while all other state-changing hooks (onDeposit, onTransfer) do",
+        "admin_dependency": "None - any caller can exploit this",
+        "exploitation_window": "Permanent - available whenever a lender has any credential state"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can an attacker consume one-time-use credentials on providers by calling validateCredential through this path?",
+          "Does clearing an expired credential prevent the lender from refreshing it through normal market interaction?",
+          "Can the attacker trigger unintended state changes in role providers via validateCredential?"
+        ],
+        "validation_requirements": [
+          "Call onQueueWithdrawal from non-market address and verify storage is modified",
+          "Confirm _tryValidateCredential makes CALL (not staticcall) to provider, enabling stateful side effects",
+          "Test with various hooksData payloads to enumerate exploitation paths"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify a lender with an active or expired credential in _lenderStatus",
+        "phase_2": "Craft hooksData with >20 bytes pointing to a registered role provider",
+        "phase_3": "Call onQueueWithdrawal(victimAddress, 0, 0, fakeState, craftedHooksData) from attacker EOA",
+        "phase_4": "If validateCredential succeeds, lender's credential state is updated and provider's one-time credential is consumed without an actual withdrawal",
+        "coordination_requirements": "None - single transaction, any caller"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Credential state for any lender can be manipulated by unauthorized callers",
+        "operational_disruption": "Lenders may lose one-time credentials, need re-authentication, or have credential state unexpectedly modified",
+        "recovery_difficulty": "Lender must re-obtain credentials from role providers",
+        "affected_operations": "All credential-gated operations (deposit, transfer, withdrawal) affected indirectly"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - single transaction",
+        "technical_skills": "Basic - craft calldata to a public function",
+        "operational_timing": "Anytime"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Calls to onQueueWithdrawal from non-market addresses",
+        "operational_anomalies": "Unexpected credential state changes without corresponding market interactions",
+        "behavioral_patterns": "Repeated calls targeting specific lender addresses",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H002",
+      "title": "HooksConfig.onSetAnnualInterestAndReserveRatioBips Checks returndatasize Before External Call Due to Yul Evaluation Order",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In HooksConfig.sol's `onSetAnnualInterestAndReserveRatioBips`, the assembly block uses `if or(lt(returndatasize(), 0x40), iszero(call(gas(), target, ...)))`. Yul evaluates arguments left-to-right, so `returndatasize()` is read BEFORE the `call` is made. This means `lt(returndatasize(), 0x40)` checks the return data size from the PREVIOUS external call in the market's execution context, not from the hooks call. If no prior call returned >= 64 bytes (or no prior call was made), this evaluates to true, making the `or` always true, causing a revert even when the hooks call succeeds and returns valid data. This could brick the `setAnnualInterestAndReserveRatioBips` functionality entirely.",
+      "investigation_rationale": "The developer's intent was to check both call failure AND insufficient return data. But Yul left-to-right evaluation means the returndatasize check uses stale data. Other hook functions (onDeposit, onTransfer, etc.) don't have this pattern since they return void. This is the only hook that expects return data.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onSetAnnualInterestAndReserveRatioBips"
+      ],
+      "affected_contracts": [
+        "HooksConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksConfig.sol",
+          "function": "onSetAnnualInterestAndReserveRatioBips"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksConfig.sol",
+        "lines": "SetAnnualInterestAndReserveRatioBips assembly block",
+        "pattern": "or(lt(returndatasize(), 0x40), iszero(call(...))) evaluates returndatasize() before the call opcode executes; should be or(iszero(call(...)), lt(returndatasize(), 0x40)) or separate checks"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "The market contract's execution path for setAnnualInterestBips must not include a prior external call returning >= 64 bytes before invoking this library function",
+        "The hooks flag useOnSetAnnualInterestAndReserveRatioBips must be enabled"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Yul evaluates `lt(returndatasize(), 0x40)` BEFORE the `call` opcode, checking stale RETURNDATASIZE from prior execution context",
+        "admin_dependency": "Affects borrower's ability to adjust interest rates",
+        "exploitation_window": "Permanent if the market's execution path doesn't have a prior call with >= 64 bytes return data"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "What is the exact execution path in the market contract before calling this library function?",
+          "Does the market contract make any external calls returning >= 64 bytes before this point?",
+          "Can this be triggered deterministically to permanently brick interest rate changes?"
+        ],
+        "validation_requirements": [
+          "Deploy a market with hooks enabled for setAnnualInterestAndReserveRatioBips",
+          "Call setAnnualInterestBips and check if it reverts with the hooks return data",
+          "Verify by swapping or() operands that the bug is confirmed"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify market with useOnSetAnnualInterestAndReserveRatioBips enabled",
+        "phase_2": "Analyze market's execution path to confirm no prior call returns >= 64 bytes",
+        "phase_3": "If confirmed, borrower cannot adjust interest rates, permanently locking parameters",
+        "phase_4": "No active exploitation needed - the bug manifests during normal operations",
+        "coordination_requirements": "None - this is a latent code defect"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Borrower permanently unable to modify annual interest rate or reserve ratio through the hooks",
+        "operational_disruption": "Market parameters frozen, borrower cannot respond to changing market conditions",
+        "recovery_difficulty": "No recovery possible without contract redeployment - market is non-upgradable",
+        "affected_operations": "setAnnualInterestAndReserveRatioBips on all markets using this HooksConfig library"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None - latent defect",
+        "technical_skills": "N/A - manifests naturally",
+        "operational_timing": "Any time borrower tries to change interest rate"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Reverted setAnnualInterestBips transactions",
+        "operational_anomalies": "Consistent failure to update interest rates on hooked markets",
+        "behavioral_patterns": "All attempts to change interest rates fail",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H003",
+      "title": "Unauthorized validateCredential Invocation Consumes One-Time Provider Credentials",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "Building on the missing isHooked check in AccessControlHooks.onQueueWithdrawal (OPS-H001), an attacker can craft hooksData with >20 bytes to trigger `_tryValidateCredential`, which makes a stateful `CALL` (not staticcall) to the role provider's `validateCredential` function. If the provider implements one-time-use credential logic (consuming a token, incrementing a nonce, etc.), the attacker's unauthorized call burns the lender's credential without any actual market operation occurring. When the function succeeds (provider returns valid credential), storage is updated and the transaction completes, permanently consuming the credential.",
+      "investigation_rationale": "_tryValidateCredential uses `call(gas(), providerAddress, 0, ...)` which allows state changes in the provider. Combined with the missing isHooked check, anyone can trigger this stateful call for any lender address. The provider has no way to distinguish authorized market-originating calls from unauthorized attacker-originating calls.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onQueueWithdrawal",
+        "_tryValidateCredential"
+      ],
+      "affected_contracts": [
+        "AccessControlHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "onQueueWithdrawal"
+        },
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "_tryValidateCredential"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "AccessControlHooks.sol",
+        "lines": "_tryValidateCredential assembly block",
+        "pattern": "call(gas(), providerAddress, 0, ...) is a stateful CALL, combined with missing isHooked check in onQueueWithdrawal allowing any caller to invoke this path"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A role provider with stateful validateCredential (one-time-use credentials) must be registered",
+        "Attacker knows the provider address and can craft valid hooksData format",
+        "Target lender must not be a known lender on the attacker's address (always true since attacker is not a market)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "CALL to external provider is made without verifying msg.sender is a legitimate market",
+        "admin_dependency": "None",
+        "exploitation_window": "Anytime a lender has a one-time credential available"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Which deployed role providers implement stateful validateCredential with one-time-use semantics?",
+          "Can providers distinguish between legitimate market calls and attacker calls?",
+          "What is the cost to the lender of having their credential consumed?"
+        ],
+        "validation_requirements": [
+          "Deploy a mock one-time credential provider",
+          "Call onQueueWithdrawal from attacker address with crafted hooksData",
+          "Verify provider's one-time credential is consumed"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Identify registered role providers with stateful validateCredential",
+        "phase_2": "Encode hooksData as [provider_address(20 bytes)][credential_data(N bytes)]",
+        "phase_3": "Call onQueueWithdrawal(victimLender, 0, 0, emptyState, hooksData)",
+        "phase_4": "Provider's validateCredential is called, consuming the one-time credential. Lender must obtain a new credential.",
+        "coordination_requirements": "None - single transaction"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Lender credentials can be consumed by unauthorized parties",
+        "operational_disruption": "Lenders denied access to deposits/withdrawals until new credentials obtained",
+        "recovery_difficulty": "Lender must re-obtain credentials from the provider",
+        "affected_operations": "All credential-gated market operations for affected lenders"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low",
+        "technical_skills": "Basic calldata construction",
+        "operational_timing": "After lender obtains credential but before they use it"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "validateCredential calls from non-market msg.sender contexts",
+        "operational_anomalies": "Lender credentials disappearing without corresponding market operations",
+        "behavioral_patterns": "Repeated targeting of specific lenders",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H004",
+      "title": "Borrower Bypasses Temporary Reserve Ratio via Repeated 25% APR Step-Downs",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The temporary reserve ratio mechanism in MarketConstraintHooks allows a borrower to reduce APR by up to 25% (2500 bips relative difference) without triggering an elevated reserve ratio. After the 2-week temporary period expires, the new lower APR becomes the baseline for the next reduction. By repeating 25% reductions every 2 weeks, a borrower can reduce APR from 10000 to ~3164 bips (68% total reduction) over 8 weeks without ever triggering elevated reserve ratios above the original. This undermines the protection mechanism designed to give lenders time to exit.",
+      "investigation_rationale": "_calculateTemporaryReserveRatioBips returns originalReserveRatioBips when relativeDiff <= 2500. After expiry, delete temporaryExcessReserveRatio[market] resets the state, and the new current APR becomes the baseline for the next reduction. The mechanism has no memory of cumulative reductions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onSetAnnualInterestAndReserveRatioBips",
+        "_calculateTemporaryReserveRatioBips"
+      ],
+      "affected_contracts": [
+        "MarketConstraintHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarketConstraintHooks.sol",
+          "function": "onSetAnnualInterestAndReserveRatioBips"
+        },
+        {
+          "file": "MarketConstraintHooks.sol",
+          "function": "_calculateTemporaryReserveRatioBips"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarketConstraintHooks.sol",
+        "lines": "_calculateTemporaryReserveRatioBips",
+        "pattern": "relativeDiff <= 2500 returns originalReserveRatioBips unchanged; after expiry, delete temporaryExcessReserveRatio resets baseline to current lower APR"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Borrower controls setAnnualInterestBips on the market",
+        "Market has an existing APR high enough for multiple 25% reductions to be meaningful",
+        "Borrower is willing to wait 2 weeks between each reduction"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Each 25% reduction from the current baseline avoids elevated reserve ratio; mechanism has no cumulative reduction tracking",
+        "admin_dependency": "Borrower-initiated rate changes",
+        "exploitation_window": "2-week intervals between reductions"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is the 8-week timeline acceptable for lender protection, or should cumulative reductions be tracked?",
+          "Do lenders have sufficient off-chain notification to react within 2-week windows?",
+          "What is the economic impact of a 68% APR reduction over 8 weeks vs immediate?"
+        ],
+        "validation_requirements": [
+          "Simulate 4 sequential 25% APR reductions with 2-week waits",
+          "Verify each step triggers only the original reserve ratio",
+          "Calculate total APR reduction without elevated reserve protection"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Set APR to 75% of current (25% reduction) - no elevated reserve ratio",
+        "phase_2": "Wait 2 weeks for temporary period to expire, APR rate becomes new baseline",
+        "phase_3": "Repeat: reduce 25% from new baseline (e.g., 10000→7500→5625→4219→3164)",
+        "phase_4": "After 8 weeks, APR reduced ~68% without ever triggering penalty reserve ratios",
+        "coordination_requirements": "Patient execution over 8+ weeks"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Borrower effectively bypasses the reserve ratio protection mechanism",
+        "operational_disruption": "Lenders receive drastically reduced yield without proportional reserve protection",
+        "recovery_difficulty": "No mechanism for lenders to prevent gradual reduction",
+        "affected_operations": "Interest accrual, reserve ratio enforcement"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - single borrower acting over time",
+        "technical_skills": "Basic - standard admin function calls",
+        "operational_timing": "2-week intervals"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Sequential 25% APR reductions at 2-week intervals",
+        "operational_anomalies": "Monotonically decreasing APR with no elevated reserve ratio events",
+        "behavioral_patterns": "Predictable 2-week cadence of rate changes",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H005",
+      "title": "Reentrancy via Stateful CALL in _tryValidateCredential Enables Provider-Driven State Corruption",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "_tryValidateCredential uses `call(gas(), providerAddress, ...)` (a stateful CALL, not staticcall) to invoke validateCredential on external role providers. This occurs within onDeposit, onTransfer, and onQueueWithdrawal hooks before the lender's credential state is finalized in storage. A malicious or compromised role provider can use this callback to reenter the hooks contract or the calling market contract, potentially manipulating state between credential validation and storage writes.",
+      "investigation_rationale": "The external call forwards all gas and allows arbitrary code execution by the provider. While the credential state is in memory (not yet written to storage), the provider could reenter other functions that read stale storage state. The hooks contract has no reentrancy guard.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_tryValidateCredential",
+        "onDeposit",
+        "onTransfer",
+        "onQueueWithdrawal"
+      ],
+      "affected_contracts": [
+        "AccessControlHooks.sol",
+        "FixedTermLoanHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "_tryValidateCredential"
+        },
+        {
+          "file": "FixedTermLoanHooks.sol",
+          "function": "_tryValidateCredential"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "AccessControlHooks.sol",
+        "lines": "_tryValidateCredential assembly block",
+        "pattern": "call(gas(), providerAddress, 0, ...) with no reentrancy guard; state writes happen after return in _writeLenderStatus"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Borrower must have added a malicious or compromised role provider",
+        "Provider must implement validateCredential with reentrant behavior",
+        "Target hook function must be in a state where reentrancy causes meaningful corruption"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "External CALL to untrusted provider code with full gas before state is committed to storage",
+        "admin_dependency": "Requires malicious provider to be registered (borrower action)",
+        "exploitation_window": "During any deposit, transfer, or withdrawal that invokes credential validation via hooksData"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Can a malicious provider reenter the hooks to grant itself additional credentials?",
+          "Can reentrancy allow bypassing the credential replacement rules in _grantRole?",
+          "Does the market contract have reentrancy protection that limits the impact?"
+        ],
+        "validation_requirements": [
+          "Deploy malicious provider that reenters hooks on validateCredential callback",
+          "Test specific reentrancy paths: grantRole, blockFromDeposits, onDeposit",
+          "Verify if market-level reentrancy guards mitigate the risk"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Borrower registers malicious provider via addRoleProvider",
+        "phase_2": "Provider's validateCredential makes reentrant calls to the hooks contract",
+        "phase_3": "During reentrant call, provider calls grantRole to set credentials before outer call completes",
+        "phase_4": "Outer _writeLenderStatus may overwrite the reentrantly-set credential with stale data",
+        "coordination_requirements": "Malicious provider contract deployment"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Provider can manipulate credential state for arbitrary lenders during callbacks",
+        "operational_disruption": "Stale credential state written to storage after reentrant modifications",
+        "recovery_difficulty": "Requires provider removal and credential re-issuance",
+        "affected_operations": "All credential-gated operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium - requires malicious provider contract",
+        "technical_skills": "Advanced - reentrancy exploitation",
+        "operational_timing": "During credential validation transactions"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Unusual call depth during credential validation",
+        "operational_anomalies": "Credential state inconsistencies after validation",
+        "behavioral_patterns": "Provider making calls back to hooks during validation",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H006",
+      "title": "Gas Griefing via Malicious Pull Provider Consuming All Gas in Credential Loop",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Both _tryGetCredential and _loopTryGetCredential pass all remaining gas to external pull providers via `staticcall(gas(), providerAddress, ...)`. A malicious or buggy pull provider can consume all available gas (e.g., infinite loop), causing the entire credential validation to revert with Out of Gas. Since _loopTryGetCredential iterates over all pull providers, even a single malicious provider can DoS all credential validation, preventing deposits, transfers, and withdrawals for all lenders on all markets using the hooks instance.",
+      "investigation_rationale": "The gas() opcode forwards all remaining gas to the staticcall. There is no gas limit cap for the external call. A single malicious provider in the _pullProviders array blocks all credential refresh attempts since the loop encounters the OOG revert.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_tryGetCredential",
+        "_loopTryGetCredential",
+        "onDeposit",
+        "onTransfer",
+        "onQueueWithdrawal"
+      ],
+      "affected_contracts": [
+        "AccessControlHooks.sol",
+        "FixedTermLoanHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "_tryGetCredential"
+        },
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "_loopTryGetCredential"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "AccessControlHooks.sol",
+        "lines": "_tryGetCredential assembly block",
+        "pattern": "staticcall(gas(), providerAddress, ...) forwards all remaining gas; no gas cap; failure propagates as OOG to parent"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "A pull provider must be registered that consumes excessive gas (malicious or buggy)",
+        "The lender's credential validation must reach the loop path (no valid cached credential)"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "All gas forwarded to external calls with no cap; single provider failure DoSes entire loop",
+        "admin_dependency": "Borrower must have added the malicious provider (or provider was later compromised)",
+        "exploitation_window": "Permanent until borrower removes the malicious provider"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Does the staticcall's failure propagate as an OOG or as a silent false return?",
+          "Can the borrower remove the malicious provider quickly enough to restore service?",
+          "Is there a gas limit that would prevent the loop from being fully DoSed?"
+        ],
+        "validation_requirements": [
+          "Deploy a gas-consuming mock pull provider",
+          "Register it and verify credential validation fails with OOG",
+          "Confirm borrower can remove provider to restore service"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Compromise or deploy a malicious pull provider with gas-consuming getCredential",
+        "phase_2": "Borrower unknowingly adds it via addRoleProvider",
+        "phase_3": "All credential validation attempts that reach the loop fail with OOG",
+        "phase_4": "Deposits, transfers, withdrawals blocked for all lenders until provider is removed",
+        "coordination_requirements": "Provider deployment and social engineering of borrower"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "All credential-gated operations blocked",
+        "operational_disruption": "Complete market freeze for deposits and withdrawals",
+        "recovery_difficulty": "Borrower must identify and remove the malicious provider",
+        "affected_operations": "onDeposit, onTransfer, onQueueWithdrawal on all markets"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Medium - requires provider to be registered",
+        "technical_skills": "Basic - deploy gas-consuming contract",
+        "operational_timing": "After provider registration"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "OOG reverts on credential validation transactions",
+        "operational_anomalies": "All deposits/withdrawals failing simultaneously",
+        "behavioral_patterns": "Consistent OOG at a specific call depth",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H007",
+      "title": "HooksConfig.onBorrow Uses RepayHook_Base_Size Instead of BorrowHook_Base_Size Constant",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In HooksConfig.sol's `onBorrow` function, the assembly block calculates the hook call size using `add(RepayHook_Base_Size, extraCalldataBytes)` instead of `add(BorrowHook_Base_Size, extraCalldataBytes)`. Both constants are currently defined as 0x0224, so there is no functional impact. However, this is a code defect where the wrong constant is referenced. If either constant is modified independently in a future update, the borrow hook would send incorrectly-sized calldata to the hooks contract, potentially truncating or padding the call data and causing the hooks contract to revert or misinterpret parameters.",
+      "investigation_rationale": "The function clearly handles borrow operations but references a repay-related constant. The constant values happen to be identical (0x0224) because borrow and repay hooks have the same calldata structure, but using the wrong named constant creates a maintenance hazard.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onBorrow"
+      ],
+      "affected_contracts": [
+        "HooksConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksConfig.sol",
+          "function": "onBorrow"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksConfig.sol",
+        "lines": "onBorrow assembly block, size calculation",
+        "pattern": "let size := add(RepayHook_Base_Size, extraCalldataBytes) — should be BorrowHook_Base_Size"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Currently no impact since both constants equal 0x0224",
+        "Risk manifests only if constants are changed independently in future"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Wrong constant name in borrow function referencing repay constant",
+        "admin_dependency": "None",
+        "exploitation_window": "Future code maintenance"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Are BorrowHook_Base_Size and RepayHook_Base_Size always identical by design?",
+          "Should the constants be unified into one if they always match?",
+          "Are there other hook functions with similar constant misreferences?"
+        ],
+        "validation_requirements": [
+          "Verify both constants are identical: BorrowHook_Base_Size == RepayHook_Base_Size == 0x0224",
+          "Confirm no functional impact in current deployment",
+          "Flag for code review correction"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "No current exploitation possible",
+        "phase_2": "If constants diverge in future update, onBorrow sends wrong calldata size",
+        "phase_3": "Hooks contract receives truncated/malformed data, potentially reverting or misinterpreting",
+        "phase_4": "All borrow operations would fail or behave incorrectly",
+        "coordination_requirements": "None - latent defect"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "None currently",
+        "operational_disruption": "Potential future borrow operation failures if constants diverge",
+        "recovery_difficulty": "Requires contract redeployment to fix",
+        "affected_operations": "onBorrow hook calls"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "N/A",
+        "operational_timing": "N/A"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "N/A currently",
+        "operational_anomalies": "N/A currently",
+        "behavioral_patterns": "N/A currently",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H008",
+      "title": "MarketState.withdrawableProtocolFees Underflow Blocks Fee Collection in Undercollateralized Markets",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In MarketState.sol's `withdrawableProtocolFees`, the calculation `uint256 totalAvailableAssets = totalAssets - state.normalizedUnclaimedWithdrawals` will revert with an arithmetic underflow in Solidity 0.8+ if `totalAssets < state.normalizedUnclaimedWithdrawals`. This can occur when a market becomes severely undercollateralized (e.g., borrower defaults, bad debt accumulates). The revert would prevent the protocol from collecting any fees and could block critical market functions that call this method.",
+      "investigation_rationale": "Solidity 0.8.25 (configured in foundry.toml) has checked arithmetic by default. The subtraction has no explicit underflow protection (no satSub). If market becomes insolvent, this function reverts instead of returning 0, potentially bricking fee collection paths.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "withdrawableProtocolFees"
+      ],
+      "affected_contracts": [
+        "MarketState.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarketState.sol",
+          "function": "withdrawableProtocolFees"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarketState.sol",
+        "lines": "withdrawableProtocolFees function",
+        "pattern": "uint256 totalAvailableAssets = totalAssets - state.normalizedUnclaimedWithdrawals; unchecked subtraction in checked arithmetic context"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market must be severely undercollateralized: totalAssets < normalizedUnclaimedWithdrawals",
+        "This typically occurs during borrower default or bad debt scenarios"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Unchecked subtraction that reverts instead of returning 0 in edge case",
+        "admin_dependency": "None - triggered by market conditions",
+        "exploitation_window": "During market insolvency events"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is withdrawableProtocolFees called in state-changing market functions (not just views)?",
+          "Does the revert block critical operations like withdrawal processing?",
+          "Should the function use satSub and return 0 in undercollateralized scenarios?"
+        ],
+        "validation_requirements": [
+          "Create a market state where totalAssets < normalizedUnclaimedWithdrawals",
+          "Call withdrawableProtocolFees and verify it reverts",
+          "Trace callers to determine impact on critical paths"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Borrower defaults, totalAssets drops below normalizedUnclaimedWithdrawals",
+        "phase_2": "Any function calling withdrawableProtocolFees reverts",
+        "phase_3": "Protocol fee collection and potentially other market operations are blocked",
+        "phase_4": "Market enters a degraded state where certain operations are permanently blocked",
+        "coordination_requirements": "Market insolvency (may occur naturally)"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Protocol fee collection blocked in insolvent markets",
+        "operational_disruption": "Market functions dependent on this calculation revert",
+        "recovery_difficulty": "Requires borrower to recollateralize market",
+        "affected_operations": "Protocol fee withdrawal, potentially market state updates"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "Low - triggered by market conditions",
+        "technical_skills": "N/A - natural event",
+        "operational_timing": "During market insolvency"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Reverting fee collection transactions on distressed markets",
+        "operational_anomalies": "Inability to process fees during default scenarios",
+        "behavioral_patterns": "Market operations failing when totalAssets drops",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H009",
+      "title": "Borrower Can Instantly Eliminate Fixed-Term Lockup by Setting fixedTermEndTime to Zero",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "FixedTermLoanHooks.setFixedTermEndTime allows the borrower to set the fixed term end time to 0 (or any past timestamp). The only check is `newFixedTermEndTime > hookedMarket.fixedTermEndTime` (must not increase). Since 0 is always <= any existing value, the borrower can instantly eliminate the fixed-term lockup protection. In onQueueWithdrawal, the check `market.fixedTermEndTime > block.timestamp` becomes `0 > block.timestamp` which is always false, allowing immediate withdrawals. This breaks the fixed-term guarantee that lenders relied upon when depositing.",
+      "investigation_rationale": "The setFixedTermEndTime function enforces monotonic decrease but has no minimum value check. The borrower could attract deposits with a long fixed term, then set it to 0, allowing themselves to trigger mass withdrawals or remove the liquidity guarantee.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setFixedTermEndTime",
+        "onQueueWithdrawal"
+      ],
+      "affected_contracts": [
+        "FixedTermLoanHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "FixedTermLoanHooks.sol",
+          "function": "setFixedTermEndTime"
+        },
+        {
+          "file": "FixedTermLoanHooks.sol",
+          "function": "onQueueWithdrawal"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "FixedTermLoanHooks.sol",
+        "lines": "setFixedTermEndTime function",
+        "pattern": "Only checks newFixedTermEndTime > hookedMarket.fixedTermEndTime (no increase), no minimum value check; 0 is always valid"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Borrower has deployed a fixed-term market",
+        "Borrower calls setFixedTermEndTime with newFixedTermEndTime = 0"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "No minimum value enforcement in setFixedTermEndTime",
+        "admin_dependency": "Requires borrower action (intended admin power, but no safeguard against eliminating the term entirely)",
+        "exploitation_window": "Anytime during the fixed term"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is eliminating the fixed term entirely an intended borrower capability?",
+          "Should there be a minimum remaining term or should the function only allow reduction to current block.timestamp?",
+          "Do lenders have any on-chain recourse if the term is eliminated?"
+        ],
+        "validation_requirements": [
+          "Call setFixedTermEndTime(market, 0) as borrower",
+          "Verify lenders can immediately queue withdrawals afterward",
+          "Assess impact on lender expectations and market stability"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Borrower creates market with attractive fixed term (e.g., 180 days)",
+        "phase_2": "Lenders deposit based on the term commitment",
+        "phase_3": "Borrower calls setFixedTermEndTime(market, 0), instantly eliminating the lockup",
+        "phase_4": "Borrower can now borrow without the liquidity guarantee that the fixed term provided",
+        "coordination_requirements": "Borrower action only"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Fixed-term guarantee completely eliminated",
+        "operational_disruption": "Market model breaks - borrower loses fixed-term liquidity assurance",
+        "recovery_difficulty": "Cannot restore the fixed term once reduced",
+        "affected_operations": "All withdrawal queuing operations"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None - single borrower transaction",
+        "technical_skills": "None - standard function call",
+        "operational_timing": "Anytime during the fixed term"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "setFixedTermEndTime called with value 0 or far-past timestamp",
+        "operational_anomalies": "Fixed-term market suddenly allowing withdrawals",
+        "behavioral_patterns": "Term reduction shortly after large deposit inflow",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "OPS-H010",
+      "title": "Credential Cross-Contamination: Global _lenderStatus Shared Across All Markets on Same Hooks Instance",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "The `_lenderStatus` mapping is global across all markets using the same hooks instance. A credential granted by any role provider automatically applies to ALL markets managed by the same hooks contract, not just the intended market. While `isKnownLenderOnMarket` is per-market (correctly), the initial credential check in `_tryValidateAccessInner` uses the global `_lenderStatus`. A lender approved for one market (e.g., a low-risk market) automatically has deposit access to all other markets (e.g., high-risk markets) managed by the same hooks instance, bypassing any intended per-market access differentiation.",
+      "investigation_rationale": "_lenderStatus[account] stores a single credential that is checked by all market hooks. The hooks instance is deployed per-borrower and shared across markets. If the borrower intends different access policies per market (e.g., different risk tiers), the shared credential makes this impossible.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_tryValidateAccessInner",
+        "onDeposit",
+        "onTransfer",
+        "onQueueWithdrawal"
+      ],
+      "affected_contracts": [
+        "AccessControlHooks.sol",
+        "FixedTermLoanHooks.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "AccessControlHooks.sol",
+          "function": "_tryValidateAccessInner"
+        },
+        {
+          "file": "FixedTermLoanHooks.sol",
+          "function": "_tryValidateAccessInner"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "AccessControlHooks.sol",
+        "lines": "_tryValidateAccessInner first line",
+        "pattern": "_lenderStatus[account] is a single global mapping used by all markets; no market-specific credential scoping"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Borrower deploys multiple markets through the same hooks instance",
+        "Borrower intends different access control policies per market",
+        "A lender obtains a credential for any one market"
+      ],
+      "initial_operational_evidence": {
+        "suspicious_workflow": "Single _lenderStatus mapping shared across all markets; credential from market A grants access to markets B, C, etc.",
+        "admin_dependency": "Borrower configuration of multiple markets on same hooks",
+        "exploitation_window": "Permanent - inherent to the architecture"
+      },
+      "investigation_scope": {
+        "operational_questions": [
+          "Is per-market access differentiation an expected use case for borrowers with multiple markets?",
+          "Should _lenderStatus be scoped per-market instead of global?",
+          "Can this lead to compliance violations if different markets have different KYC requirements?"
+        ],
+        "validation_requirements": [
+          "Deploy two markets with same hooks instance",
+          "Grant credential for market A only",
+          "Verify lender can deposit in market B without separate approval"
+        ]
+      },
+      "preliminary_attack_methodology": {
+        "phase_1": "Obtain credential for the least restrictive market under a borrower's hooks instance",
+        "phase_2": "Use the same credential to deposit in more restrictive markets",
+        "phase_3": "Bypass any intended per-market access control differentiation",
+        "phase_4": "Access restricted markets without meeting their specific credential requirements",
+        "coordination_requirements": "None - standard lender actions"
+      },
+      "potential_operational_impact": {
+        "administrative_compromise": "Per-market access control policy cannot be enforced",
+        "operational_disruption": "Unauthorized access to restricted markets",
+        "recovery_difficulty": "Requires separate hooks instances per market (architectural change)",
+        "affected_operations": "All credential-gated operations across all markets on the same hooks"
+      },
+      "execution_requirements_analysis": {
+        "governance_tokens_needed": "None",
+        "coordination_complexity": "None",
+        "technical_skills": "None - standard deposit operations",
+        "operational_timing": "After obtaining credential for any market"
+      },
+      "investigation_priorities": {
+        "on_chain_signals": "Deposits from lenders who only have credentials for different markets",
+        "operational_anomalies": "Lenders accessing markets they shouldn't have credentials for",
+        "behavioral_patterns": "Credential obtained for easy market, deposits made in restricted market",
+        "detection_difficulty": "medium"
+      }
+    }
+  ]
+}

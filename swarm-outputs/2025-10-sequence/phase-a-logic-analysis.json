@@ -1,0 +1,478 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T07:39:53.047Z",
+    "duration_ms": 502447
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-SIG-RECOVERY",
+        "source": "User-provided signature bytes (calldata)",
+        "path": [
+          "Calls.execute receives _payload + _signature",
+          "BaseAuth.signatureValidation dispatches to BaseSig.recover or static sig check",
+          "BaseSig.recover parses signatureFlag, reads checkpoint/threshold",
+          "BaseSig.recoverBranch recursively parses merkle tree nodes",
+          "ecrecover/ERC1271/Sapient calls recover signer addresses",
+          "Weights accumulated, merkle root computed",
+          "imageHash computed from root + threshold + checkpoint + checkpointer",
+          "imageHash validated against stored or CREATE2-derived hash"
+        ],
+        "transformations": [
+          "ERC-2098 compact signature decomposed to r,s,v",
+          "ecrecover maps (hash,v,r,s) to address",
+          "Leaf hash computed per signer type",
+          "Merkle root built by sequential hashing of leaves/nodes",
+          "imageHash = fkeccak256(fkeccak256(fkeccak256(root, threshold), checkpoint), checkpointer)"
+        ],
+        "sinks": [
+          "imageHash compared to storage or CREATE2 address"
+        ],
+        "trust_changes": "Raw bytes transition from untrusted user input to validated auth state after imageHash match",
+        "validation_points": [
+          "Weight >= threshold check",
+          "imageHash match against storage/CREATE2",
+          "Checkpoint ordering in chained signatures",
+          "Snapshot constraint check"
+        ],
+        "exposure_risks": [
+          "opHash exposed to ERC1271/Sapient external contracts during validation"
+        ],
+        "manipulation_risks": [
+          "ecrecover returns address(0) on invalid sig - weight still added to tree",
+          "Unchecked arithmetic in recoverBranch can overflow weight after FLAG_SUBDIGEST sets it to max",
+          "LibBytes reads out-of-bounds return 0 silently instead of reverting",
+          "noChainId flag is set by signature, allowing cross-chain replay if signer opts in"
+        ]
+      },
+      {
+        "flow_id": "DF-02-SESSION-SIG",
+        "source": "Session signature bytes from SessionSig.recoverSignature",
+        "path": [
+          "SessionManager.recoverSapientSignature receives payload and encodedSignature",
+          "SessionSig.recoverSignature parses session configuration",
+          "Attestation list parsed and identity-signature verified",
+          "Per-call signatures recovered via ecrecover",
+          "Explicit calls validated via _validateExplicitCall with permission matching",
+          "Implicit calls validated via _validateImplicitCall with attestation check",
+          "Usage limits accumulated and validated via _validateLimitUsageIncrement",
+          "imageHash returned for sapient verification"
+        ],
+        "transformations": [
+          "Session configuration decoded into merkle tree with permissions, blacklist, identity signer",
+          "Attestation packed format decoded to struct",
+          "hashCallWithReplayProtection creates per-call hash for session signer verification",
+          "Permission rules applied with parameter masking and comparison"
+        ],
+        "sinks": [
+          "imageHash returned to BaseSig for merkle leaf computation",
+          "Usage limits written to storage via incrementUsageLimit"
+        ],
+        "trust_changes": "Session signer trust bounded by permissions; identity signer authenticates attestations; attestation validates implicit mode",
+        "validation_points": [
+          "Identity signer must match recovered signer from attestation signature",
+          "Session signer recovered from per-call signature must be non-zero",
+          "Permission rules validated per call",
+          "Blacklist checked for implicit calls",
+          "acceptImplicitRequest return value matched against magic"
+        ],
+        "exposure_risks": [
+          "acceptImplicitRequest external call to target contract in implicit mode",
+          "ERC1271 external call for recovery signature validation"
+        ],
+        "manipulation_risks": [
+          "Attestation index out of bounds checked but list size is uint8 limiting to 255",
+          "Implicit calls depend on target contract returning correct magic value",
+          "Session permissions matched by linear scan - first match wins"
+        ]
+      },
+      {
+        "flow_id": "DF-03-RECOVERY-FLOW",
+        "source": "Recovery signer submits payload via queuePayload",
+        "path": [
+          "queuePayload validates signer's signature against recovery payload hash",
+          "Payload hash stored in timestampForQueuedPayload mapping",
+          "After timelock, recoverSapientSignatureCompact checks queued timestamp",
+          "_recoverBranch walks recovery merkle tree to find matching leaf",
+          "Returns merkle root as imageHash if verified"
+        ],
+        "transformations": [
+          "Recovery uses separate EIP712 domain ('Sequence Wallet - Recovery Mode')",
+          "recoveryPayloadHash computed with Recovery's domain separator",
+          "Payload.hashFor computed with Payload's domain separator for queue storage key"
+        ],
+        "sinks": [
+          "timestampForQueuedPayload storage mapping",
+          "queuedPayloadHashes array"
+        ],
+        "trust_changes": "Recovery signer gains time-delayed execution authority",
+        "validation_points": [
+          "Signature validation (ECDSA or ERC1271)",
+          "queuedAt != 0 check",
+          "queuedAt >= minTimestamp",
+          "block.timestamp - queuedAt >= requiredDeltaTime"
+        ],
+        "exposure_risks": [
+          "ERC1271 external call for contract signers"
+        ],
+        "manipulation_risks": [
+          "No mechanism to cancel queued payloads once queued",
+          "queuedPayloadHashes array grows unboundedly per signer per wallet",
+          "requiredDeltaTime only 24 bits (max ~194 days)"
+        ]
+      },
+      {
+        "flow_id": "DF-04-PAYLOAD-EXECUTION",
+        "source": "Packed payload bytes from execute/selfExecute/executeUserOp",
+        "path": [
+          "Payload.fromPackedCalls decodes packed bytes to Decoded struct",
+          "Nonce consumed via _consumeNonce",
+          "Signature validated via signatureValidation",
+          "_execute iterates calls with error handling",
+          "LibOptim.call or LibOptim.delegatecall dispatches"
+        ],
+        "transformations": [
+          "Global flag byte decoded to space, nonce, call count parameters",
+          "Per-call flag byte decoded to target, value, data, gas limit, delegate, fallback, behavior"
+        ],
+        "sinks": [
+          "External contract calls via call/delegatecall",
+          "Nonce storage update",
+          "Events emitted"
+        ],
+        "trust_changes": "Validated payload gains execution authority in wallet context",
+        "validation_points": [
+          "Nonce sequential check",
+          "Signature weight >= threshold",
+          "imageHash validity"
+        ],
+        "exposure_risks": [
+          "Delegatecall to external contracts in wallet context",
+          "Return data from failed calls exposed in events"
+        ],
+        "manipulation_risks": [
+          "onlyFallback logic depends on immediately preceding call's success - error flag resets each iteration",
+          "gasLimit=0 uses gasleft() which can be manipulated by relayers"
+        ]
+      },
+      {
+        "flow_id": "DF-05-HOOKS-DELEGATECALL",
+        "source": "Any external call to wallet with unrecognized function selector",
+        "path": [
+          "Hooks.fallback reads hook for selector",
+          "If hook exists, delegatecall to hook implementation",
+          "Hook executes in wallet's storage context"
+        ],
+        "transformations": [
+          "msg.data forwarded as-is to hook via delegatecall"
+        ],
+        "sinks": [
+          "Hook contract executes with full wallet storage access"
+        ],
+        "trust_changes": "Hook gains full storage write access to wallet",
+        "validation_points": [
+          "Hook must be registered via addHook (onlySelf)"
+        ],
+        "exposure_risks": [
+          "Malicious hook can modify any storage slot including implementation, imageHash, nonce"
+        ],
+        "manipulation_risks": [
+          "Hook can overwrite implementation address to hijack wallet",
+          "Hook can modify image hash to change signer configuration",
+          "No validation that hook contract is safe before delegatecall"
+        ]
+      },
+      {
+        "flow_id": "DF-06-WEBAUTHN-PASSKEY",
+        "source": "WebAuthn authenticator data and client JSON",
+        "path": [
+          "Passkeys.recoverSapientSignatureCompact receives digest and encoded signature",
+          "_decodeSignature parses flags and extracts auth data",
+          "WebAuthn.verify validates authenticatorData flags and client JSON",
+          "sha256 computed over authenticatorData || sha256(clientDataJSON)",
+          "P256.verifySignature checks secp256r1 signature",
+          "_rootForPasskey computes merkle root from public key and metadata"
+        ],
+        "transformations": [
+          "Challenge base64-encoded and matched in clientDataJSON",
+          "authenticatorData flags checked for User Present and optionally User Verified",
+          "Double SHA256 hash for message construction",
+          "P256 signature verification with malleability check"
+        ],
+        "sinks": [
+          "Returns merkle root hash for sapient leaf in BaseSig tree"
+        ],
+        "trust_changes": "WebAuthn assertion validated against P256 public key",
+        "validation_points": [
+          "type field must equal 'webauthn.get'",
+          "challenge must match base64-encoded digest",
+          "User Present flag required",
+          "User Verified flag conditional",
+          "P256 signature validity with s <= N/2"
+        ],
+        "exposure_risks": [
+          "P256 precompile availability depends on chain (RIP-7212)"
+        ],
+        "manipulation_risks": [
+          "challengeIndex and typeIndex are user-provided - verified via string matching",
+          "Origin not verified - relies on authenticator enforcement",
+          "rpIdHash not verified - relies on authenticator enforcement"
+        ]
+      },
+      {
+        "flow_id": "DF-07-USAGE-LIMIT-TRACKING",
+        "source": "Session usage from explicit call validation",
+        "path": [
+          "SessionManager validates calls and tracks usage per signer",
+          "PermissionValidator.validatePermission accumulates cumulative rule values",
+          "Usage limits collected in SessionUsageLimits array",
+          "_validateLimitUsageIncrement verifies first call matches expected increment",
+          "incrementUsageLimit stores new usage amounts"
+        ],
+        "transformations": [
+          "Cumulative rule values summed with storage baseline",
+          "Value tracking hashed with signer and VALUE_TRACKING_ADDRESS",
+          "Expected increment call data encoded and hash-compared"
+        ],
+        "sinks": [
+          "limitUsage mapping in PermissionValidator storage"
+        ],
+        "trust_changes": "Usage limits enforced at validation time, persisted via first call",
+        "validation_points": [
+          "incrementUsageLimit only allows increasing usage (no decrement)",
+          "First call must be increment with BEHAVIOR_REVERT_ON_ERROR",
+          "Call data hash must match expected increment"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "incrementUsageLimit is externally callable - anyone can increase their own wallet's usage (DoS by external party not possible since msg.sender is wallet key)",
+          "If first call fails, entire transaction reverts, preventing limit bypass"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Wallet authentication requires signer weights meeting threshold against verified imageHash",
+        "Nonces are per-space and must be sequential within each space",
+        "Session signers have bounded permissions: explicit (per-target rules) or implicit (attestation-based)",
+        "Recovery requires time-delayed payload queuing with minimum timestamp constraints",
+        "Image hash updates trigger implementation upgrade from Stage1 to Stage2",
+        "Hooks extend wallet via delegatecall, requiring self-call to install/remove",
+        "ERC4337 operations validate via isValidSignature treating userOpHash as a digest"
+      ],
+      "economic_incentives": [
+        "Session signers are bounded by value limits and cumulative parameter rules",
+        "Recovery timelock creates delay between queue and execution, allowing intervention",
+        "Checkpoint ordering in chained signatures enforces configuration update ordering",
+        "Usage limits prevent session signers from exceeding allocated resources across transactions"
+      ],
+      "governance_mechanisms": [
+        "Wallet configuration (imageHash) updated via weighted threshold signatures",
+        "Chained signatures enable configuration migration with checkpoint ordering",
+        "Checkpointer middleware can provide external state snapshots for validation",
+        "addHook/removeHook gated by onlySelf requiring full wallet auth"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "FLAG_SUBDIGEST sets weight to type(uint256).max, then subsequent signers in same branch add weight in unchecked arithmetic",
+          "expected_behavior": "Weight should remain at or above type(uint256).max to always pass threshold",
+          "actual_behavior": "In unchecked block, weight overflows to a small value (e.g., type(uint256).max + 1 = 0), potentially falling below threshold",
+          "risk_level": "high",
+          "exploitation_potential": "A valid subdigest match in a configuration with other signers in the same merkle branch could cause signature rejection (DoS). An attacker with knowledge of the config structure could craft signatures that trigger this overflow, preventing legitimate operations. Even having a subdigest in a sub-branch that gets weight-summed in a parent with other signers triggers this."
+        },
+        {
+          "scenario": "ecrecover returns address(0) for invalid ECDSA signatures in FLAG_SIGNATURE_HASH and FLAG_SIGNATURE_ETH_SIGN",
+          "expected_behavior": "Invalid signatures should not contribute weight to the signature tree",
+          "actual_behavior": "Weight is unconditionally added for address(0), and a leaf node for address(0) is included in the merkle root",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit since address(0) leaf would mismatch the configured imageHash. However, if a configuration accidentally includes address(0) as a signer, any invalid signature would satisfy that leaf."
+        },
+        {
+          "scenario": "LibBytes reads beyond calldata bounds",
+          "expected_behavior": "Out-of-bounds reads should revert",
+          "actual_behavior": "calldataload beyond bounds returns zero-padded data, functions return 0 or zero values silently",
+          "risk_level": "medium",
+          "exploitation_potential": "Malformed signatures or payloads could cause silent misinterpretation of data. For example, a truncated signature could be parsed with zero-filled values, potentially matching unexpected configurations. The impact depends on what downstream checks catch zero values."
+        },
+        {
+          "scenario": "Blacklist sorted check uses strict less-than, allowing duplicate entries",
+          "expected_behavior": "Blacklist should contain unique sorted addresses",
+          "actual_behavior": "Duplicate consecutive addresses pass the sort check (< not <=), and address(0) is allowed as first entry",
+          "risk_level": "low",
+          "exploitation_potential": "Duplicates waste gas and configuration space but don't affect blacklist correctness for binary search lookups"
+        },
+        {
+          "scenario": "Recovery payloads cannot be cancelled once queued",
+          "expected_behavior": "Wallet owner should be able to cancel pending recovery payloads",
+          "actual_behavior": "No cancellation mechanism exists; once queued, a payload remains permanently and becomes executable after timelock",
+          "risk_level": "medium",
+          "exploitation_potential": "If a recovery signer's key is compromised and used to queue a malicious payload, the wallet owner cannot prevent execution after the timelock expires, only by updating configuration to invalidate the recovery setup"
+        },
+        {
+          "scenario": "SessionManager initializes totalValueUsed from storage but sessionUsageLimits array is sized to payload.calls.length, not unique signers count",
+          "expected_behavior": "Array should be sized for unique signers",
+          "actual_behavior": "Array is over-allocated (one entry per call), leading to empty entries that must be filtered later",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploitation, but the linear scan for matching signer in sessionUsageLimits has O(n*m) complexity where n=calls and m=entries, potentially causing gas issues for large payloads"
+        },
+        {
+          "scenario": "ExplicitSessionManager allows first call to address(this) without permission validation",
+          "expected_behavior": "Only incrementUsageLimit should be allowed without explicit permission",
+          "actual_behavior": "Any function on SessionManager can be called at index 0 without permission, but _validateLimitUsageIncrement later validates the call data matches expected increment",
+          "risk_level": "low",
+          "exploitation_potential": "If there are no usage limits and the first call targets SessionManager, _validateLimitUsageIncrement catches it. If there are limits, the call data must match. Effectively secure but relies on post-validation."
+        },
+        {
+          "scenario": "Chained signature processes checkpointer only on the last sub-signature",
+          "expected_behavior": "Checkpointer state should be consistent across all sub-signatures",
+          "actual_behavior": "In recoverChained, checkpointer is passed only to the last sub-signature (when nrindex == _signature.length), intermediate signatures use address(0) as checkpointer",
+          "risk_level": "low",
+          "exploitation_potential": "By design - only the most recent (lowest checkpoint) configuration uses the checkpointer"
+        },
+        {
+          "scenario": "Guest contract fallback executes arbitrary calls without authentication",
+          "expected_behavior": "Guest is a deliberate unauthenticated dispatcher",
+          "actual_behavior": "Any caller can execute calls through Guest, including value transfers if Guest holds ETH",
+          "risk_level": "medium",
+          "exploitation_potential": "If ETH is accidentally sent to a Guest contract, anyone can drain it. No auth, no nonce, no replay protection for Guest operations."
+        },
+        {
+          "scenario": "Static signature timestamp check uses <= instead of <",
+          "expected_behavior": "Timestamp should be a clear expiry boundary",
+          "actual_behavior": "timestamp <= block.timestamp means the signature expires AT the timestamp, not after it. A timestamp of 0 would be immediately expired.",
+          "risk_level": "low",
+          "exploitation_potential": "Off-by-one: a static signature with timestamp == block.timestamp would be rejected. Users must set timestamp > block.timestamp, which is the natural behavior."
+        },
+        {
+          "scenario": "Payload.fromPackedCalls uses calldatasize-based reading without boundary validation in LibBytes",
+          "expected_behavior": "Malformed packed payload should revert cleanly",
+          "actual_behavior": "Out-of-bounds reads in LibBytes return 0, leading to potentially valid but unintended Decoded payloads",
+          "risk_level": "medium",
+          "exploitation_potential": "A truncated payload could be parsed as having zero addresses (address(0)) for call targets, zero values, empty data - potentially causing unexpected self-calls or calls to address(0)"
+        },
+        {
+          "scenario": "SessionManager bans BEHAVIOR_ABORT_ON_ERROR but allows BEHAVIOR_IGNORE_ERROR for non-first calls",
+          "expected_behavior": "All session calls should have predictable execution outcomes",
+          "actual_behavior": "BEHAVIOR_IGNORE_ERROR calls can fail silently after usage limits are committed via the first incrementUsageLimit call",
+          "risk_level": "low",
+          "exploitation_potential": "A session signer could intentionally create calls that fail with IGNORE_ERROR, consuming usage limits without actual execution. This wastes the signer's own limits."
+        }
+      ],
+      "assumption_violations": [
+        "BaseSig assumes weight will not overflow in unchecked block - violated when FLAG_SUBDIGEST sets weight to max and other signers exist",
+        "LibBytes assumes callers will only read within valid bounds - violated by malformed inputs producing silent zero reads",
+        "Recovery assumes block.timestamp is always > 0 - generally true on mainnet but could fail on test chains",
+        "WebAuthn assumes authenticators properly enforce origin and rpIdHash - violated if authenticator is compromised or misconfigured",
+        "SessionManager assumes session signers won't collude to bypass individual permission boundaries - mitigated by per-signer permissions but cumulative limits are per-signer not per-session",
+        "Stage1Auth assumes FACTORY and INIT_CODE_HASH remain constant - violated if factory is upgraded or wallet creation code changes",
+        "Hooks assume delegatecall targets are trustworthy - violated if a malicious hook is installed"
+      ],
+      "game_theory_risks": [
+        "Recovery signers can queue payloads that the wallet owner cannot cancel, creating a race between recovery execution and config update",
+        "Session signers with BEHAVIOR_IGNORE_ERROR can cause calls to fail silently while consuming shared usage limits",
+        "A bundle relayer could manipulate gas availability to cause gas-limited calls to fail (if gasLimit is set)",
+        "Implicit session targets (ISignalsImplicitMode implementers) could return incorrect magic values to block or allow operations"
+      ],
+      "integration_risks": [
+        "ERC1271 external calls during signature validation could be reentrancy vectors or gas-consuming",
+        "ISapient/ISapientCompact external calls during signature validation expose payload information",
+        "ICheckpointer external calls could return stale or manipulated snapshots",
+        "ISignalsImplicitMode.acceptImplicitRequest could revert, fail, or return incorrect values",
+        "P256 precompile (RIP-7212) availability varies across chains; fallback Solidity verifier must be deployed",
+        "ERC4337 EntryPoint trust assumption - entrypoint address is immutable and must be correct"
+      ],
+      "calculation_errors": [
+        "BaseSig.recoverBranch: unchecked weight overflow when FLAG_SUBDIGEST/FLAG_SIGNATURE_ANY_ADDRESS_SUBDIGEST sets weight=type(uint256).max and subsequent items add weight",
+        "PermissionValidator: cumulative rule previousUsage==0 check conflates 'first use in payload with 0 amount' and 'not yet seen in payload' - both fall through to storage read, which is correct but fragile",
+        "SessionSig.recoverConfiguration: maxPermissionsSize estimation uses integer division which could undercount if encoded.length is not a multiple of MIN_ENCODED_PERMISSION_SIZE - but this results in over-allocation not under-allocation, so it's safe"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "ETH (native)",
+          "behaviors": [
+            "rebasing:false"
+          ],
+          "decimals": 18,
+          "notes": "Native ETH used for call values and gas. Value limits tracked per session signer via VALUE_TRACKING_ADDRESS sentinel."
+        },
+        {
+          "address_or_symbol": "VALUE_TRACKING_ADDRESS (0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE)",
+          "behaviors": [],
+          "decimals": 18,
+          "notes": "Sentinel address used as key for native value limit tracking in session permissions, not a real token"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "nonce_sequential",
+          "state_vars": [
+            "Nonce.readNonce(space)"
+          ],
+          "description": "For each nonce space, nonce values must be consumed sequentially (n, n+1, n+2, ...)"
+        },
+        {
+          "name": "imageHash_authenticity",
+          "state_vars": [
+            "IMAGE_HASH_KEY storage",
+            "FACTORY",
+            "INIT_CODE_HASH"
+          ],
+          "description": "Stage1: imageHash derived from CREATE2(factory, imageHash, initCodeHash) == address(this). Stage2: imageHash stored in IMAGE_HASH_KEY must match recovered imageHash from signature"
+        },
+        {
+          "name": "signature_weight_threshold",
+          "state_vars": [
+            "threshold",
+            "weight from recoverBranch"
+          ],
+          "description": "Recovered signer weight must be >= signature threshold for valid authentication. VIOLATED by unchecked overflow when subdigest + other signers in same branch."
+        },
+        {
+          "name": "chained_checkpoint_decreasing",
+          "state_vars": [
+            "checkpoint per sub-signature"
+          ],
+          "description": "Chained signatures must have strictly decreasing checkpoint values, ensuring configuration history ordering"
+        },
+        {
+          "name": "session_usage_monotonic",
+          "state_vars": [
+            "limitUsage mapping"
+          ],
+          "description": "Session usage limits can only increase (incrementUsageLimit reverts on decrease), preventing replay of lower usage values"
+        },
+        {
+          "name": "recovery_timelock",
+          "state_vars": [
+            "timestampForQueuedPayload",
+            "requiredDeltaTime",
+            "minTimestamp"
+          ],
+          "description": "Recovery payloads can only execute after queuing timestamp + requiredDeltaTime has elapsed AND queuing timestamp >= minTimestamp"
+        },
+        {
+          "name": "reentrancy_guard",
+          "state_vars": [
+            "STATUS_KEY storage slot"
+          ],
+          "description": "execute() and executeUserOp() are protected by nonReentrant modifier preventing recursive entry"
+        },
+        {
+          "name": "session_no_self_call",
+          "state_vars": [],
+          "description": "Session-authorized transactions cannot call the wallet itself (call.to != wallet) or use delegate calls, preventing privilege escalation"
+        }
+      ]
+    }
+  }
+}

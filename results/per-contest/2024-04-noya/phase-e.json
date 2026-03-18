@@ -1,0 +1,132 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Keepers execute() hashes dynamic bytes field incorrectly per EIP-712, breaking standard signing tool compatibility",
+      "severity": "high",
+      "summary": "The Keepers multisig controls all vault operations. Its EIP-712 struct hash computation on line 101 passes `data` (bytes calldata) directly to `abi.encode(TXTYPE_HASH, nonce, destination, data, gasLimit, executor, deadline)`. Per EIP-712 spec, dynamic types must be encoded as keccak256(data) in the struct hash. The abi.encode of bytes includes offset+length+content, fundamentally different from keccak256(data).\n\nAny standard EIP-712 signing tool (ethers.js _signTypedData, MetaMask signTypedData_",
+      "description": [
+        {
+          "file": "contracts/governance/Keepers.sol",
+          "line_start": 100,
+          "line_end": 101,
+          "desc": "The TXTYPE_HASH declares 'bytes data' as a field. Per EIP-712 spec, dynamic types like bytes must be hashed with keccak256 before encoding. The code passes raw data to abi.encode, producing ABI-encoded tuple instead of keccak256(data). Standard EIP-712 signing tools produce different hashes."
+        }
+      ],
+      "impact": "If standard EIP-712 signing tools are used, the multisig becomes non-functional, permanently freezing all vault operations and locking user funds.",
+      "proof_of_concept": "1. Keepers multisig deployed as vault keeper.\n2. Signers use standard EIP-712 signing tools.\n3. Standard tools hash bytes field differently than the contract expects.\n4. Signature verification fails; all execute() calls revert.\n5. All vault operations are frozen.\n6. User deposits in queue and pending withdrawals are permanently locked.",
+      "remediation": "Hash bytes before struct encoding: `keccak256(abi.encode(TXTYPE_HASH, nonce, destination, keccak256(data), gasLimit, executor, deadline))`"
+    },
+    {
+      "title": "PendleConnector.isMarketEmpty omits Penpie staked LP balance, enabling premature position removal",
+      "severity": "high",
+      "summary": "PendleConnector.isMarketEmpty() returns true when SY, PT, YT, and direct LP are zero, but doesn't check pendleMarketDepositHelper.balance(market, address(this)). The _getPositionTVL function correctly includes this Penpie balance.\n\nWhen decreasePosition(market, 0, true) is called with closePosition=true, isMarketEmpty returns true even if significant LP is staked in Penpie. The position is removed from tracking, causing the Penpie-staked LP value to vanish from TVL calculations.",
+      "description": [
+        {
+          "file": "contracts/connectors/PendleConnector.sol",
+          "line_start": 303,
+          "line_end": 309,
+          "desc": "isMarketEmpty() checks SY, PT, YT, and direct LP balances but omits Penpie staked LP balance (pendleMarketDepositHelper.balance). _getPositionTVL on line 269 DOES include this balance. Inconsistency enables position removal while Penpie value remains."
+        }
+      ],
+      "impact": "TVL underreporting by the full value of Penpie-staked LP tokens causes share price depression.",
+      "proof_of_concept": "1. Manager stakes Pendle LP into Penpie via depositIntoPenpie().\n2. All direct balances (SY, PT, YT, LP) reach zero.\n3. decreasePosition with closePosition=true called.\n4. isMarketEmpty returns true, position removed.\n5. Penpie-staked LP value vanishes from TVL.\n6. Share price drops, harming existing depositors.",
+      "remediation": "Add Penpie balance check: `&& pendleMarketDepositHelper.balance(address(market), address(this)) == 0`"
+    },
+    {
+      "title": "retrieveTokensForWithdraw tracks requested amounts not actual received, causing withdrawal shortfall",
+      "severity": "high",
+      "summary": "In retrieveTokensForWithdraw(), line 561 uses the requested amount: `amountAskedForWithdraw_temp += retrieveData[i].withdrawAmount`. But sendTokensToTrustedAddress (BaseConnector lines 90-97) decodes data to get newAmount and transfers only newAmount.\n\nIf Watchers reduce amounts, the accounting claims more was requested than received. fulfillCurrentWithdrawGroup() passes because amountAskedForWithdraw matches totalCBAmount, but actual funds are insufficient. During executeWithdraw, totalABAmount",
+      "description": [
+        {
+          "file": "contracts/accountingManager/AccountingManager.sol",
+          "line_start": 556,
+          "line_end": 561,
+          "desc": "amountAskedForWithdraw_temp accumulates retrieveData[i].withdrawAmount (requested) instead of actual received (balanceAfter - balanceBefore). sendTokensToTrustedAddress may transfer different newAmount due to Watcher adjustments."
+        }
+      ],
+      "impact": "Systematic underpayment of withdrawers when Watcher adjusts amounts downward.",
+      "proof_of_concept": "1. Withdraw group needs 1000 USDC.\n2. Two retrieve calls of 500 each.\n3. Watcher adjusts first to 400 actual.\n4. amountAskedForWithdraw = 1000, but only 900 received.\n5. Users get pro-rata of 900/1000 = 90% of expected.",
+      "remediation": "Track actual: `amountAskedForWithdraw_temp += (balanceAfter - balanceBefore);`"
+    },
+    {
+      "title": "MaverickConnector.removeLiquidityFromMaverickPool always removes position even on partial removal",
+      "severity": "high",
+      "summary": "MaverickConnector.removeLiquidityFromMaverickPool always removes the holding position from registry (removePosition=true on line 126). But Maverick removeLiquidity can be partial - only removing some bins. After partial removal, remaining liquidity is untracked.\n\nContrast with UNIv3Connector which checks `if (currentLiquidity == p.liquidity)` before removing.",
+      "description": [
+        {
+          "file": "contracts/connectors/MaverickConnector.sol",
+          "line_start": 125,
+          "line_end": 127,
+          "desc": "removeLiquidityFromMaverickPool unconditionally passes removePosition=true, regardless of whether removal is partial or complete."
+        }
+      ],
+      "impact": "TVL underreporting after partial Maverick removal causes share price depression.",
+      "proof_of_concept": "1. Manager adds liquidity across multiple bins.\n2. Partial removal from some bins.\n3. Position removed despite remaining liquidity.\n4. TVL drops by untracked amount.",
+      "remediation": "Only remove position when all liquidity has been removed."
+    },
+    {
+      "title": "CurveConnector TVL uses calc_withdraw_one_coin, manipulable via pool imbalancing",
+      "severity": "high",
+      "summary": "CurveConnector._getPositionTVL values LP via calc_withdraw_one_coin, which simulates single-sided withdrawal at current pool ratios. This is spot-dependent and manipulable by imbalancing the pool with flash-loaned funds.\n\nAn attacker can deposit large amounts of the withdrawal token, depressing the per-LP-token withdrawal amount, then deposit at deflated TVL. After reversing the manipulation, attacker's shares are worth more than paid.",
+      "description": [
+        {
+          "file": "contracts/connectors/CurveConnector.sol",
+          "line_start": 297,
+          "line_end": 303,
+          "desc": "estimateWithdrawAmount calls curvePool.calc_withdraw_one_coin which uses current pool state. Reserves manipulable by large trades within a transaction."
+        }
+      ],
+      "impact": "Share price manipulation via Curve pool reserve manipulation enables value extraction.",
+      "proof_of_concept": "1. Vault has 1M USDC of Curve LP.\n2. Attacker flash-loans 10M USDC, deposits into 3pool.\n3. calc_withdraw_one_coin returns ~85% of normal.\n4. TVL drops to ~850K.\n5. Attacker deposits at deflated price.\n6. Attacker removes 10M from 3pool.\n7. TVL returns to 1M, attacker profits ~18%.",
+      "remediation": "Use get_virtual_price() * LP count for manipulation-resistant valuation."
+    },
+    {
+      "title": "SiloConnector.isSiloEmpty omits debt token check, enabling position removal with outstanding debt",
+      "severity": "high",
+      "summary": "isSiloEmpty (lines 130-141) only checks collateral balances, not debt balances. After liquidation, the position may have zero collateral but non-zero debt tokens. When withdraw is called with closePosition=true, isSiloEmpty returns true, removing the position from tracking. The untracked debt effectively inflates TVL since the subtracted value disappears from _getPositionTVL.",
+      "description": [
+        {
+          "file": "contracts/connectors/SiloConnector.sol",
+          "line_start": 130,
+          "line_end": 141,
+          "desc": "isSiloEmpty checks only collateralToken and collateralOnlyToken. Does NOT check debtToken. Position with zero collateral but outstanding debt considered 'empty'."
+        }
+      ],
+      "impact": "Untracked debt inflates TVL after position removal, causing incorrect share pricing.",
+      "proof_of_concept": "1. Silo position: 100 ETH collateral, 80 ETH borrow.\n2. Liquidation leaves 0 collateral, 10 ETH debt.\n3. withdraw with closePosition=true.\n4. isSiloEmpty = true (no collateral).\n5. Position removed. 10 ETH debt untracked.\n6. TVL overstated by 10 ETH. Share price inflated.",
+      "remediation": "Add debt check: `if (IERC20(assetsS[i].debtToken).balanceOf(address(this)) > 0) return false;`"
+    },
+    {
+      "title": "BalancerConnector._getPositionTVL extrapolates from single token reserve with weight amplification, enabling flash-loan TVL manipulation",
+      "severity": "high",
+      "summary": "BalancerConnector._getPositionTVL extrapolates total pool value from one token's reserve divided by its weight. The reserves from IBalancerVault.getPoolTokens are spot values manipulable via flash loans. The 1/weight factor amplifies the manipulation: for a 50/50 pool, any change to the reference token's reserve is doubled in the TVL calculation.\n\nThis creates a larger manipulation surface than other spot-price-based TVL calculations because the weight amplification means the attacker needs less",
+      "description": [
+        {
+          "file": "contracts/connectors/BalancerConnector.sol",
+          "line_start": 162,
+          "line_end": 173,
+          "desc": "_getPositionTVL computes TVL as (tokenReserve * oraclePrice / weight) * lpBalance / totalSupply. Uses spot reserves from getPoolTokens. Division by weight (typically 0.5e18 for 50/50) amplifies manipulation impact by 2x."
+        }
+      ],
+      "impact": "Flash-loan-based TVL manipulation with weight amplification enables value extraction from vault.",
+      "proof_of_concept": "1. Balancer 50/50 WETH/USDC pool, weight=0.5e18.\n2. Attacker flash-swaps 1M USDC into pool.\n3. USDC reserve increases.\n4. TVL = (inflated_value / 0.5e18) * lpBalance / totalSupply.\n5. Division by 0.5e18 doubles the manipulation impact.\n6. Deposit/withdrawal at manipulated TVL extracts value.",
+      "remediation": "Use pool.getRate() or fair LP pricing formula instead of single-token extrapolation."
+    },
+    {
+      "title": "CompoundConnector getCollBlanace and getBorrowBalanceInBase use incompatible unit spaces, causing unconditional TVL underflow on any borrow",
+      "severity": "high",
+      "summary": "getCollBlanace (lines 95-123) adds principalInBase (raw base token units) and collateral values computed as collateralBalance * collateralPrice * baseScale / collateralScale / basePrice, which simplifies to base token native units. getBorrowBalanceInBase (lines 84-90) computes borrowBalance * basePrice / baseScale, which is virtual base units (raw * basePrice / baseScale).\n\nFor USDC (basePrice=1e8, baseScale=1e6): getCollBlanace returns values in 1e6 units, getBorrowBalanceInBase returns values ",
+      "description": [
+        {
+          "file": "contracts/connectors/CompoundConnector.sol",
+          "line_start": 84,
+          "line_end": 131,
+          "desc": "getCollBlanace returns values in base token native units (e.g., raw USDC with 6 decimals). getBorrowBalanceInBase returns values in virtual base units (= raw * basePrice / baseScale, approximately 100x larger for USDC). _getPositionTVL subtracts these incompatible values, and getAccountHealthFactor divides them."
+        }
+      ],
+      "impact": "ANY non-zero borrow on a USDC Compound III market causes unconditional TVL revert, permanently freezing all vault operations. Unlike the general underflow DoS (Swarm TECH-H003) which requires debt > collateral from market conditions, this happens with even tiny borrows against large collateral due to the 100x unit scaling mismatch.",
+      "proof_of_concept": "1. CompoundConnector deposits 1000 USDC to Compound III.\n2. CompoundConnector borrows 100 USDC (well within safe limits).\n3. positiveBalance = ~1000e6 (base native units).\n4. negativeBalance = 100e6 * 1e8 / 1e6 = 1e10 (virtual base units).\n5. positiveBalance - negativeBalance = 1e9 - 1e10 = UNDERFLOW REVERT.\n6. TVL calculation reverts, blocking ALL vault operations.\n7. All user deposits and pending withdrawals are frozen.",
+      "remediation": "Normalize getBorrowBalanceInBase to return base token native units: `return comet.borrowBalanceOf(address(this));` — or equivalently, multiply getCollBlanace by basePrice/baseScale to convert to virtual base units. Both sides must use the same unit space."
+    }
+  ]
+}

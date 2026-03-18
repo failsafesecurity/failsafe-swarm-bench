@@ -1,0 +1,174 @@
+{
+  "metadata": {
+    "threat_model_id": "TM_ari_basing_evmbench_unprivileged_no_front_run_primary_opus_2026Mar08-21h32m46s",
+    "phase": "D",
+    "process": "single_hypothesis_validation",
+    "hypothesis_index": 7,
+    "hypothesis_id": "TECH-H013",
+    "llm_model": "gemini",
+    "timestamp": "2026-03-08T22:16:11.430Z",
+    "validation_duration_ms": 131446
+  },
+  "original_hypothesis": {
+    "hypothesis_id": "TECH-H013",
+    "title": "calcLpTokenSupply divides by zero when one reserve is zero (but not both), potentially blocking operations in depleted-reserve states",
+    "risk_level": "HIGH",
+    "attack_realism": "HIGH",
+    "stride_category": "Denial of Service",
+    "hypothesis_description": "calcLpTokenSupply only short-circuits when both reserves are zero. If one reserve is zero and the other is non-zero, the function proceeds and computes dP using division by (scaledReserves[x] * N), which will be zero and revert. Any state-changing path that calls calcLpTokenSupply (directly or via calcRate/calcReserveAtRatioSwap) can be forced to revert when the pool becomes one-sided.",
+    "investigation_rationale": "Depleted-reserve states can occur organically (aggressive trading) or be induced by an attacker in thin pools. If withdrawals or critical maintenance operations depend on calcLpTokenSupply, this becomes a lock-up/availability risk.",
+    "config_dependent": false,
+    "deployment_assumptions": [],
+    "config_evidence": "",
+    "affected_functions": [
+      "calcLpTokenSupply(uint256[],bytes)",
+      "calcRate(uint256[],uint256,uint256,bytes)",
+      "calcReserveAtRatioSwap(uint256[],uint256,uint256[],bytes)"
+    ],
+    "affected_contracts": [
+      "src/functions/Stable2.sol"
+    ],
+    "inventory_refs": [
+      {
+        "file": "Stable2.sol",
+        "function": "calcRate(uint256[],uint256,uint256,bytes)"
+      }
+    ],
+    "proof_of_signal": {
+      "file": "src/functions/Stable2.sol",
+      "lines": "approx. 58-92",
+      "pattern": "only checks (r0==0 && r1==0); then dP = dP*D/(scaledReserves[0]*N) and /(scaledReserves[1]*N) => div by zero if either reserve is 0"
+    },
+    "invariant_citation": {
+      "invariant_id": "INV-ECON-001",
+      "relationship": "NONE"
+    },
+    "preconditions": [
+      "A Well operation reaches a state where one reserve is zero (or rounds to zero after scaling) while the other is nonzero",
+      "That operation (or a subsequent one) calls calcLpTokenSupply via Stable2",
+      "No alternate path exists that bypasses calcLpTokenSupply for withdrawals/emergency exits"
+    ],
+    "initial_code_evidence": {
+      "suspicious_location": "src/functions/Stable2.sol calcLpTokenSupply",
+      "vulnerable_pattern": "missing guard for single-sided zero reserve",
+      "specific_concern": "division by zero revert prevents LP supply computation",
+      "missing_safeguards": "no early return/revert with explicit error when reserves[i]==0"
+    },
+    "investigation_scope": {
+      "analysis_questions": [
+        "Can a Stable2 Well reach a one-sided reserve state through swaps (consider min reserve constraints, if any, in Well.sol)?",
+        "Which state-changing functions in Well.sol rely on calcLpTokenSupply even for withdrawals/burns?",
+        "Does scaling with low decimals make small reserves round to zero and trigger this unexpectedly?"
+      ],
+      "validation_requirements": [
+        "Simulation: drive reserves[0] to 0 (or 1 unit) and verify which Well operations revert",
+        "Review Well.sol withdrawal logic for dependency on Stable2.calcLpTokenSupply",
+        "Add invariant test: if reserves[i]==0 XOR reserves[j]==0, operations should have defined behavior"
+      ]
+    },
+    "preliminary_attack_scenario": "Attacker repeatedly swaps to drain token0 to (near) zero. After this, any subsequent swap/liquidity/oracle update that calls calcLpTokenSupply reverts due to division by zero, freezing the pool until external liquidity is added in the depleted token.",
+    "prerequisites": [
+      "Ability to trade enough to push one reserve to zero (more feasible in small pools)"
+    ],
+    "potential_impact_if_confirmed": {
+      "financial_impact": "Indirect; may lock users from executing certain operations and prevent price/oracle updates",
+      "affected_users": "All pool users during the one-sided state",
+      "recovery_possibility": "Recoverable by adding the depleted token; may be impossible if all state-changing paths revert"
+    },
+    "investigation_complexity": "medium",
+    "validation_priority": "medium",
+    "test_coverage_gap": "No tests for single-sided zero reserves in lpTokenSupply/rate paths",
+    "technical_investigation_focus": {
+      "gas_analysis_needed": "No",
+      "capital_requirements": "Depends on pool depth; low for small pools",
+      "execution_timing": "Multi-transaction to deplete reserve then trigger reverting call",
+      "detection_analysis": "Monitor reserves approaching zero and reverting transactions referencing Stable2"
+    },
+    "original_category": "technical",
+    "original_specialist": "technical"
+  },
+  "validation_context": {
+    "relevant_contracts": [
+      "Stable2LUT1.sol",
+      "Stable2.sol",
+      "WellUpgradeable.sol",
+      "WellDeployer.sol",
+      "Logger.sol"
+    ],
+    "filtered_test_context_available": false,
+    "filtered_test_files_count": 0,
+    "filtered_test_files": [],
+    "prompt_character_count": 245091
+  },
+  "validation_result": {
+    "validation_status": "CONFIRMED",
+    "confidence_level": "high",
+    "mechanism": "Division by zero on single depleted reserve",
+    "impact_summary": "A single zero reserve causes division by zero in `calcLpTokenSupply` and `calcReserve`, permanently bricking the pool, oracle updates, and single-sided withdrawals.",
+    "detailed_analysis": "The `calcLpTokenSupply` function calculates the StableSwap invariant `D`. It includes a fast-path return if both reserves are zero: `if (reserves[0] == 0 && reserves[1] == 0) return 0;`. However, if only one reserve is zero, it proceeds to the Newton-Raphson iteration. Inside the loop, it calculates `dP = dP * lpTokenSupply / (scaledReserves[0] * N);` and similarly for `scaledReserves[1]`. If either reserve is zero, this results in a division by zero, causing a revert.\n\nThe developers added a comment acknowledging this: `// If division by 0, this will be borked: only withdrawal will work. And that is good`. However, this assumption is critically flawed:\n1. It breaks the Pump (oracle) mechanism. `calcRate` calls `calcLpTokenSupply`, so any oracle update will revert, potentially DoS'ing external protocols (like Beanstalk) that rely on the oracle.\n2. It breaks `removeLiquidityOneToken` for the remaining token. If a user tries to withdraw the non-zero token, `calcReserve` is called. `calcReserve` calculates `c` by dividing by the *other* reserve: `c = ... / (reserves * N)`. If the other reserve is zero, this also reverts with a division by zero.\n\nA reserve can reach exactly zero organically or via an attacker. If a user calls `removeLiquidityOneToken` to withdraw token A, and leaves a very small `lpTokenSupply` relative to the remaining reserve of token B, the calculation for the new reserve of token A in `calcReserve` will suffer from precision loss. Specifically, `c` will evaluate to 0, causing the new reserve to converge to 0. Once the reserve is updated to 0, the pool is permanently bricked.",
+    "code_evidence_assessment": "The vulnerable code is located in `Stable2.sol` within `calcLpTokenSupply` (lines 74-75) and `getBandC` (line 276). The lack of a guard against a single zero reserve leads to an unhandled division by zero. The code explicitly acknowledges the division by zero but incorrectly assumes it is a safe 'borked' state.",
+    "vulnerable_code_snippets": [
+      {
+        "function_name": "calcLpTokenSupply",
+        "file_name": "src/functions/Stable2.sol",
+        "line_numbers": "72-75",
+        "code_snippet": "            uint256 dP = lpTokenSupply;\n            // If division by 0, this will be borked: only withdrawal will work. And that is good\n            dP = dP * lpTokenSupply / (scaledReserves[0] * N);\n            dP = dP * lpTokenSupply / (scaledReserves[1] * N);",
+        "vulnerability_explanation": "If either `scaledReserves[0]` or `scaledReserves[1]` is zero (but not both), the division by zero causes a revert, blocking any function that relies on the LP token supply calculation."
+      },
+      {
+        "function_name": "getBandC",
+        "file_name": "src/functions/Stable2.sol",
+        "line_numbers": "271-276",
+        "code_snippet": "    function getBandC(\n        uint256 Ann,\n        uint256 lpTokenSupply,\n        uint256 reserves\n    ) private pure returns (uint256 c, uint256 b) {\n        c = lpTokenSupply * lpTokenSupply / (reserves * N) * lpTokenSupply * A_PRECISION / (Ann * N);",
+        "vulnerability_explanation": "If the `reserves` parameter (which represents the *other* token's reserve) is zero, this calculation reverts due to division by zero, breaking `calcReserve` and preventing users from withdrawing the remaining token."
+      }
+    ],
+    "execution_path_analysis": {
+      "entry_point": "Stable2.calcLpTokenSupply",
+      "calling_sequence": [
+        "Well.removeLiquidityOneToken",
+        "Stable2.calcReserve",
+        "Well._setReserves (sets one reserve to 0)",
+        "Well.swap / Well.addLiquidity / Pump.update",
+        "Stable2.calcRate",
+        "Stable2.calcLpTokenSupply"
+      ],
+      "vulnerable_code_path": "When a reserve is reduced to 0 (e.g., via precision loss in `calcReserve` during a large single-sided withdrawal), the pool state is updated. Any subsequent operation that triggers `calcLpTokenSupply` (like a swap or oracle update) or `calcReserve` (like withdrawing the other token) will hit the division by zero at `dP = dP * lpTokenSupply / (scaledReserves[0] * N);` or `c = ... / (reserves * N);` and revert."
+    },
+    "config_validation": {
+      "is_config_dependent": false,
+      "deployment_assumptions_checked": [],
+      "deployment_evidence": "Not applicable.",
+      "config_conclusion": "UNVERIFIABLE"
+    },
+    "attack_scenario_validation": "An attacker can intentionally brick a pool. They call `removeLiquidityOneToken` to withdraw almost all of one token. By carefully choosing the amount of LP tokens to burn, they force the new reserve calculation in `calcReserve` to round down to exactly 0 (because `c` evaluates to 0 when `lpTokenSupply` is small). Once the reserve is 0, the pool is bricked. Any protocol relying on the pool's oracle (Pump) will also experience DoS when attempting to read or update the rate.",
+    "impact_assessment": "HIGH. A permanently bricked pool traps remaining user funds (except via proportional withdrawal, which users may not be able to execute via standard UI) and causes a Denial of Service for any integrated protocols relying on the pool's oracle.",
+    "recommended_mitigations": [
+      "In `calcLpTokenSupply`, explicitly check if either reserve is zero and revert with a clear error, or handle the zero-reserve case mathematically.",
+      "In `calcReserve`, ensure that the returned reserve cannot be zero, or enforce a minimum liquidity invariant in the Well to prevent reserves from ever reaching zero.",
+      "Re-evaluate the assumption that 'only withdrawal will work' when a reserve is zero, as it ignores the impact on oracles and single-sided withdrawals."
+    ],
+    "inventory_refs": [
+      {
+        "file": "src/functions/Stable2.sol",
+        "function": "calcLpTokenSupply"
+      },
+      {
+        "file": "src/functions/Stable2.sol",
+        "function": "calcReserve"
+      },
+      {
+        "file": "src/functions/Stable2.sol",
+        "function": "calcRate"
+      }
+    ],
+    "replication_plan": "1. Deploy a Stable2 Well with two tokens.\n2. Add initial liquidity.\n3. Call `removeLiquidityOneToken` with an LP amount that leaves a very small `lpTokenSupply`, forcing the withdrawn token's reserve to round to 0.\n4. Attempt to call `calcRate` or `removeLiquidityOneToken` for the other token and observe the division by zero revert.",
+    "uncertainties": [
+      "Whether the Basin Well implementation enforces a minimum liquidity that is large enough to prevent `c` from rounding to 0 in all practical scenarios (though math suggests `c` can still round to 0 even with 1000 wei minimum liquidity)."
+    ],
+    "additional_testing_needed": [
+      "Fuzz test `calcReserve` with extremely small `lpTokenSupply` and large `reserves` to verify the exact boundary where `reserve` rounds to 0.",
+      "Integration test with `Well.sol` to confirm `removeLiquidityOneToken` can successfully set a reserve to 0."
+    ]
+  }
+}

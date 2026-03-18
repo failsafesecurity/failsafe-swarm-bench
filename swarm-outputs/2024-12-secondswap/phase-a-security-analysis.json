@@ -1,0 +1,322 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-08T05:43:46.681Z",
+    "duration_ms": 136265
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Marketplace Admin (s2Admin)",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "addCoin",
+          "setMarketplaceSettingAddress",
+          "setBuyerFee",
+          "setSellerFee",
+          "setFeeAccount",
+          "setPenaltyFee",
+          "setMarketplaceStatus",
+          "setReferral"
+        ],
+        "failure_modes": [
+          "Admin key compromise leading to malicious fee changes or marketplace freeze",
+          "Incorrect fee configuration causing denial of service"
+        ],
+        "attack_vectors": [
+          "Privilege escalation",
+          "Fee manipulation to drain user funds"
+        ]
+      },
+      {
+        "boundary": "Token Issuer",
+        "trust_level": "semi-trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "setMaxSellPercent",
+          "deployVesting",
+          "createVesting",
+          "transferVesting"
+        ],
+        "failure_modes": [
+          "Issuer maliciously changing max sell percent to trap user funds",
+          "Issuer arbitrarily transferring user vestings to themselves"
+        ],
+        "attack_vectors": [
+          "Rug pull via arbitrary vesting transfer",
+          "Denial of service by setting max sell percent to zero"
+        ]
+      },
+      {
+        "boundary": "Marketplace Users (Buyers/Sellers)",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "listVesting",
+          "unlistVesting",
+          "spotPurchase",
+          "claim",
+          "whitelistAddress"
+        ],
+        "failure_modes": [
+          "Reentrancy during purchase flow",
+          "Exploitation of vesting math bugs to extract excess tokens",
+          "Bypassing private sale whitelists"
+        ],
+        "attack_vectors": [
+          "Reentrancy attacks via ERC777 hooks",
+          "Math manipulation in transferVesting",
+          "Unauthorized self-whitelisting"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unlisted Vesting",
+        "to_state": "Listed Vesting",
+        "trigger": "listVesting",
+        "conditions": [
+          "Vesting plan is sellable",
+          "Seller has sufficient available balance",
+          "Listing amount does not exceed max sell percent limit",
+          "Price and amount are greater than zero"
+        ],
+        "invariants": [
+          "Seller's vesting balance decreases by listing amount",
+          "VestingManager's vesting balance increases by listing amount",
+          "Listing record is created with correct parameters"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Listed Vesting",
+        "to_state": "Purchased Vesting",
+        "trigger": "spotPurchase",
+        "conditions": [
+          "Listing is active",
+          "Buyer is whitelisted (if private)",
+          "Purchase amount meets minimum requirements",
+          "Purchase amount does not exceed listing balance"
+        ],
+        "invariants": [
+          "Listing balance decreases by purchase amount",
+          "Payment tokens are distributed to seller and fee collector",
+          "Buyer receives vesting allocation from VestingManager"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Vested Tokens",
+        "to_state": "Claimed Tokens",
+        "trigger": "claim",
+        "conditions": [
+          "Current time is past start time",
+          "Claimable amount is greater than zero"
+        ],
+        "invariants": [
+          "User's amountClaimed increases by claimable amount",
+          "User's stepsClaimed increases by claimable steps",
+          "Tokens are transferred to user"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-107",
+        "pattern": "Reentrancy",
+        "locations": [
+          "SecondSwap_Marketplace.sol: spotPurchase",
+          "SecondSwap_Marketplace.sol: _handleTransfers"
+        ],
+        "severity": "critical",
+        "evidence": "In `_handleTransfers`, external calls (`safeTransferFrom` and `safeTransfer`) are made to transfer payment tokens before the `listing.balance` is decremented in `spotPurchase`.",
+        "exploitation_method": "If the payment token supports hooks (e.g., ERC777), an attacker can reenter `spotPurchase` during the transfer hook. Since `listing.balance` is not yet updated, they can purchase the same listing multiple times, draining pooled vesting allocations from the `VestingManager`.",
+        "affected_assets": [
+          "Vested tokens held by VestingManager"
+        ]
+      },
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Access Control",
+        "locations": [
+          "SecondSwap_Whitelist.sol: whitelistAddress"
+        ],
+        "severity": "critical",
+        "evidence": "The `whitelistAddress` function is `external` and lacks any access control modifiers (e.g., `onlyOwner` or `onlyLotOwner`).",
+        "exploitation_method": "Any user can call this function to add their own address to the whitelist, completely bypassing the private sale restrictions intended by the seller.",
+        "affected_assets": [
+          "Private listing allocations"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Underflow / Math Logic Bug",
+        "locations": [
+          "SecondSwap_StepVesting.sol: transferVesting"
+        ],
+        "severity": "critical",
+        "evidence": "When transferring vesting, `grantorVesting.releaseRate` is recalculated as `grantorVesting.totalAmount / numOfSteps`. This ignores the fact that steps have already passed and tokens have been claimed.",
+        "exploitation_method": "A user can claim tokens for several steps, then transfer a portion of their vesting. The flawed `releaseRate` recalculation allows them to claim more tokens in the remaining steps than their remaining `totalAmount`, effectively stealing tokens from the contract balance.",
+        "affected_assets": [
+          "Vesting contract token balance"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "State Inconsistency / Logic Bug",
+        "locations": [
+          "SecondSwap_VestingManager.sol: listVesting",
+          "SecondSwap_VestingManager.sol: completePurchase",
+          "SecondSwap_StepVesting.sol: _createVesting"
+        ],
+        "severity": "critical",
+        "evidence": "The `VestingManager` pools all listed vestings into its own address (`address(this)`). When `_createVesting` adds to an existing balance, it does not update or average `stepsClaimed`. Buyers inherit the `stepsClaimed` of the VestingManager.",
+        "exploitation_method": "Buyers receive corrupted vesting schedules. If the VestingManager's `stepsClaimed` is high (from a previous seller), the buyer loses those steps and cannot claim their full purchased amount. Conversely, it can allow claiming of already-claimed tokens.",
+        "affected_assets": [
+          "Buyer vesting allocations"
+        ]
+      },
+      {
+        "swc_id": "SWC-112",
+        "pattern": "Trust Boundary Violation / Centralization Risk",
+        "locations": [
+          "SecondSwap_VestingDeployer.sol: transferVesting"
+        ],
+        "severity": "high",
+        "evidence": "The function allows the token owner (`_tokenOwner[msg.sender]`) to call `transferVesting` with any `_grantor` address.",
+        "exploitation_method": "A malicious or compromised token issuer can arbitrarily transfer vested tokens from any user's address to their own, confiscating assets purchased on the marketplace.",
+        "affected_assets": [
+          "All user vesting allocations"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Logic Bug / Unpaid Fees",
+        "locations": [
+          "SecondSwap_Marketplace.sol: _handleTransfers"
+        ],
+        "severity": "medium",
+        "evidence": "`referralFeeCost` is calculated, but the tokens are never actually transferred to the `_referral` address. The entire fee amount (`buyerFeeTotal + sellerFeeTotal`) is sent to the `feeCollector`.",
+        "exploitation_method": "Referrers do not receive their promised rewards, breaking the protocol's incentive mechanism.",
+        "affected_assets": [
+          "Referral rewards"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service",
+        "locations": [
+          "SecondSwap_MarketplaceSetting.sol: constructor",
+          "SecondSwap_Marketplace.sol: unlistVesting"
+        ],
+        "severity": "medium",
+        "evidence": "`penaltyFee` is initialized to `10 ether` (10 * 10^18). If the payment token (USDT) has 6 decimals, this equates to 10 trillion USDT.",
+        "exploitation_method": "Users attempting to unlist their vestings early will have their transactions revert because they cannot afford the impossibly high penalty fee, locking their listings until `minListingDuration` passes.",
+        "affected_assets": [
+          "Seller listed allocations"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "SecondSwap_Marketplace.sol",
+          "function": "addCoin(address)",
+          "guards": [
+            "msg.sender == s2Admin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Adds supported payment tokens"
+        },
+        {
+          "contract": "SecondSwap_Marketplace.sol",
+          "function": "setMarketplaceSettingAddress(address)",
+          "guards": [
+            "msg.sender == s2Admin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Changes the core settings contract"
+        },
+        {
+          "contract": "SecondSwap_MarketplaceSetting.sol",
+          "function": "setBuyerFee(uint256)",
+          "guards": [
+            "onlyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Max 50%"
+        },
+        {
+          "contract": "SecondSwap_MarketplaceSetting.sol",
+          "function": "setSellerFee(uint256)",
+          "guards": [
+            "onlyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Max 50%"
+        },
+        {
+          "contract": "SecondSwap_MarketplaceSetting.sol",
+          "function": "setMarketplaceStatus(bool)",
+          "guards": [
+            "onlyAdmin"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Freezes marketplace operations"
+        },
+        {
+          "contract": "SecondSwap_VestingManager.sol",
+          "function": "setSellable(address,bool)",
+          "guards": [
+            "msg.sender == s2Admin || msg.sender == vestingDeployer"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Enables/disables selling for a vesting plan"
+        },
+        {
+          "contract": "SecondSwap_VestingManager.sol",
+          "function": "setMaxSellPercent(address,uint256)",
+          "guards": [
+            "msg.sender == tokenIssuer"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Token issuer can restrict sellable amounts"
+        },
+        {
+          "contract": "SecondSwap_VestingDeployer.sol",
+          "function": "transferVesting(address,address,uint256,address,string)",
+          "guards": [
+            "msg.sender == tokenOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Allows token owner to arbitrarily move user vestings"
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

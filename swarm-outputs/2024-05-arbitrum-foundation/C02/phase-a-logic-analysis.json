@@ -1,0 +1,507 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T21:52:52.145Z",
+    "duration_ms": 500822
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User (msg.sender) via createLayerZeroEdge",
+        "path": [
+          "EdgeChallengeManager.createLayerZeroEdge(args)",
+          "Validator whitelist check via assertionChain",
+          "For Block edges: decode proof, validate assertion hashes, check endHistoryRoot",
+          "EdgeChallengeManagerLib.createLayerZeroEdge (type checks, common checks, add to store)",
+          "Stake transfer: safeTransferFrom(msg.sender, receiver, sa)"
+        ],
+        "transformations": [
+          "Assertion state data decoded from args.proof",
+          "Machine hashes computed via oneStepProofEntry.getMachineHash",
+          "startHistoryRoot computed from single-leaf Merkle tree of startState",
+          "Edge ID computed as keccak256(mutualId, endHistoryRoot)",
+          "Mutual ID computed as keccak256(level, originId, startHeight, startHistoryRoot, endHeight)"
+        ],
+        "sinks": [
+          "EdgeStore.edges mapping",
+          "EdgeStore.firstRivals mapping",
+          "stakeToken balances"
+        ],
+        "trust_changes": "User-supplied assertion data is validated against on-chain assertion chain; proof data trusted after Merkle verification",
+        "validation_points": [
+          "Validator whitelist check",
+          "Assertion hash validation via assertionChain.validateAssertionHash",
+          "Assertion pending and has sibling checks",
+          "Machine status not RUNNING checks",
+          "Merkle inclusion proof for endState in endHistoryRoot",
+          "Merkle prefix proof from start to end",
+          "For non-Block: hasLengthOneRival check on claim, level progression check"
+        ],
+        "exposure_risks": [
+          "Edge data is publicly visible in storage"
+        ],
+        "manipulation_risks": [
+          "Race condition in firstRivals: the order of edge creation determines which stake stays in contract vs goes to excessStakeReceiver",
+          "Adversary can front-run honest edge creation to become the 'first' edge"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "User via bisectEdge",
+        "path": [
+          "EdgeChallengeManager.bisectEdge(edgeId, bisectionHistoryRoot, prefixProof)",
+          "Check edge is Pending and has rival",
+          "Compute mandatoryBisectionHeight",
+          "Verify prefix proof for bisectionHistoryRoot",
+          "Create lower and upper child edges",
+          "Set children on parent edge"
+        ],
+        "transformations": [
+          "mandatoryBisectionHeight computed from start/end heights using XOR and MSB operations",
+          "Lower child: [startHeight, middleHeight] with startHistoryRoot to bisectionHistoryRoot",
+          "Upper child: [middleHeight, endHeight] with bisectionHistoryRoot to endHistoryRoot"
+        ],
+        "sinks": [
+          "EdgeStore.edges (new children)",
+          "EdgeStore.firstRivals (updated for new edges)",
+          "Parent edge children fields"
+        ],
+        "trust_changes": "Bisection history root trusted after prefix proof verification",
+        "validation_points": [
+          "Edge must be Pending",
+          "Edge must have rival (prevents unnecessary bisection)",
+          "Children already set check (prevents double bisection)",
+          "Merkle prefix proof verification",
+          "Lower child may already exist (merge move)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Adversary controls bisection timing but height is deterministic",
+          "Lower child may pre-exist from rival bisection, affecting rival tracking"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Timer cache update chain (bottom-up)",
+        "path": [
+          "Leaf edges accumulate timeUnrivaled based on block.number - createdAtBlock",
+          "updateTimerCacheByChildren propagates min(lowerChild, upperChild) cache to parent",
+          "updateTimerCacheByClaim propagates claiming edge's cache to claimed edge (cross-level)",
+          "confirmEdgeByTime checks total timer >= challengePeriodBlocks"
+        ],
+        "transformations": [
+          "timeUnrivaled: block.number - createdAtBlock (if unrivaled), or firstRivalCreatedAtBlock - createdAtBlock (if rivaled)",
+          "timeUnrivaledTotal: timeUnrivaled + min(children caches)",
+          "Timer cache capped at uint64.max",
+          "Timer cache only increases (monotonic)"
+        ],
+        "sinks": [
+          "ChallengeEdge.totalTimeUnrivaledCache",
+          "ChallengeEdge.status (Confirmed)",
+          "EdgeStore.confirmedRivals"
+        ],
+        "trust_changes": "Timer values derived from block.number which is trusted on L1",
+        "validation_points": [
+          "Timer cache only increases",
+          "Only one rival per mutual group can be confirmed",
+          "confirmEdgeByTime requires layer zero edge",
+          "Assertion unrivaled blocks added for first-child block edges"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Adversary can delay calling updateTimerCacheByChildren for honest edges, but honest party can call it themselves",
+          "Timer cache monotonicity means an adversary cannot decrease a timer once set"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "User via confirmEdgeByOneStepProof",
+        "path": [
+          "EdgeChallengeManager.confirmEdgeByOneStepProof(edgeId, oneStepData, prevConfig, ...)",
+          "getPrevAssertionHash traverses edge levels via firstRivals to find Block-level origin",
+          "assertionChain.validateConfig for prev assertion",
+          "Calculate machineStep by traversing levels with stepSize multiplication",
+          "Verify beforeHash inclusion in startHistoryRoot",
+          "Execute one step proof via oneStepProofEntry.proveOneStep",
+          "Verify afterHash inclusion in endHistoryRoot",
+          "Set edge as confirmed with max timer cache"
+        ],
+        "transformations": [
+          "machineStep = SmallStep.startHeight + sum(stepSize * BigStep[i].startHeight)",
+          "stepSize grows by bigStepHeight at each level",
+          "afterHash produced by oneStepProofEntry.proveOneStep"
+        ],
+        "sinks": [
+          "ChallengeEdge.status (Confirmed)",
+          "ChallengeEdge.totalTimeUnrivaledCache (uint64.max)",
+          "EdgeStore.confirmedRivals"
+        ],
+        "trust_changes": "One step proof entry contract is fully trusted; execution context from prevConfig is validated against assertion chain",
+        "validation_points": [
+          "Edge must be SmallStep type",
+          "Edge must be length one",
+          "prevConfig validated against assertion chain",
+          "Merkle inclusion proofs for before and after states",
+          "One step proof execution"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "machineStep calculation traverses via firstRivals which returns the SECOND edge created; all rivals share same startHeight so this is safe",
+          "If oneStepProofEntry has a bug, incorrect edges could be confirmed"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Validator via stakeOnNewAssertion / newStakeOnNewAssertion",
+        "path": [
+          "RollupUserLogic.stakeOnNewAssertion or newStakeOnNewAssertion",
+          "Validate staker is staked with sufficient amount",
+          "Validate prev assertion exists and staker can move",
+          "RollupCore.createNewAssertion: validate config, states, inbox position",
+          "Create AssertionNode in storage",
+          "If not first child: transfer requiredStake to loserStakeEscrow",
+          "For newStakeOnNewAssertion: receiveTokens at end"
+        ],
+        "transformations": [
+          "assertionHash = keccak256(parentAssertionHash, afterState.hash(), inboxAcc)",
+          "configHash = keccak256(wasmModuleRoot, requiredStake, challengeManager, confirmPeriodBlocks, nextInboxPosition)",
+          "nextInboxPosition adjusted if no new messages (currentInboxPosition + 1)"
+        ],
+        "sinks": [
+          "_assertions mapping",
+          "loserStakeEscrow (for non-first children)",
+          "_stakerMap"
+        ],
+        "trust_changes": "User-supplied assertion data validated against on-chain state (bridge, inbox, prev assertion)",
+        "validation_points": [
+          "Staker is active and has sufficient stake",
+          "Prev assertion exists",
+          "Machine status constraints (FINISHED or ERRORED after, FINISHED before)",
+          "Inbox position bounds",
+          "Assertion uniqueness (not already seen)",
+          "Minimum assertion period for non-overflow assertions"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If stakeToken is fee-on-transfer, receiveTokens receives less than expected",
+          "Non-first-child stake transfer may drain contract if many branches created",
+          "Excess stake beyond requiredStake may become stuck (acknowledged in comments)"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Validator via confirmAssertion",
+        "path": [
+          "RollupUserLogic.confirmAssertion",
+          "Validate assertion exists and is pending",
+          "Validate prevConfig against prevAssertion.configHash",
+          "Check deadline passed (block.number >= createdAtBlock + confirmPeriodBlocks)",
+          "Check prev is latest confirmed",
+          "If prev has second child: verify winning edge from challengeManager",
+          "RollupCore.confirmAssertionInternal: update outbox, set latestConfirmed"
+        ],
+        "transformations": [
+          "assertionHash validated as keccak256(parentAssertionHash, confirmState.hash(), inboxAcc)",
+          "blockHash and sendRoot extracted from confirmState for outbox update"
+        ],
+        "sinks": [
+          "outbox (sendRoot, blockHash)",
+          "_latestConfirmed",
+          "assertion.status = Confirmed"
+        ],
+        "trust_changes": "winningEdge data from challengeManager is trusted if prevConfig.challengeManager is validated against configHash",
+        "validation_points": [
+          "Assertion pending check",
+          "Deadline check",
+          "Prev is latest confirmed",
+          "Winning edge confirmed and grace period passed",
+          "assertionHash pre-image validation"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "challengeManager address in prevConfig is user-supplied but validated against configHash",
+          "Grace period ensures challenge result is observable before assertion confirmation"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "Anyone via refundStake",
+        "path": [
+          "EdgeChallengeManager.refundStake(edgeId)",
+          "edge.setRefunded() - checks confirmed, layer zero, not already refunded",
+          "safeTransfer(edge.staker, stakeAmounts[edge.level])"
+        ],
+        "transformations": [],
+        "sinks": [
+          "stakeToken balance of edge.staker",
+          "edge.refunded = true"
+        ],
+        "trust_changes": "No access control - anyone can trigger refund but tokens always go to edge.staker",
+        "validation_points": [
+          "Edge must be Confirmed",
+          "Edge must be layer zero (has claimId and staker)",
+          "Edge must not already be refunded"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If the confirmed edge was NOT the first edge created for its mutual group, its stake was sent to excessStakeReceiver, but the contract still holds the first edge's stake amount - sufficient for exactly one refund per mutual group",
+          "If stakeToken is fee-on-transfer, edge.staker receives less than stakeAmounts[level]"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Each mutual ID group (edges sharing same start parameters and end height) can have at most one confirmed edge",
+        "Timer caches are monotonically non-decreasing and capped at uint64.max",
+        "Edges are never deleted from storage, only created and potentially confirmed",
+        "Layer zero edges require stake deposits; only one stake per mutual group is retained in the contract",
+        "Bisection heights are deterministic to ensure rival edges bisect at the same points",
+        "Only SmallStep length-1 edges can be confirmed via one-step proof",
+        "Only layer zero edges can be confirmed by time",
+        "Challenge hierarchy: Block → BigStep(s) → SmallStep, each level claims a length-1 edge in the level below",
+        "Assertions can only be confirmed after deadline passes and winning edge exists for disputed assertions"
+      ],
+      "economic_incentives": [
+        "Stakers must deposit tokens to create layer zero edges, disincentivizing spam",
+        "First edge's stake retained in contract for refund; subsequent rivals' stakes sent to excessStakeReceiver",
+        "Honest validator is expected to be reimbursed via excessStakeReceiver (out-of-band mechanism)",
+        "Validators stake tokens to create assertions; non-first-child stakes sent to loserStakeEscrow",
+        "Only winning assertion's staker effectively retains their stake",
+        "Challenge period must be long enough to cover censorship resistance + offchain computation time"
+      ],
+      "governance_mechanisms": [
+        "Validator whitelist can be disabled via removeWhitelistAfterFork (chain ID change) or removeWhitelistAfterValidatorAfk (201600 blocks inactivity)",
+        "anyTrustFastConfirmer can bypass normal confirmation process (intended for AnyTrust chains)",
+        "Security council / admin can pause the contract via PausableUpgradeable"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Fee-on-transfer stake token used in EdgeChallengeManager",
+          "expected_behavior": "Contract receives exact stakeAmounts[level] on edge creation and refunds exact stakeAmounts[level]",
+          "actual_behavior": "Contract receives less than stakeAmounts[level] due to transfer fee, but refundStake attempts to transfer the full stakeAmounts[level], potentially causing insufficient balance reverts for some refunds",
+          "risk_level": "medium",
+          "exploitation_potential": "If stakeToken charges fees, the contract balance will be less than expected, and some stakers may not be able to claim refunds. Unlikely if standard ERC20 is used as intended, but no explicit defense."
+        },
+        {
+          "scenario": "Losing staker calls returnOldDeposit after their assertion's child is created",
+          "expected_behavior": "Losing staker should not receive their full stake back since requiredStake was sent to loserStakeEscrow",
+          "actual_behavior": "withdrawStaker adds full amountStaked to withdrawableFunds, but the contract may lack tokens because requiredStake was already transferred to loserStakeEscrow. The withdrawStakerFunds call will revert on safeTransfer, but _withdrawableFunds and totalWithdrawableFunds remain inflated.",
+          "risk_level": "medium",
+          "exploitation_potential": "Creates phantom withdrawable balances in accounting. Losing stakers cannot actually withdraw (safeTransfer fails), but totalWithdrawableFunds is permanently inflated, creating inconsistent accounting state."
+        },
+        {
+          "scenario": "Multiple non-first-child assertions created from same predecessor",
+          "expected_behavior": "Each non-first-child creation sends requiredStake to loserStakeEscrow from contract balance",
+          "actual_behavior": "Each creation deducts requiredStake from rollup contract balance. If many branches created, contract may not have sufficient balance for both loserStakeEscrow transfers and honest staker withdrawals.",
+          "risk_level": "low",
+          "exploitation_potential": "Requires significant capital to create many branches. Each branch requires a staker with requiredStake deposited. The contract receives each staker's deposit and immediately sends requiredStake to escrow, so balance should net to one requiredStake per predecessor."
+        },
+        {
+          "scenario": "getPrevAssertionHash called on edge where lower-level firstRivals is UNRIVALED",
+          "expected_behavior": "Should return the Block-level originId",
+          "actual_behavior": "If firstRivals[originId] returns UNRIVALED hash, get(store, UNRIVALED) reverts with EdgeNotExists. However, this scenario should be unreachable because higher-level edges can only exist when the lower-level claim has rivals.",
+          "risk_level": "low",
+          "exploitation_potential": "No practical exploitation path due to edge creation constraints, but the function lacks a graceful error message for this case."
+        },
+        {
+          "scenario": "Zero stakeAmounts for some levels with non-zero stakeToken",
+          "expected_behavior": "Edges at those levels are created without stake",
+          "actual_behavior": "Code correctly handles this: if sa == 0, no transfer occurs. However, edges at those levels can be created for free, removing economic disincentive for spam.",
+          "risk_level": "low",
+          "exploitation_potential": "If a level has zero stake, adversaries can spam edges at that level without cost, potentially causing DoS on honest validators who must respond."
+        },
+        {
+          "scenario": "Edge confirmed by one-step-proof has different ordering of setConfirmedRival and setConfirmed vs confirmEdgeByTime",
+          "expected_behavior": "Both paths should atomically confirm the edge and record it as the confirmed rival",
+          "actual_behavior": "confirmEdgeByOneStepProof calls setConfirmedRival then setConfirmed, while confirmEdgeByTime calls setConfirmed then setConfirmedRival. Both are atomic within the transaction so neither ordering creates a vulnerability.",
+          "risk_level": "low",
+          "exploitation_potential": "No exploitation, but code inconsistency could mask future bugs if either function is modified."
+        },
+        {
+          "scenario": "Block edge creation when assertion predecessor has more than 2 children",
+          "expected_behavior": "childCreated silently ignores 3rd+ children (no secondChildBlock update)",
+          "actual_behavior": "Works correctly since only firstChildBlock and secondChildBlock are tracked. 3rd+ children function normally as non-first children.",
+          "risk_level": "low",
+          "exploitation_potential": "None - the protocol handles arbitrary numbers of children correctly via the isFirstChild flag."
+        },
+        {
+          "scenario": "Honest validator's edge is the 2nd created (stake goes to excessStakeReceiver) but it gets confirmed",
+          "expected_behavior": "Confirmed edge staker should receive refund",
+          "actual_behavior": "refundStake transfers stakeAmounts[level] from the contract. Since the 1st edge's stake is in the contract (regardless of who created it), the refund succeeds. The economic loss to the honest validator is their stake going to excessStakeReceiver initially, but the refund comes from the adversary's retained stake.",
+          "risk_level": "low",
+          "exploitation_potential": "The protocol ensures one stake per mutual group is retained. The honest validator may have paid their stake to excessStakeReceiver, but receives the equivalent amount back from the retained stake. Net result is correct."
+        },
+        {
+          "scenario": "confirmEdgeByTime called with arbitrary claimStateData for non-block-level or non-first-child edge",
+          "expected_behavior": "claimStateData should be ignored",
+          "actual_behavior": "For non-block-level edges or non-first-child claims, assertionBlocks remains 0 and claimStateData is not validated. Correct behavior - no impact from garbage data.",
+          "risk_level": "low",
+          "exploitation_potential": "None - unused data cannot affect outcome."
+        },
+        {
+          "scenario": "VALIDATOR_AFK_BLOCKS constant on a chain with non-12-second block time",
+          "expected_behavior": "28 days of inactivity before whitelist removal",
+          "actual_behavior": "201600 blocks at non-12-second block time gives different calendar time. On a 2-second block chain, this would be ~4.67 days instead of 28 days.",
+          "risk_level": "medium",
+          "exploitation_potential": "On chains with faster block times, the validator whitelist could be removed much sooner than intended, allowing anyone to participate in the rollup validation prematurely."
+        }
+      ],
+      "assumption_violations": [
+        "stakeToken is assumed to be a standard ERC20 without fee-on-transfer, rebasing, or callback mechanisms. Using a non-standard token breaks refund accounting in both EdgeChallengeManager and RollupUserLogic.",
+        "block.number is assumed to monotonically increase at a predictable rate. On L2 chains or after hard forks, block timing assumptions may break.",
+        "The one step proof entry contract is assumed to be correct and non-malicious. A compromised or buggy oneStepProofEntry could confirm invalid edges.",
+        "The bridge and assertion chain contracts are assumed to be correct. Incorrect sequencerInboxAccs or assertion data would break the challenge integrity.",
+        "It's assumed that honest validators will actively update timer caches and respond to challenges within the challenge period. If they don't, adversary edges can win by time."
+      ],
+      "game_theory_risks": [
+        "An adversary can create many rival edges at each level, forcing the honest party to respond to each via bisection. The stake requirement limits this but each response costs gas.",
+        "Timer inheritance means an adversary who delays their challenges (creating rivals late) gives honest edges more unrivaled time. The adversary cannot claw back time once the honest edge has accumulated it.",
+        "The excessStakeReceiver mechanism means the first edge creator's stake is retained while later ones go to excess. A sequencer could front-run honest validators to ensure the adversary's stake is retained and the honest validator's goes to excess, though this doesn't affect correctness since refunds come from the retained stake.",
+        "Creating assertions on multiple branches (fork attacks) requires proportional capital (requiredStake per branch) which limits the economic viability of such attacks.",
+        "The challenge grace period prevents confirmation immediately after a winning edge is found, giving time for the community to observe and respond to potentially incorrect outcomes."
+      ],
+      "integration_risks": [
+        "The assertionChain interface is critical - if validateAssertionHash or validateConfig are compromised, invalid edges or assertions could be created.",
+        "oneStepProofEntry executes arbitrary computation to produce afterHash. A vulnerability in the proof system could allow false confirmations.",
+        "bridge.sequencerInboxAccs is trusted for inbox accumulator values. If the bridge is compromised, assertion validity checks break.",
+        "The outbox.updateSendRoot call in confirmAssertionInternal is a trusted external call that updates L2-to-L1 message roots.",
+        "safeTransferFrom/safeTransfer for stakeToken are external calls at end of functions. If token has reentrancy vectors (ERC-777), the onlyValidator modifier and isStaked checks provide some protection but no explicit reentrancy guard exists."
+      ],
+      "calculation_errors": [
+        "machineStep calculation in confirmEdgeByOneStepProof accumulates startHeight * stepSize across BigStep levels. For very large heights (e.g., all at 2^26) and many levels, the intermediate products could be very large but won't overflow uint256 given reasonable parameters (total < 2^256).",
+        "mandatoryBisectionHeight uses XOR and MSB to find deterministic bisection points. The formula ((end - 1) & mask) correctly identifies the highest power-of-2-aligned boundary between start and end.",
+        "timeUnrivaled calculation: when firstRivalCreatedAtBlock == edgeCreatedAtBlock, returns 0. This means edges created in the same block as their rival get zero unrivaled time, which is correct behavior.",
+        "assertionBlocks calculation: getSecondChildCreationBlock - getFirstChildCreationBlock. Both are uint64, subtraction is safe because secondChildBlock >= firstChildBlock (second child always created after or at same time as first)."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "stakeToken (EdgeChallengeManager)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Used as IERC20 with SafeERC20. Code assumes no fee-on-transfer: transfers exact stakeAmounts[level] and refunds same amount. Fee-on-transfer tokens would cause accounting mismatch. The contract does NOT check received amounts.",
+          "approval_model": "bounded",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "evidence_refs": [
+            {
+              "file": "EdgeChallengeManager.sol",
+              "lines": [
+                213,
+                216
+              ],
+              "function": "createLayerZeroEdge"
+            },
+            {
+              "file": "EdgeChallengeManager.sol",
+              "lines": [
+                297,
+                300
+              ],
+              "function": "refundStake"
+            }
+          ]
+        },
+        {
+          "address_or_symbol": "stakeToken (RollupUserLogic)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Same stake token used in rollup. SafeERC20 used. Token received AFTER state changes in newStakeOnNewAssertion (CEI not strictly followed but atomicity provides safety). Transfer to loserStakeEscrow occurs from contract balance; if contract balance is insufficient due to prior transfers, safeTransfer reverts.",
+          "approval_model": "bounded",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "evidence_refs": [
+            {
+              "file": "RollupUserLogic.sol",
+              "lines": [
+                162,
+                163
+              ],
+              "function": "stakeOnNewAssertion"
+            },
+            {
+              "file": "RollupUserLogic.sol",
+              "lines": [
+                252
+              ],
+              "function": "withdrawStakerFunds"
+            }
+          ]
+        }
+      ],
+      "invariants": [
+        {
+          "name": "single_confirmed_rival",
+          "state_vars": [
+            "store.confirmedRivals[mutualId]"
+          ],
+          "description": "For each mutualId, at most one edge can be confirmed. Enforced by setConfirmedRival which reverts if confirmedRivals[mutualId] is already set."
+        },
+        {
+          "name": "timer_cache_monotonicity",
+          "state_vars": [
+            "ChallengeEdge.totalTimeUnrivaledCache"
+          ],
+          "description": "Timer cache values only increase. updateTimerCache only writes if newValue > currentAccuTimer. Capped at uint64.max."
+        },
+        {
+          "name": "edge_immutability",
+          "state_vars": [
+            "store.edges[edgeId]"
+          ],
+          "description": "Edges are never deleted. Core fields (originId, startHistoryRoot, startHeight, endHistoryRoot, endHeight, level) never change after creation. Only status, children, refunded, confirmedAtBlock, and totalTimeUnrivaledCache can be updated."
+        },
+        {
+          "name": "single_bisection",
+          "state_vars": [
+            "ChallengeEdge.lowerChildId",
+            "ChallengeEdge.upperChildId"
+          ],
+          "description": "setChildren reverts if children are already set, preventing double bisection."
+        },
+        {
+          "name": "single_refund",
+          "state_vars": [
+            "ChallengeEdge.refunded"
+          ],
+          "description": "setRefunded reverts if already refunded. Only confirmed layer zero edges can be refunded."
+        },
+        {
+          "name": "stake_balance_conservation",
+          "state_vars": [
+            "stakeToken.balanceOf(EdgeChallengeManager)",
+            "stakeAmounts[]"
+          ],
+          "description": "For each mutual group, exactly one stakeAmounts[level] is retained in the contract (from the first edge). All subsequent rivals' stakes go to excessStakeReceiver. At most one refund per mutual group is possible."
+        },
+        {
+          "name": "deterministic_bisection_height",
+          "state_vars": [],
+          "description": "mandatoryBisectionHeight is a pure function of start and end heights, ensuring rival edges bisect at identical points, which is critical for the merge-move optimization."
+        },
+        {
+          "name": "level_progression",
+          "state_vars": [
+            "ChallengeEdge.level"
+          ],
+          "description": "Levels progress strictly: Block(0) → BigStep(1..N) → SmallStep(N+1). Layer zero edges at level L+1 claim length-1 rivaled edges at level L. nextEdgeLevel enforces this."
+        }
+      ]
+    }
+  }
+}

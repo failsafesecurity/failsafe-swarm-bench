@@ -1,0 +1,291 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T00:48:49.478Z",
+    "duration_ms": 211201
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Seaport to Create Policy",
+        "trust_level": "trusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "Create.validateOrder"
+        ],
+        "failure_modes": [
+          "Seaport provides invalid execution data",
+          "Signature replay on different orders"
+        ],
+        "attack_vectors": [
+          "Exploiting Seaport vulnerabilities to force invalid order validation"
+        ]
+      },
+      {
+        "boundary": "User to Stop Policy",
+        "trust_level": "untrusted",
+        "validation": "extensive",
+        "sanitization": "present",
+        "entry_functions": [
+          "Stop.stopRent",
+          "Stop.stopRentBatch"
+        ],
+        "failure_modes": [
+          "Invalid order hash provided",
+          "Order already stopped"
+        ],
+        "attack_vectors": [
+          "Reentrancy during settlement",
+          "Passing fake order data to bypass checks"
+        ]
+      },
+      {
+        "boundary": "Safe to Guard Policy",
+        "trust_level": "semi-trusted",
+        "validation": "extensive",
+        "sanitization": "absent",
+        "entry_functions": [
+          "Guard.checkTransaction"
+        ],
+        "failure_modes": [
+          "Guard bypassed via delegatecall",
+          "Hook overrides default checks"
+        ],
+        "attack_vectors": [
+          "Using whitelisted MultiSend to execute hidden transfers",
+          "Exploiting incomplete hook implementations"
+        ]
+      },
+      {
+        "boundary": "Admin to Protocol",
+        "trust_level": "trusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "Admin.toggleWhitelistDelegate",
+          "Admin.toggleWhitelistExtension",
+          "Admin.upgradeStorage",
+          "Admin.setFee"
+        ],
+        "failure_modes": [
+          "Admin key compromise",
+          "Whitelisting malicious delegates"
+        ],
+        "attack_vectors": [
+          "Upgrading modules to malicious implementations",
+          "Setting fee to 100%"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Unrented",
+        "to_state": "Rented",
+        "trigger": "Create.validateOrder",
+        "conditions": [
+          "Valid EIP-712 signature",
+          "Fulfiller owns recipient Safe",
+          "Seaport executions match expected recipients"
+        ],
+        "invariants": [
+          "ERC20s go to PaymentEscrow",
+          "NFTs go to Rental Safe",
+          "Order hash recorded in Storage"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      },
+      {
+        "from_state": "Rented",
+        "to_state": "Stopped",
+        "trigger": "Stop.stopRent",
+        "conditions": [
+          "Rental duration expired OR lender stops PAY order",
+          "Order exists in Storage"
+        ],
+        "invariants": [
+          "NFTs returned to lender",
+          "ERC20s distributed pro-rata or in full",
+          "Order hash removed from Storage"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Access Control / Guard Bypass",
+        "locations": [
+          "Guard.sol:checkTransaction"
+        ],
+        "severity": "high",
+        "evidence": "The guard explicitly allows `Enum.Operation.DelegateCall` if the target is in `whitelistedDelegates`. If a batching contract like `MultiSend` is whitelisted, users can delegatecall to it and execute arbitrary internal calls that bypass the guard's selector checks.",
+        "exploitation_method": "Safe owner creates a transaction to delegatecall a whitelisted `MultiSend` contract, packing calls to `ERC721.transferFrom` for rented assets. The guard allows the delegatecall, and the internal transfers execute without guard intervention.",
+        "affected_assets": [
+          "Rented ERC721 and ERC1155 tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-127",
+        "pattern": "Security Check Bypass",
+        "locations": [
+          "Guard.sol:checkTransaction"
+        ],
+        "severity": "medium",
+        "evidence": "If a hook is active for a target contract, `_forwardToHook` is called and the `else` branch containing `_checkTransaction` is skipped. The hook is entirely responsible for security checks.",
+        "exploitation_method": "If an admin whitelists a hook for a contract (e.g., a staking contract) that does not reimplement the strict selector checks of `_checkTransaction`, the Safe owner can transfer rented assets out.",
+        "affected_assets": [
+          "Rented ERC721 and ERC1155 tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service / Accounting Logic Error",
+        "locations": [
+          "PaymentEscrow.sol:increaseDeposit",
+          "PaymentEscrow.sol:_settlePayment"
+        ],
+        "severity": "high",
+        "evidence": "`increaseDeposit` increments `balanceOf[token]` by the full `amount` specified in the order, but fee-on-transfer tokens will deliver less to the contract. During `settlePayment`, the contract attempts to transfer the full amount out, which will revert due to insufficient balance.",
+        "exploitation_method": "Attacker creates a rental using a fee-on-transfer ERC20 token. The rental cannot be stopped because `settlePayment` reverts, permanently locking the lender's NFT in the attacker's Safe.",
+        "affected_assets": [
+          "Lender's rented NFTs",
+          "ERC20 tokens in PaymentEscrow"
+        ]
+      },
+      {
+        "swc_id": "SWC-113",
+        "pattern": "DoS with Failed Call",
+        "locations": [
+          "Reclaimer.sol:_transferERC721",
+          "Reclaimer.sol:_transferERC1155"
+        ],
+        "severity": "medium",
+        "evidence": "`reclaimRentalOrder` uses `safeTransferFrom` to return NFTs to the lender. If the lender is a smart contract that does not implement `onERC721Received`, the transfer reverts.",
+        "exploitation_method": "If a lender contract lacks the receiver hook, or if an attacker intentionally uses a blacklisted address for ERC20 payments, `stopRent` will consistently revert, locking the rental state.",
+        "affected_assets": [
+          "Rented NFTs"
+        ]
+      },
+      {
+        "swc_id": "SWC-101",
+        "pattern": "Integer Overflow",
+        "locations": [
+          "PaymentEscrow.sol:_calculatePaymentProRata"
+        ],
+        "severity": "low",
+        "evidence": "`uint256 numerator = (amount * elapsedTime) * 1000;` can overflow if `amount` is extremely large.",
+        "exploitation_method": "Attacker uses a massive `amount` of a worthless ERC20 token in a PAY order. The overflow prevents the lender from stopping the rental early, acting as a griefing vector.",
+        "affected_assets": [
+          "Lender's rented NFTs (temporarily locked until expiration)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Admin.sol",
+          "function": "toggleWhitelistDelegate(address,bool)",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Can lead to guard bypass if MultiSend is whitelisted"
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "toggleWhitelistExtension(address,bool)",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "upgradeStorage(address)",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "freezeStorage()",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "upgradePaymentEscrow(address)",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "freezePaymentEscrow()",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "skim(address,address)",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Admin.sol",
+          "function": "setFee(uint256)",
+          "guards": [
+            "onlyRole(\"ADMIN_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Guard.sol",
+          "function": "updateHookPath(address,address)",
+          "guards": [
+            "onlyRole(\"GUARD_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        },
+        {
+          "contract": "Guard.sol",
+          "function": "updateHookStatus(address,uint8)",
+          "guards": [
+            "onlyRole(\"GUARD_ADMIN\")"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

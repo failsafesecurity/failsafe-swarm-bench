@@ -1,0 +1,288 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T05:23:43.042Z",
+    "duration_ms": 310548
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "access_condition",
+        "target_contract": "PEMCertChainLib.sol",
+        "description": "The notBefore date tag validation in decodeCert has a logic error: the condition `(notBeforeTag != 0x17 && notBeforeTag == 0x18)` simplifies to `notBeforeTag == 0x18`, meaning valid GeneralizedTime (0x18) certificates are rejected, while arbitrary invalid tags (e.g., 0x05) for notBefore are accepted.",
+        "attack_scenario": "An attacker crafts a certificate with an invalid ASN.1 tag for the notBefore field (e.g., 0x05 instead of 0x17/0x18). The malformed tag passes the broken validation, and X509DateUtils.toTimestamp interprets garbage bytes as a timestamp, potentially producing notBefore=0, making the certificate appear perpetually valid. Meanwhile, legitimate certificates using GeneralizedTime are rejected, causing DoS for valid SGX attestations.",
+        "invariant_logic": "For cert validity parsing: (notBeforeTag == 0x17 || notBeforeTag == 0x18) && (notAfterTag == 0x17 || notAfterTag == 0x18). The current code checks `(notBeforeTag != 0x17 && notBeforeTag == 0x18)` which should be `(notBeforeTag != 0x17 && notBeforeTag != 0x18)`.",
+        "solidity_property": "function invariant_notBeforeTagValidation(bytes1 notBeforeTag, bytes1 notAfterTag) public pure { bool shouldReject = (notBeforeTag != 0x17 && notBeforeTag != 0x18) || (notAfterTag != 0x17 && notAfterTag != 0x18); assert(shouldReject == ((notBeforeTag != 0x17 && notBeforeTag != 0x18) || (notAfterTag != 0x17 && notAfterTag != 0x18))); }",
+        "inventory_refs": [
+          {
+            "file": "PEMCertChainLib.sol",
+            "function": "decodeCert"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "monotonicity",
+        "target_contract": "CrossChainOwned.sol",
+        "description": "The nextTxId must strictly increase by exactly 1 on each successful onMessageInvocation execution, AND the increment must happen AFTER the delegatecall to address(this) succeeds. Since onMessageInvocation deliberately lacks nonReentrant and calls address(this).call(txdata), the nextTxId increment (via nextTxId++) occurs after the external call, meaning re-entrant paths into the same contract during the call still see the old nextTxId.",
+        "attack_scenario": "If address(this).call(txdata) invokes a function that somehow triggers another bridge message processing (though guarded by onlyFromNamed('bridge')), the same txId could theoretically be used twice. More practically, if the call reverts but nextTxId was already incremented, the tx sequence would have a gap, permanently blocking future cross-chain transactions. However since the revert check is after the call and before the increment, this specific case reverts the whole tx.",
+        "invariant_logic": "post(nextTxId) == pre(nextTxId) + 1 for each successful onMessageInvocation call; txId parameter must equal pre(nextTxId)",
+        "solidity_property": "function invariant_nextTxIdMonotonic(uint64 preNextTxId) public view { assert(nextTxId >= preNextTxId); assert(nextTxId - preNextTxId <= 1); }",
+        "inventory_refs": [
+          {
+            "file": "CrossChainOwned.sol",
+            "function": "onMessageInvocation"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "TaikoL2.sol",
+        "description": "The publicInputHash forms a cryptographic chain linking consecutive L2 blocks. Each anchor() call verifies publicInputHash against the hash computed from the previous 255 block hashes plus chainId, then updates it. If this chain is broken (hash mismatch), the L2 becomes permanently stuck as no future anchor can pass verification.",
+        "attack_scenario": "If an anchor transaction is processed with incorrect block hashes (e.g., due to a chain reorg or manipulated blockhash), the publicInputHash would be set to an inconsistent value. All subsequent anchor transactions would fail the PUBLIC_INPUT_HASH_MISMATCH check, effectively halting L2 block finalization. This is irreversible without a contract upgrade.",
+        "invariant_logic": "publicInputHash == keccak256(prevBlockHashes[0..254], chainId) where prevBlockHashes are the actual blockhashes of the previous 255 blocks",
+        "solidity_property": "function invariant_publicInputHashConsistency() public view { (bytes32 expectedOld,) = _calcPublicInputHash(block.number - 1); assert(publicInputHash == expectedOld); }",
+        "inventory_refs": [
+          {
+            "file": "TaikoL2.sol",
+            "function": "anchor"
+          },
+          {
+            "file": "TaikoL2.sol",
+            "function": "_calcPublicInputHash"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "AutomataDcapV3Attestation.sol",
+        "description": "In _verifyCertChain, the loop terminates early when issuerPubKeyHash matches ROOTCA_PUBKEY_HASH. For a 3-cert chain [PCK, Intermediate, Root], when i=1 the issuer is certs[2] (root). If root's pubkey matches ROOTCA_PUBKEY_HASH, the loop breaks without ever reaching i=2 to validate the root certificate's own expiry (notBefore/notAfter) and self-signature.",
+        "attack_scenario": "An attacker provides a certificate chain where the root CA certificate has expired (notAfter < block.timestamp). Since the root cert's expiry is never checked (the loop breaks at i=1 after matching the root pubkey hash), the attestation succeeds with an expired trust anchor. While the root CA key might still be valid, the certificate metadata (including revocation information embedded in the cert) is not verified.",
+        "invariant_logic": "For all certificates in the chain including root: block.timestamp > cert.notBefore && block.timestamp < cert.notAfter",
+        "solidity_property": "function invariant_allCertsNotExpired(IPEMCertChainLib.ECSha256Certificate[] memory certs) public view { for(uint i = 0; i < certs.length; i++) { assert(block.timestamp > certs[i].notBefore && block.timestamp < certs[i].notAfter); } }",
+        "inventory_refs": [
+          {
+            "file": "AutomataDcapV3Attestation.sol",
+            "function": "_verifyCertChain"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "PEMCertChainLib.sol",
+        "description": "In _findTcb, the cpusvns array is sized SGX_TCB_CPUSVN_SIZE (16) but the loop iterates SGX_TCB_CPUSVN_SIZE + 1 (17) times. When PCESVN_OID is encountered, it's stored in pcesvn instead of cpusvns[i]. If PCESVN_OID is NOT the last element in the DER sequence, the final iteration (i=16) writes to cpusvns[16] which is out of bounds, causing a revert.",
+        "attack_scenario": "If Intel changes the ordering of SVN components in PCK certificates such that PCESVN is not the last component, all attestation verification would revert with an array out-of-bounds error. Additionally, even when PCESVN is encountered mid-sequence, cpusvns retains a zero at the PCESVN's index position, potentially causing TCB level matching to use incorrect SVN values.",
+        "invariant_logic": "cpusvns.length == 16 && loop_iterations == 17 implies exactly one iteration must match PCESVN_OID; cpusvns[i] is only written when i < 16",
+        "solidity_property": "function invariant_cpusvnsBounds() public pure { uint256[] memory cpusvns = new uint256[](16); for(uint i = 0; i < 17; i++) { if(i == 16) { /* must be PCESVN or OOB */ } } }",
+        "inventory_refs": [
+          {
+            "file": "PEMCertChainLib.sol",
+            "function": "_findTcb"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "TaikoL2.sol",
+        "description": "The anchor() function MUST only be callable by GOLDEN_TOUCH_ADDRESS and MUST be the first transaction in each L2 block. This is enforced on-chain by the sender check, but the critical invariant that anchor is called exactly once per block as the first transaction relies on the L2 node implementation, not the contract.",
+        "attack_scenario": "If the L2 node software has a bug allowing a block without an anchor transaction, or with anchor as a non-first transaction, the publicInputHash chain breaks. Additionally, if multiple anchor transactions are included in one block, the second would fail the PUBLIC_INPUT_HASH_MISMATCH check since the first already updated the hash. The gasExcess calculation would also be incorrect since _parentGasUsed would be applied twice.",
+        "invariant_logic": "msg.sender == GOLDEN_TOUCH_ADDRESS && tx is first in block && exactly one anchor per block",
+        "solidity_property": "function invariant_anchorAccess() public view { /* Cannot fully verify on-chain; sender check: */ assert(msg.sender == GOLDEN_TOUCH_ADDRESS); }",
+        "inventory_refs": [
+          {
+            "file": "TaikoL2.sol",
+            "function": "anchor"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "TimelockTokenPool.sol",
+        "description": "The grant lifecycle must follow: unallocated → granted → (optionally voided). A grant can never be re-granted once set (ALREADY_GRANTED check). After void(), grantStart and grantPeriod are zeroed which makes _getAmountOwned return the full remaining amount immediately. The unlock schedule (unlockStart/unlockCliff/unlockPeriod) remains unchanged, ensuring already-vested tokens maintain their unlock schedule.",
+        "attack_scenario": "If void() could be called repeatedly or if the grant amount could be modified after void(), an attacker (malicious owner) could manipulate the vesting schedule. The current implementation correctly prevents re-granting and makes void() idempotent (second void returns 0 since amountOwned == amount after first void). However, the owner can void at any time before full vesting, immediately stopping further vesting.",
+        "invariant_logic": "For any recipient r: r.amountWithdrawn <= _getAmountUnlocked(r.grant) && _getAmountUnlocked(r.grant) <= _getAmountOwned(r.grant) && _getAmountOwned(r.grant) <= r.grant.amount",
+        "solidity_property": "function invariant_grantIntegrity(address recipient) public view { Recipient storage r = recipients[recipient]; uint128 owned = _getAmountOwned(r.grant); uint128 unlocked = _getAmountUnlocked(r.grant); assert(r.amountWithdrawn <= unlocked); assert(unlocked <= owned); assert(owned <= r.grant.amount); }",
+        "inventory_refs": [
+          {
+            "file": "TimelockTokenPool.sol",
+            "function": "grant"
+          },
+          {
+            "file": "TimelockTokenPool.sol",
+            "function": "void"
+          },
+          {
+            "file": "TimelockTokenPool.sol",
+            "function": "_withdraw"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "MerkleClaimable.sol",
+        "description": "Once a claim hash is marked as claimed (isClaimed[hash] = true), it must remain claimed forever regardless of merkle root changes. However, setConfig() allows the owner to change merkleRoot, claimStart, and claimEnd without any constraints. Changing the merkleRoot creates a new set of valid claims while old claimed hashes remain marked, but any leaf present in both old and new trees that was already claimed cannot be re-claimed. Critically, if the owner sets claimStart > claimEnd, the claim window becomes invalid.",
+        "attack_scenario": "The owner changes merkleRoot to a tree that includes previously-unclaimed users from the old tree plus new users. Users who claimed under the old root are protected (isClaimed prevents re-claim). But if the owner sets merkleRoot to bytes32(0) during active claims, the ongoingClaim modifier blocks all claims. The owner could also extend claimEnd indefinitely or set it to 0 to stop claims.",
+        "invariant_logic": "forall hash: isClaimed[hash] == true implies isClaimed[hash] remains true (monotonically increasing set); claim window: claimStart < claimEnd when merkleRoot != 0",
+        "solidity_property": "function invariant_claimIrreversible(bytes32 hash) public view { /* once set to true, should never become false */ if(isClaimed[hash]) { assert(isClaimed[hash] == true); } }",
+        "inventory_refs": [
+          {
+            "file": "MerkleClaimable.sol",
+            "function": "_verifyClaim"
+          },
+          {
+            "file": "MerkleClaimable.sol",
+            "function": "setConfig"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "ERC20Airdrop2.sol",
+        "description": "The withdraw() function lacks both nonReentrant guard and access control - anyone can call withdraw(user) for any user. While tokens flow to the correct user, the function performs state update (withdrawnAmount[user] += amount) before the external call (transferFrom). If the token contract has callback mechanisms (ERC777, hooks), reentrancy could allow double-withdrawal within a single transaction.",
+        "attack_scenario": "If the airdrop token implements ERC777 or similar callback mechanisms, an attacker contract could reenter withdraw() during the transferFrom call. Since withdrawnAmount is updated before the transfer, getBalance() would return 0 on reentry, mitigating double-spend. However, anyone calling withdraw(victim) forces the victim to receive tokens at a potentially undesired time, which could have tax or accounting implications.",
+        "invariant_logic": "withdrawnAmount[user] <= claimedAmount[user] && withdrawnAmount[user] <= timeBasedAllowance(user)",
+        "solidity_property": "function invariant_withdrawBounds(address user) public view { (uint256 balance, ) = getBalance(user); assert(withdrawnAmount[user] <= claimedAmount[user]); }",
+        "inventory_refs": [
+          {
+            "file": "ERC20Airdrop2.sol",
+            "function": "withdraw"
+          },
+          {
+            "file": "ERC20Airdrop2.sol",
+            "function": "getBalance"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "TaikoL2.sol",
+        "description": "The lastSyncedBlock only updates when _l1BlockId > lastSyncedBlock + BLOCK_SYNC_THRESHOLD (5). The base fee calculation uses lastSyncedBlock to compute numL1Blocks for gas issuance. If lastSyncedBlock is 0 (initial state), numL1Blocks is forced to 0 regardless of _l1BlockId, meaning no gas issuance reduction occurs. This is intentional to prevent the first-block edge case from zeroing gasExcess, but means the first anchor after initialization could have an inflated gasExcess.",
+        "attack_scenario": "After initialization with a non-zero gasExcess, the first anchor call with a very high _l1BlockId would NOT reduce gasExcess (since lastSyncedBlock == 0 forces numL1Blocks = 0). This means _parentGasUsed is added to gasExcess without any issuance offset, potentially causing a temporarily high base fee. This is by design but could surprise users immediately after deployment.",
+        "invariant_logic": "gasExcess == 0 || basefee >= 1; when gasExcess > 0 && lastSyncedBlock > 0: gasExcess adjusts based on (excess + parentGasUsed - numL1Blocks * gasTarget)",
+        "solidity_property": "function invariant_basefeeNonZero() public view { (uint256 bf,) = _calc1559BaseFee(getConfig(), lastSyncedBlock + 1, 0); assert(bf >= 1); }",
+        "inventory_refs": [
+          {
+            "file": "TaikoL2.sol",
+            "function": "_calc1559BaseFee"
+          },
+          {
+            "file": "TaikoL2.sol",
+            "function": "anchor"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "AutomataDcapV3Attestation.sol",
+        "description": "The contract has no ownership transfer mechanism. The owner is set in the constructor and can never be changed. All configuration functions (setMrSigner, setMrEnclave, configureTcbInfoJson, configureQeIdentityJson, addRevokedCertSerialNum, toggleLocalReportCheck) become permanently inaccessible if the owner key is lost or compromised. Unlike EssentialContract-derived contracts which have Ownable2Step, this contract uses a simple owner pattern.",
+        "attack_scenario": "If the owner's private key is compromised, the attacker gains permanent, irrevocable control over all attestation configuration: they can whitelist arbitrary MrEnclave/MrSigner values, remove certificate revocations, and reconfigure TCB info to accept outdated or compromised enclaves. If the key is lost, the contract can never update its configuration to revoke compromised certificates or update TCB info, eventually making all attestations fail as Intel updates its infrastructure.",
+        "invariant_logic": "owner is immutable after construction; no transfer/renounce mechanism exists",
+        "solidity_property": "function invariant_ownerImmutable(address expectedOwner) public view { assert(owner == expectedOwner); }",
+        "inventory_refs": [
+          {
+            "file": "AutomataDcapV3Attestation.sol",
+            "function": "constructor"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "SigVerifyLib.sol",
+        "description": "verifyES256Signature uses assert(success) after staticcall to ES256VERIFIER. If the ES256VERIFIER address has no code deployed (or is destroyed), staticcall returns success=false with empty returndata. The assert(success) then consumes ALL remaining gas before reverting, as assert failures use the INVALID opcode which does not refund gas.",
+        "attack_scenario": "If ES256VERIFIER is not deployed or is self-destructed, every attestation verification that reaches the ES256 signature check will consume all provided gas before reverting. This makes attestation verification extremely expensive to fail, creating a griefing vector where users pay maximum gas for guaranteed failures. The assert should be a require with a meaningful error message.",
+        "invariant_logic": "ES256VERIFIER.code.length > 0 must hold for verifyES256Signature to not consume all gas on failure",
+        "solidity_property": "function invariant_es256VerifierExists() public view { assert(ES256VERIFIER.code.length > 0); }",
+        "inventory_refs": [
+          {
+            "file": "SigVerifyLib.sol",
+            "function": "verifyES256Signature"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "AutomataDcapV3Attestation.sol",
+        "description": "In _verifyParsedQuote step 3, there is a redundant check: `if (!verifiedEnclaveIdSuccessfully)` is checked twice. The second conditional block `if (!verifiedEnclaveIdSuccessfully || qeTcbStatus == SGX_ENCLAVE_REPORT_ISVSVN_REVOKED)` can never satisfy the first disjunct since it was already handled. While not a vulnerability, this indicates potential copy-paste error where the ISVSVN_REVOKED check may have been intended as a standalone check.",
+        "attack_scenario": "Not directly exploitable, but the code structure suggests the developer may have intended a different flow. If the first check was meant to be removed when the second was added, a future refactor could accidentally remove the wrong check, allowing unverified enclave identity to pass.",
+        "invariant_logic": "verifiedEnclaveIdSuccessfully == true && qeTcbStatus != SGX_ENCLAVE_REPORT_ISVSVN_REVOKED must both hold after step 3",
+        "solidity_property": "function invariant_enclaveIdVerified(bool verified, uint8 status) public pure { assert(verified == true); assert(status != 1); }",
+        "inventory_refs": [
+          {
+            "file": "AutomataDcapV3Attestation.sol",
+            "function": "_verifyParsedQuote"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "TaikoL2EIP1559Configurable.sol",
+        "description": "The owner can call setConfigAndExcess to set gasExcess to 0 at any time, which permanently disables the EIP-1559 dynamic base fee (making basefee always return 1 wei). This is an extremely powerful lever that affects all L2 users. Additionally, the owner can set gasExcess to type(uint64).max, causing the base fee to spike to the maximum exponential curve value.",
+        "attack_scenario": "A compromised owner sets gasExcess to type(uint64).max, causing the base fee to reach astronomical levels, effectively making all L2 transactions prohibitively expensive. Alternatively, setting gasExcess to 0 makes the base fee 1 wei permanently, which could enable spam attacks on the L2 network. Since this is controlled via cross-chain ownership (CrossChainOwned), the attack requires compromising the L1 owner or bridge.",
+        "invariant_logic": "gasExcess changes should preserve reasonable basefee bounds; gasExcess == 0 implies basefee == 1 (dynamic fee disabled)",
+        "solidity_property": "function invariant_gasExcessReasonable() public view { if(gasExcess > 0) { Config memory c = getConfig(); uint256 bf = Lib1559Math.basefee(gasExcess, uint256(c.basefeeAdjustmentQuotient) * c.gasTargetPerL1Block); assert(bf >= 1 && bf <= 10000 gwei); } }",
+        "inventory_refs": [
+          {
+            "file": "TaikoL2EIP1559Configurable.sol",
+            "function": "setConfigAndExcess"
+          },
+          {
+            "file": "TaikoL2.sol",
+            "function": "_calc1559BaseFee"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-015",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "TimelockTokenPool.sol",
+        "description": "The withdraw(address _to, bytes memory _sig) function uses ECDSA.recover to determine the recipient from a signature, but the signed message contains no nonce, no chain ID, no contract address, and no expiry timestamp. While replay within the same contract is mitigated by amountWithdrawn tracking (subsequent calls yield 0 withdrawal), the signature is valid across all chains and all TimelockTokenPool instances.",
+        "attack_scenario": "A TimelockTokenPool is deployed on both mainnet and a testnet/L2 with the same recipient having grants on both. The recipient signs a withdrawal message for a specific _to address on testnet. An attacker replays this signature on mainnet, causing the mainnet tokens to be sent to the same _to address. If _to is a contract address that the recipient controls on testnet but not on mainnet, the tokens are lost.",
+        "invariant_logic": "Withdrawal signature should bind to: (chain_id, contract_address, nonce_or_amount, expiry) to prevent cross-chain and cross-contract replay",
+        "solidity_property": "function invariant_withdrawSigBindsToContext() public view { /* Signature should include block.chainid and address(this) */ }",
+        "inventory_refs": [
+          {
+            "file": "TimelockTokenPool.sol",
+            "function": "withdraw"
+          }
+        ]
+      }
+    ]
+  }
+}

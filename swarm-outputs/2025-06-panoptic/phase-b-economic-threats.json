@@ -1,0 +1,958 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "HypoVault.sol",
+      "PanopticVaultAccountant.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-05T07:58:02.187Z",
+    "duration_ms": 633052
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "Token1 Premium Sign Inversion in NAV Calculation Systematically Misprices Shares",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In computeNAV, the token1 premium exposure is computed as `longPremium.leftSlot() - shortPremium.leftSlot()`, which is the OPPOSITE sign convention of token0's `shortPremium.rightSlot() - longPremium.rightSlot()`. For a vault that has net earned token1 premiums (short > long), the NAV subtracts earned premiums instead of adding them, systematically understating NAV. Conversely, owed premiums are added instead of subtracted, overstating NAV.",
+      "investigation_rationale": "This is a clear code-level sign error that directly corrupts the NAV used for all deposit and withdrawal fulfillment pricing. Any vault with Panoptic positions that accumulate token1 premiums will have incorrect share pricing, enabling value extraction during fulfillments.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "computeNAV",
+        "fulfillDeposits",
+        "fulfillWithdrawals"
+      ],
+      "affected_contracts": [
+        "PanopticVaultAccountant.sol",
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "function": "computeNAV"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "fulfillDeposits"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "fulfillWithdrawals"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PanopticVaultAccountant.sol",
+        "lines": "110-115",
+        "pattern": "poolExposure1 = int256(uint256(longPremium.leftSlot())) - int256(uint256(shortPremium.leftSlot())) uses inverted sign compared to poolExposure0 = int256(uint256(shortPremium.rightSlot())) - int256(uint256(longPremium.rightSlot()))"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Vault has open Panoptic positions that accumulate token1 premiums",
+        "shortPremium.leftSlot() differs from longPremium.leftSlot()",
+        "Manager calls fulfillDeposits or fulfillWithdrawals using the mispriced NAV"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "poolExposure1 = longPremium.leftSlot() - shortPremium.leftSlot() vs correct: shortPremium.leftSlot() - longPremium.leftSlot()",
+        "manipulation_vector": "Sign inversion of token1 premium contribution to NAV distorts share pricing automatically",
+        "profit_hypothesis": "If net token1 premium earned = P, NAV is off by 2*P (swung from +P to -P). Depositors during understated NAV get excess shares; withdrawers during overstated NAV get excess assets."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the typical magnitude of token1 premium accumulation for active Panoptic strategies?",
+          "How does the 2x NAV swing affect share price for a typical vault TVL?",
+          "Can an external observer time deposit/withdrawal requests to exploit predictable NAV distortion?"
+        ],
+        "validation_requirements": [
+          "Verify Panoptic LeftRightUnsigned slot conventions for premium (leftSlot = token1, rightSlot = token0)",
+          "Compute NAV with correct and incorrect signs for realistic premium scenarios",
+          "Trace impact through fulfillDeposits/fulfillWithdrawals share pricing"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Proportional to vault TVL (requires validation)",
+        "estimated_execution_cost": "Standard deposit/withdrawal gas costs",
+        "potential_profit_range": "Up to 2 * net_token1_premium value extracted per fulfillment cycle",
+        "estimated_profit_margin": "Depends on premium magnitude relative to TVL",
+        "attack_duration": "Multi-block (deposit request → fulfillment → execution)"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None beyond normal deposit capital",
+        "optimal_timing": "When vault has large accumulated token1 premiums",
+        "market_impact_assessment": "No market impact; bug exists in code logic"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All existing shareholders when NAV is understated; all withdrawers when NAV is overstated",
+        "estimated_impact_per_user": "Proportional to their share of the vault relative to the premium magnitude",
+        "total_value_at_risk": "All vault assets are at risk over time through cumulative mispricing"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical premium values for Panoptic options strategies",
+        "calculation_validation": "Side-by-side NAV computation with correct vs inverted sign",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "Per-Pool NAV Clamping to Zero Inflates NAV by Ignoring Underwater Pool Debt",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "computeNAV sums NAV across pools using `nav += uint256(Math.max(poolExposure0 + poolExposure1, 0))`. Negative per-pool exposure (debt/loss) is clamped to zero instead of reducing the aggregate NAV. If Pool A has +100 exposure and Pool B has -80 exposure, NAV reports 100 instead of the correct 20. This systematically overstates NAV whenever any pool has negative net exposure.",
+      "investigation_rationale": "Overstated NAV directly corrupts fulfillment pricing. During deposit fulfillment, inflated totalAssets means depositors receive fewer shares than fair value. During withdrawal fulfillment, inflated totalAssets means withdrawers receive more assets than fair value, draining the vault. This occurs automatically in normal vault operations whenever pools have mixed profitability.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "computeNAV",
+        "fulfillDeposits",
+        "fulfillWithdrawals"
+      ],
+      "affected_contracts": [
+        "PanopticVaultAccountant.sol",
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "function": "computeNAV"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PanopticVaultAccountant.sol",
+        "lines": "182",
+        "pattern": "nav += uint256(Math.max(poolExposure0 + poolExposure1, 0)) clamps negative pool exposure to zero per-pool instead of aggregating then clamping"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Vault has positions in 2+ pools",
+        "At least one pool has negative net exposure (underwater)",
+        "At least one pool has positive net exposure"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "nav += uint256(Math.max(pool_i_exposure, 0)) for each pool; should be nav = max(sum(all_pool_exposures), 0)",
+        "manipulation_vector": "Multi-pool vaults automatically overstate NAV when any pool is underwater",
+        "profit_hypothesis": "NAV inflation = sum of absolute values of negative pool exposures. E.g., if underwater pool has -50 exposure, NAV is overstated by 50."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How common is it for a multi-pool vault to have one underwater pool while others are profitable?",
+          "What is the maximum NAV inflation possible with typical Panoptic strategies?",
+          "Does the manager benefit from this by timing withdrawals during high NAV inflation?"
+        ],
+        "validation_requirements": [
+          "Model NAV calculation with multi-pool scenarios including one or more underwater pools",
+          "Compare per-pool clamped NAV vs aggregate clamped NAV for realistic portfolios",
+          "Verify downstream impact on fulfillDeposits and fulfillWithdrawals share pricing"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - occurs automatically during normal operations",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Equal to total absolute negative pool exposures across all underwater pools",
+        "estimated_profit_margin": "Proportional to underwater pool losses vs vault TVL",
+        "attack_duration": "Persistent while any pool is underwater"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During volatile markets when pools diverge in profitability",
+        "market_impact_assessment": "No market action needed; occurs from normal market movements"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Depositors (receive fewer shares) and remaining shareholders (diluted by overpaid withdrawers)",
+        "estimated_impact_per_user": "Proportional to NAV inflation relative to vault TVL",
+        "total_value_at_risk": "Entire vault TVL at risk during sustained multi-pool losses"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical number of pools and position exposure ranges",
+        "calculation_validation": "Build test case with 2+ pools, one underwater, compare NAV outputs",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "Double MulDiv Rounding in executeDeposit Systematically Shortchanges Depositors",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Information Disclosure",
+      "hypothesis_description": "executeDeposit performs two consecutive mulDiv operations: first computing userAssetsDeposited = mulDiv(queuedAmount, assetsFulfilled, assetsDeposited), then sharesReceived = mulDiv(userAssetsDeposited, sharesReceived, assetsFulfilled). Each mulDiv rounds down independently, compounding the rounding error. A single-step mulDiv(queuedAmount, totalSharesReceived, assetsDeposited) would be more precise. Over many users and epochs, the orphaned dust shares accumulate in totalSupply but are permanently unclaimable.",
+      "investigation_rationale": "The double rounding is a code correctness issue that systematically disadvantages every depositor. While individual losses are small (dust), the aggregate over many users and epochs could become material, and the pattern represents a demonstrable code defect.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "executeDeposit"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "executeDeposit"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "257-265",
+        "pattern": "Two sequential Math.mulDiv calls with intermediate rounding: mulDiv(queued, fulfilled, deposited) then mulDiv(result, shares, fulfilled)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Partial epoch fulfillment (assetsFulfilled < assetsDeposited)",
+        "Multiple users in the same epoch with non-trivial deposit amounts",
+        "Values not perfectly divisible"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Two sequential mulDiv with intermediate rounding vs single mulDiv(queuedAmount, sharesReceived, assetsDeposited)",
+        "manipulation_vector": "Systematic per-user dust loss on every deposit execution",
+        "profit_hypothesis": "Per-user loss is 0-1 wei per mulDiv, ~1-2 wei per execution. Over 1000 users × 100 epochs = up to 200K wei orphaned."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the maximum per-user dust loss per execution?",
+          "Does the loss compound across many epochs of partial fulfillment?",
+          "Can the orphaned shares in totalSupply affect share pricing over time?"
+        ],
+        "validation_requirements": [
+          "Compare double-mulDiv vs single-mulDiv outputs for typical deposit amounts",
+          "Calculate cumulative dust loss for realistic user counts and epoch counts",
+          "Verify that orphaned totalSupply doesn't materially affect share pricing"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - occurs naturally",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "Dust amounts per user; aggregate may be material over long periods",
+        "estimated_profit_margin": "< 0.01% per user per epoch",
+        "attack_duration": "Persistent across all epochs"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Always active during partial fulfillments",
+        "market_impact_assessment": "None"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All depositors executing fulfilled deposits",
+        "estimated_impact_per_user": "1-2 wei per execution (requires validation)",
+        "total_value_at_risk": "Aggregate dust across all users and epochs"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical deposit amounts, number of users, partial fulfillment ratios",
+        "calculation_validation": "Fuzz test comparing double vs single mulDiv precision loss",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "Unset feeWallet (address(0)) Permanently Blocks All Profitable Withdrawal Executions",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "feeWallet defaults to address(0) (never set in constructor). If performanceFeeBps > 0 and feeWallet is never set via setFeeWallet(), any executeWithdrawal where the user has profit (assetsToWithdraw > withdrawnBasis) will attempt SafeTransferLib.safeTransfer to address(0). Most ERC-20 tokens revert on transfer to address(0), permanently blocking all profitable withdrawal executions.",
+      "investigation_rationale": "This is a configuration gap that creates a denial-of-service for all profitable withdrawals. Users who have already burned their shares via requestWithdrawal cannot recover them if the withdrawal execution reverts, effectively locking their funds until the owner sets a valid feeWallet.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "feeWallet is never set via setFeeWallet() after deployment",
+        "performanceFeeBps > 0",
+        "underlying token reverts on transfer to address(0)"
+      ],
+      "config_evidence": "Constructor does not set feeWallet. No deployment script provided to verify post-deploy setup. feeWallet defaults to address(0) in storage.",
+      "affected_functions": [
+        "executeWithdrawal",
+        "setFeeWallet"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "executeWithdrawal"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "setFeeWallet"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "328-331",
+        "pattern": "SafeTransferLib.safeTransfer(underlyingToken, feeWallet, performanceFee) where feeWallet can be address(0); no validation in constructor or executeWithdrawal"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "performanceFeeBps > 0",
+        "feeWallet == address(0) (not set after deployment)",
+        "User's withdrawal has profit (assetsToWithdraw > withdrawnBasis)",
+        "Underlying token reverts on transfer to address(0)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No feeWallet validation in constructor or executeWithdrawal",
+        "manipulation_vector": "Configuration omission causes DoS on all profitable withdrawals",
+        "profit_hypothesis": "No profit to attacker; victims lose access to withdrawal proceeds proportional to their burned shares"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the total value of shares that could be burned before the issue is discovered?",
+          "Can the owner recover the situation by calling setFeeWallet after the fact?",
+          "Are there any ERC-20 tokens that allow transfer to address(0)?"
+        ],
+        "validation_requirements": [
+          "Verify feeWallet default value is address(0)",
+          "Test executeWithdrawal with feeWallet=address(0) and positive performanceFee",
+          "Confirm that setting feeWallet after the fact unblocks pending withdrawals"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - not an attack, configuration gap",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Until owner calls setFeeWallet()"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "Immediately after deployment without proper setup",
+        "market_impact_assessment": "All profitable withdrawals blocked"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with profitable withdrawal requests",
+        "estimated_impact_per_user": "100% of their withdrawal is blocked (shares already burned)",
+        "total_value_at_risk": "All profitable withdrawal proceeds in the vault"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Verify constructor does not set feeWallet; check deployment scripts",
+        "calculation_validation": "Test revert path on executeWithdrawal with feeWallet=address(0)",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "NAV Underflow in Fulfillment Functions Bricks Vault When Underwater",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Both fulfillDeposits and fulfillWithdrawals compute totalAssets as `computeNAV() + 1 - assetsDeposited - reservedWithdrawalAssets`. If the vault's NAV drops below assetsDeposited + reservedWithdrawalAssets (due to investment losses or market conditions), this subtraction underflows, reverting the transaction. The manager cannot fulfill any deposits or withdrawals, effectively bricking the vault. Users' deposited assets are locked with no withdrawal path since they haven't received shares.",
+      "investigation_rationale": "This underflow creates a dead-end state where the vault cannot process any epoch transitions. Users who deposited assets cannot get them back (cancelDeposit requires onlyManager, but even if called, the manager may not have funds to return if they were invested). The vault becomes permanently stuck until NAV recovers above the threshold.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "fulfillDeposits",
+        "fulfillWithdrawals"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "fulfillDeposits"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "fulfillWithdrawals"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "351-354",
+        "pattern": "totalAssets = accountant.computeNAV(...) + 1 - epochState.assetsDeposited - reservedWithdrawalAssets; unchecked subtraction underflows if NAV < deposits + reserved"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Vault has significant pending deposits (assetsDeposited) or reserved withdrawal assets",
+        "Manager invests deposited funds and incurs losses, or market conditions drop NAV",
+        "computeNAV() + 1 < assetsDeposited + reservedWithdrawalAssets"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Unsigned subtraction: NAV + 1 - deposits - reserved can underflow",
+        "manipulation_vector": "Market losses or ECON-H001/H002 NAV miscalculations trigger underflow",
+        "profit_hypothesis": "No direct profit; DoS locks all user funds in the vault"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What percentage NAV drop triggers the underflow for typical vault configurations?",
+          "Can cancelDeposit/cancelWithdrawal still function during this state?",
+          "Does ECON-H002 (per-pool clamping) or ECON-H001 (sign inversion) make this underflow more likely?"
+        ],
+        "validation_requirements": [
+          "Compute threshold NAV that triggers underflow for various deposit/reserve levels",
+          "Test recovery path: can manager cancel deposits to reduce assetsDeposited?",
+          "Verify interaction with NAV clamping bugs"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - triggered by market conditions",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A - DoS not profit extraction",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Until NAV recovers or manager cancels all deposits"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "During significant market downturns",
+        "market_impact_assessment": "Large pending deposits increase vulnerability threshold"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with pending deposits or withdrawals",
+        "estimated_impact_per_user": "100% of deposited assets locked",
+        "total_value_at_risk": "All pending deposits plus all reserved withdrawal assets"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical assetsDeposited and reservedWithdrawalAssets magnitudes",
+        "calculation_validation": "Fuzz underflow boundary conditions",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "Zero Fulfillment Amount Creates Permanently Stuck User Funds via Division-by-Zero Epoch",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "If the manager calls fulfillDeposits(0, ...) or fulfillWithdrawals(0, ...), the epoch state records 0 for assetsFulfilled/sharesFulfilled. The epoch advances, and the aggregate unfulfilled amount rolls over correctly. However, individual users' executeDeposit/executeWithdrawal for that epoch will revert with division by zero (mulDiv denominator = 0). Since the function reverts, the per-user rollover to epoch+1 never occurs. The user's deposit/withdrawal is permanently stuck in the zero-fulfilled epoch with no recovery path.",
+      "investigation_rationale": "This is a missing input validation that creates an irrecoverable fund-locking state. The aggregate epoch rollover diverges from per-user state, making individual user funds inaccessible. cancelDeposit/cancelWithdrawal only work for the current epoch, not past epochs, so the manager cannot help after the epoch advances further.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "fulfillDeposits",
+        "fulfillWithdrawals",
+        "executeDeposit",
+        "executeWithdrawal"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "fulfillDeposits"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "executeDeposit"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "fulfillWithdrawals"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "executeWithdrawal"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "257-265",
+        "pattern": "executeDeposit: Math.mulDiv(userAssetsDeposited, sharesReceived, assetsFulfilled) where assetsFulfilled=0 causes division by zero; no validation in fulfillDeposits that assetsToFulfill > 0"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Manager calls fulfillDeposits(0, ...) or fulfillWithdrawals(0, ...)",
+        "Users have deposits/withdrawals queued in the affected epoch",
+        "Epoch advances beyond the zero-fulfilled epoch (making cancelDeposit/cancelWithdrawal inaccessible)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No require(assetsToFulfill > 0) or require(sharesToFulfill > 0) in fulfill functions",
+        "manipulation_vector": "Manager error or malice creates irrecoverable epoch state",
+        "profit_hypothesis": "No profit extraction; user funds permanently locked in zero-fulfilled epoch"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any recovery mechanism for funds stuck in a zero-fulfilled epoch?",
+          "Can the manager use manage() to manually recover stuck funds?",
+          "How quickly does the epoch advance past the stuck epoch?"
+        ],
+        "validation_requirements": [
+          "Test fulfillDeposits(0, ...) and verify executeDeposit reverts for affected users",
+          "Verify cancelDeposit cannot access past epochs",
+          "Test whether manage() can manually transfer stuck deposits back to users"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - manager error, not capital-based attack",
+        "estimated_execution_cost": "Gas cost of fulfillDeposits(0, ...)",
+        "potential_profit_range": "N/A - fund locking, not extraction",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent once epoch advances"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "N/A"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with deposits/withdrawals in the zero-fulfilled epoch",
+        "estimated_impact_per_user": "100% of queued deposit amount or burned shares permanently lost",
+        "total_value_at_risk": "Sum of all queued deposits or withdrawal entitlements in the affected epoch"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Math.mulDiv behavior with 0 denominator (confirm revert)",
+        "calculation_validation": "End-to-end test: fulfillDeposits(0) → executeDeposit → revert",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "Oracle Time-Based Staleness Not Validated Allowing Outdated Prices in NAV",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "computeNAV validates manager-provided prices against TWAP oracles using a deviation band check, but never verifies the TWAP oracle's last update timestamp. If the underlying Uniswap pool has low activity, the TWAP uses stale observations that may be hours or days old. The manager can provide prices within maxPriceDeviation of the stale TWAP, but far from actual market prices, leading to incorrect NAV calculation.",
+      "investigation_rationale": "The deviation check only ensures consistency between manager price and TWAP, not that either reflects current market conditions. A stale TWAP becomes the reference point, and the manager (even acting honestly) may not realize the TWAP is outdated, especially for less liquid pools.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Pool oracle (poolOracle, oracle0, oracle1) uses a low-activity Uniswap pool",
+        "twapWindow is set but pool has no observations within that window"
+      ],
+      "config_evidence": "PanopticVaultAccountant.sol: PoolInfo struct has twapWindow parameter but no timestamp freshness field. PanopticMath.twapFilter is called without any timestamp validation.",
+      "affected_functions": [
+        "computeNAV"
+      ],
+      "affected_contracts": [
+        "PanopticVaultAccountant.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "function": "computeNAV"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PanopticVaultAccountant.sol",
+        "lines": "100-105",
+        "pattern": "Math.abs(managerPrice - PanopticMath.twapFilter(oracle, twapWindow)) > maxPriceDeviation checks deviation but not underlying oracle freshness timestamp"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-008",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "One or more oracles used in computeNAV have stale observations",
+        "Actual market price has diverged significantly from stale TWAP",
+        "Manager provides price within deviation band of stale TWAP"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "TWAP deviation check without timestamp freshness validation",
+        "manipulation_vector": "Stale oracle allows NAV to be calculated at outdated prices",
+        "profit_hypothesis": "NAV mispricing proportional to (actual_price - stale_price) * position_size"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the realistic staleness window for typical Uniswap pools used as oracles?",
+          "How much can prices diverge over the maximum staleness period?",
+          "Does the twapWindow parameter mitigate staleness for actively traded pools?"
+        ],
+        "validation_requirements": [
+          "Analyze Uniswap observation frequency for target pools",
+          "Calculate NAV error for realistic staleness scenarios",
+          "Test PanopticMath.twapFilter behavior with stale observations"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Proportional to vault TVL for profit extraction",
+        "estimated_execution_cost": "Standard fulfillment gas",
+        "potential_profit_range": "Proportional to price divergence × position size",
+        "estimated_profit_margin": "Depends on pool liquidity and observation frequency",
+        "attack_duration": "Single block fulfillment with stale prices"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Low-activity oracle pool required",
+        "optimal_timing": "During high volatility with low-activity oracle pools",
+        "market_impact_assessment": "No market action needed; relies on natural staleness"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Depositors or withdrawers depending on direction of price staleness",
+        "estimated_impact_per_user": "Proportional to their share of the mispriced epoch",
+        "total_value_at_risk": "Fulfilled deposit/withdrawal amounts in the affected epoch"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical twapWindow values, target pool observation frequencies",
+        "calculation_validation": "Test computeNAV with simulated stale oracle data",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "Fee-on-Transfer Token as Underlying Creates Accounting Mismatch and Last-Withdrawer Loss",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "requestDeposit records the full `assets` parameter into queuedDeposit and depositEpochState.assetsDeposited, but SafeTransferLib.safeTransferFrom transfers fewer tokens to the vault if the underlying is a fee-on-transfer token. The vault's actual balance is less than the recorded deposits, creating a growing shortfall. Early withdrawers receive full entitlements, while later withdrawers face insufficient balance and reverted transfers.",
+      "investigation_rationale": "The contract performs no received-amount validation after the transfer. If deployed with a fee-on-transfer underlying token, the accounting mismatch grows with every deposit, eventually causing insolvency. The documentation states 'Valid EIP-20 tokens' which technically includes fee-on-transfer tokens.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "underlyingToken is a fee-on-transfer ERC-20 token"
+      ],
+      "config_evidence": "HypoVault.sol constructor accepts any address as underlyingToken. No balance-before/after check in requestDeposit. Project docs say 'Valid EIP-20 tokens' but fee-on-transfer is EIP-20 compliant.",
+      "affected_functions": [
+        "requestDeposit",
+        "executeWithdrawal"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "requestDeposit"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "228-234",
+        "pattern": "queuedDeposit += assets; safeTransferFrom(assets) without checking actual received amount; no balance delta validation"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "underlyingToken is a fee-on-transfer ERC-20 token",
+        "Multiple users deposit over time, accumulating shortfall",
+        "Users execute withdrawals, draining actual balance faster than recorded"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "queuedDeposit[user][epoch] += assets records nominal amount; vault receives assets - fee",
+        "manipulation_vector": "Growing accounting shortfall between recorded deposits and actual balance",
+        "profit_hypothesis": "Early withdrawers extract full value; last withdrawers face insolvency"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What fee-on-transfer tokens are likely deployment candidates?",
+          "How quickly does the shortfall grow relative to deposit volume?",
+          "Can an attacker deliberately exploit the shortfall by timing withdrawals?"
+        ],
+        "validation_requirements": [
+          "Test requestDeposit with a mock fee-on-transfer token",
+          "Calculate shortfall accumulation rate for typical fee percentages",
+          "Verify executeWithdrawal behavior when vault balance < reservedWithdrawalAssets"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Proportional to desired extraction amount",
+        "estimated_execution_cost": "Standard deposit/withdrawal gas",
+        "potential_profit_range": "Up to total accumulated fee shortfall extractable by early withdrawers",
+        "estimated_profit_margin": "Equal to the transfer fee percentage accumulated across all deposits",
+        "attack_duration": "Multi-epoch"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None beyond normal deposit capital",
+        "optimal_timing": "Early withdrawal before shortfall causes reverts",
+        "market_impact_assessment": "N/A"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Last withdrawers unable to execute withdrawals",
+        "estimated_impact_per_user": "Up to 100% of withdrawal entitlement",
+        "total_value_at_risk": "Cumulative transfer fees across all deposits"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Candidate underlying tokens and their fee structures",
+        "calculation_validation": "Model shortfall growth for common fee-on-transfer rates",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Manager Can Drain reservedWithdrawalAssets via manage() Breaking Withdrawal Solvency",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "The manage() function allows the manager to execute arbitrary calls from the vault, including ERC-20 transfers of the underlying token. There is no check that the vault retains at least reservedWithdrawalAssets worth of underlying tokens after the call. A compromised or malicious manager can drain all reserved assets, making fulfilled but unexecuted withdrawals permanently insolvent.",
+      "investigation_rationale": "While the manager is trusted per the threat model, this represents a critical solvency invariant violation. Users who burned their shares via requestWithdrawal and had their withdrawal fulfilled are entitled to their pro-rata assets. The manage() function can silently break this entitlement with no safeguard, time delay, or on-chain alert.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "manage",
+        "executeWithdrawal"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "manage"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "executeWithdrawal"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "341-344",
+        "pattern": "manage() executes arbitrary calls with no post-condition check that IERC20(underlyingToken).balanceOf(vault) >= reservedWithdrawalAssets"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Manager is compromised or acts maliciously",
+        "reservedWithdrawalAssets > 0 (fulfilled but unexecuted withdrawals exist)",
+        "Manager calls manage() to transfer underlying tokens to an external address"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No post-call balance check in manage()",
+        "manipulation_vector": "manage(underlyingToken, transfer(attacker, amount), 0) drains reserved assets",
+        "profit_hypothesis": "Attacker extracts up to reservedWithdrawalAssets worth of underlying tokens"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the typical reservedWithdrawalAssets balance?",
+          "Could a minimum balance check be added to manage() without breaking legitimate operations?",
+          "Are there monitoring tools that would detect this drain?"
+        ],
+        "validation_requirements": [
+          "Test manage() call that transfers underlying tokens out",
+          "Verify executeWithdrawal reverts after reserve drain",
+          "Evaluate feasibility of post-call balance invariant check"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (manager privilege required)",
+        "estimated_execution_cost": "Gas for manage() call",
+        "potential_profit_range": "Up to 100% of reservedWithdrawalAssets",
+        "estimated_profit_margin": "Near 100%",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "After large withdrawal fulfillment with high reservedWithdrawalAssets",
+        "market_impact_assessment": "Direct token theft, no market impact"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with fulfilled but unexecuted withdrawals",
+        "estimated_impact_per_user": "100% of their withdrawal entitlement",
+        "total_value_at_risk": "reservedWithdrawalAssets balance"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Typical reservedWithdrawalAssets values",
+        "calculation_validation": "Test drain scenario end-to-end",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "Manager NAV Bias via maxPriceDeviation Band Enables Systematic Value Extraction",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "The manager provides tick prices to computeNAV that are validated to be within maxPriceDeviation of the TWAP. The manager can consistently pick prices at the extreme of the allowed band to systematically inflate NAV during deposit fulfillment (diluting new depositors) or deflate NAV during withdrawal fulfillment (underpaying withdrawers). This creates a persistent extraction opportunity bounded by the deviation band.",
+      "investigation_rationale": "Even a small per-epoch bias compounds over many fulfillment cycles. The deviation band is a security parameter, but its width directly determines the manager's ability to bias pricing. A wide deviation band (needed for volatile assets) also creates a larger extraction window.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "maxPriceDeviation is set to a non-trivial value (e.g., > 100 ticks)"
+      ],
+      "config_evidence": "PanopticVaultAccountant.sol: PoolInfo.maxPriceDeviation is a configurable parameter set via updatePoolsHash. No deployment script to verify actual value.",
+      "affected_functions": [
+        "computeNAV",
+        "fulfillDeposits",
+        "fulfillWithdrawals"
+      ],
+      "affected_contracts": [
+        "PanopticVaultAccountant.sol",
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "PanopticVaultAccountant.sol",
+          "function": "computeNAV"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "PanopticVaultAccountant.sol",
+        "lines": "100-105",
+        "pattern": "Math.abs(managerPrice - TWAP) <= maxPriceDeviation allows manager to choose prices at band extremes for each pool and conversion oracle"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-007",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Manager acts maliciously or collusively",
+        "maxPriceDeviation is wide enough to materially affect NAV",
+        "Vault has significant positions requiring tick-based valuation"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Manager chooses poolPrice, token0Price, token1Price within deviation band",
+        "manipulation_vector": "Systematic band-edge pricing across all 3 price inputs per pool",
+        "profit_hypothesis": "Per-epoch extraction up to deviation_band_width × position_notional × number_of_price_inputs"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What are typical maxPriceDeviation values in production?",
+          "How does compounding across multiple pools amplify the bias?",
+          "What is the annualized extraction rate for realistic parameters?"
+        ],
+        "validation_requirements": [
+          "Calculate NAV at band extremes vs center for typical position portfolios",
+          "Model cumulative extraction over 100+ fulfillment cycles",
+          "Compare extraction magnitude to typical vault returns"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "None (manager privilege)",
+        "estimated_execution_cost": "Standard fulfillment gas",
+        "potential_profit_range": "0.1-1% per fulfillment cycle depending on deviation band width",
+        "estimated_profit_margin": "Compounds over many cycles",
+        "attack_duration": "Ongoing per fulfillment"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Every fulfillment cycle",
+        "market_impact_assessment": "No market action needed"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Depositors or withdrawers depending on bias direction",
+        "estimated_impact_per_user": "Proportional to deviation band width and position sizes",
+        "total_value_at_risk": "Cumulative extraction across all fulfillment cycles"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Realistic maxPriceDeviation values and position sizes",
+        "calculation_validation": "NAV sensitivity analysis to price deviations",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H011",
+      "title": "No User Self-Cancel Mechanism Creates Permanent Fund Lock If Manager Becomes Unavailable",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "cancelDeposit and cancelWithdrawal are both onlyManager. If the manager becomes unresponsive (key loss, compromise, dispute), users have no mechanism to recover queued assets. The owner can change the manager via setManager, but even a new manager must actively process cancellations. If both owner and manager are unavailable, user funds are permanently locked with no timeout-based escape hatch.",
+      "investigation_rationale": "While the trust model states managers are trusted, the absence of a user self-cancel mechanism creates a systemic risk where a single point of failure (manager availability) can lock arbitrary amounts of user funds. This is a protocol design gap that becomes critical if the manager key is lost or if there's a governance dispute.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "cancelDeposit",
+        "cancelWithdrawal",
+        "requestDeposit",
+        "requestWithdrawal"
+      ],
+      "affected_contracts": [
+        "HypoVault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HypoVault.sol",
+          "function": "cancelDeposit"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "cancelWithdrawal"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "requestDeposit"
+        },
+        {
+          "file": "HypoVault.sol",
+          "function": "requestWithdrawal"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HypoVault.sol",
+        "lines": "241-252",
+        "pattern": "cancelDeposit is onlyManager with no user-callable alternative or timeout-based self-cancel"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Manager becomes unavailable (key loss, compromise, dispute)",
+        "Owner is also unavailable or unable to set a new responsive manager",
+        "Users have pending deposit or withdrawal requests"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No timeout-based self-cancel: users must rely entirely on manager availability",
+        "manipulation_vector": "Manager unavailability locks all pending user funds indefinitely",
+        "profit_hypothesis": "No profit extraction; pure fund-locking DoS for all queued users"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the expected manager uptime and key management setup?",
+          "Is there a governance process to replace an unavailable manager?",
+          "What is the maximum TVL that could be locked in pending requests?"
+        ],
+        "validation_requirements": [
+          "Verify no alternative path exists for users to recover queued assets",
+          "Assess whether owner can fully recover the situation via setManager",
+          "Evaluate whether a time-delayed self-cancel mechanism is feasible"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A - fund locking, not extraction",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Indefinite until manager restored"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "N/A"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All users with pending deposits or withdrawals",
+        "estimated_impact_per_user": "100% of queued deposit or burned withdrawal shares locked",
+        "total_value_at_risk": "Total pending deposits + value of shares in pending withdrawals"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Manager key management setup and governance procedures",
+        "calculation_validation": "Verify all code paths require manager for fund recovery",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

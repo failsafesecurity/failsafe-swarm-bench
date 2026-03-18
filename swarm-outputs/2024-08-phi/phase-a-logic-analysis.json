@@ -1,0 +1,380 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-05T00:19:58.582Z",
+    "duration_ms": 352471
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-share-trade",
+        "source": "User (msg.sender) via buyShareCred/sellShareCred",
+        "path": [
+          "buyShareCred/sellShareCred entry",
+          "_handleTrade validation",
+          "BondingCurve.getPriceData external call",
+          "_updateCuratorShareBalance state mutation",
+          "currentSupply update",
+          "ETH transfer to curator (sell) or refund (buy)",
+          "ETH transfer to protocolFeeDestination",
+          "ETH deposit to PhiRewards for creator"
+        ],
+        "transformations": [
+          "Bonding curve price calculation from supply+amount",
+          "Protocol fee = price * protocolFeePercent / 10000",
+          "Creator fee = price * royaltyRate / 10000 (0 when supply=0)"
+        ],
+        "sinks": [
+          "shareBalance mapping",
+          "creds[credId].currentSupply",
+          "curator ETH balance",
+          "protocolFeeDestination",
+          "PhiRewards balanceOf[creator]"
+        ],
+        "trust_changes": "User-submitted amount/credId is validated but bonding curve is trusted external contract. Price is computed externally.",
+        "validation_points": [
+          "isExist check",
+          "MAX_SUPPLY check",
+          "msg.value >= total cost (buy)",
+          "share balance >= amount (sell)",
+          "lock period check (sell)"
+        ],
+        "exposure_risks": [
+          "No reentrancy guard on individual buyShareCred/sellShareCred - ETH sent to curator before protocol fees on sell path"
+        ],
+        "manipulation_risks": [
+          "buyShareCredFor resets lastTradeTimestamp for any curator address, enabling griefing to block sells for 10 minutes",
+          "batchBuyShareCred can reset lock periods for multiple creds at once for a victim address"
+        ]
+      },
+      {
+        "flow_id": "DF-02-claim-mint",
+        "source": "User via PhiFactory.claim()",
+        "path": [
+          "claim() decompresses data",
+          "Decodes artId and fetches art data",
+          "Computes mintFee via getArtMintFee",
+          "Self-calls this.merkleClaim or this.signatureClaim with mintFee as value",
+          "_validateAndUpdateClaimState checks",
+          "_processClaim sends protocol fee and remainder to art contract",
+          "PhiNFT1155.claimFromFactory mints token",
+          "PhiRewards.handleRewardsAndGetValueSent distributes rewards"
+        ],
+        "transformations": [
+          "mintFee = quantity * (artistReward + artMintFee + referralReward + verifierReward + curateReward) + quantity * mintProtocolFee",
+          "Reward split: artist gets mintFee + artistReward, referral gets referralReward, verifier gets verifierReward, curators get curateReward"
+        ],
+        "sinks": [
+          "PhiNFT1155 token balance",
+          "PhiRewards balanceOf for artist/referral/verifier",
+          "CuratorRewardsDistributor balanceOf",
+          "protocolFeeDestination"
+        ],
+        "trust_changes": "Self-call via this.merkleClaim changes msg.sender to address(this), bypassing TxOriginMismatch check. Signature verification trusts phiSignerAddress.",
+        "validation_points": [
+          "Signature/merkle proof verification",
+          "Expiry check",
+          "Mint fee check",
+          "Time range check",
+          "Max supply check"
+        ],
+        "exposure_risks": [
+          "Excess ETH sent to claim() beyond mintFee is trapped in factory - no refund to original caller",
+          "Refund in _processClaim goes to _msgSender() which is address(this) when called via self-call path"
+        ],
+        "manipulation_risks": [
+          "Chain ID decoded but not validated in signatureClaim - relies on signer not cross-signing"
+        ]
+      },
+      {
+        "flow_id": "DF-03-curator-rewards-distribution",
+        "source": "Anyone calling CuratorRewardsDistributor.distribute()",
+        "path": [
+          "distribute() reads balanceOf[credId]",
+          "Fetches curator addresses and share counts from Cred contract",
+          "Computes proportional rewards per curator",
+          "Zeroes balanceOf[credId]",
+          "Sends royalty + rounding dust to msg.sender",
+          "Calls PhiRewards.depositBatch with actual amounts"
+        ],
+        "transformations": [
+          "royaltyfee = totalBalance * withdrawRoyalty / RATIO_BASE",
+          "distributeAmount = totalBalance - royaltyfee",
+          "userRewards = distributeAmount * userShares / totalShares"
+        ],
+        "sinks": [
+          "msg.sender (royalty + dust)",
+          "PhiRewards balanceOf for each curator"
+        ],
+        "trust_changes": "Reads share data from external Cred contract - assumes accuracy at time of call",
+        "validation_points": [
+          "credId existence check",
+          "totalBalance > 0",
+          "totalNum > 0"
+        ],
+        "exposure_risks": [
+          "Caller receives royalty fee + rounding dust as incentive - MEV opportunity for frontrunning"
+        ],
+        "manipulation_risks": [
+          "Attacker buys many shares just before distribute is called to get disproportionate share, then sells immediately after",
+          "Share data is read atomically so no TOCTOU within single tx, but incentive to manipulate share composition before distribution"
+        ]
+      },
+      {
+        "flow_id": "DF-04-cred-id-tracking",
+        "source": "_updateCuratorShareBalance internal calls",
+        "path": [
+          "_addCredIdPerAddress or _removeCredIdPerAddress called",
+          "_credIdsPerAddress array modified",
+          "_credIdsPerAddressCredIdIndex updated",
+          "_credIdsPerAddressArrLength incremented/decremented",
+          "_credIdExistsPerAddress set (only in _updateCuratorShareBalance, NOT in the public functions)"
+        ],
+        "transformations": [
+          "Array swap-and-pop for removal"
+        ],
+        "sinks": [
+          "_credIdsPerAddress mapping",
+          "_credIdsPerAddressCredIdIndex",
+          "_credIdsPerAddressArrLength",
+          "_credIdExistsPerAddress"
+        ],
+        "trust_changes": "CRITICAL: _addCredIdPerAddress and _removeCredIdPerAddress are public - any external caller can manipulate these directly",
+        "validation_points": [
+          "EmptyArray check",
+          "IndexOutofBounds check",
+          "WrongCredId check in remove"
+        ],
+        "exposure_risks": [
+          "External manipulation of per-address cred tracking leads to DoS on sells"
+        ],
+        "manipulation_risks": [
+          "Attacker calls _removeCredIdPerAddress to remove a valid credId for a user, causing subsequent sell operations to revert with WrongCredId",
+          "Attacker calls _addCredIdPerAddress to add duplicate/fake credIds, corrupting tracking data"
+        ]
+      },
+      {
+        "flow_id": "DF-05-rewards-withdrawal",
+        "source": "User or third party via RewardControl.withdraw/withdrawFor/withdrawWithSig",
+        "path": [
+          "Validate to address is non-zero",
+          "Read balance, handle FULL_BALANCE (0) sentinel",
+          "Check amount <= balance",
+          "Decrement balanceOf",
+          "Transfer ETH to destination"
+        ],
+        "transformations": [
+          "amount=0 becomes full balance withdrawal"
+        ],
+        "sinks": [
+          "Recipient ETH balance"
+        ],
+        "trust_changes": "withdrawFor allows any third party to trigger withdrawal from any address to itself",
+        "validation_points": [
+          "Address zero check",
+          "Balance sufficiency check",
+          "Signature verification for withdrawWithSig"
+        ],
+        "exposure_risks": [
+          "withdrawFor(addr, 0) forces full withdrawal of any address's balance without their consent"
+        ],
+        "manipulation_risks": [
+          "Third party can force-withdraw rewards for a user, potentially disrupting their withdrawal timing strategy",
+          "Could force ETH onto a contract that has expensive receive() logic, causing gas griefing"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Cred shares follow a bonding curve pricing model with max supply of 999",
+        "First share of each cred is bought by the creator during creation",
+        "10-minute lock period after buying before selling is allowed",
+        "Minting credential NFTs requires merkle proof or signature verification",
+        "Mint fees split between artist, referrer, verifier, and curator rewards",
+        "Creator royalty fees on share trades are configurable up to 50%",
+        "Protocol fees are taken on both buy and sell sides of share trades"
+      ],
+      "economic_incentives": [
+        "Curators earn proportional rewards from mint fees based on share ownership",
+        "Creators earn royalty fees on every share trade",
+        "Referrers earn fixed reward per mint",
+        "Verifiers earn fixed reward per mint",
+        "distribute() caller gets withdrawal royalty (up to 10%) plus rounding dust as incentive"
+      ],
+      "governance_mechanisms": [
+        "Owner can pause/unpause contracts",
+        "Owner controls fee parameters and whitelist",
+        "Owner authorizes UUPS upgrades",
+        "Art creator can update art settings including mint fee and royalties"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "Attacker calls public _removeCredIdPerAddress to remove a user's credId tracking entry",
+          "expected_behavior": "Only internal contract logic should manage cred ID tracking",
+          "actual_behavior": "_removeCredIdPerAddress is public, allowing anyone to remove entries. This causes subsequent sells to revert in _updateCuratorShareBalance because the internal _removeCredIdPerAddress call finds mismatched data (WrongCredId revert)",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker can permanently DoS any user's ability to sell their shares for a specific credId. User's funds (shares) become locked with no way to sell."
+        },
+        {
+          "scenario": "Attacker calls public _addCredIdPerAddress to add fake credId entries for a user",
+          "expected_behavior": "Only internal logic should add credId tracking entries",
+          "actual_behavior": "_addCredIdPerAddress is public, allowing anyone to add arbitrary entries. This corrupts _credIdsPerAddressArrLength and _credIdsPerAddressCredIdIndex without updating _credIdExistsPerAddress, leading to inconsistent state",
+          "risk_level": "high",
+          "exploitation_potential": "Corrupts getPositionsForCurator results, can desync tracking indices causing further _removeCredIdPerAddress calls to fail"
+        },
+        {
+          "scenario": "Attacker uses buyShareCredFor to buy 1 share for a victim's address, resetting their lock period",
+          "expected_behavior": "Lock period should only be set for the address initiating the buy",
+          "actual_behavior": "lastTradeTimestamp[credId][curator_] = block.timestamp sets lock period for the curator (victim), preventing them from selling for 10 minutes",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker can repeatedly call buyShareCredFor with minimal cost (1 share at low supply) to continuously prevent a victim from selling. Combined with batchBuyShareCred, can lock multiple creds simultaneously."
+        },
+        {
+          "scenario": "getPositionsForCurator called with start_ > 0",
+          "expected_behavior": "Return correct credIds and amounts for the pagination range",
+          "actual_behavior": "Uses credIds[i] instead of credIds[index] where i starts from start_. When start_ > 0, this writes beyond array bounds (array length is stopIndex-start_ but index i >= start_), causing revert. Even with start_=0, skipped entries create gaps that are incorrectly truncated by assembly resize.",
+          "risk_level": "medium",
+          "exploitation_potential": "View function that returns incorrect data. Any frontend or contract relying on paginated results gets wrong position data. Reverts when start_ > 0."
+        },
+        {
+          "scenario": "BondingCurve._getCreatorFee called when supply is 0",
+          "expected_behavior": "Return creatorFee = 0 as implemented in getPriceData",
+          "actual_behavior": "_getCreatorFee sets creatorFee = 0 when supply == 0 but does NOT return, falling through to calculate creatorFee from royaltyRate. This means getBuyPriceAfterFee and getSellPriceAfterFee return incorrect prices at supply=0.",
+          "risk_level": "medium",
+          "exploitation_potential": "Price quote functions show incorrect fees at supply=0, misleading users about actual costs. Actual trades use getPriceData which returns correctly."
+        },
+        {
+          "scenario": "User sends excess ETH to PhiFactory.claim()",
+          "expected_behavior": "Excess ETH refunded to caller",
+          "actual_behavior": "claim() computes exact mintFee and forwards only that amount via this.merkleClaim/this.signatureClaim. Excess ETH remains stuck in factory. Only recoverable by owner via withdraw().",
+          "risk_level": "medium",
+          "exploitation_potential": "Users lose excess ETH sent above the mint fee. Owner can drain accumulated excess."
+        },
+        {
+          "scenario": "Individual buyShareCred/sellShareCred without reentrancy protection",
+          "expected_behavior": "All state-mutating ETH transfer functions protected by reentrancy guard",
+          "actual_behavior": "Only batch operations have nonReentrant modifier. Individual _handleTrade sends ETH (refund on buy, payout on sell) before sending protocol fees and creator fees.",
+          "risk_level": "medium",
+          "exploitation_potential": "Malicious curator contract receiving sell payout could reenter to buy at reduced supply, though share balance is already updated making direct re-sell impossible. Cross-function reentrancy paths may exist."
+        },
+        {
+          "scenario": "Anyone calls withdrawFor(address, 0) on RewardControl",
+          "expected_behavior": "Only account owner should initiate full withdrawal",
+          "actual_behavior": "withdrawFor has no access control. amount=0 is treated as FULL_BALANCE sentinel, causing entire balance withdrawal. Funds go to the from address so not stolen, but forces withdrawal.",
+          "risk_level": "medium",
+          "exploitation_potential": "Griefer can force full withdrawal for any address. Could disrupt protocols composing with PhiRewards that expect accumulated balances. Could force ETH onto contracts with expensive or reverting receive functions."
+        },
+        {
+          "scenario": "Sell when price - protocolFee - creatorFee underflows",
+          "expected_behavior": "Sell should always return non-negative amount to seller",
+          "actual_behavior": "No explicit check that price > protocolFee + creatorFee. Relies on Solidity 0.8 underflow revert. With high royalty rates (up to 50% buy + 50% sell) plus protocol fees, sell payout could be very small or cause revert.",
+          "risk_level": "low",
+          "exploitation_potential": "Creator sets maximum sell royalty (50%) and protocol fee could cause sells to revert or return negligible amounts, trapping curator funds."
+        },
+        {
+          "scenario": "Cred supply reaches 0 after all shares sold",
+          "expected_behavior": "Cred should have clear rules about zero supply state",
+          "actual_behavior": "No minimum supply enforced after creation. If all shares including creator's initial share are sold, supply=0. New buys are still possible. getPriceData returns creatorFee=0 at supply=0, creating asymmetric fee behavior.",
+          "risk_level": "low",
+          "exploitation_potential": "Creator sells their share to avoid royalty on first subsequent buy, then rebuys at lower cost."
+        }
+      ],
+      "assumption_violations": [
+        "_addCredIdPerAddress and _removeCredIdPerAddress are named with underscore prefix suggesting internal but marked public, violating encapsulation",
+        "BondingCurve._getCreatorFee assumes supply_==0 check with early return, but missing return statement means fee is always calculated",
+        "PhiFactory.claim assumes msg.value equals exact mintFee, but no excess refund mechanism exists in claim() itself",
+        "Individual trade functions assume reentrancy is not exploitable despite lack of nonReentrant modifier",
+        "withdrawFor assumes forced withdrawal to self is always benign"
+      ],
+      "game_theory_risks": [
+        "Lock period griefing: An attacker can buy 1 share for a target via buyShareCredFor for minimal cost, resetting the 10-minute lock period and preventing the target from selling. Cost is only the price of 1 share.",
+        "Curator rewards front-running: Anyone calling distribute() gets the royalty fee. A bot can monitor for large accumulated balances and front-run distribution calls to claim the royalty.",
+        "Sandwich attack on share trades: Since bonding curve prices depend on supply, an attacker can buy before a known large buy and sell after, profiting from the price increase. The 10-minute lock period mitigates but doesn't eliminate this for patient attackers.",
+        "Creator fee extraction: Creator sets max royalty (50%) on buy and sell, extracting up to 50% of trade value on each side, leaving curators with significant losses when selling."
+      ],
+      "integration_risks": [
+        "BondingCurve is an external contract called by Cred for pricing - if compromised or incorrectly implemented, all trade pricing breaks",
+        "PhiRewards.handleRewardsAndGetValueSent has no access control - any contract can call it directly, though they must provide correct ETH",
+        "CuratorRewardsDistributor reads share data from Cred contract - if Cred is upgraded and share data format changes, distribution breaks",
+        "PhiNFT1155 relies on PhiFactory for artData - if factory is upgraded, NFT contract may get inconsistent data",
+        "Cross-chain credential tracking assumes honest merkle root setting by the signer - no on-chain verification of cross-chain state"
+      ],
+      "calculation_errors": [
+        "BondingCurve._getCreatorFee: Missing return statement after setting creatorFee=0 for supply_==0 causes fee to be calculated anyway. This affects getBuyPriceAfterFee and getSellPriceAfterFee view functions.",
+        "getPositionsForCurator: Uses credIds[i] instead of credIds[index], causing out-of-bounds access when start_ > 0 and incorrect sparse array data when entries are filtered out.",
+        "CuratorRewardsDistributor.distribute: Rounding loss in (distributeAmount * userAmounts) / totalNum accumulates across all curators. Dust goes to caller. With many curators or small amounts, significant value can leak to caller."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "PhiNFT1155",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "pausable",
+            "soulbound_conditional"
+          ],
+          "decimals": 0,
+          "notes": "ERC1155 token. Transfers blocked when soulBounded flag is true (except from address(0) for minting). Per-minter URIs supported for advanced tokens."
+        },
+        {
+          "address_or_symbol": "ETH",
+          "behaviors": [],
+          "decimals": 18,
+          "notes": "Native ETH used for all payments: share trades, minting fees, rewards. SafeTransferLib used for transfers. Multiple ETH custody points: Cred contract (bonding curve reserves), PhiRewards (accumulated rewards), CuratorRewardsDistributor (pending curator rewards), PhiFactory (transient during claims)."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "bonding_curve_reserve_solvency",
+          "state_vars": [
+            "Cred.balance",
+            "sum of all sellable share values"
+          ],
+          "description": "Cred contract ETH balance must be sufficient to pay out all possible sells at current supply. Since buy deposits match curve pricing and sell withdrawals match curve pricing minus fees, protocol fees and creator fees create a surplus."
+        },
+        {
+          "name": "share_supply_consistency",
+          "state_vars": [
+            "creds[credId].currentSupply",
+            "sum(shareBalance[credId])"
+          ],
+          "description": "For each credId, currentSupply must equal sum of all curator share balances. Maintained by _updateCuratorShareBalance and supply increment/decrement in _handleTrade."
+        },
+        {
+          "name": "rewards_balance_solvency",
+          "state_vars": [
+            "PhiRewards.balance",
+            "sum(PhiRewards.balanceOf)"
+          ],
+          "description": "PhiRewards contract ETH balance must be >= sum of all account balances. deposit() uses unchecked addition which could theoretically overflow, breaking this invariant."
+        },
+        {
+          "name": "cred_tracking_consistency",
+          "state_vars": [
+            "_credIdsPerAddress",
+            "_credIdExistsPerAddress",
+            "_credIdsPerAddressArrLength",
+            "_credIdsPerAddressCredIdIndex"
+          ],
+          "description": "BROKEN INVARIANT: Public _addCredIdPerAddress and _removeCredIdPerAddress allow external manipulation, desynchronizing these tracking structures from actual share ownership."
+        },
+        {
+          "name": "max_supply_bound",
+          "state_vars": [
+            "creds[credId].currentSupply"
+          ],
+          "description": "currentSupply must never exceed MAX_SUPPLY (999). Enforced on buy in _handleTrade and _validateAndCalculateBatch."
+        }
+      ]
+    }
+  }
+}

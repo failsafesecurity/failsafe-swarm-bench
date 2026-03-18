@@ -1,0 +1,401 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T21:35:53.267Z",
+    "duration_ms": 182919
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-well-data-decode",
+        "source": "bytes calldata data (user/Well immutable config)",
+        "path": [
+          "decodeWellData",
+          "getScaledReserves",
+          "calcLpTokenSupply/calcReserve/calcRate"
+        ],
+        "transformations": [
+          "abi.decode to (uint256, uint256)",
+          "default 0→18 for decimals",
+          "10^(18-decimals) scaling"
+        ],
+        "sinks": [
+          "scaledReserves used in all invariant calculations"
+        ],
+        "trust_changes": "User-supplied data directly controls decimal scaling without full validation",
+        "validation_points": [
+          "decimal0 == 0 check",
+          "decimal1 == 0 check (BUGGY)",
+          "decimal > 18 check"
+        ],
+        "exposure_risks": [
+          "Incorrect scaling propagates to all LP/reserve/rate calculations"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: decodeWellData has a copy-paste bug — second check tests `decimal0 == 0` instead of `decimal1 == 0`. If decimal1 is passed as 0, it remains 0 (not defaulted to 18), causing reserves[1] to be scaled by 10^18 instead of the correct factor. This corrupts all downstream calculations including LP token supply, reserve computation, and rate calculations."
+        ]
+      },
+      {
+        "flow_id": "DF-002-lp-supply-calc",
+        "source": "reserves[] (user input via Well)",
+        "path": [
+          "calcLpTokenSupply",
+          "getScaledReserves",
+          "Newton iteration (255 max)",
+          "return lpTokenSupply"
+        ],
+        "transformations": [
+          "decimal scaling",
+          "D invariant Newton convergence: D[j+1] = (Ann*sum + dP*N)*D / ((Ann-1)*D + (N+1)*dP)"
+        ],
+        "sinks": [
+          "lpTokenSupply returned to callers (calcReserveAtRatioSwap, calcRate, etc.)"
+        ],
+        "trust_changes": "Scaled reserves are trusted after scaling; no bounds check on magnitude",
+        "validation_points": [
+          "reserves[0]==0 && reserves[1]==0 → return 0",
+          "sumReserves==0 → return 0",
+          "convergence check <=1"
+        ],
+        "exposure_risks": [
+          "No convergence revert — if 255 iterations exhausted, returns last (potentially wrong) value"
+        ],
+        "manipulation_risks": [
+          "If one reserve is 0 and the other is non-zero, the initial check passes but dP calculation divides by (scaledReserves[0] * N) which is 0, causing revert. This is an unhandled edge case that can cause DoS for pools with one empty reserve."
+        ]
+      },
+      {
+        "flow_id": "DF-003-reserve-at-ratio-swap",
+        "source": "reserves[], ratios[], j index, data (caller input)",
+        "path": [
+          "decodeWellData",
+          "getScaledReserves (reserves & ratios)",
+          "targetPrice calc",
+          "LUT lookup (getRatiosFromPriceSwap)",
+          "calcLpTokenSupply",
+          "Newton iteration: updateReserve → calcReserve → _calcRate",
+          "return scaled-down reserve"
+        ],
+        "transformations": [
+          "ratio→price (scaledRatios[i]*1e6/scaledRatios[j])",
+          "LUT interpolation for initial estimate",
+          "parityReserve = lpTokenSupply/2",
+          "Newton step via updateReserve",
+          "calcReserve for other token",
+          "_calcRate for price"
+        ],
+        "sinks": [
+          "reserve value returned to caller"
+        ],
+        "trust_changes": "LUT data is hardcoded and trusted; ratios from caller are scaled but not bounds-checked",
+        "validation_points": [
+          "PRICE_THRESHOLD convergence check (100 = 0.01%)",
+          "LUT price range 0.001083e6 to 10.709509e6"
+        ],
+        "exposure_risks": [
+          "Silent return of 0 if no convergence in 255 iterations"
+        ],
+        "manipulation_risks": [
+          "If scaledRatios[j] is 0, targetPrice calculation divides by zero.",
+          "If targetPrice is outside LUT range, the LUT reverts, which is correct but may DoS legitimate operations at extreme prices.",
+          "Non-convergence silently returns 0, which could be exploited by callers expecting a valid reserve value."
+        ]
+      },
+      {
+        "flow_id": "DF-004-reserve-at-ratio-liquidity",
+        "source": "reserves[], ratios[], j index, data (caller input)",
+        "path": [
+          "decodeWellData",
+          "getScaledReserves",
+          "targetPrice calc",
+          "LUT lookup (getRatiosFromPriceLiquidity)",
+          "scaledReserves[j] from scaledReserves[i]*lutRatio",
+          "Newton iteration: updateReserve → calcRate",
+          "return scaled-down reserve"
+        ],
+        "transformations": [
+          "ratio→price",
+          "LUT-based initial reserve estimate from fixed reserve[i]",
+          "Newton step via updateReserve",
+          "calcRate recalculates LP supply each iteration"
+        ],
+        "sinks": [
+          "reserve value returned to caller"
+        ],
+        "trust_changes": "Trusts that input reserves[i] is reasonable; LUT data hardcoded",
+        "validation_points": [
+          "PRICE_THRESHOLD convergence check"
+        ],
+        "exposure_risks": [
+          "Silent return of 0 on non-convergence",
+          "LP supply recalculated each iteration may cause oscillation"
+        ],
+        "manipulation_risks": [
+          "Non-convergence silently returns 0, which could be interpreted as a valid output.",
+          "If reserves[i] is very small or zero, scaledReserves[j] will also be zero/tiny, potentially causing division-by-zero in subsequent calcRate calls."
+        ]
+      },
+      {
+        "flow_id": "DF-005-upgrade-authorization",
+        "source": "newImplementation address (any caller)",
+        "path": [
+          "upgradeTo/upgradeToAndCall",
+          "_authorizeUpgrade",
+          "aquifer().wellImplementation checks",
+          "_upgradeToAndCallUUPS"
+        ],
+        "transformations": [
+          "Implementation slot updated to newImplementation"
+        ],
+        "sinks": [
+          "ERC1967 implementation slot"
+        ],
+        "trust_changes": "CRITICAL: No msg.sender check — anyone can call upgradeTo. Only validates new implementation is registered in aquifer.",
+        "validation_points": [
+          "delegatecall check",
+          "aquifer well mapping check",
+          "proxiableUUID check"
+        ],
+        "exposure_risks": [
+          "Any address can upgrade the well to any aquifer-registered implementation"
+        ],
+        "manipulation_risks": [
+          "CRITICAL: upgradeTo and upgradeToAndCall lack onlyOwner or onlyProxy modifiers. Any user can upgrade the proxy to any well implementation registered in the same aquifer, potentially changing the well's logic maliciously (e.g., to a well with backdoor functions). The OwnableUpgradeable inheritance provides __Ownable_init but onlyOwner is never applied to upgrade functions."
+        ]
+      },
+      {
+        "flow_id": "DF-006-rate-calculation",
+        "source": "reserves[], i, j indices",
+        "path": [
+          "_calcRate",
+          "copy reserves",
+          "add PRICE_PRECISION to reserves[j]",
+          "calcReserve for i",
+          "subtract to get rate"
+        ],
+        "transformations": [
+          "Numerical derivative: rate = reserves[i] - calcReserve(reserves_with_j_incremented, i, ...)"
+        ],
+        "sinks": [
+          "rate value used in convergence checks"
+        ],
+        "trust_changes": "No trust changes, internal calculation",
+        "validation_points": [
+          "None — no validation that rate is reasonable"
+        ],
+        "exposure_risks": [
+          "Precision loss for very large reserves where 1e6 perturbation is negligible"
+        ],
+        "manipulation_risks": [
+          "For very large scaled reserves, adding PRICE_PRECISION (1e6) to an 18-decimal value may cause the rate calculation to return 0 due to precision loss in the Newton iteration, leading to incorrect price readings."
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "StableSwap invariant: 4*A*(b0+b1) + D = 4*A*D + D^3/(4*b0*b1)",
+        "LP token supply D is computed via Newton's method convergence",
+        "Reserve calculation uses quadratic Newton iteration",
+        "Rate is computed as numerical derivative (finite difference with PRICE_PRECISION step)",
+        "LUT provides initial estimates for Newton convergence in ratio-targeting functions",
+        "Decimal scaling normalizes all tokens to 18 decimals internally",
+        "Wells are deployed via Aquifer using EIP-1167 minimal proxy pattern"
+      ],
+      "economic_incentives": [
+        "LPs deposit tokens and receive LP tokens proportional to their share of D",
+        "Traders swap tokens with the pool rebalancing per the StableSwap curve",
+        "Amplification parameter A=100 (with 2 decimal precision, effective A=1) keeps prices near parity"
+      ],
+      "governance_mechanisms": [
+        "WellUpgradeable uses UUPS pattern for upgrades",
+        "OwnableUpgradeable provides owner role via init",
+        "Aquifer acts as factory and registry for valid well implementations"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "decodeWellData called with decimal1=0 (e.g., data = abi.encode(6, 0))",
+          "expected_behavior": "decimal1 should default to 18, same as decimal0",
+          "actual_behavior": "decimal1 remains 0 because the second check is `if (decimal0 == 0)` instead of `if (decimal1 == 0)`. This causes reserves[1] to be scaled by 10^18, massively inflating its value in all calculations.",
+          "risk_level": "high",
+          "exploitation_potential": "If a well is deployed with decimal1=0 in its data encoding, all LP supply calculations, reserve calculations, and rate calculations will be severely corrupted. This could allow an attacker to drain the pool by exploiting the incorrect invariant calculations. Even if not directly exploitable due to Well construction constraints, any integration passing 0 for decimal1 will break entirely."
+        },
+        {
+          "scenario": "One reserve is zero, the other is non-zero",
+          "expected_behavior": "calcLpTokenSupply should handle gracefully or revert clearly",
+          "actual_behavior": "The function passes the initial `if (reserves[0] == 0 && reserves[1] == 0)` check but then divides by `scaledReserves[0] * N` which is 0, causing an unhandled revert",
+          "risk_level": "medium",
+          "exploitation_potential": "Can cause DoS in any function that calls calcLpTokenSupply when one reserve is depleted. Could prevent withdrawals or other operations in edge pool states."
+        },
+        {
+          "scenario": "Newton's method doesn't converge in calcReserveAtRatioSwap or calcReserveAtRatioLiquidity",
+          "expected_behavior": "Function should revert with a descriptive error (like calcReserve does)",
+          "actual_behavior": "Function silently returns 0 (Solidity default for uint256 return value) since there is no revert after the for loop",
+          "risk_level": "high",
+          "exploitation_potential": "A return value of 0 could be misinterpreted by callers (e.g., Beanstalk protocol) as a valid reserve value. This could lead to incorrect pricing, unfair trades, or protocol-level accounting errors. An attacker could craft inputs that prevent convergence to receive a 0 reserve output."
+        },
+        {
+          "scenario": "upgradeTo called by non-owner address with a valid aquifer-registered implementation",
+          "expected_behavior": "Only the owner should be able to upgrade the implementation",
+          "actual_behavior": "Any address can call upgradeTo because _authorizeUpgrade has no msg.sender check and upgradeTo has no onlyOwner modifier",
+          "risk_level": "high",
+          "exploitation_potential": "An attacker can register a malicious well implementation in the aquifer (by boring a new well with a malicious implementation), then upgrade any WellUpgradeable proxy to this new implementation. The new implementation could contain functions to drain funds, change ownership, or manipulate pool state."
+        },
+        {
+          "scenario": "Price exactly at LUT boundary (e.g., price = 0.001083e6)",
+          "expected_behavior": "Should return valid PriceData",
+          "actual_behavior": "The boundary check is `price < 0.001083e6` for revert, so price = 0.001083e6 falls into the first valid bracket which returns data for range 0.27702e6 down to 0.001083e6. This is correct.",
+          "risk_level": "low",
+          "exploitation_potential": "Minimal — boundary is handled correctly"
+        },
+        {
+          "scenario": "updateReserve underflow when step size exceeds current reserve",
+          "expected_behavior": "Should handle gracefully or limit step size",
+          "actual_behavior": "If pd.targetPrice > pd.currentPrice significantly, the subtraction `reserve - pd.maxStepSize * (pd.targetPrice - pd.currentPrice) / (pd.lutData.highPrice - pd.lutData.lowPrice)` could underflow and revert in Solidity 0.8.x",
+          "risk_level": "medium",
+          "exploitation_potential": "Could cause DoS for calcReserveAtRatioSwap/calcReserveAtRatioLiquidity at certain price targets where the Newton step is too aggressive."
+        },
+        {
+          "scenario": "getBandC overflow with large lpTokenSupply",
+          "expected_behavior": "Correct computation of c and b parameters",
+          "actual_behavior": "c = lpTokenSupply * lpTokenSupply / (reserves * N) * lpTokenSupply * A_PRECISION / (Ann * N) — the intermediate `lpTokenSupply * lpTokenSupply` can overflow for lpTokenSupply > ~2^128. With 18 decimal tokens, this limits total pool size.",
+          "risk_level": "low",
+          "exploitation_potential": "In practice, pool values are unlikely to approach these limits, but extreme edge cases with high-decimal dust could theoretically trigger this."
+        },
+        {
+          "scenario": "calcReserveAtRatioSwap with j > 1 or invalid index",
+          "expected_behavior": "Should validate j is 0 or 1",
+          "actual_behavior": "No validation on j; if j >= 2, array access would revert with out-of-bounds, but the error message is unhelpful",
+          "risk_level": "low",
+          "exploitation_potential": "Low — would just revert, no fund loss"
+        },
+        {
+          "scenario": "scaledRatios[j] is 0 in calcReserveAtRatioSwap/calcReserveAtRatioLiquidity",
+          "expected_behavior": "Should handle or revert cleanly",
+          "actual_behavior": "pd.targetPrice = scaledRatios[i] * PRICE_PRECISION / scaledRatios[j] causes division by zero revert",
+          "risk_level": "low",
+          "exploitation_potential": "Low — just reverts"
+        },
+        {
+          "scenario": "Large price gap in LUT between 0.001083e6 and 0.213318e6 (swap) or 0.27702e6 (liquidity)",
+          "expected_behavior": "Linear interpolation should provide reasonable initial estimate",
+          "actual_behavior": "The interpolation across such a wide range may produce a very poor initial estimate, causing Newton's method to require many more iterations or fail to converge",
+          "risk_level": "medium",
+          "exploitation_potential": "Could be exploited to cause non-convergence (silent return 0) for prices in the extreme low range"
+        }
+      ],
+      "assumption_violations": [
+        "decodeWellData assumes both decimal default checks are correct, but the second check is buggy (checks decimal0 instead of decimal1)",
+        "calcReserveAtRatioSwap/calcReserveAtRatioLiquidity assume Newton's method always converges within 255 iterations — no fallback if it doesn't",
+        "The upgrade mechanism assumes _authorizeUpgrade is sufficient for access control, but it lacks sender verification",
+        "calcLpTokenSupply assumes neither reserve is individually zero when sumReserves > 0",
+        "The A parameter from the LUT is assumed to match the hardcoded LUT data — if a different LUT is provided, the A parameter and the precomputed data will be inconsistent",
+        "_calcRate assumes PRICE_PRECISION (1e6) is a meaningful perturbation relative to reserve magnitude — breaks for reserves >> 1e18"
+      ],
+      "game_theory_risks": [
+        "Missing access control on upgradeTo allows any user to upgrade the well to a different (potentially malicious) implementation registered in the aquifer",
+        "Silent return of 0 from non-converging ratio calculations could be exploited by MEV searchers who can craft specific reserve/ratio combinations",
+        "The decodeWellData bug with decimal1=0 could be used to create a well where one token's reserves are inflated by 10^18 in calculations, allowing the attacker to extract value from mismatched invariant calculations"
+      ],
+      "integration_risks": [
+        "External protocols calling calcReserveAtRatioSwap/calcReserveAtRatioLiquidity may receive 0 on non-convergence and treat it as valid",
+        "The Aquifer factory is trusted to correctly map implementations — if compromised, all upgradeable wells are at risk",
+        "Pumps (oracles) rely on correct rate calculations; the decodeWellData bug could feed incorrect rates to oracles",
+        "Tokens with 0 decimals configured will trigger the decodeWellData bug path, causing catastrophic miscalculation"
+      ],
+      "calculation_errors": [
+        {
+          "location": "Stable2.decodeWellData",
+          "description": "Line `if (decimal0 == 0) { decimal1 = 18; }` should be `if (decimal1 == 0) { decimal1 = 18; }`. Copy-paste error causes decimal1 to never be defaulted to 18.",
+          "impact": "All calculations using decimal1=0 will scale reserves[1] by 10^18 instead of the correct factor, corrupting LP supply, reserve, and rate calculations."
+        },
+        {
+          "location": "Stable2.calcLpTokenSupply",
+          "description": "No revert on non-convergence after 255 iterations. Function returns the last computed (potentially incorrect) lpTokenSupply value.",
+          "impact": "Incorrect LP supply could lead to economic exploitation."
+        },
+        {
+          "location": "Stable2.calcReserveAtRatioSwap / calcReserveAtRatioLiquidity",
+          "description": "No revert on non-convergence. Functions return Solidity default 0.",
+          "impact": "Downstream consumers may interpret 0 as a valid reserve, leading to incorrect economic decisions."
+        }
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "IERC20 (generic Well token pair)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false"
+          ],
+          "decimals": 18,
+          "notes": "Well function supports tokens with 0-18 decimals via decodeWellData scaling. CRITICAL BUG: decimal1=0 is not properly defaulted to 18 due to copy-paste error in decodeWellData. Tokens with fee-on-transfer are not accounted for in reserve calculations."
+        },
+        {
+          "address_or_symbol": "WellUpgradeable LP Token",
+          "behaviors": [
+            "permit:true",
+            "rebasing:false",
+            "mint_burn_restricted"
+          ],
+          "decimals": 18,
+          "notes": "LP token inherits from Well → ERC20Upgradeable with ERC20Permit. Supply determined by StableSwap D invariant.",
+          "approval_model": "infinite_ok",
+          "transfer_model": "standard"
+        }
+      ],
+      "invariants": [
+        {
+          "name": "stableswap_invariant",
+          "state_vars": [
+            "reserves[0]",
+            "reserves[1]",
+            "lpTokenSupply (D)",
+            "A parameter"
+          ],
+          "description": "4*A*(b0+b1) + D = 4*A*D + D^3/(4*b0*b1). Must hold at all times for pool consistency."
+        },
+        {
+          "name": "lp_supply_conservation",
+          "state_vars": [
+            "totalSupply()",
+            "sum(user LP balances)"
+          ],
+          "description": "Total LP token supply must equal sum of all user LP balances."
+        },
+        {
+          "name": "decimal_scaling_correctness",
+          "state_vars": [
+            "decimals[0]",
+            "decimals[1]",
+            "scaledReserves"
+          ],
+          "description": "VIOLATED: decimal1=0 is not defaulted correctly, breaking the scaling invariant."
+        },
+        {
+          "name": "newton_convergence_guarantee",
+          "state_vars": [
+            "iteration_count",
+            "convergence_threshold"
+          ],
+          "description": "VIOLATED in calcReserveAtRatioSwap/calcReserveAtRatioLiquidity: no revert on non-convergence."
+        },
+        {
+          "name": "upgrade_access_control",
+          "state_vars": [
+            "owner",
+            "implementation"
+          ],
+          "description": "VIOLATED: upgradeTo/upgradeToAndCall lack onlyOwner checks, allowing unauthorized upgrades."
+        }
+      ]
+    }
+  }
+}

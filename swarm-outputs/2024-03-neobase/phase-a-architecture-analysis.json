@@ -1,0 +1,982 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "architecture_entry_points",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.1 Asset Inventory - Financial assets, state assets, privilege assets, reputation assets",
+      "1.3 System Architecture Mapping - Contract hierarchies, dependencies, upgrade patterns, access control",
+      "2.1 Entry Point Enumeration - Public/external functions, callbacks, parameter analysis"
+    ],
+    "timestamp": "2026-03-09T00:07:35.344Z",
+    "duration_ms": 102435
+  },
+  "analysis": {
+    "asset_inventory": {
+      "financial_assets": [
+        "Native CANTO (ETH-equivalent) held by VotingEscrow as locked deposits and returned on withdraw",
+        "Native CANTO (ETH-equivalent) held by LendingLedger to pay epoch-based rewards via claim()",
+        "Underlying ERC20 tokens held by LiquidityGauge (deposited via depositUnderlying and withdrawn via withdrawUnderlying)",
+        "Gauge-weighted emission stream (cantoPerBlock by epoch) as a reward distribution mechanism"
+      ],
+      "state_assets": [
+        "VotingEscrow.locked[user]: amount, end, delegated, delegatee (principal + delegation relationships)",
+        "VotingEscrow.userPointHistory[user][epoch], userPointEpoch[user] (per-user voting power history)",
+        "VotingEscrow.pointHistory[epoch], globalEpoch (global voting power history)",
+        "VotingEscrow.slopeChanges[timestamp] (scheduled global slope deltas)",
+        "VotingEscrow.unlockOverride (global early-unlock flag)",
+        "GaugeController.gauge_types_[gauge] and gauge_type_names[typeId], n_gauge_types (gauge registry and types)",
+        "GaugeController.vote_user_slopes[user][gauge], vote_user_power[user], last_user_vote[user][gauge] (user voting allocations)",
+        "GaugeController.points_weight[gauge][week], changes_weight[gauge][week], time_weight[gauge] (per-gauge weight history)",
+        "GaugeController.points_sum[type][week], changes_sum[type][week], time_sum[type] (per-type aggregate history)",
+        "GaugeController.points_total[week], time_total (global aggregate history)",
+        "GaugeController.points_type_weight[type][week], time_type_weight[type] (type weight history)",
+        "LendingLedger.lendingMarketWhitelist[market] (market allowlist)",
+        "LendingLedger.marketInfo[market]: accCantoPerShare, secRewardsPerShare, lastRewardBlock (reward accounting)",
+        "LendingLedger.userInfo[market][user]: amount, rewardDebt, secRewardDebt (user reward accounting)",
+        "LendingLedger.cantoPerBlock[epochBlock] (emission schedule)",
+        "LendingLedger.lendingMarketTotalBalance[market] (tracked total supply per market/gauge)",
+        "LendingLedger.liquidityGauges[marketOrGauge] (bi-directional market<->gauge mapping)",
+        "LendingLedger.averageBlockTime, referenceBlockNumber, referenceBlockTime (timestamp approximation parameters)",
+        "LiquidityGauge ERC20 state: balances, allowances, totalSupply (gauge share token representing deposited underlying)",
+        "LiquidityGauge.underlyingToken and LiquidityGauge.lendingLedger (integration configuration)"
+      ],
+      "privilege_assets": [
+        "VotingEscrow.governance (can set governance and toggle unlockOverride)",
+        "GaugeController.governance (can set governance, add/remove gauges, add types, change weights, remove gauge weights)",
+        "LendingLedger.governance (can set governance, whitelist markets and deploy LiquidityGauge, setRewards, setBlockTimeParameters)",
+        "Market whitelist control in LendingLedger (controls which contracts can legitimately accrue/claim rewards via update_market/sync_ledger path)",
+        "Gauge registry control in GaugeController (controls which gauges are eligible to receive weight and thus rewards)"
+      ],
+      "reputation_assets": [
+        "veCANTO voting power and historical checkpoints (governance legitimacy / snapshot correctness)",
+        "Gauge weights and type weights (emission direction credibility)",
+        "Market whitelist status (market legitimacy and reward eligibility)",
+        "LiquidityGauge share token supply (LP position representation and transfer reputation effects)",
+        "Protocol-wide reward accounting correctness (trust in rewards distribution)"
+      ]
+    },
+    "system_architecture": {
+      "contracts_analyzed": [
+        "VotingEscrow.sol",
+        "GaugeController.sol",
+        "LendingLedger.sol",
+        "LiquidityGauge.sol",
+        "Deploy.sol"
+      ],
+      "inheritance_hierarchy": "VotingEscrow inherits OpenZeppelin ReentrancyGuard. LiquidityGauge inherits OpenZeppelin ERC20 and ERC20Burnable (and uses SafeERC20). GaugeController and LendingLedger do not inherit other project contracts but hold references: GaugeController references VotingEscrow; LendingLedger references GaugeController and deploys LiquidityGauge instances; LiquidityGauge calls back into LendingLedger via sync_ledger in _afterTokenTransfer. Deploy.sol is a Forge script (not a production contract).",
+      "external_dependencies": [
+        "@openzeppelin/contracts/security/ReentrancyGuard.sol",
+        "@openzeppelin/contracts/utils/math/Math.sol",
+        "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol",
+        "@openzeppelin/contracts/token/ERC20/ERC20.sol",
+        "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol",
+        "forge-std/Script.sol (deployment tooling)"
+      ],
+      "upgrade_patterns": "None. All core contracts use constructors and no proxy/initializer patterns are present. LiquidityGauge instances are deployed with `new` from LendingLedger (factory-like behavior).",
+      "access_control_structure": "Custom `onlyGovernance` modifiers in VotingEscrow, GaugeController, and LendingLedger with a single `governance` address each. No role-based AccessControl, no pausing. Privileged functions include governance changes, gauge/type/weight management, market whitelisting, reward schedule configuration, and block-time parameter tuning. LiquidityGauge has no privileged admin functions.",
+      "architecture_notes": [
+        "Callback coupling: LiquidityGauge triggers LendingLedger.sync_ledger on every transfer/mint/burn, which updates rewards and balances; this creates a high-frequency external call surface and potential DoS vectors.",
+        "Native token flows: VotingEscrow accepts/returns native CANTO via payable createLock/increaseAmount and call-based withdraw; LendingLedger pays native CANTO via call in claim and can receive native CANTO via receive().",
+        "Reward math depends on GaugeController.gauge_relative_weight_write, which mutates GaugeController state during LendingLedger.update_market."
+      ]
+    },
+    "entry_points": [
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "constructor(string _name, string _symbol, address _governance)",
+        "visibility": "public",
+        "parameters": [
+          "string _name",
+          "string _symbol",
+          "address _governance"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "pointHistory[0]",
+          "name",
+          "symbol",
+          "governance"
+        ],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "setGovernance(address _governance)",
+        "visibility": "external",
+        "parameters": [
+          "address _governance"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "governance"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "toggleUnlockOverride()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "unlockOverride"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "lockEnd(address _addr)",
+        "visibility": "external",
+        "parameters": [
+          "address _addr"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "getLastUserPoint(address _addr)",
+        "visibility": "external",
+        "parameters": [
+          "address _addr"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "checkpoint()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "pointHistory[globalEpoch..]",
+          "globalEpoch",
+          "slopeChanges (read-only in this call path when _addr=0, but affects global point writing)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "createLock(uint256 _value)",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _value"
+        ],
+        "modifiers": [
+          "payable",
+          "nonReentrant"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "locked[msg.sender]",
+          "userPointHistory[msg.sender][*]",
+          "userPointEpoch[msg.sender]",
+          "pointHistory[*]",
+          "globalEpoch",
+          "slopeChanges[*]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "increaseAmount(uint256 _value)",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _value"
+        ],
+        "modifiers": [
+          "payable",
+          "nonReentrant"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "locked[msg.sender]",
+          "locked[delegatee] (if delegated lock)",
+          "userPointHistory[msg.sender][*]",
+          "userPointEpoch[msg.sender]",
+          "userPointHistory[delegatee][*] (if delegated lock)",
+          "userPointEpoch[delegatee] (if delegated lock)",
+          "pointHistory[*]",
+          "globalEpoch",
+          "slopeChanges[*]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "withdraw()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "nonReentrant"
+        ],
+        "authentication_required": false,
+        "state_changes": [
+          "locked[msg.sender]",
+          "userPointHistory[msg.sender][*]",
+          "userPointEpoch[msg.sender]",
+          "pointHistory[*]",
+          "globalEpoch",
+          "slopeChanges[*]"
+        ],
+        "external_calls": [
+          "msg.sender.call{value: amountToSend}(\"\")"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "balanceOf(address _owner)",
+        "visibility": "public",
+        "parameters": [
+          "address _owner"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "balanceOfAt(address _owner, uint256 _blockNumber)",
+        "visibility": "public",
+        "parameters": [
+          "address _owner",
+          "uint256 _blockNumber"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "totalSupply()",
+        "visibility": "public",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "VotingEscrow.sol",
+        "function": "totalSupplyAt(uint256 _blockNumber)",
+        "visibility": "public",
+        "parameters": [
+          "uint256 _blockNumber"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "constructor(address _votingEscrow, address _governance)",
+        "visibility": "public",
+        "parameters": [
+          "address _votingEscrow",
+          "address _governance"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "votingEscrow",
+          "governance",
+          "time_total"
+        ],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "setGovernance(address _governance)",
+        "visibility": "external",
+        "parameters": [
+          "address _governance"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "governance"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "gauge_types(address _addr)",
+        "visibility": "external",
+        "parameters": [
+          "address _addr"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "add_gauge(address addr, int128 gauge_type)",
+        "visibility": "external",
+        "parameters": [
+          "address addr",
+          "int128 gauge_type"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "gauge_types_[addr]",
+          "time_sum[gauge_type] (potentially)",
+          "time_weight[addr]",
+          "points_weight[addr][next_time] (via _change_gauge_weight)",
+          "points_sum[gauge_type][next_time] (via _change_gauge_weight)",
+          "points_total[next_time] and time_total (via _change_gauge_weight)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "remove_gauge(address _gauge)",
+        "visibility": "external",
+        "parameters": [
+          "address _gauge"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "gauge_types_[_gauge]",
+          "points_weight[_gauge][next_time].bias/slope",
+          "points_sum[gauge_type][next_time].bias/slope",
+          "changes_weight[_gauge][time_to_check] (loop)",
+          "changes_sum[gauge_type][time_to_check] (loop)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "checkpoint()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "points_total[*]",
+          "time_total",
+          "points_sum[*][*] (via _get_sum)",
+          "time_sum[*]",
+          "points_type_weight[*][*] (via _get_type_weight)",
+          "time_type_weight[*]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "checkpoint_gauge(address _gauge)",
+        "visibility": "external",
+        "parameters": [
+          "address _gauge"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "points_weight[_gauge][*]",
+          "changes_weight[_gauge][*] (read for fill, written only elsewhere)",
+          "time_weight[_gauge]",
+          "points_total[*]",
+          "time_total",
+          "points_sum[*][*]",
+          "time_sum[*]",
+          "points_type_weight[*][*]",
+          "time_type_weight[*]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "gauge_relative_weight(address _gauge, uint256 _time)",
+        "visibility": "external",
+        "parameters": [
+          "address _gauge",
+          "uint256 _time"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "gauge_relative_weight_write(address _gauge, uint256 _time)",
+        "visibility": "external",
+        "parameters": [
+          "address _gauge",
+          "uint256 _time"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "points_weight[_gauge][*]",
+          "time_weight[_gauge]",
+          "points_total[*]",
+          "time_total",
+          "points_sum[*][*]",
+          "time_sum[*]",
+          "points_type_weight[*][*]",
+          "time_type_weight[*]"
+        ],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "add_type(string _name, uint256 _weight)",
+        "visibility": "external",
+        "parameters": [
+          "string _name",
+          "uint256 _weight"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "gauge_type_names[type_id]",
+          "n_gauge_types",
+          "points_type_weight[type_id][next_time] (if _weight != 0)",
+          "points_total[next_time] and time_total (if _weight != 0)",
+          "time_type_weight[type_id] (if _weight != 0)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "change_type_weight(int128 type_id, uint256 weight)",
+        "visibility": "external",
+        "parameters": [
+          "int128 type_id",
+          "uint256 weight"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "points_type_weight[type_id][next_time]",
+          "time_type_weight[type_id]",
+          "points_total[next_time]",
+          "time_total"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "change_gauge_weight(address addr, uint256 weight)",
+        "visibility": "external",
+        "parameters": [
+          "address addr",
+          "uint256 weight"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "points_weight[addr][next_time].bias",
+          "time_weight[addr]",
+          "points_sum[gauge_type][next_time].bias",
+          "time_sum[gauge_type]",
+          "points_total[next_time]",
+          "time_total"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "remove_gauge_weight(address _gauge)",
+        "visibility": "public",
+        "parameters": [
+          "address _gauge"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "points_weight[_gauge][next_time].bias/slope",
+          "points_sum[gauge_type][next_time].bias/slope",
+          "changes_weight[_gauge][time_to_check] (loop)",
+          "changes_sum[gauge_type][time_to_check] (loop)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "vote_for_gauge_weights(address _gauge_addr, uint256 _user_weight)",
+        "visibility": "external",
+        "parameters": [
+          "address _gauge_addr",
+          "uint256 _user_weight"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "vote_user_power[msg.sender]",
+          "points_weight[_gauge_addr][next_time].bias/slope",
+          "points_sum[gauge_type][next_time].bias/slope",
+          "changes_weight[_gauge_addr][old_slope.end] (potentially)",
+          "changes_sum[gauge_type][old_slope.end] (potentially)",
+          "changes_weight[_gauge_addr][new_slope.end]",
+          "changes_sum[gauge_type][new_slope.end]",
+          "points_total[*] and time_total (via _get_total)",
+          "vote_user_slopes[msg.sender][_gauge_addr]",
+          "last_user_vote[msg.sender][_gauge_addr]"
+        ],
+        "external_calls": [
+          "VotingEscrow.getLastUserPoint(msg.sender)",
+          "VotingEscrow.lockEnd(msg.sender)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "get_gauge_weight(address _gauge)",
+        "visibility": "external",
+        "parameters": [
+          "address _gauge"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "get_type_weight(int128 type_id)",
+        "visibility": "external",
+        "parameters": [
+          "int128 type_id"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "get_total_weight()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "GaugeController.sol",
+        "function": "get_weights_sum_per_type(int128 type_id)",
+        "visibility": "external",
+        "parameters": [
+          "int128 type_id"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "constructor(address _gaugeController, address _governance)",
+        "visibility": "public",
+        "parameters": [
+          "address _gaugeController",
+          "address _governance"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "gaugeController",
+          "governance",
+          "referenceBlockNumber",
+          "referenceBlockTime"
+        ],
+        "external_calls": [],
+        "risk_assessment": "low"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "setGovernance(address _governance)",
+        "visibility": "external",
+        "parameters": [
+          "address _governance"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "governance"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "update_market(address _market)",
+        "visibility": "public",
+        "parameters": [
+          "address _market"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "marketInfo[_market].accCantoPerShare",
+          "marketInfo[_market].secRewardsPerShare",
+          "marketInfo[_market].lastRewardBlock"
+        ],
+        "external_calls": [
+          "GaugeController.gauge_relative_weight_write(_market, epochTime)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "sync_ledger(address _lender, int256 _delta)",
+        "visibility": "external",
+        "parameters": [
+          "address _lender",
+          "int256 _delta"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "userInfo[market][lender].amount",
+          "userInfo[market][lender].rewardDebt",
+          "userInfo[market][lender].secRewardDebt",
+          "lendingMarketTotalBalance[market]",
+          "marketInfo[market].accCantoPerShare (via update_market)",
+          "marketInfo[market].secRewardsPerShare (via update_market)",
+          "marketInfo[market].lastRewardBlock (via update_market)"
+        ],
+        "external_calls": [
+          "GaugeController.gauge_relative_weight_write(market, epochTime) (via update_market)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "claim(address _market)",
+        "visibility": "external",
+        "parameters": [
+          "address _market"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "userInfo[_market][msg.sender].rewardDebt",
+          "marketInfo[_market].accCantoPerShare (via update_market)",
+          "marketInfo[_market].secRewardsPerShare (via update_market)",
+          "marketInfo[_market].lastRewardBlock (via update_market)"
+        ],
+        "external_calls": [
+          "GaugeController.gauge_relative_weight_write(_market, epochTime) (via update_market)",
+          "msg.sender.call{value: uint256(cantoToSend)}(\"\")"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "setRewards(uint256 _fromEpoch, uint256 _toEpoch, uint256 _amountPerBlock)",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _fromEpoch",
+          "uint256 _toEpoch",
+          "uint256 _amountPerBlock"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "cantoPerBlock[epoch] (loop from _fromEpoch to _toEpoch)"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "whiteListLendingMarket(address _market, bool _isWhiteListed, bool _hasGauge)",
+        "visibility": "external",
+        "parameters": [
+          "address _market",
+          "bool _isWhiteListed",
+          "bool _hasGauge"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "liquidityGauges[_market] (if _hasGauge and not set)",
+          "liquidityGauges[gaugeAddress] (reverse mapping, if gauge deployed)",
+          "lendingMarketWhitelist[_market]",
+          "marketInfo[_market].lastRewardBlock (if whitelisting enabled)"
+        ],
+        "external_calls": [
+          "new LiquidityGauge(_market, address(this))"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "setBlockTimeParameters(uint256 _averageBlockTime, uint256 _referenceBlockTime, uint256 _referenceBlockNumber)",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _averageBlockTime",
+          "uint256 _referenceBlockTime",
+          "uint256 _referenceBlockNumber"
+        ],
+        "modifiers": [
+          "onlyGovernance"
+        ],
+        "authentication_required": true,
+        "state_changes": [
+          "averageBlockTime",
+          "referenceBlockTime",
+          "referenceBlockNumber"
+        ],
+        "external_calls": [],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LendingLedger.sol",
+        "function": "receive()",
+        "visibility": "external",
+        "parameters": [],
+        "modifiers": [
+          "payable"
+        ],
+        "authentication_required": false,
+        "state_changes": [],
+        "external_calls": [],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "constructor(address _underlyingToken, address _lendingLedger)",
+        "visibility": "public",
+        "parameters": [
+          "address _underlyingToken",
+          "address _lendingLedger"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "underlyingToken",
+          "lendingLedger",
+          "ERC20 name/symbol (constructor args)"
+        ],
+        "external_calls": [
+          "ERC20(_underlyingToken).symbol() (external call during construction, twice)"
+        ],
+        "risk_assessment": "medium"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "depositUnderlying(uint256 _amount)",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 balances (mint to user)",
+          "ERC20 totalSupply"
+        ],
+        "external_calls": [
+          "IERC20(underlyingToken).safeTransferFrom(user, this, _amount)",
+          "LendingLedger.sync_ledger(user, +_amount) (via _afterTokenTransfer hook on mint)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "withdrawUnderlying(uint256 _amount)",
+        "visibility": "external",
+        "parameters": [
+          "uint256 _amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 balances (burn from user)",
+          "ERC20 totalSupply"
+        ],
+        "external_calls": [
+          "LendingLedger.sync_ledger(user, -_amount) (via _afterTokenTransfer hook on burn)",
+          "IERC20(underlyingToken).safeTransfer(user, _amount)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "transfer(address to, uint256 amount)",
+        "visibility": "public",
+        "parameters": [
+          "address to",
+          "uint256 amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 balances (from/to)"
+        ],
+        "external_calls": [
+          "LendingLedger.sync_ledger(from, -amount) (via _afterTokenTransfer hook)",
+          "LendingLedger.sync_ledger(to, +amount) (via _afterTokenTransfer hook)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "transferFrom(address from, address to, uint256 amount)",
+        "visibility": "public",
+        "parameters": [
+          "address from",
+          "address to",
+          "uint256 amount"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "ERC20 allowances[from][spender]",
+          "ERC20 balances (from/to)"
+        ],
+        "external_calls": [
+          "LendingLedger.sync_ledger(from, -amount) (via _afterTokenTransfer hook)",
+          "LendingLedger.sync_ledger(to, +amount) (via _afterTokenTransfer hook)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "burn(uint256 amount)",
+        "visibility": "public",
+        "parameters": [
+          "uint256 amount"
+        ],
+        "modifiers": [],
+        "authentication_required": false,
+        "state_changes": [
+          "ERC20 balances (burn)",
+          "ERC20 totalSupply"
+        ],
+        "external_calls": [
+          "LendingLedger.sync_ledger(msg.sender, -amount) (via _afterTokenTransfer hook on burn)"
+        ],
+        "risk_assessment": "high"
+      },
+      {
+        "contract": "LiquidityGauge.sol",
+        "function": "burnFrom(address account, uint256 amount)",
+        "visibility": "public",
+        "parameters": [
+          "address account",
+          "uint256 amount"
+        ],
+        "modifiers": [],
+        "authentication_required": true,
+        "state_changes": [
+          "ERC20 allowances[account][spender]",
+          "ERC20 balances (burn)",
+          "ERC20 totalSupply"
+        ],
+        "external_calls": [
+          "LendingLedger.sync_ledger(account, -amount) (via _afterTokenTransfer hook on burn)"
+        ],
+        "risk_assessment": "high"
+      }
+    ],
+    "inventories": {
+      "upgradeability_surface": [
+        {
+          "contract": "VotingEscrow.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Non-upgradeable: constructor sets governance/name/symbol and initializes pointHistory[0]. Inherits ReentrancyGuard but does not expose inherited management functions (none exist besides internal status)."
+        },
+        {
+          "contract": "GaugeController.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Non-upgradeable: constructor sets references and time_total."
+        },
+        {
+          "contract": "LendingLedger.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Non-upgradeable: constructor sets gaugeController/governance and block-time reference. Deploys LiquidityGauge instances."
+        },
+        {
+          "contract": "LiquidityGauge.sol",
+          "pattern": "None",
+          "initializer_guards": [],
+          "collision_risk": "low",
+          "notes": "Non-upgradeable ERC20 + ERC20Burnable. Name/symbol derived via external calls to underlying token symbol() during construction."
+        }
+      ]
+    }
+  }
+}

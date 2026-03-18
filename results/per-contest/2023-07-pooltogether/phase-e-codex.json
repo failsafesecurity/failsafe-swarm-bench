@@ -1,0 +1,84 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "uint16 Draw ID Overflow Permanently Halts Draw Closure and Prize Funding",
+      "severity": "high",
+      "summary": "`lastClosedDrawId` is stored as `uint16` in `TieredLiquidityDistributor` and is incremented draw-by-draw. `PrizePool.contributePrizeTokens()` and `PrizePool.closeDraw()` both depend on `lastClosedDrawId + 1`. After 65,535 closed draws, the next increment reverts in Solidity 0.8 checked arithmetic. At that point, `closeDraw()` can no longer progress the system, and `contributePrizeTokens()` cannot attribute new prize liquidity for the next draw. This is a hard liveness failure that eventually tur",
+      "description": [
+        {
+          "file": "prize-pool/src/PrizePool.sol",
+          "line_start": 319,
+          "line_end": 320,
+          "desc": "The protocol uses a uint16 draw counter and repeatedly computes `lastClosedDrawId + 1`; once `lastClosedDrawId` reaches 65535, checked arithmetic overflows and reverts, bricking core paths that require the next draw id."
+        }
+      ],
+      "impact": "Permanent protocol liveness failure for prize distribution/funding in the affected PrizePool instance, with practical lock/stranding of future prize flow and inability to continue normal draw lifecycle.",
+      "proof_of_concept": "1. The system runs normally until `lastClosedDrawId == 65535` (faster on short draw periods). 2. The draw manager attempts to call `closeDraw()` for the next draw; `lastClosedDrawId + 1` overflows and reverts. 3. Vault liquidation paths depending on `contributePrizeTokens()` also fail because they use the same overflowing expression. 4. No new draw can be closed and no new contributions can be scheduled, permanently halting prize progression and stranding prize-flow value in the old deployment.",
+      "remediation": "Use a wider draw id type (e.g., uint32/uint64) consistently across PrizePool, TieredLiquidityDistributor, and DrawAccumulator indexing paths, and add explicit boundary checks plus migration-safe handling before rollover."
+    },
+    {
+      "title": "DrawAccumulator uint96 Truncation Can Create Synthetic Unaccounted Balance and Break Prize Accounting",
+      "severity": "high",
+      "summary": "The accumulator stores live contribution state in `Observation.available` (uint96). During `add()`, the code performs unchecked narrowing conversions from uint256 arithmetic into uint96. If cumulative available balance exceeds the uint96 range, the stored value wraps/truncates. PrizePool accounting relies on this accumulator via `_accountedBalance()` (`obs.available + obs.disbursed - _totalWithdrawn`). After truncation, `_accountedBalance()` becomes materially lower than the real token balance, ",
+      "description": [
+        {
+          "file": "prize-pool/src/libraries/DrawAccumulatorLib.sol",
+          "line_start": 92,
+          "line_end": 93,
+          "desc": "`available` is stored as uint96 and assigned via explicit narrowing casts from uint256 (`uint96(_amount + remainingAmount)` / `uint96(newestObservation_.available + _amount)`), silently truncating high bits when above 2^96-1."
+        }
+      ],
+      "impact": "High-severity accounting corruption: synthetic unaccounted balance can be created from truncation, enabling theft via contribution attribution paths and destabilizing PrizePool solvency/accounting guarantees.",
+      "proof_of_concept": "1. A high-liquidity deployment (or high-smoothing accumulation) drives accumulator `available` above `type(uint96).max`. 2. A subsequent `contributePrizeTokens()` call triggers `DrawAccumulatorLib.add()`, where the uint96 cast truncates high bits. 3. PrizePool now under-accounts token liabilities because `_accountedBalance()` reads the truncated accumulator state. 4. `contributePrizeTokens()` observes a large artificial `deltaBalance` and allows contribution attribution without new token transfer for that synthetic gap. 5. The attacker re-attributes this synthetic balance to attacker-controlled vault flow, converting accounting corruption into extractable prize value and/or long-term insolvency pressure.",
+      "remediation": "Store accumulator monetary fields in wider types (at least uint256 or a safely bounded wider type), remove narrowing casts in `add()`, and add explicit bounds checks/reverts before assignment. Also add invariant checks that accumulator totals cannot decrease from casting effects."
+    },
+    {
+      "title": "TWAB Observation uint96 Truncation Lets Attackers Force Deterministic Prize Wins and Drain Tier Liquidity",
+      "severity": "high",
+      "summary": "Prize winner checks in PrizePool rely on TwabController TWABs for both user balance and vault total supply. Because Twab observations truncate delegate balances to uint96 while account state itself is uint112, the recorded historical total supply can wrap to a tiny number while a specific user observation remains near uint96 max. This breaks the intended invariant that user TWAB is bounded by total supply TWAB. In `TierCalculationLib.isWinner`, the random value is reduced modulo total-supply TWA",
+      "description": [
+        {
+          "file": "twab-controller/src/libraries/TwabLib.sol",
+          "line_start": 47,
+          "line_end": 52,
+          "desc": "Account delegate balances are tracked as uint112, but every stored TWAB observation truncates them to uint96 (`balance: uint96(accountDetails.delegateBalance)`), allowing wraparound once balances exceed 2^96-1."
+        }
+      ],
+      "impact": "Critical theft risk: attacker can claim an outsized share (potentially near-all) of prize liquidity for their vault and drain value that should remain available to honest vault participants.",
+      "proof_of_concept": "1. Attacker uses a vault namespace they control (or their own namespace in TwabController) and mints TWAB balances so raw delegated total supply exceeds 2^96 (e.g., one account at `type(uint96).max`, another with +2). 2. Total-supply observation wraps to a tiny uint96 value, while the attacker-controlled winner address can retain a very large non-wrapped per-user observation. 3. Attacker contributes a small amount of prize tokens for that vault so vaultPortion is non-zero. 4. After draw close, attacker claims prizes for their high-TWAB winner address across prize indices. 5. In winner checks, `random % vaultTwabTotalSupply` is almost always 0 due wrapped denominator, while `winningZone` is > 0, so claims succeed at near-deterministic rate and consume shared tier liquidity/reserve.",
+      "remediation": "Use a consistent width for stored and observed TWAB balances (at least uint112 end-to-end or uint256), and hard-revert on downcasts. Add invariant checks that historical observed total-supply TWAB cannot be lower than any constituent user TWAB for the same interval due type truncation."
+    },
+    {
+      "title": "Tier Prize Size uint96 Truncation Underpays Winners and Can Permanently Strand Tier Liquidity",
+      "severity": "high",
+      "summary": "`_computePrizeSize` returns a uint256 derived from accumulated tier liquidity, but both `_nextDraw` and `_getTier` narrow it to uint96 without bounds checks. For sufficiently large accumulated liquidity (e.g., high-liquidity tokens or long accrual windows), the stored prize size wraps. `PrizePool.claimPrize` then pays and consumes only the truncated amount, not the real tier entitlement. This creates persistent payout distortion and leaves large amounts of tier liquidity unclaimable by intended ",
+      "description": [
+        {
+          "file": "prize-pool/src/abstract/TieredLiquidityDistributor.sol",
+          "line_start": 365,
+          "line_end": 367,
+          "desc": "Tier prize sizes are computed as uint256 but stored/recomputed with unchecked downcasts to uint96, silently truncating when true prize size exceeds 2^96-1."
+        }
+      ],
+      "impact": "High-severity loss/lock: winners are underpaid relative to accrued tier liquidity, and a portion of protocol assets can become permanently stranded in tier accounting state.",
+      "proof_of_concept": "1. Tier liquidity accumulates until true per-prize amount for a tier exceeds `type(uint96).max`. 2. On draw transition or tier refresh, prize size is truncated via uint96 cast. 3. Claimers claim prizes and receive only the wrapped value; `_consumeLiquidity` removes only that wrapped amount. 4. Excess liquidity remains trapped in tier accounting instead of being paid to winners. 5. If/when truncated value becomes zero, claims can complete with zero payout while liquidity remains stranded.",
+      "remediation": "Store prize sizes in a wider type (uint256 or safely bounded wider integer) and hard-revert on narrowing conversions. Add explicit upper-bound checks before assignment and invariant tests that paid+remaining tier liquidity tracks computed accrual without truncation loss."
+    },
+    {
+      "title": "Vault Burns Truncated Shares but Withdraws Full Assets, Enabling Asset Drain Above uint96 Balance",
+      "severity": "high",
+      "summary": "Vault share accounting in TwabController mutates balances with uint96 amounts, but external ERC4626 flows accept uint256 share amounts. In `redeem`, `_assets` is computed from the full `_shares` input, then `_withdraw` calls `_burn(_owner, _shares)`. `_burn` performs `uint96(_shares)`, silently truncating high bits. The vault then withdraws/transfers `_assets` based on the untruncated amount. Once an account holds more than 2^96-1 shares, it can request redemption/withdrawal sized by the full ba",
+      "description": [
+        {
+          "file": "vault/src/Vault.sol",
+          "line_start": 531,
+          "line_end": 533,
+          "desc": "`redeem/withdraw` compute assets from full uint256 share amount, but `_burn` narrows `_shares` to uint96 before calling TwabController, so burns can be drastically smaller than the shares used for asset withdrawal."
+        }
+      ],
+      "impact": "Critical direct theft: once the uint96 threshold is crossed, attackers can withdraw disproportionate assets and drain vault TVL, causing insolvency and depositor losses.",
+      "proof_of_concept": "1. Attacker accumulates a share balance above `type(uint96).max` (possible via repeated deposits/mints). 2. Attacker calls `redeem` with a share amount > 2^96. 3. Vault computes `_assets` from full `_shares`, then `_burn` truncates to uint96 and burns only the low bits. 4. Vault withdraws/transfers the full `_assets` amount to attacker. 5. Attacker repeats to drain assets backed by other depositors while retaining most of their nominal share balance.",
+      "remediation": "Enforce strict upper bounds so no account action can ever require burning/transferring/minting > uint96 shares, or migrate TwabController/Vault share mutation interfaces to a wider type (uint256) and use SafeCast reverts on narrowing boundaries. Add invariant tests asserting burned shares exactly match shares used for asset conversion in withdraw/redeem paths."
+    }
+  ]
+}

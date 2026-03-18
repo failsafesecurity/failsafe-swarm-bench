@@ -1,0 +1,770 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Bot-Initiated Yield Liquidation Uses Wrong Yield Account, Making Unhealthy Positions Unliquidatable",
+      "severity": "high",
+      "summary": "In _unstake and _repay, the yield account is resolved via yieldAccounts[msg.sender]. When botAdmin calls these functions to force-liquidate an unhealthy position, the lookup uses yieldAccounts[botAdmin] instead of sd.yieldAccount (the actual user's yield account). Since botAdmin likely has no yield account (address(0)), the require check reverts immediately. Even if botAdmin somehow had a yield account, subsequent operations (deducting yieldShares, requesting withdrawals, claiming) operate on th",
+      "description": [
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 235,
+          "line_end": 270,
+          "desc": "vars.yieldAccout = IYieldAccount(yieldAccounts[msg.sender]); used when msg.sender == botAdmin; should use sd.yieldAccount"
+        },
+        {
+          "file": "YieldEthStakingLido.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: protocolRequestWithdrawal"
+        },
+        {
+          "file": "YieldEthStakingEtherfi.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: protocolRequestWithdrawal"
+        },
+        {
+          "file": "YieldSavingsDai.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: protocolClaimWithdraw"
+        }
+      ],
+      "impact": "CRITICAL: Every unhealthy yield staking position cannot be force-liquidated by the bot mechanism. This defeats the entire purpose of the botAdmin liquidation system. In a market downturn, multiple positions could simultaneously become unhealthy, and none could be liquidated, leading to potentially unlimited bad debt accumulation against the lending pool. All lending pool depositors bear the loss from unrecoverable positions. The only mitigation is a contract upgrade, but bad debt accumulated before the upgrade is permanent.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Bot-Initiated Repay DoS: extraAmount Transfer Pulls from NFT Owner Who Can Block Liquidation by Revoking Approval",
+      "severity": "high",
+      "summary": "In _repay, when claimedYield < nftDebtWithFine, the contract attempts `underlyingAsset.safeTransferFrom(vars.nftOwner, address(this), vars.extraAmount)`. When botAdmin initiates repay for a liquidation, this pulls funds from the NFT owner's wallet. If the NFT owner has not approved the contract or revokes approval, the transfer reverts, blocking the entire liquidation flow. This is independent of TECH-H001 (which would also block bot repay for a different reason).",
+      "description": [
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 329,
+          "line_end": 331,
+          "desc": "underlyingAsset.safeTransferFrom(vars.nftOwner, ...) in bot-callable path without owner's cooperation"
+        }
+      ],
+      "impact": "HIGH impact. If TECH-H001 is fixed, this becomes the primary blocker for bot-initiated liquidations of underwater yield positions. Any NFT owner whose position is underwater (yield < debt + fine) has zero incentive to maintain approval and every incentive to revoke it. This leads to: (1) Bad debt accumulation in the lending pool, (2) Inability to clear unhealthy yield positions, (3) Protocol insolvency risk if multiple positions become unliquidatable simultaneously.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unstake Fines Permanently Locked in YieldStaking Contracts with No Extraction Mechanism",
+      "severity": "high",
+      "summary": "When botAdmin triggers an unstake with a fine, `totalUnstakeFine += unstakeFine` is incremented but never decremented in _repay. The fine amount (in WETH/DAI) is collected from the user or yield during repay and stays in the YieldStaking contract as the underlying ERC20 token. There is no function to withdraw or sweep ERC20 tokens from the YieldStaking contracts. The emergencyEtherTransfer functions only handle native ETH, not WETH/ERC20.",
+      "description": [
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 263,
+          "line_end": 264,
+          "desc": "totalUnstakeFine += unstakeFine; never decremented; no sweep function for ERC20"
+        }
+      ],
+      "impact": "Medium severity. Protocol revenue (unstake fines) is permanently locked in the contract. InitConfigYield.s.sol shows maxUnstakeFine = 100 for multiple NFTs across all three yield strategies. While individual fines may be small, they accumulate over the protocol lifetime. The issue is recoverable via contract upgrade (TransparentUpgradeableProxy is used), but the current code has no extraction mechanism.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Missing Chainlink Price Staleness Time Check Allows Borrowing Against Stale Overvalued Collateral",
+      "severity": "high",
+      "summary": "PriceOracle.getAssetPriceFromChainlink validates `updatedAt != 0` and `answeredInRound >= roundId` but does not enforce a maximum age for the price data (e.g., `block.timestamp - updatedAt < MAX_STALENESS`). If a Chainlink feed's heartbeat stops or has significant delays, the protocol continues using the last known price indefinitely. An attacker observing a price drop in external markets (while the oracle is stale) can borrow maximum amounts against overvalued collateral.",
+      "description": [
+        {
+          "file": "PriceOracle.sol",
+          "line_start": 81,
+          "line_end": 89,
+          "desc": "Missing (block.timestamp - updatedAt < MAX_STALENESS) check after latestRoundData"
+        }
+      ],
+      "impact": "HIGH severity. The missing staleness check affects all price-dependent operations in the protocol: cross-margin borrowing (health factor), isolated lending (NFT loan health), yield staking (NFT valuation for leverage), cross-margin liquidation triggers, and isolate auction triggers. During a Chainlink outage coinciding with significant market movement, the protocol could accumulate bad debt proportional to the price divergence multiplied by total collateral. All depositors of borrowed assets would be at risk.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "PoolManager dispatch() Can Delegatecall to address(0) If Module Is Uninstalled Without Removing Proxy Trust",
+      "severity": "high",
+      "summary": "In PoolManager.dispatch(), if a trusted proxy's moduleImpl is address(0) (multi-proxy module), the function falls back to moduleLookup[moduleId]. If the module has been uninstalled (moduleLookup[moduleId] set to address(0)) but the proxy remains in trustedSenders, dispatch will delegatecall to address(0). A delegatecall to address(0) succeeds silently with no execution, returning empty data. This could cause callers expecting return data or state changes to silently receive incorrect results.",
+      "description": [
+        {
+          "file": "PoolManager.sol",
+          "line_start": 43,
+          "line_end": 57,
+          "desc": "No check that moduleImpl != address(0) before delegatecall; address(0) delegatecall returns success"
+        }
+      ],
+      "impact": "The defect is a missing safety check that could lead to silent transaction success with no state changes. Impact severity depends on the Installer's uninstallation behavior (not in scope). If the Installer doesn't clean trustedSenders, the impact could include: (1) User confusion from apparently successful but no-op transactions, (2) ETH loss if sent via msg.value to the stale proxy (ETH goes to PoolManager with no accounting), (3) Potential state inconsistencies if callers rely on return data from the call. The defect is real regardless of exploitability - the code should validate the delegatecall target.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ERC721 Cross Supply Decrease Missing Owner Verification Allows Accounting Corruption",
+      "severity": "high",
+      "summary": "VaultLogic.erc721DecreaseCrossSupply checks tokenData.supplyMode == SUPPLY_MODE_CROSS but does NOT verify tokenData.owner == user parameter. If a caller (via module code) passes a different user address than the actual token owner, the userScaledCrossSupply of the wrong user gets decremented while the actual owner's count stays inflated. This could lead to the owner retaining phantom collateral counting.",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 340,
+          "line_end": 350,
+          "desc": "No require(tokenData.owner == user) check; only checks supplyMode"
+        }
+      ],
+      "impact": "If exploited (wrong user passed by any caller), the actual token owner retains phantom collateral in their userScaledCrossSupply count. This inflates their collateral value in health factor calculations (GenericLogic._getUserERC721BalanceInBaseCurrency uses assetData.userScaledCrossSupply), potentially allowing undercollateralized borrowing. The conservation invariant INV-ECON-002 (totalScaledCrossSupply == sum of userScaledCrossSupply) would also be violated since the wrong user's counter could underflow or go negative (revert in Solidity 0.8+). Severity is HIGH if any caller misuses the function.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Yield cap bypass: yield borrow uses borrowIndex instead of supplyIndex, enabling over-borrowing from pool",
+      "severity": "high",
+      "summary": "In YieldLogic.executeYieldBorrowERC20(), the 'totalSupply' used to enforce yieldCap/yieldManagerCap is computed using groupData.borrowIndex (yield group's borrow index) instead of assetData.supplyIndex (supply index). Since borrowIndex generally grows faster than supplyIndex, the cap denominator becomes inflated over time, allowing a whitelisted yield staker to borrow more than the intended fraction of actual supplied assets, potentially draining liquidity and harming lenders/borrowers.",
+      "description": [
+        {
+          "file": "YieldLogic.sol",
+          "line_start": 39,
+          "line_end": 76,
+          "desc": "vars.totalSupply = VaultLogic.erc20GetTotalCrossSupply(assetData, groupData.borrowIndex); // should use assetData.supplyIndex for total supply"
+        }
+      ],
+      "impact": "The impact is HIGH to CRITICAL depending on time horizon and pool utilization. With deployed feeFactor of 20% and typical lending utilization ratios, the borrowIndex/supplyIndex divergence grows meaningfully over months. This allows yield stakers to borrow more than the intended fraction of actual deposits, reducing available liquidity for regular borrowers and suppliers. In extreme cases, this could drain the pool's liquidity entirely, creating systemic risk. The per-staker cap (ymData.yieldCap) is equally affected since it also uses the inflated totalSupply.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Isolate Auction Griefing via Reverting Fallbacks",
+      "severity": "high",
+      "summary": "Attackers can win isolate NFT auctions at their initial bid price by bidding from a smart contract that reverts on receiving ERC20 refunds.",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 382,
+          "line_end": 383,
+          "desc": "IERC20Upgradeable(asset).safeTransfer(to, amount);"
+        }
+      ],
+      "impact": "MEDIUM severity. The push-based refund pattern creates a potential permanent DoS on isolate auctions when used with blocklist-capable tokens like USDT. If triggered, the borrower loses their NFT at potentially the minimum bid price, and the protocol may accumulate bad debt if the bid doesn't cover the loan. However, the practical exploitability is LOW because getting an address blocklisted on USDT requires external compliance action from Tether, not something an attacker can trigger at will.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Unstake Fine is Economically Negligible Due to uint16 Type and Direct Addition",
+      "severity": "high",
+      "summary": "The `maxUnstakeFine` is defined as a `uint16`, limiting its maximum value to 65,535. In `_repay`, this fine is added directly to the debt (`vars.nftDebt + sd.unstakeFine`), which is denominated in WETH (18 decimals). A maximum fine of 65,535 wei is worth a fraction of a cent, completely breaking the economic penalty for liquidation.",
+      "description": [
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 262,
+          "line_end": 262,
+          "desc": "vars.nftDebtWithFine = vars.nftDebt + sd.unstakeFine; (where unstakeFine is bounded by uint16 max 65535)"
+        }
+      ],
+      "impact": "HIGH - The unstake fine mechanism is entirely broken for 18-decimal tokens. Users have no economic disincentive to take maximum leverage and walk away from underwater positions. This creates moral hazard where losses are socialized to the lending pool while profits are privatized by the borrower. The protocol's intended liquidation penalty (which based on the comment should be up to 1 ETH) provides zero actual deterrence.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Yield Group Without Rate Model Bricks All Asset Operations via updateInterestIndexs Revert",
+      "severity": "high",
+      "summary": "When yield is enabled for an asset via executeSetAssetYieldEnable, a new group is added to the asset's groupList but its rateModel is left as address(0). The separate call to setAssetYieldRate must follow to set it. However, updateInterestRates iterates ALL groups in the asset's groupList and calls IInterestRateModel(loopGroupData.rateModel).calculateGroupBorrowRate(). Calling address(0) with an interface function returns 0 bytes, failing Solidity's ABI return-data size check, reverting the enti",
+      "description": [
+        {
+          "file": "InterestLogic.sol",
+          "line_start": 123,
+          "line_end": 149,
+          "desc": "updateInterestRates iterates assetGroupIds and calls IInterestRateModel(loopGroupData.rateModel).calculateGroupBorrowRate() without checking rateModel != address(0)"
+        },
+        {
+          "file": "ConfigureLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: executeSetAssetYieldEnable()"
+        }
+      ],
+      "impact": "CRITICAL. Between setAssetYieldEnable and setAssetYieldRate (or if the latter is never called), all operations that invoke updateInterestRates for the affected asset revert. This includes at minimum: yield borrows/repays (confirmed in YieldLogic), and very likely standard borrows, repays, and potentially withdrawals (standard lending protocol pattern). Existing borrowers cannot repay. Liquidations cannot proceed. Deposits may also be blocked depending on whether the deposit flow calls updateInterestRates. The asset market is effectively frozen for all users.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "_accrueFeeToTreasury toUint128 Truncation Can Permanently DoS High-Activity Asset",
+      "severity": "high",
+      "summary": "In InterestLogic._accrueFeeToTreasury, the fee increment is cast to uint128 via SafeCast.toUint128() before being added to the uint256 accruedFee field. If vars.amountToMint.rayDiv(assetData.supplyIndex) exceeds type(uint128).max (~3.4e38), the SafeCast reverts. Since _accrueFeeToTreasury is called within updateInterestIndexs on every state-changing operation, this would permanently brick the asset. With sufficiently large totalScaledBorrow and/or prolonged periods between index updates, the sca",
+      "description": [
+        {
+          "file": "InterestLogic.sol",
+          "line_start": 189,
+          "line_end": 192,
+          "desc": "assetData.accruedFee += vars.amountToMint.rayDiv(assetData.supplyIndex).toUint128() \u2014 accruedFee is uint256 but increment is cast to uint128"
+        }
+      ],
+      "impact": "If triggered, the impact is complete asset freeze \u2014 no deposits, withdrawals, borrows, repays, or liquidations can occur for the affected asset. This is permanent until a code upgrade. However, the probability of reaching the trigger condition with real-world parameters is negligibly low. The defect is real but the risk rating should account for the extreme preconditions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "YieldStakingBase Health Factor Calculation Reverts on Zero Debt Edge Case",
+      "severity": "high",
+      "summary": "YieldStakingBase.calculateHealthFactor calls wadDiv(totalNftValue + totalYieldValue, totalDebtValue). If totalDebtValue is 0, wadDiv reverts (division by zero in assembly). While this shouldn't occur during normal _stake (debt is just created), it can occur if: (1) during getTotalDebt view call, the pool reports 0 debt due to rounding in convertToDebtAssets, or (2) a second _stake on the same NFT where previous debt was nearly fully repaid externally (breaking the debt share to asset conversion)",
+      "description": [
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 441,
+          "line_end": 449,
+          "desc": "(totalNftValue + totalYieldValue).wadDiv(totalDebtValue) without zero-debt check; contrast with GenericLogic.calculateHealthFactorFromBalances which returns max on zero debt"
+        }
+      ],
+      "impact": "The code defect is confirmed but practical impact is LOW under current conditions because: (1) during _stake, the borrow just occurred so getTotalDebt() > 0; (2) during _unstake, active stakes have non-zero debt in the pool; (3) external actors cannot easily desync the debt tracking. However, the defect represents a missing safety invariant that could become critical if the system's debt accounting is ever disrupted. The asymmetry with GenericLogic.calculateHealthFactorFromBalances indicates an oversight in the yield staking implementation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Healthy Isolate Loans Can Be Forced Into Auction",
+      "severity": "high",
+      "summary": "ValidateLogic.validateIsolateAuctionLoan does not verify that the loan's health factor is below the liquidation threshold before allowing an auction to start. This could allow attackers to force healthy loans into auction.",
+      "description": [
+        {
+          "file": "ValidateLogic.sol",
+          "line_start": 469,
+          "line_end": 482,
+          "desc": "Missing health factor check in validateIsolateAuctionLoan"
+        }
+      ],
+      "impact": "HIGH severity. Any isolate loan in ACTIVE status can be forced into auction regardless of its health factor. This enables griefing attacks against healthy positions, forcing borrowers to pay bid fines to redeem their NFTs, and potentially allows attackers to acquire NFT collateral at a discount through the auction mechanism. The vulnerability affects all isolate margin lending positions in the protocol.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "YieldAccount.initialize permits yieldManager=address(0), creating irrecoverable accounts and trapped funds scenarios",
+      "severity": "high",
+      "summary": "YieldAccount.initialize does not validate that _registry and _manager are non-zero. If a YieldAccount is initialized with yieldManager = address(0), no one can call onlyManager functions to move funds or approve protocols. If assets are later sent to such an account (mistake or integration bug), they become effectively stuck unless the registry rescues them (onlyRegistry), but registry address could also be mis-set.",
+      "description": [
+        {
+          "file": "YieldAccount.sol",
+          "line_start": 29,
+          "line_end": 37,
+          "desc": "function initialize(address _registry, address _manager) public initializer { yieldRegistry=_registry; yieldManager=_manager; } // no nonzero checks"
+        }
+      ],
+      "impact": "MEDIUM severity. The defect creates a path to permanently unusable yield accounts if address(0) is whitelisted as a manager. Funds sent to such accounts are trapped from the manager's perspective but recoverable via the registry rescue mechanism. The defect requires admin misconfiguration (adding address(0) as a yield manager), reducing likelihood. However, the lack of basic input validation is a code-level defect that should be fixed regardless of exploitation difficulty.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Debt Dust Accumulation Via Rounding to Zero in Health Factor Calculation",
+      "severity": "high",
+      "summary": "In GenericLogic._getUserERC20DebtInBaseCurrency, the calculation `(assetPrice * userTotalDebt) / (10 ** assetData.underlyingDecimals)` performs integer division that can truncate small debt amounts to zero. For assets with high decimals (18) and relatively low unit prices, an attacker could open many tiny borrow positions across different groups where each rounds to 0 in the health factor calculation, accumulating real debt that is invisible to the health factor check.",
+      "description": [
+        {
+          "file": "GenericLogic.sol",
+          "line_start": 200,
+          "line_end": 207,
+          "desc": "userTotalDebt = assetPrice * userTotalDebt; return userTotalDebt / (10 ** assetData.underlyingDecimals); truncates small debts"
+        }
+      ],
+      "impact": "CONFIRMED as a code defect. The integer division truncation creates a blind spot in the health factor system where real on-chain debt is invisible. While the financial impact per position is negligible (~$0.01 per borrow per group for WETH), and gas costs make exploitation unprofitable, the code violates the fundamental invariant INV-ECON-007 that health factor must reflect all debt. The protocol would accumulate unrecoverable dust bad debt over time if exploited. The defect could become more significant if low-price, high-decimal tokens are added to the protocol in the future.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Yield Staking createYieldAccount Callable by Anyone for Any User Without Authorization",
+      "severity": "high",
+      "summary": "YieldStakingBase.createYieldAccount(address user) is a public function with no access control - anyone can create a yield account for any user address. Since yieldAccounts[user] can only be set once (the function reverts if already set), this means an attacker can front-run a user's createYieldAccount call on chains with public mempools, or simply grief by creating accounts for addresses that haven't requested them. The created account is legitimate (managed by the correct yield manager), so the",
+      "description": [
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 118,
+          "line_end": 124,
+          "desc": "No msg.sender == user check; anyone can create account for any address"
+        }
+      ],
+      "impact": "LOW severity in practice. The created account is fully functional and correctly configured. The user can use the pre-created account for all subsequent operations (_stake checks yieldAccounts[msg.sender] which is set regardless of who called createYieldAccount). Impact is limited to: (1) gas griefing via front-running on public mempool chains, (2) unnecessary clone deployment for addresses that may never use the system. No fund loss, no operational disruption beyond the initial failed transaction.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Interest Rate Index uint128 Overflow Permanently Bricks Asset Operations",
+      "severity": "high",
+      "summary": "Supply and borrow indices are stored as uint128 and updated via SafeCast.toUint128(). Starting from 1e27 (RAY), the maximum growth factor before overflow is ~3.4e11x. While this seems large, a misconfigured interest rate model returning extremely high rates, or a prolonged period without any interaction on a high-rate asset, could cause the index to overflow. Once this happens, all operations on the asset (deposit, withdraw, borrow, repay) permanently revert.",
+      "description": [
+        {
+          "file": "InterestLogic.sol",
+          "line_start": 163,
+          "line_end": 166,
+          "desc": "assetData.supplyIndex = nextSupplyIndex.toUint128() and groupData.borrowIndex = nextBorrowIndex.toUint128() \u2014 SafeCast reverts on overflow with no recovery"
+        }
+      ],
+      "impact": "If triggered, the impact is CRITICAL: all deposits, withdrawals, borrows, and repays for the affected asset permanently revert. There is no admin recovery mechanism \u2014 no function to reset indices or bypass the overflow. All user funds deposited as that asset are permanently locked. The severity is mitigated by the extreme conditions required under deployed configurations (~190+ years), but the absence of a recovery mechanism and rate bounds makes it a genuine code defect.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "RepayETH Function Allows BotAdmin to Force User WETH Spending",
+      "severity": "high",
+      "summary": "The repayETH logic flaw allows the botAdmin to extract WETH from the NFT owner's wallet while keeping the ETH they sent.",
+      "description": [
+        {
+          "file": "YieldEthStakingEtherfi.sol",
+          "line_start": 55,
+          "line_end": 56,
+          "desc": "IWETH(address(underlyingAsset)).transfer(msg.sender, msg.value);"
+        }
+      ],
+      "impact": "No actual impact. The described attack path is non-functional due to the yield account resolution bug (INV-ACC-001). Even if the path were open, the ETH\u2192WETH conversion is value-neutral for the caller, and the shortfall payment from nftOwner is the same as in regular repay().",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Yield NFT Price Manipulation via Oracle for Leveraged Borrowing Beyond Actual Collateral Value",
+      "severity": "high",
+      "summary": "YieldStakingBase.getNftPriceInUnderlyingAsset computes nftPriceInBase/underlyingAssetPriceInBase to determine NFT value in underlying terms. With leverageFactor=50000 (500%), the max borrow is 5x the NFT price. If the NFT oracle reports a temporarily inflated price (NFT oracles typically have weaker freshness guarantees than Chainlink), a user can borrow up to 5x the inflated value. When the oracle corrects, the position is deeply underwater and the lending pool absorbs the loss. The BendNFTOrac",
+      "description": [
+        {
+          "file": "PriceOracle.sol",
+          "line_start": 92,
+          "line_end": 102,
+          "desc": "getAssetPriceFromBendNFTOracle only checks nftPriceInNftBase > 0; no staleness or freshness validation for NFT oracle"
+        },
+        {
+          "file": "YieldStakingBase.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: getNftPriceInUnderlyingAsset"
+        }
+      ],
+      "impact": "HIGH severity. The missing staleness check combined with 500% leverage creates disproportionate risk. NFT floor prices can move 20%+ in hours, while NFT oracle updates may lag significantly. Each exploited position can create bad debt equal to leverageFactor * oracle_deviation * NFT_price. With multiple NFTs, cumulative bad debt could drain significant pool liquidity. Additionally, the separate botAdmin bug (INV-ACC-001) may prevent automated liquidation of underwater positions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Native Token Deposit/Repay/Bid Flows Broken Due to WETH Approval Requirement After Wrap",
+      "severity": "high",
+      "summary": "wrapNativeTokenInWallet wraps ETH to WETH and transfers it to the user via IWETH.transferFrom(pool, user). Subsequently, executeDepositERC20/executeRepay/executeAuction calls erc20TransferInLiquidity which does safeTransferFrom(user, pool, amount), requiring the user to have WETH approval for the pool. Users depositing native ETH will not have pre-approved the pool for WETH, causing all native token deposit, repay, and bid transactions to revert.",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 464,
+          "line_end": 470,
+          "desc": "wrapNativeTokenInWallet transfers WETH to user via transferFrom(pool, user). Then erc20TransferInLiquidity in the caller does safeTransferFrom(user, pool, amount) requiring user WETH approval."
+        },
+        {
+          "file": "BVault.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: depositERC20"
+        }
+      ],
+      "impact": "HIGH severity. Complete breakage of all native ETH deposit, repay, liquidation, and auction functionality across 8+ entry points. This affects all users who attempt to use native ETH with the protocol. While users can work around this by manually wrapping and approving WETH, this breaks the core user experience and protocol design intent. During time-critical operations like liquidations, this could cause failed liquidation attempts leading to bad debt accumulation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Flash Loan ERC20 Bypasses availableLiquidity Tracking and Can Access Bid Escrow Funds",
+      "severity": "high",
+      "summary": "erc20TransferOutOnFlashLoan performs raw safeTransfer without checking assetData.availableLiquidity. The flash loan amount is not validated against available liquidity - it can access the entire token balance including bid escrow amounts (totalBidAmout). This can temporarily disrupt auction bid refunds during the callback and violates the solvency invariant that bid amounts are always available for refund.",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 363,
+          "line_end": 368,
+          "desc": "erc20TransferOutOnFlashLoan does IERC20.safeTransfer without checking availableLiquidity or totalBidAmout; no validation that amount <= availableLiquidity"
+        },
+        {
+          "file": "FlashLoanLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: executeFlashLoanERC20"
+        }
+      ],
+      "impact": "Severity: HIGH. The defect allows flash loans to access bid escrow funds, violating INV-ECON-001 (pool balance >= availableLiquidity + totalBidAmout at all times). During the callback: (1) Auction bids with refunds will revert, (2) Isolate redeems with bid refunds will revert, (3) Isolate liquidations with remain bid transfers will revert. While the disruption is temporary (within a single transaction), it can be used to: grief ongoing auctions, prevent timely liquidations (combined with oracle manipulation or time-sensitive operations), or disrupt auction participants' transactions. The lack of nonReentrant on flashLoanERC20 explicitly enables the callback to invoke these vulnerable paths.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Flash Loan ERC20 Missing Balance Delta Verification Enables Token Drain with Fee-on-Transfer Tokens",
+      "severity": "high",
+      "summary": "erc20TransferOutOnFlashLoan and erc20TransferInOnFlashLoan perform raw safeTransfer/safeTransferFrom without pre/post balance checks. Unlike erc20TransferInLiquidity and erc20TransferOutLiquidity which verify balance deltas, flash loan transfers do not validate that the exact amount was received. For fee-on-transfer tokens, the pool loses value on each flash loan (fee deducted on both outgoing and incoming transfer).",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 355,
+          "line_end": 374,
+          "desc": "erc20TransferOutOnFlashLoan and erc20TransferInOnFlashLoan lack pre/post balance checks present in erc20TransferInLiquidity (lines 300-310)"
+        }
+      ],
+      "impact": "For any fee-on-transfer token configured with flash loans enabled: (1) Each flash loan cycle causes the pool's actual token balance to decrease by fee_percentage * flash_loan_amount. (2) The tracked availableLiquidity remains unchanged, creating an accounting discrepancy. (3) After sufficient cycles, the pool becomes insolvent for that token \u2014 withdrawals and borrows will revert. (4) All depositors of that token lose access to the fee-deducted portion. The severity depends entirely on whether fee-on-transfer tokens are actually configured, which the project claims to support.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Native ERC20 withdrawal path unwraps using the original requested amount (not the capped/actual withdrawn amount), causing reverts or unintended extra WETH pull from msgSender",
+      "severity": "high",
+      "summary": "BVault.withdrawERC20 passes the user-supplied `amount` into unwrapNativeTokenInWallet after SupplyLogic.executeWithdrawERC20 may have reduced params.amount to the user's actual balance. Because the struct is passed by value, BVault does not learn the capped amount. unwrapNativeTokenInWallet then transferFroms WETH from msgSender for the (too-large) original amount, reverting or potentially pulling additional WETH from msgSender if they have balance+allowance.",
+      "description": [
+        {
+          "file": "src/modules/BVault.sol",
+          "line_start": 20,
+          "line_end": 20,
+          "desc": "after executeWithdrawERC20(...), calls unwrapNativeTokenInWallet(asset, msgSender, amount) using original amount variable"
+        },
+        {
+          "file": "SupplyLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: executeWithdrawERC20()"
+        }
+      ],
+      "impact": "HIGH severity. (1) All native ETH withdrawals using type(uint256).max or any amount exceeding user balance will revert, constituting a denial of service for a common user pattern ('withdraw all'). (2) If receiver != msgSender in native path, the WETH was sent to receiver but unwrap pulls from msgSender, creating a mismatch. (3) If msgSender has sufficient pre-existing WETH balance and allowance, excess WETH beyond the withdrawn amount could be pulled, causing direct financial loss. Users must use exact amounts for native withdrawals, which requires off-chain balance calculation \u2014 fragile and error-prone.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Isolate Liquidation Sends NFT to Caller Instead of Winning Bidder - Free NFT Theft",
+      "severity": "high",
+      "summary": "In executeIsolateLiquidate, the NFT collateral is transferred to params.msgSender (the caller of isolateLiquidate) instead of loanData.lastBidder (the auction winner). The winning bidder's escrowed funds are consumed to repay the debt, but the NFT goes to whoever calls the function after the auction ends. Any address can call isolateLiquidate\u2014there is no access control restricting it to the winning bidder.",
+      "description": [
+        {
+          "file": "IsolateLogic.sol",
+          "line_start": 370,
+          "line_end": 377,
+          "desc": "VaultLogic.erc721TransferIsolateSupplyOnLiquidate(nftAssetData, params.msgSender, params.nftTokenIds) and VaultLogic.erc721TransferOutLiquidity(nftAssetData, params.msgSender, params.nftTokenIds) use params.msgSender instead of loanData.lastBidder"
+        },
+        {
+          "file": "IsolateLiquidation.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: isolateLiquidate"
+        }
+      ],
+      "impact": "CRITICAL. This vulnerability allows any address to steal NFT collateral from auction winners. The winning bidder loses their entire bid amount (which can be tens or hundreds of ETH for valuable NFTs) and receives nothing. The attacker receives the NFT for free if the bid covers the debt, or for only the extra amount if debt accrued beyond the bid. This completely breaks the auction mechanism and makes participating in auctions financially dangerous. All isolate auction participants are potential victims.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Underflow in totalBidAmout during isolate liquidation permanently blocks liquidations",
+      "severity": "high",
+      "summary": "In executeIsolateLiquidate, the protocol subtracts totalBorrowAmount from assetData.totalBidAmout. However, the amount originally added to totalBidAmout during the auction was loanData.bidAmount. Since totalBorrowAmount includes accrued interest and can exceed bidAmount, this subtraction will underflow and revert if there are no other bids in escrow, permanently blocking the liquidation.",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 384,
+          "line_end": 387,
+          "desc": "assetData.totalBidAmout -= amount; where amount is vars.totalBorrowAmount"
+        }
+      ],
+      "impact": "CRITICAL. This bug blocks isolate loan liquidations whenever accrued interest between the last bid and liquidation execution causes the borrow amount to exceed the bid amount, AND there is insufficient totalBidAmout from other active auctions to absorb the difference. This creates permanent bad debt and locks lender funds. Given that interest accrues continuously and auction duration is 1 day (as configured in deployment scripts), this is highly likely to occur in normal operation.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Arbitrary onBehalf parameter in isolate repay allows targeted debt reduction or DoS",
+      "severity": "high",
+      "summary": "validateIsolateRepayBasic does not verify that onBehalf matches the NFT owner. An attacker can repay a loan specifying an arbitrary onBehalf address, causing that address's userScaledIsolateBorrow to decrease while the actual borrower's debt remains artificially inflated. This can be used to grief users by causing underflows in their future repayments.",
+      "description": [
+        {
+          "file": "IsolateLogic.sol",
+          "line_start": 153,
+          "line_end": 154,
+          "desc": "VaultLogic.erc20DecreaseIsolateScaledBorrow(debtGroupData, params.onBehalf, vars.scaledRepayAmount);"
+        },
+        {
+          "file": "ValidateLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: validateIsolateRepayBasic"
+        }
+      ],
+      "impact": "HIGH severity. The bug enables targeted DoS against any user with isolate borrows. The victim cannot repay their loan through normal means because their userScaledIsolateBorrow will underflow. Their NFT collateral remains locked, and as interest accrues, the loan will eventually go to auction/liquidation where the victim loses their collateral. The attacker's cost is the repayment amount (which goes to repaying someone else's actual debt), making this a griefing attack with real financial harm to victims.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Original borrowers retain NFT delegation rights after liquidation",
+      "severity": "high",
+      "summary": "executeDelegateERC721 allows borrowers to delegate NFT utility rights via DelegateRegistryV2. If the NFT is liquidated with supplyAsCollateral = true, the protocol retains ownership but transfers internal accounting to the liquidator. However, the external delegation is never revoked, allowing the original borrower to permanently retain utility/airdrop rights at the liquidator's expense.",
+      "description": [
+        {
+          "file": "LiquidationLogic.sol",
+          "line_start": 380,
+          "line_end": 385,
+          "desc": "Missing delegation revocation when transferring internal ownership to liquidator"
+        },
+        {
+          "file": "PoolLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: executeDelegateERC721"
+        }
+      ],
+      "impact": "HIGH impact. NFT utility rights (airdrops, token-gated access, governance) can represent significant value. In high-profile NFT collections, airdrops can be worth thousands of dollars per token. The borrower can intentionally exploit this by delegating before liquidation, extracting maximum loan value, and retaining utility. Liquidators are the direct victims, receiving less value than expected for their liquidation payment. This undermines liquidator incentives, which are critical for protocol solvency.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "IsolateRedeem Decreases Wrong User's Borrow Balance Enabling Debt Theft",
+      "severity": "high",
+      "summary": "executeIsolateRedeem calls erc20DecreaseIsolateScaledBorrow(debtGroupData, params.msgSender, vars.amountScaled) using the caller's address instead of the actual loan borrower (tokenData.owner). An attacker with their own isolate borrow in the same group can call isolateRedeem on another user's auctioned loan, getting the attacker's own borrow balance decreased while paying the redeem amount. The loan's scaledAmount is correctly decreased but per-user accounting is corrupted, breaking the invaria",
+      "description": [
+        {
+          "file": "IsolateLogic.sol",
+          "line_start": 211,
+          "line_end": 213,
+          "desc": "erc20DecreaseIsolateScaledBorrow(debtGroupData, params.msgSender, vars.amountScaled) uses params.msgSender instead of tokenData.owner"
+        },
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: erc20DecreaseIsolateScaledBorrow()"
+        }
+      ],
+      "impact": "CRITICAL: This is a concrete code defect that corrupts per-user borrow accounting. Direct impacts: (1) Attacker gets own debt tracking reduced without reducing their own loan, (2) Original borrower accumulates phantom debt that persists after full loan repayment, (3) The borrowedAssets flag may never be cleared for the original borrower due to residual userScaledIsolateBorrow, (4) Attacker's own loan becomes un-repayable if the decrease exceeds their remaining userScaledIsolateBorrow. Systemic impacts: divergence between sum(userScaledIsolateBorrow) and sum(loanData.scaledAmount), interest accrual on phantom debt, potential permanent locking of user accounts.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "ERC721 Flash Loan Bypasses lockerAddr Check Allowing Extraction of Yield-Locked NFTs",
+      "severity": "high",
+      "summary": "executeFlashLoanERC721 checks tokenData.owner and loanData.loanStatus but does NOT check tokenData.lockerAddr. An NFT locked by a yield manager (lockerAddr != address(0)) can be flash-loaned out of the pool. During the callback, the attacker has physical custody of an NFT that the yield protocol believes is locked, enabling manipulation such as claiming airdrops, manipulating delegation, or breaking yield protocol assumptions.",
+      "description": [
+        {
+          "file": "FlashLoanLogic.sol",
+          "line_start": 52,
+          "line_end": 73,
+          "desc": "Flash loan ERC721 validation checks tokenData.owner and loanData.loanStatus but has no check for tokenData.lockerAddr != address(0)"
+        },
+        {
+          "file": "ValidateLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: validateFlashLoanERC721Basic()"
+        },
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: erc721SetTokenLockerAddr"
+        }
+      ],
+      "impact": "HIGH severity. The lockerAddr mechanism is a fundamental security primitive of the yield integration. Bypassing it through flash loans allows: (1) Claiming airdrops/rewards that should accrue to the pool or yield protocol during the lock period. (2) Manipulating external protocol state (e.g., governance votes, delegation) during the callback. (3) Potentially breaking yield manager assumptions, leading to stuck funds or incorrect accounting in yield strategies. The attack requires only gas costs and can be executed in a single transaction by the NFT owner.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Cross Liquidation ERC721 Missing Close Factor Enables Over-Liquidation",
+      "severity": "high",
+      "summary": "executeCrossLiquidateERC20 enforces a close factor (50% when HF close to 1, 100% for deeply underwater positions) via _calculateUserERC20Debt. However, executeCrossLiquidateERC721 has NO close factor mechanism. A liquidator can specify up to MAX_LIQUIDATION_ERC721_TOKEN_NUM tokens to liquidate regardless of how slightly underwater the position is. For a borrower barely below HF=1, the liquidator can seize all their NFTs (capturing the liquidation bonus on each), far exceeding what would be neede",
+      "description": [
+        {
+          "file": "LiquidationLogic.sol",
+          "line_start": 120,
+          "line_end": 200,
+          "desc": "executeCrossLiquidateERC721 has no close factor check; compare with _calculateUserERC20Debt lines which enforce closeFactor = DEFAULT_LIQUIDATION_CLOSE_FACTOR or MAX_LIQUIDATION_CLOSE_FACTOR"
+        }
+      ],
+      "impact": "HIGH severity. Borrowers with ERC721 cross collateral face disproportionate liquidation losses compared to ERC20 collateral borrowers. With 5 NFTs at 10 ETH each and 10% bonus, the borrower loses ~5 ETH in bonus (10% of 50 ETH) when a close-factor-limited liquidation would only extract ~1-2 ETH in bonus. This creates a strong economic asymmetry that disadvantages NFT collateral users and incentivizes predatory liquidation behavior. The invariant INV-ECON-007 is violated because collateral seized (in terms of bonus value extracted) far exceeds what is proportionate to restore solvency.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Isolate Auction First Bid Minimum Equals Borrow Amount Creating Permanent Bad Debt",
+      "severity": "high",
+      "summary": "The first bid in an isolate auction must be >= vars.borrowAmount AND >= vars.liquidatePrice. If the NFT floor price drops significantly below the accumulated debt (borrowAmount >> NFT value), no rational bidder will bid because they'd pay more than the NFT is worth. The loan becomes permanently stuck: can't be liquidated (no bidder), can't be repaid by owner (they abandoned it), creating unrecoverable bad debt. calculateNftLoanLiquidatePrice confirms the liquidatePrice is bounded by borrowAmount",
+      "description": [
+        {
+          "file": "IsolateLogic.sol",
+          "line_start": 175,
+          "line_end": 181,
+          "desc": "require(params.amounts[vars.nidx] >= vars.borrowAmount) enforces bid >= debt; when debt >> NFT value, no rational bidder participates"
+        },
+        {
+          "file": "GenericLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: calculateNftLoanLiquidatePrice"
+        }
+      ],
+      "impact": "The impact is systemic: during major NFT market downturns, multiple isolate loans could simultaneously become underwater. Each underwater loan permanently locks the borrowed ERC20 liquidity. If enough positions go underwater, the pool's availableLiquidity could be significantly reduced, potentially triggering a bank run scenario where remaining lenders race to withdraw before liquidity is exhausted. The protocol has no visible mechanism to socialize bad debt or force-close underwater positions. The deployment script shows LTV of 6000 bp, so a >40% NFT price decline (historically common in NFT markets) combined with accrued interest could trigger this scenario.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Isolate Liquidation Fails to Clear Locker Address, Permanently Bricking Re-Deposited NFTs",
+      "severity": "high",
+      "summary": "When an isolate loan is liquidated, the protocol fails to reset the NFT's `lockerAddr`. If the liquidated NFT is ever re-deposited into the protocol, it becomes permanently stuck and cannot be withdrawn.",
+      "description": [
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 470,
+          "line_end": 481,
+          "desc": "Clears owner and supplyMode but omits tokenData.lockerAddr = address(0)"
+        }
+      ],
+      "impact": "CRITICAL: Any NFT that goes through isolate liquidation will have a permanently stale lockerAddr. If the NFT is ever re-deposited into the same pool, it becomes permanently stuck. For supplyAsCollateral=true, the liquidator's NFT is immediately stuck. This represents a permanent loss of user funds (NFTs) that can only be resolved through a contract upgrade. The issue occurs naturally during normal protocol operation without any attacker involvement.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Missing Oracle Price Validation Allows Zero-Price Mass Liquidations",
+      "severity": "high",
+      "summary": "The protocol does not validate oracle prices for zero values. If an oracle returns 0 for a collateral asset, the protocol calculates the user's collateral value as 0 without reverting, immediately making the position liquidatable.",
+      "description": [
+        {
+          "file": "GenericLogic.sol",
+          "line_start": 106,
+          "line_end": 115,
+          "desc": "No check for vars.assetPrice == 0 before using it in multiplication."
+        }
+      ],
+      "impact": "HIGH impact. If any oracle returns 0 for a collateral asset: (1) All positions using that collateral become instantly liquidatable regardless of actual collateral value. (2) Mass liquidations can occur across the protocol. (3) User funds are irreversibly lost as collateral is seized. (4) For isolate lending, calculateNftLoanLiquidatePrice would revert on division by zero if the DEBT asset price is 0, potentially bricking liquidation/auction flows. The severity depends on whether PriceOracle.sol (not in scope) has zero-price protections. Without seeing that contract, the core protocol logic is defensively deficient.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Untrusted ERC20 or ERC721 token behavior can lock the protocol due to strict balance-delta invariants on transfers",
+      "severity": "high",
+      "summary": "VaultLogic enforces exact balance deltas for ERC20 transfers in/out and between wallets (poolSizeAfter == poolSizeBefore \u00b1 amount). Tokens with transfer fees, rebasing, blocklists, or non-standard balance semantics can cause reverts and lock deposits/withdrawals/repays/liquidations for that asset. While the documentation claims support for weird ERC20 traits, these strict checks explicitly reject them, creating an operational DoS vector if such assets are listed.",
+      "description": [
+        {
+          "file": "src/libraries/logic/VaultLogic.sol",
+          "line_start": 20,
+          "line_end": 20,
+          "desc": "require(poolSizeAfter == (poolSizeBefore + amount), Errors.INVALID_TRANSFER_AMOUNT)"
+        },
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: erc20TransferBetweenWallets()"
+        }
+      ],
+      "impact": "HIGH impact. If triggered, the affected asset market freezes completely: deposits revert (erc20TransferInLiquidity), withdrawals revert (erc20TransferOutLiquidity), repayments revert (erc20TransferInLiquidity), liquidations revert (erc20TransferInLiquidity for debt payment), and auction operations revert (erc20TransferInBidAmount/erc20TransferOutBidAmount). Positions become stuck, potentially leading to cascading insolvency as debt accrues without ability to repay or liquidate. Recovery requires protocol upgrade or emergency intervention.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Isolate Auction Interest Accrual Between Bid and Liquidation Can Create Underpaid Debt",
+      "severity": "high",
+      "summary": "Interest accrues between the time a bid is placed and when liquidation is executed. The bid amount is fixed at bidding time, but borrowAmount grows with compound interest. In executeIsolateLiquidate, if bidAmount < borrowAmount, the difference (extraBorrowAmounts) must be paid by the caller. However, the caller is NOT the bidder (per ECON-H001). Combined with the NFT theft issue, an attacker can time liquidation to maximize the interval, ensuring extraBorrowAmounts pushes cost onto the legitimat",
+      "description": [
+        {
+          "file": "IsolateLogic.sol",
+          "line_start": 340,
+          "line_end": 355,
+          "desc": "borrowAmount computed with current normalizedIndex; bidAmount is fixed from auction time; gap paid by params.msgSender"
+        }
+      ],
+      "impact": "No impact. The described interest accrual gap is correctly handled by the extraBorrowAmounts mechanism. The protocol's solvency is maintained because the require check ensures full debt coverage. The caller bears the interest cost, which is appropriate since they receive the NFT collateral. At typical rates (5-10% APY) over a 1-day auction, the gap is approximately 0.014-0.027% of principal - small but correctly accounted for.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Malicious bidders can permanently lock isolate auctions using reverting fallbacks or blocklists",
+      "severity": "high",
+      "summary": "executeIsolateAuction refunds the previous bidder using erc20TransferOutBidAmount. If the previous bidder is a smart contract that reverts on ERC20 transfers (for tokens with callbacks) or an address blacklisted by the token (e.g., USDC), the refund will revert. This prevents anyone from outbidding them, allowing the attacker to win the auction at the minimum price.",
+      "description": [
+        {
+          "file": "IsolateLogic.sol",
+          "line_start": 250,
+          "line_end": 252,
+          "desc": "VaultLogic.erc20TransferOutBidAmount(debtAssetData, vars.oldLastBidder, vars.oldBidAmount);"
+        },
+        {
+          "file": "VaultLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: erc20TransferOutBidAmount"
+        }
+      ],
+      "impact": "HIGH severity. If triggered, this vulnerability: (1) Permanently locks the auction, preventing competitive bidding. (2) The attacker wins the NFT at the minimum bid price (which equals the debt amount), potentially far below market value. (3) The borrower's NFT redemption via isolateRedeem is also blocked (same push-refund pattern). (4) Protocol lenders bear losses if the NFT is sold below its true value. The practical exploitability depends on the attacker's ability to get their address blacklisted, which is a limiting factor. However, the code defect exists regardless.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Supply/borrow index uint128 casting may brick assets under extreme rate model outputs or long inactivity windows",
+      "severity": "high",
+      "summary": "InterestLogic stores supplyIndex and borrowIndex as uint128 and uses SafeCastUpgradeable.toUint128() when updating. Under extreme borrowRate/supplyRate values (e.g., misconfigured/buggy interest rate model) or very long time deltas, next indexes can exceed uint128 max, causing permanent reverts on updateInterestIndexs for the asset, effectively bricking all operations touching that asset.",
+      "description": [
+        {
+          "file": "InterestLogic.sol",
+          "line_start": 170,
+          "line_end": 230,
+          "desc": "nextSupplyIndex/nextBorrowIndex cast via toUint128(); overflow reverts and blocks further operations"
+        }
+      ],
+      "impact": "If triggered, this causes permanent denial of service for all operations on the affected asset. Users cannot withdraw funds, borrowers cannot repay debts, and liquidations cannot proceed. This locks all deposited funds and creates permanently bad debt. Recovery would require a contract upgrade and state migration, which is complex given the shared storage architecture. The severity is MEDIUM because it requires admin misconfiguration or extremely long inactivity periods with current deployed IRMs, but the impact if triggered is HIGH (permanent fund lockup).",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    },
+    {
+      "title": "Flash Loan ERC20 Reentrancy Enables Borrowing at Manipulated Interest Rates",
+      "severity": "high",
+      "summary": "flashLoanERC20 lacks nonReentrant modifier. During the IFlashLoanReceiver callback, availableLiquidity is NOT decremented for flash-loaned tokens. An attacker can re-enter executeCrossBorrowERC20 during the callback. The borrow's updateInterestRates call sees inflated availableLiquidity, computing artificially low utilization and therefore lower borrow rates. The actual token transfer for the borrow succeeds if pool retains sufficient unlent balance. The attacker locks in below-market borrow rat",
+      "description": [
+        {
+          "file": "FlashLoan.sol",
+          "line_start": 16,
+          "line_end": 28,
+          "desc": "flashLoanERC20 has whenNotPaused but NO nonReentrant modifier; FlashLoanLogic transfers tokens out without updating availableLiquidity, then invokes external callback"
+        },
+        {
+          "file": "FlashLoanLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: executeFlashLoanERC20()"
+        },
+        {
+          "file": "BorrowLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: executeCrossBorrowERC20"
+        },
+        {
+          "file": "InterestLogic.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: updateInterestRates()"
+        }
+      ],
+      "impact": "No impact. While the reentrancy vector is real and a reentrant borrow can be executed during a flash loan callback, the interest rates are NOT manipulated. The borrow rate computed during the reentrant call is identical to what it would be without the flash loan. No depositor yield is suppressed, no protocol fees are lost, and no accounting invariant is violated.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "contested"
+    }
+  ]
+}

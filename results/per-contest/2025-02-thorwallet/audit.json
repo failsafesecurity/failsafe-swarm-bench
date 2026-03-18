@@ -1,0 +1,243 @@
+{
+  "vulnerabilities": [
+    {
+      "title": "Off-by-One Boundary at Exactly 360 Days Allows TGT Deposit for Zero TITN Output",
+      "severity": "high",
+      "summary": "At exactly block.timestamp - launchTime == 360 days, onTokenTransfer allows the deposit (uses strict > 360 days check), but quoteTitn returns 0 (uses < 360 days in both rate branches). The user's TGT is transferred into the contract but 0 claimable TITN is credited. Additionally, claimTitn reverts at >= 360 days, so the user cannot reclaim anything. The TGT is permanently locked with no TITN received.",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 73,
+          "line_end": 74,
+          "desc": "onTokenTransfer: (block.timestamp - launchTime > 360 days) revert; quoteTitn: if(timeSinceLaunch < 90 days)...else if(timeSinceLaunch < 360 days)...else titnAmount=0; claimTitn: (block.timestamp - launchTime >= 360 days) revert"
+        }
+      ],
+      "impact": "Any user depositing TGT at exactly the 360-day boundary loses 100% of their deposited TGT with zero TITN in return. The TGT cannot be recovered — there is no refund mechanism. The owner's withdraw() function could theoretically return the TGT, but there is no automated mechanism and no guarantee the owner would do so. Additionally, this bug affects not just the exact-second boundary but conceptually demonstrates a missing safeguard (require(titnOut > 0)) that should protect users from zero-output deposits at any time.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "TITN Insolvency via Unlimited TGT Deposits – No Cap Enforcement",
+      "severity": "high",
+      "summary": "onTokenTransfer accepts unlimited TGT deposits and allocates proportional TITN via quoteTitn without checking whether cumulative allocated TITN exceeds the available TITN_ARB (173.7M). If total TGT deposited exceeds TGT_TO_EXCHANGE (579M), totalTitnClaimable exceeds TITN_ARB, rendering the contract insolvent. TGT max supply is ~1B (TGT_TO_EXCHANGE is 57.9% of it), so depositing the full supply would over-commit TITN by ~72%. Early claimers can drain the contract via claimTitn, leaving late claim",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 67,
+          "line_end": 84,
+          "desc": "onTokenTransfer increments claimableTitnPerUser and totalTitnClaimable by quoteTitn(amount) without any check that totalTitnClaimable + totalTitnClaimed <= TITN_ARB or titn.balanceOf(this)"
+        }
+      ],
+      "impact": "CRITICAL. If TGT deposits exceed 579M (which is feasible given ~1B total TGT supply), the contract becomes insolvent. Early claimers drain the TITN pool; late claimers lose 100% of their expected TITN. The withdrawRemainingTitn function is additionally broken by underflow. The entire 173.7M TITN allocation is at risk.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "withdrawRemainingTitn Permanent DoS via Arithmetic Underflow",
+      "severity": "high",
+      "summary": "In withdrawRemainingTitn(), the calculation `unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable` will underflow (revert in Solidity 0.8+) if the contract's TITN balance at snapshot time is less than totalTitnClaimable. This occurs when TGT deposits exceed TGT_TO_EXCHANGE (ECON-H001), causing totalTitnClaimable > actual TITN balance. The snapshot is attempted on every call when remainingTitnAfter1Year == 0 (which it stays at if balance < totalTitnClaimable), permanently DoS-ing all p",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 100,
+          "line_end": 132,
+          "desc": "Line ~117: `uint256 unclaimedTitn = remainingTitnAfter1Year - initialTotalClaimable` — no check that remainingTitnAfter1Year >= initialTotalClaimable. If contract balance < totalTitnClaimable at snapshot, underflow reverts permanently."
+        }
+      ],
+      "impact": "CRITICAL severity. After 360 days, if the underflow condition exists, ALL users who have not fully claimed their TITN via claimTitn (before 360 days) permanently lose access to their tokens. There is no admin recovery function, no emergency withdrawal, and no way to fix the snapshot values. The contract enters a dead state for post-360-day operations. The amount at risk is up to the full TITN_ARB (173.7M TITN) if no users claimed before 360 days.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Permanent Transfer Restriction Griefing via Cross-Chain Dust Bridging",
+      "severity": "high",
+      "summary": "The _credit function in Titn.sol permanently sets isBridgedTokenHolder[_to] = true for any address receiving bridged tokens, with no mechanism to clear it. An attacker can bridge a dust amount (1 wei) of TITN to any victim's address on a non-Arbitrum chain. This permanently marks the victim as a bridged token holder. When isBridgedTokensTransferLocked is true, the victim cannot transfer their TITN (including legitimately acquired non-bridged tokens) on that chain, except to the owner, transferAl",
+      "description": [
+        {
+          "file": "Titn.sol",
+          "line_start": 96,
+          "line_end": 105,
+          "desc": "_credit line 103: `isBridgedTokenHolder[_to] = true` — permanent, no clearing function exists. _validateTransfer line 82: `isBridgedTokenHolder[from]` blocks transfers when isBridgedTokensTransferLocked is true."
+        }
+      ],
+      "impact": "HIGH severity. Any TITN holder's address can be targeted at negligible cost. The victim loses the ability to transfer, sell, or interact with DeFi protocols using their TITN on the affected chain. This could lock significant value permanently. The attack scales trivially - an attacker could target hundreds of addresses in a loop for a few dollars total. The only owner remediation is disabling all transfer restrictions globally, which may compromise other security objectives.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Zero-Output Deposits Accepted During Late Decay Phase",
+      "severity": "high",
+      "summary": "onTokenTransfer checks `amount == 0` for the input TGT amount but never validates that the output titnOut is non-zero. During the late decay phase (approaching 360 days) and due to integer division truncation, quoteTitn can return 0 for non-trivial TGT amounts. The deposit succeeds, TGT is permanently locked in the contract, and the user receives 0 claimable TITN. This extends beyond the exact 360d boundary (ECON-H003) to any point where the decay formula produces a zero result due to rounding.",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 80,
+          "line_end": 84,
+          "desc": "Line 80: `uint256 titnOut = quoteTitn(amount)` — no check for titnOut > 0 before crediting. Line 142-144: decay formula with integer division `(tgtAmount * TITN_ARB * remainingtime) / (TGT_TO_EXCHANGE * 270 days)` rounds to 0 when remainingtime is small enough relative to tgtAmount."
+        }
+      ],
+      "impact": "The code defect is real but its practical impact varies: (1) During the 90-360 day decay phase, only sub-dust TGT amounts (< ~78M wei ≈ 0.00000000008 TGT) produce zero output — negligible economic impact. (2) At the exact 360-day boundary, ANY TGT amount produces zero output — this is the more impactful scenario. The root cause is the same missing check: require(titnOut > 0). The defect violates the principle that a contract should not silently accept value and credit nothing.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "lzEndpoint Transfer Exemption Creates Irrecoverable Token Loss Path",
+      "severity": "high",
+      "summary": "_validateTransfer exempts transfers where `to == lzEndpoint`, intending to allow bridging. However, actual OFT bridging uses OFT.send() → _debit() → _burn(), which bypasses transfer/transferFrom entirely. The lzEndpoint exemption therefore only enables direct ERC20 transfers TO the LayerZero endpoint address, which does NOT bridge the tokens – they become permanently stuck at the endpoint address. On Arbitrum (where all non-exempt transfers are blocked), this is one of only two allowed destinati",
+      "description": [
+        {
+          "file": "Titn.sol",
+          "line_start": 72,
+          "line_end": 87,
+          "desc": "Line 86: `to != lzEndpoint` — exempts transfers to lzEndpoint. But OFT._debit() uses _burn() (line 21 of OFT base), not transfer(). So `to == lzEndpoint` in a transfer() call sends tokens to the endpoint contract address directly, not bridging them."
+        }
+      ],
+      "impact": "Any user on Arbitrum who calls `transfer(lzEndpoint, amount)` loses 100% of the transferred amount permanently. While this requires user confusion (not an active attack), the code's design makes this confusion likely by (a) explicitly allowing transfers to lzEndpoint as one of only two permitted destinations, and (b) using a comment 'Allow transfers to LayerZero endpoint' that implies this is the way to bridge. The defect is in the code logic itself — the exemption serves no valid purpose and creates a harmful side effect.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "withdrawRemainingTitn Snapshot Race: First Caller Determines Distribution for All Users",
+      "severity": "high",
+      "summary": "The first caller of withdrawRemainingTitn() after 360 days sets remainingTitnAfter1Year and initialTotalClaimable permanently. These snapshot values determine the proportional bonus for ALL subsequent users. If the contract's TITN balance is manipulated before the first call (e.g., by someone sending TITN directly to the contract or owner withdrawing), the snapshot captures a distorted state. While donation doesn't benefit the donor (analysis shows net-negative), the owner or a coordinated entit",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 105,
+          "line_end": 112,
+          "desc": "Lines 107-111: `if (remainingTitnAfter1Year == 0) { remainingTitnAfter1Year = currentRemainingTitn; initialTotalClaimable = totalTitnClaimable; }` — One-shot initialization based on current state, permanent for all users."
+        }
+      ],
+      "impact": "The owner can extract TITN from the contract before the snapshot, reducing the proportional bonus for all users who have not yet claimed. The maximum impact is the entire unclaimed bonus pool (TITN_ARB - totalTitnClaimed - totalTitnClaimable at the 360-day mark). If the owner withdraws enough TITN to make remainingTitnAfter1Year < initialTotalClaimable, the subtraction at line 118 underflows (Solidity 0.8+ reverts), permanently DoS-ing all post-year claims — a more severe outcome covered by INV-STATE-003.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Precision Loss in Proportional Distribution Traps TITN",
+      "severity": "high",
+      "summary": "In withdrawRemainingTitn, the user's bonus is calculated as (claimableTitn * unclaimedTitn) / initialTotalClaimable. Because Solidity integer division truncates towards zero, the sum of all userProportionalShare amounts will be strictly less than unclaimedTitn unless it divides perfectly. This leaves a dust amount of TITN permanently locked in the contract after all users have claimed.",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 122,
+          "line_end": 122,
+          "desc": "userProportionalShare = (claimableTitn * unclaimedTitn) / initialTotalClaimable truncates"
+        }
+      ],
+      "impact": "The impact is LOW in economic terms. The maximum total dust locked is approximately N wei where N is the number of users, which for 18-decimal tokens is effectively zero in monetary terms. The owner can recover dust via the withdraw() function. However, the defect means users collectively receive slightly less than their fair share of unclaimed TITN, which is a real (if minor) code defect in the distribution logic.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "TwoWay LockedStatus Enum Defined But Functionally Identical to OneWay - Missing Reverse Functionality",
+      "severity": "high",
+      "summary": "The IMerge interface defines three LockedStatus values: Locked, OneWay, and TwoWay. However, the onTokenTransfer function only checks `lockedStatus == LockedStatus.Locked`, treating OneWay and TwoWay identically. No code path exists that differentiates TwoWay from OneWay. If TwoWay was intended to enable reversible deposits (returning TGT to depositors in exchange for TITN), this functionality is completely missing. Users or governance processes expecting a TwoWay mode to provide deposit reversa",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 73,
+          "line_end": 74,
+          "desc": "onTokenTransfer only checks `lockedStatus == LockedStatus.Locked`; no code anywhere differentiates TwoWay from OneWay; no reverse exchange function exists"
+        },
+        {
+          "file": "IMerge.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: LockedStatus"
+        }
+      ],
+      "impact": "Low-medium severity. The TwoWay enum value constitutes dead code with misleading semantics. If governance or an owner sets TwoWay expecting different behavior, they get none. Users cannot reverse deposits regardless of mode. The owner can withdraw TGT via the withdraw() function, but users have no self-service reversal. This is a code quality issue (dead code / incomplete implementation) rather than a critical vulnerability, but it meets the definition of a code defect since the enum defines a semantic contract that the implementation does not fulfill.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Transfer restriction bypass by using bridge burn/mint path: Arbitrum 'locked transfers' do not prevent cross-chain exit",
+      "severity": "high",
+      "summary": "Titn restricts transfer/transferFrom via _validateTransfer, but OFT bridge-out uses internal _debit (burn) and does not call transfer/transferFrom. Therefore, even when 'bridged token transfers are locked' on Arbitrum, users can still bridge tokens out (e.g., to Base) via send(), effectively bypassing the intended 'only transfer to lzEndpoint' restriction policy if the policy was meant to block any movement other than bridging to a specific path/contract. This can undermine operational assumptio",
+      "description": [
+        {
+          "file": "contracts/Titn.sol",
+          "line_start": 21,
+          "line_end": 43,
+          "desc": "_validateTransfer restricts ERC20 transfers; OFT bridging uses internal mint/burn hooks and does not necessarily use transfer(to=lzEndpoint); lzEndpoint exemption is implemented in _validateTransfer only"
+        },
+        {
+          "file": "Titn.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: transferFrom(address from, address to, uint256 amount)"
+        }
+      ],
+      "impact": "The impact is a policy/operational control gap: the transfer lock on Arbitrum can be circumvented by bridging tokens to another chain. Users can relocate liquidity cross-chain even when transfers are locked. Additionally, the `to != lzEndpoint` exemption is dead code that could lead to unintended behavior if anyone transfers tokens directly to the endpoint address (tokens would be sent but NOT bridged, effectively losing them). The dead code indicates a fundamental misunderstanding of the OFT mechanism that could lead to further issues if the developer makes changes based on incorrect assumptions.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Off-By-One Boundary Condition Causes Irreversible Loss of TGT",
+      "severity": "high",
+      "summary": "At exactly 360 days after launch, onTokenTransfer allows TGT deposits because it checks `> 360 days`. However, quoteTitn returns 0 because it checks `< 360 days`. A user depositing at exactly this timestamp will have their TGT taken but receive 0 claimable TITN, and cannot claim because claimTitn reverts at `>= 360 days`.",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 63,
+          "line_end": 80,
+          "desc": "Inconsistent boundary operators (> vs < vs >=) across functions"
+        }
+      ],
+      "impact": "A user depositing TGT at exactly the 360-day boundary permanently loses their TGT with no TITN compensation and no recovery mechanism. The financial impact scales with the amount deposited. While the window is narrow (a single timestamp value), it represents a real code defect — the contract accepts a deposit that produces zero output. The owner's withdraw() function could theoretically return the TGT, but this requires manual admin intervention and is not a built-in safeguard.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Owner can renounce ownership and permanently brick critical admin actions (launch/lock/withdraw), leaving user funds stuck",
+      "severity": "high",
+      "summary": "MergeTgt relies on onlyOwner for setLaunchTime, setLockedStatus, deposit and withdraw. Ownable’s renounceOwnership() is publicly callable by current owner. If ownership is renounced (accidentally or maliciously), launchTime may never be set (or lock cannot be changed), and no one can deposit funding or recover tokens, potentially permanently freezing the merge or stranding assets.",
+      "description": [
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 16,
+          "line_end": 18,
+          "desc": "Critical lifecycle functions are onlyOwner; Ownable also exposes renounceOwnership() (inherited) with no override/guard to prevent bricking."
+        }
+      ],
+      "impact": "If ownership is renounced before the setup sequence: the entire merge protocol is permanently bricked with no possibility of recovery. Users cannot deposit TGT or claim TITN. If renounced after setup: loss of administrative emergency recovery (withdraw function), inability to pause deposits (setLockedStatus), and any tokens accidentally sent to the contract are permanently locked. The severity is HIGH because the damage is irreversible and affects all users.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    },
+    {
+      "title": "Changing transferAllowedContract Away From MergeTgt Permanently Locks All TITN Claims",
+      "severity": "high",
+      "summary": "MergeTgt is deployed as the transferAllowedContract on Arbitrum (per arbitrumSetup.ts). On Arbitrum (chainId 42161), ALL transfers are blocked except for exempted addresses. MergeTgt relies on being the transferAllowedContract to transfer TITN to users in claimTitn() and withdrawRemainingTitn(). If the owner calls setTransferAllowedContract() to change it to a different address (e.g., a staking contract or DEX), MergeTgt loses its exemption. All safeTransfer calls in MergeTgt would revert due to",
+      "description": [
+        {
+          "file": "Titn.sol",
+          "line_start": 72,
+          "line_end": 84,
+          "desc": "Single transferAllowedContract slot. MergeTgt relies on being this address to transfer TITN. On Arbitrum (chainId 42161), block.chainid == arbitrumChainId is always true, so ALL non-exempt transfers revert. If transferAllowedContract changes, MergeTgt's from-address is no longer exempt."
+        },
+        {
+          "file": "MergeTgt.sol",
+          "line_start": 0,
+          "line_end": 0,
+          "desc": "Affected function: claimTitn(uint256)"
+        }
+      ],
+      "impact": "All unclaimed TITN (up to 173.7M TITN) would be permanently locked in MergeTgt. Every user with claimableTitnPerUser > 0 would be unable to claim. The only recovery path is setBridgedTokenTransferLocked(false), which removes all transfer restrictions globally - a heavy-handed fix that may compromise other security invariants. Alternatively, the owner could set transferAllowedContract back to MergeTgt, but this would break whatever new contract needed the exemption.",
+      "proof_of_concept": "See technical analysis above.",
+      "remediation": "N/A",
+      "_source": "confirmed"
+    }
+  ]
+}

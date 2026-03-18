@@ -1,0 +1,381 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T03:30:56.358Z",
+    "duration_ms": 236041
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001-executeFeeSwap",
+        "source": "msg.sender (external caller providing userToken)",
+        "path": [
+          "1. Caller invokes executeFeeSwap(userToken, validatorToken, amountIn)",
+          "2. poolId computed via keccak256(abi.encode(userToken, validatorToken))",
+          "3. amountOut = (amountIn * M) / SCALE — fixed-rate calculation",
+          "4. _requireU128 checks on amountIn and amountOut",
+          "5. Reserve sufficiency check: pool.reserveValidatorToken >= amountOut",
+          "6. IERC20(userToken).transferFrom(msg.sender, address(this), amountIn) — EXTERNAL CALL",
+          "7. pool.reserveUserToken += uint128(amountIn) — STATE UPDATE AFTER EXTERNAL CALL",
+          "8. pool.reserveValidatorToken -= uint128(amountOut) — STATE UPDATE AFTER EXTERNAL CALL",
+          "9. IERC20(validatorToken).transfer(msg.sender, amountOut) — SECOND EXTERNAL CALL"
+        ],
+        "transformations": [
+          "amountOut = amountIn * 9970 / 10000 (0.3% fee deduction)",
+          "uint256 to uint128 truncation"
+        ],
+        "sinks": [
+          "pools[poolId].reserveUserToken",
+          "pools[poolId].reserveValidatorToken",
+          "msg.sender receives validatorToken"
+        ],
+        "trust_changes": "Caller-supplied token addresses are trusted without validation; any address can be passed as userToken/validatorToken",
+        "validation_points": [
+          "_requireU128 overflow guard",
+          "reserve sufficiency check before outgoing transfer"
+        ],
+        "exposure_risks": [
+          "No validation that tokens are legitimate ERC20 contracts"
+        ],
+        "manipulation_risks": [
+          "CRITICAL REENTRANCY: userToken.transferFrom callback fires BEFORE pool reserves are updated. Attacker can reenter executeFeeSwap and drain validatorToken reserves because the reserve check still passes with the old (higher) reserveValidatorToken value.",
+          "Fee-on-transfer tokens cause reserve accounting mismatch: amountIn is credited to reserves but actual tokens received may be less",
+          "No check that amountIn > 0; zero-amount swaps waste gas and emit misleading events",
+          "No slippage protection or deadline"
+        ]
+      },
+      {
+        "flow_id": "DF-002-rebalanceSwap",
+        "source": "msg.sender (external caller providing validatorToken)",
+        "path": [
+          "1. Caller invokes rebalanceSwap(userToken, validatorToken, amountOut, to)",
+          "2. Check amountOut != 0",
+          "3. amountIn = (amountOut * N) / SCALE + 1 — fixed-rate with rounding up",
+          "4. _requireU128 checks on amountOut and amountIn",
+          "5. Overflow check: pool.reserveValidatorToken + amountIn <= type(uint128).max",
+          "6. Reserve sufficiency check: pool.reserveUserToken >= amountOut",
+          "7. pool.reserveValidatorToken += uint128(amountIn) — STATE UPDATE BEFORE TRANSFER",
+          "8. pool.reserveUserToken -= uint128(amountOut) — STATE UPDATE BEFORE TRANSFER",
+          "9. IERC20(validatorToken).transferFrom(msg.sender, address(this), amountIn) — EXTERNAL CALL",
+          "10. IERC20(userToken).transfer(to, amountOut) — EXTERNAL CALL"
+        ],
+        "transformations": [
+          "amountIn = amountOut * 9985 / 10000 + 1 (0.15% fee with ceil rounding)"
+        ],
+        "sinks": [
+          "pools[poolId] reserves updated",
+          "to address receives userToken"
+        ],
+        "trust_changes": "Optimistic state update: reserves are modified before actual token transfers occur",
+        "validation_points": [
+          "amountOut != 0",
+          "_requireU128",
+          "overflow check on reserve addition",
+          "reserve sufficiency for userToken"
+        ],
+        "exposure_risks": [
+          "Arbitrary 'to' address receives userTokens"
+        ],
+        "manipulation_risks": [
+          "HIGH REENTRANCY: State is updated BEFORE transferFrom. If validatorToken has callbacks (ERC777), attacker can reenter burn or other functions while reserves reflect tokens that haven't actually arrived. Contract's actual validatorToken balance is less than reserveValidatorToken. Reentering burn would extract tokens based on inflated reserves.",
+          "Fee-on-transfer tokens: fewer tokens arrive than amountIn, but reserves reflect the full amountIn"
+        ]
+      },
+      {
+        "flow_id": "DF-003-mint",
+        "source": "msg.sender (LP depositing validatorToken)",
+        "path": [
+          "1. Caller invokes mint(userToken, validatorToken, amountValidatorToken, to)",
+          "2. Identity check: userToken != validatorToken",
+          "3. Check amountValidatorToken != 0",
+          "4. Compute poolId",
+          "5. Branch: first deposit vs subsequent deposit",
+          "5a. First deposit: liquidity = amountValidatorToken / 2 - MIN_LIQUIDITY; totalSupply += MIN_LIQUIDITY (locked, unowned)",
+          "5b. Subsequent: denom = reserveValidatorToken + (N * reserveUserToken / SCALE); liquidity = amountValidatorToken * totalSupply / denom",
+          "6. Check liquidity != 0",
+          "7. _requireU128(amountValidatorToken)",
+          "8. IERC20(validatorToken).transferFrom(msg.sender, address(this), amountValidatorToken) — EXTERNAL CALL",
+          "9. pool.reserveValidatorToken += uint128(amountValidatorToken) — STATE UPDATE AFTER EXTERNAL CALL",
+          "10. totalSupply += liquidity; liquidityBalances[to] += liquidity"
+        ],
+        "transformations": [
+          "First deposit: liquidity = amountValidatorToken/2 - 1000",
+          "Subsequent: proportional to effective pool value"
+        ],
+        "sinks": [
+          "pools[poolId].reserveValidatorToken",
+          "totalSupply[poolId]",
+          "liquidityBalances[poolId][to]"
+        ],
+        "trust_changes": "LP tokens minted to arbitrary 'to' address; no overflow check on reserveValidatorToken + amountValidatorToken (relies on Solidity 0.8 checked arithmetic giving opaque revert)",
+        "validation_points": [
+          "userToken != validatorToken",
+          "amountValidatorToken != 0",
+          "liquidity != 0",
+          "_requireU128"
+        ],
+        "exposure_risks": [
+          "LP tokens are non-transferable (no transfer function); only the owner can burn"
+        ],
+        "manipulation_risks": [
+          "REENTRANCY: validatorToken.transferFrom fires BEFORE reserve and totalSupply updates. If validatorToken has callbacks, attacker could reenter mint or other functions with stale pool state to obtain excess LP tokens.",
+          "Missing overflow check: pool.reserveValidatorToken + amountValidatorToken could overflow uint128 (only caught by Solidity checked arithmetic, giving confusing error)",
+          "Fee-on-transfer tokens: LP receives LP tokens valued at amountValidatorToken but fewer tokens actually deposited"
+        ]
+      },
+      {
+        "flow_id": "DF-004-burn",
+        "source": "msg.sender (LP removing liquidity)",
+        "path": [
+          "1. Caller invokes burn(userToken, validatorToken, liquidity, to)",
+          "2. Identity check: userToken != validatorToken",
+          "3. Check liquidity != 0",
+          "4. Check liquidityBalances[poolId][msg.sender] >= liquidity",
+          "5. _calculateBurnAmounts: amountUserToken = liquidity * reserveUserToken / totalSupply; amountValidatorToken = liquidity * reserveValidatorToken / totalSupply",
+          "6. _requireU128 checks",
+          "7. IERC20(userToken).transfer(to, amountUserToken) — EXTERNAL CALL BEFORE STATE UPDATE",
+          "8. IERC20(validatorToken).transfer(to, amountValidatorToken) — EXTERNAL CALL BEFORE STATE UPDATE",
+          "9. liquidityBalances[msg.sender] -= liquidity — STATE UPDATE AFTER TRANSFERS",
+          "10. totalSupply -= liquidity — STATE UPDATE AFTER TRANSFERS",
+          "11. pool.reserveUserToken -= amountUserToken — STATE UPDATE AFTER TRANSFERS",
+          "12. pool.reserveValidatorToken -= amountValidatorToken — STATE UPDATE AFTER TRANSFERS"
+        ],
+        "transformations": [
+          "Proportional share: amount = liquidity * reserve / totalSupply"
+        ],
+        "sinks": [
+          "to address receives both tokens",
+          "pool reserves decremented",
+          "LP balance decremented"
+        ],
+        "trust_changes": "CRITICAL: External calls happen while all state (balances, reserves, totalSupply) still reflects pre-burn values",
+        "validation_points": [
+          "userToken != validatorToken",
+          "liquidity != 0",
+          "balance >= liquidity"
+        ],
+        "exposure_risks": [
+          "Tokens sent to arbitrary 'to' address"
+        ],
+        "manipulation_risks": [
+          "CRITICAL REENTRANCY: Both token transfers occur BEFORE any state updates. If userToken or validatorToken has callback hooks (ERC777, hooks, etc.), the attacker can reenter burn(). On reentry, liquidityBalances[msg.sender] is unchanged, totalSupply is unchanged, and reserves are unchanged. The exact same liquidity amount can be burned again, extracting double (or more) the tokens. This completely drains the pool.",
+          "Division by zero if totalSupply somehow reaches 0 (mitigated by MIN_LIQUIDITY lock but worth noting)",
+          "Rounding down on both token amounts means dust is left in the pool on each burn"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Fixed-rate swap: FeeSwap charges 0.3% fee (M=9970), RebalanceSwap charges 0.15% fee (N=9985)",
+        "Single-sided LP: only validatorToken is deposited; userToken accumulates from FeeSwaps",
+        "MIN_LIQUIDITY (1000 wei) locked permanently on first deposit to prevent total supply reaching zero",
+        "LP share calculation accounts for 'effective value' of userToken at N/SCALE discount",
+        "Burns proportionally return both tokens based on LP share of totalSupply"
+      ],
+      "economic_incentives": [
+        "LPs earn spread between FeeSwap fee (0.3%) and RebalanceSwap fee (0.15%) = 0.15% per unit cycle",
+        "Rebalancers incentivized: they pay only 0.9985 validatorToken per 1 userToken extracted",
+        "No protocol fee extraction — all spread accrues to LPs",
+        "Fixed-rate model means no impermanent loss in the traditional sense, but LPs bear inventory risk if rebalancing doesn't occur"
+      ],
+      "governance_mechanisms": [
+        "No governance mechanism exists",
+        "No admin controls, no pause functionality, no fee adjustment capability",
+        "Pool creation is fully permissionless"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "CRITICAL: Reentrancy in burn() — transfers before state updates",
+          "expected_behavior": "LP tokens should be non-reusable; burning X LP tokens should only work once",
+          "actual_behavior": "Both token transfers (lines: IERC20.transfer) execute BEFORE liquidityBalances, totalSupply, and reserves are decremented. A callback-enabled token (ERC777) allows reentry into burn() where the same LP balance is still available, enabling repeated extraction.",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker deploys pool with ERC777-compatible userToken or validatorToken. Provides liquidity. Calls burn() → receives callback → reenters burn() → drains entire pool. Loss = total pool reserves."
+        },
+        {
+          "scenario": "CRITICAL: Reentrancy in executeFeeSwap() — callback before reserve update",
+          "expected_behavior": "Reserve check should prevent over-extraction of validatorToken",
+          "actual_behavior": "IERC20(userToken).transferFrom fires BEFORE reserveValidatorToken is decremented. If userToken triggers a callback, attacker reenters executeFeeSwap while reserveValidatorToken still shows the full pre-swap amount, bypassing the sufficiency check repeatedly.",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker creates pool with ERC777 userToken and legitimate validatorToken. Calls executeFeeSwap repeatedly via reentrancy callback, draining all validatorToken reserves."
+        },
+        {
+          "scenario": "HIGH: Optimistic state update in rebalanceSwap() enables phantom reserve inflation",
+          "expected_behavior": "Reserves should reflect actual token balances",
+          "actual_behavior": "pool.reserveValidatorToken is incremented BEFORE validatorToken.transferFrom actually moves tokens. During the transferFrom callback, the contract state shows inflated validatorToken reserves. Reentering burn() yields proportionally more validatorToken than actually exists.",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker with LP tokens calls rebalanceSwap with ERC777 validatorToken. During transferFrom callback, reenters burn(). Burns LP tokens based on inflated reserves. transferFrom then completes but damage is done — pool is insolvent."
+        },
+        {
+          "scenario": "Fee-on-transfer token accounting mismatch",
+          "expected_behavior": "Reserves should track actual contract balances",
+          "actual_behavior": "Reserves are updated by nominal transfer amounts (amountIn/amountOut), not actual received amounts. Fee-on-transfer tokens cause progressive divergence between tracked reserves and actual balances. Eventually, burns and swaps revert when trying to transfer more than the actual balance.",
+          "risk_level": "high",
+          "exploitation_potential": "If a pool is created with a fee-on-transfer token, LPs who deposited early can withdraw before the deficit becomes apparent, while later LPs lose funds."
+        },
+        {
+          "scenario": "executeFeeSwap with amountIn = 0",
+          "expected_behavior": "Should revert or be a no-op",
+          "actual_behavior": "amountOut = 0. No explicit check for amountIn == 0. Proceeds to transfer 0 tokens (may revert on some ERC20 implementations). Emits FeeSwap event with 0 amounts.",
+          "risk_level": "low",
+          "exploitation_potential": "Can be used for event spam/griefing, wastes gas for callers"
+        },
+        {
+          "scenario": "First depositor minting with minimum amount",
+          "expected_behavior": "Minimum liquidity lock prevents very small first deposits",
+          "actual_behavior": "MIN_LIQUIDITY = 1000 (in smallest units, ~1e-15 for 18-decimal tokens). First depositor needs only 2002 wei to get 1 LP token. For 18-decimal stablecoins, this is negligible. The protection is extremely weak.",
+          "risk_level": "low",
+          "exploitation_potential": "No classic donation-based first depositor attack is possible since reserves use internal accounting rather than balanceOf. However, the locked MIN_LIQUIDITY is economically insignificant."
+        },
+        {
+          "scenario": "Missing overflow check in mint for reserveValidatorToken accumulation",
+          "expected_behavior": "Should explicitly check and revert with descriptive error if reserves overflow uint128",
+          "actual_behavior": "rebalanceSwap has explicit overflow check for reserveValidatorToken, but mint does not. The uint128 addition will revert due to Solidity 0.8 checked math, but with a generic Panic(0x11) error instead of InsufficientReserves.",
+          "risk_level": "low",
+          "exploitation_potential": "No direct exploit; only confusing error message. In practice, uint128.max ≈ 3.4e38 is extremely large for stablecoins."
+        },
+        {
+          "scenario": "Rebasing token destroys accounting invariants",
+          "expected_behavior": "Reserves track actual balances",
+          "actual_behavior": "Positive rebases increase actual balance without updating reserves — excess tokens stuck forever. Negative rebases decrease actual balance below tracked reserves — burns/swaps revert.",
+          "risk_level": "medium",
+          "exploitation_potential": "Pools with rebasing tokens become insolvent or trap funds. Users who detect rebase events early can front-run to extract value."
+        },
+        {
+          "scenario": "Burn with pool containing only one token type (reserveUserToken = 0)",
+          "expected_behavior": "LP should receive validatorToken proportionally",
+          "actual_behavior": "amountUserToken = 0 (liquidity * 0 / totalSupply = 0). IERC20(userToken).transfer(to, 0) is called, which may revert on some ERC20 implementations that reject zero-value transfers.",
+          "risk_level": "medium",
+          "exploitation_potential": "LPs could be unable to exit if userToken reverts on zero transfer. Their funds are locked."
+        },
+        {
+          "scenario": "No slippage protection or deadline on swaps",
+          "expected_behavior": "Users should be able to specify minimum output and transaction deadline",
+          "actual_behavior": "Fixed-rate swaps have deterministic output, so slippage from price movement is not possible. However, transactions can be held in mempool indefinitely and executed when it may no longer be desired.",
+          "risk_level": "low",
+          "exploitation_potential": "Stale transactions executed at unfavorable times, though fixed rate limits the impact"
+        }
+      ],
+      "assumption_violations": [
+        "CRITICAL ASSUMPTION VIOLATED: No reentrancy guards present. The contract assumes token transfers don't trigger callbacks. Any ERC777, ERC1363, or hook-enabled token breaks this assumption.",
+        "Assumes all tokens are standard ERC20 with no fee-on-transfer, rebasing, or non-standard return behavior",
+        "Assumes token.transfer and token.transferFrom always return true or revert (no false returns checked — OZ IERC20 interface doesn't use SafeERC20)",
+        "Assumes all stablecoins have identical value (1:1 peg); any depeg breaks the fixed-rate swap economics",
+        "Assumes tokens do not revert on zero-value transfers",
+        "Assumes tokens have the same number of decimals; different decimals break the fixed-rate 1:1 assumption"
+      ],
+      "game_theory_risks": [
+        "LP value leakage: If rebalancing doesn't occur, userToken accumulates in the pool. LPs are exposed to inventory risk — they deposited validatorToken but may withdraw mostly userToken.",
+        "Arbitrage mispricing: The fixed-rate model ignores market prices. If actual market rate diverges from 1:1 minus fees, arbitrageurs will drain the more valuable token.",
+        "No incentive for rebalancers when peg holds: rebalanceSwap charges a fee, so rational actors only rebalance when userToken is cheaper than validatorToken elsewhere.",
+        "Pool can be permanently drained of validatorToken via executeFeeSwap with no mechanism to replenish other than rebalanceSwap or new LP deposits.",
+        "Malicious pool creation: Attacker can create pools with worthless tokens pretending to be stablecoins, tricking users into providing real liquidity."
+      ],
+      "integration_risks": [
+        "No SafeERC20 usage — tokens that return false instead of reverting will silently fail, leading to state updates without actual token movement",
+        "Non-standard ERC20 tokens (USDT, BNB) that don't return bool will cause the IERC20 interface calls to revert",
+        "No token whitelist or validation — pools can be created with any address including contracts that are not ERC20 tokens",
+        "No oracle integration to validate token price parity — relies entirely on the assumption that paired tokens are 1:1 stablecoins",
+        "Cross-pool interactions: same token can be userToken in one pool and validatorToken in another, creating complex interdependencies"
+      ],
+      "calculation_errors": [
+        "executeFeeSwap: amountOut = (amountIn * 9970) / 10000 — correctly implements 0.3% fee with truncation (favors pool). No error.",
+        "rebalanceSwap: amountIn = (amountOut * 9985) / 10000 + 1 — the +1 ensures minimum payment but creates disproportionate fee for very small swaps (e.g., amountOut=1 → amountIn=1, which is 0% fee instead of 0.15%)",
+        "mint first deposit: liquidity = amountValidatorToken / 2 — integer division truncates odd amounts, losing 0.5 wei of 'value'. This is negligible.",
+        "mint subsequent: denom uses N*reserveUserToken/SCALE which truncates, slightly undervaluing userToken reserves. This means slightly more LP tokens are minted than strictly correct, marginally diluting existing LPs.",
+        "_calculateBurnAmounts: proportional calculation truncates, leaving dust in the pool. Over many burns this dust accumulates. The locked MIN_LIQUIDITY ensures this dust is never orphaned."
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "userToken",
+          "behaviors": [
+            "rebasing:unknown",
+            "fee_on_transfer:unknown",
+            "permit:unknown",
+            "non_standard_return:possible",
+            "callback_onTransfer:possible"
+          ],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "User-specified token address with zero validation. Not checked for ERC20 compliance. No SafeERC20 wrapper used. Fee-on-transfer and rebasing tokens break internal reserve accounting. ERC777/ERC1363 tokens enable reentrancy attacks. Non-standard return tokens (e.g. USDT) may cause reverts through IERC20 interface."
+        },
+        {
+          "address_or_symbol": "validatorToken",
+          "behaviors": [
+            "rebasing:unknown",
+            "fee_on_transfer:unknown",
+            "permit:unknown",
+            "non_standard_return:possible",
+            "callback_onTransfer:possible"
+          ],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "User-specified token address with zero validation. Same risks as userToken. Additionally used in optimistic state update pattern in rebalanceSwap (reserves updated before transferFrom), enabling phantom reserve inflation via reentrancy."
+        },
+        {
+          "address_or_symbol": "LP_TOKEN (internal)",
+          "behaviors": [
+            "mint_burn_restricted",
+            "non_transferable"
+          ],
+          "decimals": 18,
+          "approval_model": "bounded",
+          "transfer_model": "other",
+          "accounting_model": "balanceOf",
+          "notes": "Internal LP accounting via liquidityBalances mapping. No transfer function exists — LP positions are non-transferable. MIN_LIQUIDITY (1000) locked on first deposit to prevent total supply reaching zero. Reentrancy in burn allows same LP balance to be burned multiple times."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "reserve_balance_consistency",
+          "state_vars": [
+            "pools[poolId].reserveUserToken",
+            "pools[poolId].reserveValidatorToken",
+            "IERC20(userToken).balanceOf(this)",
+            "IERC20(validatorToken).balanceOf(this)"
+          ],
+          "notes": "VIOLATED by: fee-on-transfer tokens (actual < tracked), rebasing tokens (actual != tracked), reentrancy attacks (state update ordering). The contract tracks reserves internally but never reconciles with actual balances."
+        },
+        {
+          "name": "lp_supply_conservation",
+          "state_vars": [
+            "totalSupply[poolId]",
+            "sum(liquidityBalances[poolId][*])"
+          ],
+          "notes": "totalSupply = sum(all liquidityBalances) + MIN_LIQUIDITY. MIN_LIQUIDITY is added to totalSupply on first deposit but never assigned to any address, ensuring totalSupply never reaches zero. VIOLATED during reentrancy: burn transfers tokens before decrementing balances, allowing double-burn."
+        },
+        {
+          "name": "swap_rate_invariant",
+          "state_vars": [
+            "M",
+            "N",
+            "SCALE"
+          ],
+          "notes": "Constants: FeeSwap rate = M/SCALE = 0.997, RebalanceSwap rate = SCALE/N ≈ 1.0015 (caller pays). Net LP spread per cycle ≈ 0.15%. Fixed rates regardless of pool state or market conditions."
+        },
+        {
+          "name": "burn_proportionality",
+          "state_vars": [
+            "liquidity",
+            "totalSupply[poolId]",
+            "reserveUserToken",
+            "reserveValidatorToken"
+          ],
+          "notes": "amountToken = liquidity * reserve / totalSupply. Truncation means slightly less than proportional is returned. Dust accumulates in pool over many burns."
+        }
+      ]
+    }
+  }
+}

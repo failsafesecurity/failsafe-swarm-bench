@@ -1,0 +1,356 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "invariant_state_access",
+    "llm_model": null,
+    "methodology_sections": [
+      "1. Lifecycle Integrity - State transitions, illegal states, predecessors",
+      "2. Monotonicity & Irreversibility - Increasing values, one-way transitions",
+      "3. Access & Permission Logic - Conditional access, role requirements",
+      "4. Time & Resource Integrity - Time-locks, resource bounds, expiry"
+    ],
+    "timestamp": "2026-03-05T05:24:13.625Z",
+    "duration_ms": 338034
+  },
+  "analysis": {
+    "invariants": [
+      {
+        "id": "INV-STATE-001",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "SgxVerifier.sol",
+        "description": "When an SGX instance is replaced via verifyProof, the new instance address is NOT added to addressRegistered, allowing the same address to re-register via registerInstance and obtain a duplicate instance ID, bypassing the one-instance-per-address invariant.",
+        "attack_scenario": "1) SGX enclave proves block, oldInstance replaced with newInstance via _replaceInstance. 2) addressRegistered[newInstance] remains false. 3) Attacker calls registerInstance with attestation for newInstance. 4) _addInstances succeeds (addressRegistered check passes), creating a second valid instance ID for the same address. 5) Enclave now has two valid instance IDs, can bypass expiry by rotating between them.",
+        "invariant_logic": "forall id, addr: if instances[id].addr == addr then addressRegistered[addr] == true",
+        "solidity_property": "function invariant_sgx_registered() public view { for (uint256 i = 0; i < nextInstanceId; i++) { if (instances[i].addr != address(0)) { assert(addressRegistered[instances[i].addr] == true); } } }",
+        "inventory_refs": [
+          {
+            "file": "SgxVerifier.sol",
+            "function": "_replaceInstance"
+          },
+          {
+            "file": "SgxVerifier.sol",
+            "function": "_addInstances"
+          },
+          {
+            "file": "SgxVerifier.sol",
+            "function": "verifyProof"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-002",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LibVerifying.sol",
+        "description": "Blocks must be verified in strictly sequential order: lastVerifiedBlockId must only increase by contiguous increments. No block may be verified unless all predecessors have been verified, and the parent hash chain must be unbroken.",
+        "attack_scenario": "If this invariant is violated, an attacker could skip verification of intermediate blocks, allowing invalid state transitions to be finalized on L1. The signal service would sync incorrect state roots to other chains, corrupting cross-chain message verification.",
+        "invariant_logic": "old(lastVerifiedBlockId) <= lastVerifiedBlockId AND lastVerifiedBlockId < numBlocks AND forall blockId in (old(lastVerifiedBlockId), lastVerifiedBlockId]: transition[blockId].parentHash == transition[blockId-1].blockHash",
+        "solidity_property": "function invariant_sequential_verification() public view { (TaikoData.SlotA memory a, TaikoData.SlotB memory b) = getStateVariables(); assert(b.lastVerifiedBlockId < b.numBlocks); }",
+        "inventory_refs": [
+          {
+            "file": "LibVerifying.sol",
+            "function": "verifyBlocks"
+          },
+          {
+            "file": "TaikoL1.sol",
+            "function": "proveBlock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-003",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LibProving.sol",
+        "description": "A contested transition (ts.contester != address(0)) MUST NOT be verified. Verification must halt at any contested transition until it is resolved by a higher-tier proof that clears the contester.",
+        "attack_scenario": "If a contested transition could be verified, an attacker could submit an invalid state transition, and even if someone contests it, the invalid transition would be finalized, leading to incorrect state roots being synced cross-chain and enabling theft of bridged assets.",
+        "invariant_logic": "forall blockId <= lastVerifiedBlockId: transitions[blockId][verifiedTransitionId].contester == address(0)",
+        "solidity_property": "function invariant_no_contested_verified() public view { TaikoData.Config memory config = getConfig(); (,TaikoData.SlotB memory b) = getStateVariables(); (TaikoData.Block memory blk, TaikoData.TransitionState memory ts) = getBlock(b.lastVerifiedBlockId); if (blk.verifiedTransitionId != 0) { assert(ts.contester == address(0)); } }",
+        "inventory_refs": [
+          {
+            "file": "LibVerifying.sol",
+            "function": "verifyBlocks"
+          },
+          {
+            "file": "LibProving.sol",
+            "function": "proveBlock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-004",
+        "severity": "HIGH",
+        "category": "monotonicity",
+        "target_contract": "LibProving.sol",
+        "description": "A transition's proof tier can only increase or stay the same, never decrease. New proofs must have tier >= meta.minTier AND tier >= ts.tier. This ensures proof security only strengthens over time.",
+        "attack_scenario": "If tier could decrease, an attacker could override a valid SGX proof with a cheaper optimistic proof, effectively downgrading the security guarantee and allowing invalid transitions to stand until the cooldown expires.",
+        "invariant_logic": "forall transition ts: new_proof.tier >= ts.tier AND new_proof.tier >= meta.minTier AND new_proof.tier > 0",
+        "solidity_property": "function invariant_tier_monotonic(uint64 blockId, bytes32 parentHash) public view { TaikoData.TransitionState memory ts = getTransition(blockId, parentHash); assert(ts.tier >= 0); }",
+        "inventory_refs": [
+          {
+            "file": "LibProving.sol",
+            "function": "proveBlock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-005",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LibProving.sol",
+        "description": "The proving pause toggle (pauseProving) resets lastUnpausedAt, which extends ALL active proving windows and cooldown periods. A malicious chain_pauser can indefinitely extend the assigned prover's exclusive proving window by repeatedly toggling pause, preventing any other prover from submitting proofs for first transitions.",
+        "attack_scenario": "1) Malicious chain_pauser colludes with assigned prover. 2) Assigned prover never submits proof. 3) Chain_pauser calls pauseProving(true) then pauseProving(false) every hour, resetting lastUnpausedAt. 4) Proving window for tid=1 never expires: max(ts.timestamp, lastUnpausedAt) + provingWindow*60 >= block.timestamp remains true. 5) No other prover can submit proof for the first transition, stalling block verification indefinitely.",
+        "invariant_logic": "lastUnpausedAt should only be set on genuine unpause transitions, not on repeated toggles. Alternatively: proving window expiry should be based on block proposal time, not max(proposalTime, lastUnpausedAt)",
+        "solidity_property": "function invariant_proving_window_bounded() public view { (,TaikoData.SlotB memory b) = getStateVariables(); TaikoData.Config memory config = getConfig(); assert(block.timestamp - b.lastUnpausedAt <= 2 * 2880 * 60); }",
+        "inventory_refs": [
+          {
+            "file": "LibProving.sol",
+            "function": "_checkProverPermission"
+          },
+          {
+            "file": "LibProving.sol",
+            "function": "pauseProving"
+          },
+          {
+            "file": "TaikoL1.sol",
+            "function": "unpause"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-006",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "LibProposing.sol",
+        "description": "The ring buffer for blocks must maintain the invariant that numBlocks - lastVerifiedBlockId <= blockMaxProposals. This prevents proposed blocks from overwriting unverified blocks in the ring buffer. The ring buffer size must exceed blockMaxProposals + 1 to maintain slot uniqueness.",
+        "attack_scenario": "If more blocks are proposed than the ring buffer can hold beyond lastVerifiedBlockId, new proposals would overwrite unverified block data. Provers referencing overwritten blocks would get incorrect metadata, and verification would fail or produce incorrect results.",
+        "invariant_logic": "numBlocks < lastVerifiedBlockId + blockMaxProposals + 1 AND blockRingBufferSize > blockMaxProposals + 1",
+        "solidity_property": "function invariant_ring_buffer_capacity() public view { (,TaikoData.SlotB memory b) = getStateVariables(); TaikoData.Config memory config = getConfig(); assert(b.numBlocks < b.lastVerifiedBlockId + config.blockMaxProposals + 1); assert(config.blockRingBufferSize > config.blockMaxProposals + 1); }",
+        "inventory_refs": [
+          {
+            "file": "LibProposing.sol",
+            "function": "proposeBlock"
+          },
+          {
+            "file": "LibVerifying.sol",
+            "function": "_isConfigValid"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-007",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LibProposing.sol",
+        "description": "After hook execution during block proposal, the TaikoToken balance of TaikoL1 must have increased by exactly config.livenessBond. This prevents malicious hooks from either under-paying (draining existing bonds) or over-paying (manipulating the balance check through flash-loan-like attacks on the token balance).",
+        "attack_scenario": "A malicious hook could call back into TaikoL1 or manipulate token balances to make it appear the liveness bond was paid when it was actually sourced from existing bonds in the contract. The exact balance check mitigates this, but any mechanism that can inflate the token balance between the pre and post snapshots without a real transfer would bypass it.",
+        "invariant_logic": "tko.balanceOf(address(this)) == tkoBalance_before + config.livenessBond after all hooks complete",
+        "solidity_property": "function invariant_liveness_bond_exact() public view { /* enforced inline in LibProposing.proposeBlock via balance snapshot comparison */ }",
+        "inventory_refs": [
+          {
+            "file": "LibProposing.sol",
+            "function": "proposeBlock"
+          },
+          {
+            "file": "AssignmentHook.sol",
+            "function": "onBlockProposed"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-008",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "TaikoTimelockController.sol",
+        "description": "The getMinDelay override returns 0 for TIMELOCK_ADMIN_ROLE holders, completely bypassing the governance timelock. Any holder of TIMELOCK_ADMIN_ROLE can execute proposals immediately, rendering the timelock protection meaningless if the admin role is compromised.",
+        "attack_scenario": "1) Attacker gains TIMELOCK_ADMIN_ROLE (via compromised key or social engineering). 2) Attacker schedules a malicious operation (e.g., changing AddressManager mappings to point to attacker contracts). 3) Because getMinDelay() returns 0, attacker can execute immediately in the same block. 4) Attacker drains bridged assets by replacing signal_service or bridge contract addresses.",
+        "invariant_logic": "getMinDelay() should return a non-zero value for ALL callers, or admin bypass should require additional safeguards (multisig, separate approval)",
+        "solidity_property": "function invariant_timelock_delay() public view { assert(getMinDelay() > 0 || !hasRole(TIMELOCK_ADMIN_ROLE, msg.sender)); }",
+        "inventory_refs": [
+          {
+            "file": "TaikoTimelockController.sol",
+            "function": "getMinDelay"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-009",
+        "severity": "HIGH",
+        "category": "time_resource",
+        "target_contract": "LibVerifying.sol",
+        "description": "A proven transition can only be verified after its cooldown period expires. The cooldown is computed as max(ts.timestamp, lastUnpausedAt) + cooldownWindow*60. This prevents premature finalization of potentially invalid proofs and gives contesters time to challenge.",
+        "attack_scenario": "If cooldown enforcement is bypassed, an attacker could submit a fraudulent proof and have it verified before anyone can contest it, finalizing an invalid state root. Cross-chain bridges relying on the state root would then process fraudulent messages.",
+        "invariant_logic": "forall verified transition ts: block.timestamp >= max(ts.timestamp, lastUnpausedAt) + getTier(ts.tier).cooldownWindow * 60",
+        "solidity_property": "function invariant_cooldown_respected() public view { /* Checked inline in LibVerifying.verifyBlocks loop before setting verifiedTransitionId */ }",
+        "inventory_refs": [
+          {
+            "file": "LibVerifying.sol",
+            "function": "verifyBlocks"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-010",
+        "severity": "HIGH",
+        "category": "state_machine",
+        "target_contract": "Guardians.sol",
+        "description": "Guardian set updates must atomically invalidate ALL prior pending approvals by incrementing the version counter. Approvals from a previous guardian set must never count toward the quorum of a new guardian set.",
+        "attack_scenario": "If old approvals persisted across guardian set changes, a removed malicious guardian's prior approvals could still count toward quorum, allowing a compromised minority to reach threshold for guardian-tier proofs with fewer current guardians than required.",
+        "invariant_logic": "forall hash h: _approvals[old_version][h] has no effect on isApproved() after version is incremented. setGuardians always increments version.",
+        "solidity_property": "function invariant_guardian_version() public view { assert(version > 0); assert(minGuardians >= (guardians.length + 1) >> 1); assert(guardians.length >= MIN_NUM_GUARDIANS); }",
+        "inventory_refs": [
+          {
+            "file": "Guardians.sol",
+            "function": "setGuardians"
+          },
+          {
+            "file": "Guardians.sol",
+            "function": "approve"
+          },
+          {
+            "file": "GuardianProver.sol",
+            "function": "approve"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-011",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "LibProving.sol",
+        "description": "The assigned prover is completely locked out from proving after the exclusive window or for non-first transitions. Even if the assigned prover's original proof was correct but contested, they cannot re-prove at a higher tier. The higher-tier prover becomes ts.prover, causing the assigned prover to lose half their liveness bond during verification despite proving correctly.",
+        "attack_scenario": "1) Assigned prover proves correctly at SGX tier within window. 2) Attacker contests with a different (invalid) transition at the same tier. 3) A third-party higher-tier prover confirms original transition was correct. 4) Third-party prover becomes ts.prover. 5) During verification, ts.prover != assignedProver, so assigned prover loses livenessBond/2. 6) Assigned prover gets validityBond + contestBond/4 from _overrideWithHigherProof, but still net-loses part of their liveness bond for being correct.",
+        "invariant_logic": "For tid == 1, ts.tier > 0: assignedProver is permanently excluded via _checkProverPermission. After override: ts.prover = msg.sender (not assignedProver). In verifyBlocks: if ts.prover != assignedProver, bondToReturn -= livenessBond >> 1",
+        "solidity_property": "function invariant_assigned_prover_lockout() public view { /* Structural: _checkProverPermission else branch always reverts for assignedProver when tid!=1 or tier!=0 or !inProvingWindow */ }",
+        "inventory_refs": [
+          {
+            "file": "LibProving.sol",
+            "function": "_checkProverPermission"
+          },
+          {
+            "file": "LibProving.sol",
+            "function": "_overrideWithHigherProof"
+          },
+          {
+            "file": "LibVerifying.sol",
+            "function": "verifyBlocks"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-012",
+        "severity": "CRITICAL",
+        "category": "state_machine",
+        "target_contract": "LibUtils.sol",
+        "description": "Every block stored in the ring buffer MUST have its blockId field match the expected blockId for that slot. This is the fundamental integrity check that prevents ring buffer wrap-around from causing cross-block data confusion. The check blk.blockId != _blockId must hold for every access to the ring buffer.",
+        "attack_scenario": "If the ring buffer wraps and a new block overwrites a slot that is still being referenced (e.g., during verification), the blockId mismatch check would fail and revert. However, if this check were absent or bypassable, a prover could submit proofs referencing stale block data from a previous ring buffer cycle, potentially verifying blocks with incorrect metadata.",
+        "invariant_logic": "forall slot access: blocks[blockId % ringBufferSize].blockId == blockId",
+        "solidity_property": "function invariant_ring_buffer_integrity(uint64 blockId) public view { TaikoData.Config memory config = getConfig(); (TaikoData.Block memory blk,) = getBlock(blockId); assert(blk.blockId == blockId); }",
+        "inventory_refs": [
+          {
+            "file": "LibUtils.sol",
+            "function": "getBlock"
+          },
+          {
+            "file": "LibUtils.sol",
+            "function": "getTransitionId"
+          },
+          {
+            "file": "LibVerifying.sol",
+            "function": "verifyBlocks"
+          },
+          {
+            "file": "LibProving.sol",
+            "function": "proveBlock"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-013",
+        "severity": "MEDIUM",
+        "category": "time_resource",
+        "target_contract": "LibDepositing.sol",
+        "description": "The ETH deposit ring buffer must never have an unprocessed deposit overwritten. The invariant numEthDeposits - nextEthDepositToProcess < ethDepositRingBufferSize - 1 must hold before any new deposit (including the fee deposit added by processDeposits).",
+        "attack_scenario": "If the ring buffer overflows, a new deposit would overwrite an unprocessed deposit, causing loss of user ETH. The fee deposit added in processDeposits could theoretically cause overflow if the pending count is not properly reduced by processing first.",
+        "invariant_logic": "numEthDeposits - nextEthDepositToProcess < ethDepositRingBufferSize - 1 at all times",
+        "solidity_property": "function invariant_eth_deposit_buffer() public view { (TaikoData.SlotA memory a,) = getStateVariables(); TaikoData.Config memory config = getConfig(); assert(a.numEthDeposits - a.nextEthDepositToProcess < config.ethDepositRingBufferSize - 1); }",
+        "inventory_refs": [
+          {
+            "file": "LibDepositing.sol",
+            "function": "depositEtherToL2"
+          },
+          {
+            "file": "LibDepositing.sol",
+            "function": "processDeposits"
+          },
+          {
+            "file": "LibDepositing.sol",
+            "function": "canDepositEthToL2"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-014",
+        "severity": "MEDIUM",
+        "category": "state_machine",
+        "target_contract": "LibProving.sol",
+        "description": "The nextTransitionId for a block is incremented in an unchecked block when creating new transitions. While practically infeasible (2^32 forks), if nextTransitionId overflows to 0, new transitions would collide with existing ones, corrupting proof state.",
+        "attack_scenario": "A griefing attacker submits proofs with 2^32 different parentHash values for a single block, causing nextTransitionId to overflow. After overflow, new transitions would overwrite the transition at id=0 (genesis/uninitialized), corrupting verification state.",
+        "invariant_logic": "forall block blk: blk.nextTransitionId > 0 AND blk.nextTransitionId >= blk.verifiedTransitionId",
+        "solidity_property": "function invariant_transition_id_overflow(uint64 blockId) public view { (TaikoData.Block memory blk,) = getBlock(blockId); assert(blk.nextTransitionId > 0); }",
+        "inventory_refs": [
+          {
+            "file": "LibProving.sol",
+            "function": "_createTransition"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-015",
+        "severity": "HIGH",
+        "category": "access_condition",
+        "target_contract": "SgxVerifier.sol",
+        "description": "SGX instances must pass both validity delay (INSTANCE_VALIDITY_DELAY for on-chain RA) and expiry (INSTANCE_EXPIRY) checks. However, instances replaced via _replaceInstance during proof verification get instant validity (validSince = block.timestamp) bypassing the 1-day delay, which is by design. The critical check is that expired instances cannot be used for proof verification.",
+        "attack_scenario": "An attacker reuses an attestation for an expired instance. Since _isInstanceValid checks validSince + INSTANCE_EXPIRY >= block.timestamp, expired instances are correctly rejected. But combined with INV-STATE-001 (duplicate registration), an attacker could maintain perpetually valid instance IDs.",
+        "invariant_logic": "forall proof verification: instances[id].validSince <= block.timestamp AND block.timestamp <= instances[id].validSince + INSTANCE_EXPIRY AND instances[id].addr == recovered_signer",
+        "solidity_property": "function invariant_sgx_validity(uint256 id) public view { Instance memory inst = instances[id]; if (inst.addr != address(0)) { assert(inst.validSince <= block.timestamp); } }",
+        "inventory_refs": [
+          {
+            "file": "SgxVerifier.sol",
+            "function": "_isInstanceValid"
+          },
+          {
+            "file": "SgxVerifier.sol",
+            "function": "verifyProof"
+          },
+          {
+            "file": "SgxVerifier.sol",
+            "function": "_replaceInstance"
+          }
+        ]
+      },
+      {
+        "id": "INV-STATE-016",
+        "severity": "MEDIUM",
+        "category": "access_condition",
+        "target_contract": "TaikoL1.sol",
+        "description": "Guardian proofs (TIER_GUARDIAN) are blocked by both whenNotPaused and whenProvingNotPaused modifiers on proveBlock. This means guardians cannot submit emergency proofs when proving is paused, despite being the highest authority tier. This could prevent emergency resolution of disputed transitions during a proving pause.",
+        "attack_scenario": "1) A malicious prover submits an invalid proof. 2) chain_pauser pauses proving (e.g., to prevent further damage). 3) Guardians cannot submit the correct proof because proveBlock is gated by whenProvingNotPaused. 4) The system is stuck: can't verify blocks and can't submit corrective guardian proofs until proving is unpaused. 5) If unpausing is delayed (e.g., owner key rotation), the protocol is stalled.",
+        "invariant_logic": "Guardian tier proofs should bypass provingPaused check, OR there should be a separate guardian-only proving path",
+        "solidity_property": "function invariant_guardian_always_provable() public view { /* Design gap: no dedicated guardian proving path when provingPaused == true */ }",
+        "inventory_refs": [
+          {
+            "file": "TaikoL1.sol",
+            "function": "proveBlock"
+          },
+          {
+            "file": "GuardianProver.sol",
+            "function": "approve"
+          }
+        ]
+      }
+    ]
+  }
+}

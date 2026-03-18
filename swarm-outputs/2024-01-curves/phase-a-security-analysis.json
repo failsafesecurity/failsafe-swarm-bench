@@ -1,0 +1,285 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-05T00:22:15.442Z",
+    "duration_ms": 183165
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Admin and Manager Access Control",
+        "trust_level": "untrusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "setManager",
+          "transferOwnership",
+          "setFeeRedistributor",
+          "setMaxFeePercent",
+          "setProtocolFeePercent",
+          "setExternalFeePercent",
+          "setERC20Factory",
+          "setCurves"
+        ],
+        "failure_modes": [
+          "Unauthorized users can execute privileged operations",
+          "Complete protocol takeover",
+          "Theft of funds via malicious FeeSplitter or Curves contract"
+        ],
+        "attack_vectors": [
+          "Direct call to onlyOwner/onlyManager functions by any address due to broken modifiers",
+          "Direct call to setCurves in FeeSplitter to hijack fee distribution"
+        ]
+      },
+      {
+        "boundary": "Token Trading and Fee Distribution",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "buyCurvesToken",
+          "sellCurvesToken",
+          "transferCurvesToken",
+          "claimFees"
+        ],
+        "failure_modes": [
+          "Loss of user fees on balance change",
+          "Theft of fees via token transfer",
+          "Denial of Service via array bloat",
+          "Denial of Service via zero total supply"
+        ],
+        "attack_vectors": [
+          "Transferring tokens to a new address to claim unearned fees",
+          "Wrapping all tokens to ERC20 to halt trading",
+          "Repeatedly buying/selling to bloat userTokens array"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "User has ETH, Contract has Token Supply",
+        "to_state": "User has Tokens, Contract has ETH, Fees Distributed",
+        "trigger": "buyCurvesToken",
+        "conditions": [
+          "Sale is open or user is whitelisted",
+          "msg.value >= price + totalFee"
+        ],
+        "invariants": [
+          "curvesTokenSupply equals sum of all curvesTokenBalance",
+          "ETH balance increases by price + totalFee minus distributed fees"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "User has Internal Tokens",
+        "to_state": "User has ERC20 Tokens, Internal Tokens locked in Contract",
+        "trigger": "withdraw",
+        "conditions": [
+          "User has sufficient internal token balance"
+        ],
+        "invariants": [
+          "ERC20 totalSupply equals internal tokens locked * 1 ether"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "low"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-118",
+        "pattern": "Incorrect Access Control",
+        "locations": [
+          "Security.sol: onlyOwner modifier",
+          "Security.sol: onlyManager modifier",
+          "FeeSplitter.sol: setCurves"
+        ],
+        "severity": "critical",
+        "evidence": "Modifiers evaluate boolean expressions (msg.sender == owner;) without require() or revert(). setCurves lacks any access control modifier.",
+        "exploitation_method": "An attacker can call any function protected by onlyOwner or onlyManager, or call setCurves to point to a malicious contract and drain funds.",
+        "affected_assets": [
+          "All protocol funds",
+          "All user fees"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Unprotected Ether Withdrawal / Logic Error",
+        "locations": [
+          "Curves.sol: _transfer",
+          "FeeSplitter.sol: updateFeeCredit"
+        ],
+        "severity": "critical",
+        "evidence": "The _transfer function does not update the userFeeOffset for the receiver. The receiver's offset remains 0.",
+        "exploitation_method": "An attacker can buy tokens, transfer them to a new address, and immediately call claimFees from the new address. Since the offset is 0, the contract will calculate owed fees from the beginning of time, allowing the attacker to drain the FeeSplitter.",
+        "affected_assets": [
+          "ETH in FeeSplitter"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Code With No Effects / Logic Error",
+        "locations": [
+          "FeeSplitter.sol: onBalanceChange"
+        ],
+        "severity": "high",
+        "evidence": "onBalanceChange overwrites data.userFeeOffset[account] with data.cumulativeFeePerToken without first calculating and storing the user's pending fees.",
+        "exploitation_method": "Whenever a user buys or sells a token, onBalanceChange is called, and any unclaimed fees they had accumulated are permanently lost.",
+        "affected_assets": [
+          "User claimable fees"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (Unbounded Array Bloat)",
+        "locations": [
+          "FeeSplitter.sol: onBalanceChange"
+        ],
+        "severity": "high",
+        "evidence": "userTokens[account].push(token) is called on every buy/sell without checking if the token is already in the array.",
+        "exploitation_method": "Repeatedly buying and selling a token will bloat the userTokens array, causing out-of-gas errors in getUserTokensAndClaimable and batchClaiming.",
+        "affected_assets": [
+          "User claimable fees"
+        ]
+      },
+      {
+        "swc_id": "SWC-128",
+        "pattern": "Denial of Service (Revert on Zero Supply)",
+        "locations": [
+          "FeeSplitter.sol: addFees",
+          "Curves.sol: _transferFees"
+        ],
+        "severity": "high",
+        "evidence": "addFees reverts if totalSupply_ == 0. totalSupply_ excludes tokens locked in the Curves contract (wrapped as ERC20).",
+        "exploitation_method": "If all circulating tokens are wrapped into ERC20, addFees reverts, which causes _transferFees to revert, completely halting all buying and selling of the token.",
+        "affected_assets": [
+          "Token trading functionality"
+        ]
+      },
+      {
+        "swc_id": "SWC-105",
+        "pattern": "Locked Ether",
+        "locations": [
+          "Curves.sol: _transferFees"
+        ],
+        "severity": "medium",
+        "evidence": "During a sell, if referralDefined is false, the referralFee is subtracted from the sellValue but is never sent to the protocol or the user.",
+        "exploitation_method": "Normal protocol usage will cause ETH to become permanently locked in the Curves contract.",
+        "affected_assets": [
+          "ETH in Curves contract"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [
+        {
+          "contract": "Security.sol",
+          "function": "setManager(address,bool)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "Security.sol",
+          "function": "transferOwnership(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "Curves.sol",
+          "function": "setFeeRedistributor(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "Curves.sol",
+          "function": "setMaxFeePercent(uint256)",
+          "guards": [
+            "onlyManager"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "Curves.sol",
+          "function": "setProtocolFeePercent(uint256,address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "Curves.sol",
+          "function": "setExternalFeePercent(uint256,uint256,uint256)",
+          "guards": [
+            "onlyManager"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "Curves.sol",
+          "function": "setERC20Factory(address)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Modifier is broken, effectively public"
+        },
+        {
+          "contract": "FeeSplitter.sol",
+          "function": "setCurves(Curves)",
+          "guards": [],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "No access control modifier present"
+        },
+        {
+          "contract": "CurvesERC20.sol",
+          "function": "mint(address,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Uses OpenZeppelin Ownable, correctly protected"
+        },
+        {
+          "contract": "CurvesERC20.sol",
+          "function": "burn(address,uint256)",
+          "guards": [
+            "onlyOwner"
+          ],
+          "has_timelock": false,
+          "cancel_window_sec": 0,
+          "notes": "Uses OpenZeppelin Ownable, correctly protected"
+        }
+      ],
+      "oracle_dependencies": []
+    }
+  }
+}

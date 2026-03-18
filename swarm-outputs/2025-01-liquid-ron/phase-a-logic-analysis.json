@@ -1,0 +1,472 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-09T02:49:52.089Z",
+    "duration_ms": 310271
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-native-deposit",
+        "source": "User sends native RON via deposit() or receive()",
+        "path": [
+          "User calls deposit() payable or sends RON to contract",
+          "_depositRONTo(escrow, msg.value) wraps RON to WRON, transfers WRON to Escrow",
+          "Escrow.deposit() calls IVault(vault).deposit(amount, sender)",
+          "ERC4626.deposit pulls WRON from Escrow via safeTransferFrom",
+          "Shares are minted to the original msg.sender"
+        ],
+        "transformations": [
+          "Native RON → WRON via IWRON.deposit()",
+          "WRON amount → share amount via _convertToShares"
+        ],
+        "sinks": [
+          "WRON in LiquidRon vault balance",
+          "LRON shares to user"
+        ],
+        "trust_changes": "User-originated native RON becomes vault-controlled WRON. Escrow acts as a brief intermediary to prevent totalAssets inflation during deposit.",
+        "validation_points": [
+          "whenNotPaused check",
+          "ERC4626 internal checks for zero address, max deposit"
+        ],
+        "exposure_risks": [
+          "No minimum deposit enforced",
+          "First depositor can inflate share price with minimal deposits"
+        ],
+        "manipulation_risks": [
+          "First depositor attack: with _decimalsOffset()=0, attacker deposits 1 wei, donates large WRON, inflating share price so subsequent depositors receive 0 shares",
+          "Anyone can send RON via receive() triggering deposits, which could be used for share price manipulation"
+        ]
+      },
+      {
+        "flow_id": "DF-02-erc4626-deposit",
+        "source": "User calls ERC4626 deposit(uint256,address) or mint(uint256,address) with WRON approval",
+        "path": [
+          "User approves WRON to vault",
+          "User calls deposit/mint",
+          "ERC4626 pulls WRON from user via safeTransferFrom",
+          "Shares minted to receiver"
+        ],
+        "transformations": [
+          "WRON amount → share amount via _convertToShares using totalAssets()"
+        ],
+        "sinks": [
+          "WRON in vault balance",
+          "LRON shares to receiver"
+        ],
+        "trust_changes": "Direct interaction, user-to-vault",
+        "validation_points": [
+          "whenNotPaused",
+          "ERC4626 zero checks"
+        ],
+        "exposure_risks": [
+          "WRON held in vault is counted in super.totalAssets() which is the balanceOf the vault"
+        ],
+        "manipulation_risks": [
+          "Share price depends on totalAssets() which includes operatorFeeAmount within vault WRON balance, inflating price between harvest and fetchOperatorFee"
+        ]
+      },
+      {
+        "flow_id": "DF-03-withdraw-redeem-instant",
+        "source": "User calls withdraw(assets,receiver,owner) or redeem(shares,receiver,owner)",
+        "path": [
+          "ERC4626 super.withdraw/redeem called with receiver=address(this)",
+          "Internal _withdraw burns shares from owner, transfers WRON to vault (self)",
+          "_withdrawRONTo(receiver, assets) unwraps WRON to native RON",
+          "Native RON sent to receiver via low-level call"
+        ],
+        "transformations": [
+          "LRON shares burned",
+          "WRON → RON via IWRON.withdraw()",
+          "Assets calculated via _convertToAssets"
+        ],
+        "sinks": [
+          "Native RON sent to receiver"
+        ],
+        "trust_changes": "Vault-controlled WRON becomes user-controlled native RON",
+        "validation_points": [
+          "whenNotPaused",
+          "allowance check if caller != owner",
+          "WRON balance sufficient in vault"
+        ],
+        "exposure_risks": [
+          "Reentrancy vector: native RON sent via call{value}() before function completes; however CEI pattern (burn before transfer) mitigates this"
+        ],
+        "manipulation_risks": [
+          "If vault WRON balance is insufficient (most assets delegated), withdrawal reverts. User must use requestWithdrawal flow.",
+          "Share price calculated at time of call - flash loan could manipulate totalAssets() via donation"
+        ]
+      },
+      {
+        "flow_id": "DF-04-request-withdrawal-flow",
+        "source": "User calls requestWithdrawal(shares)",
+        "path": [
+          "User's LRON shares transferred to vault via _transfer",
+          "Shares added to lockedSharesPerEpoch[epoch]",
+          "Operator calls finaliseRonRewardsForEpoch()",
+          "previewRedeem calculates assets for locked shares at current totalAssets()",
+          "_withdraw burns locked shares, sends WRON to Escrow",
+          "lockedPricePerSharePerEpoch set for the epoch",
+          "withdrawalEpoch incremented",
+          "User calls redeem(epoch) to claim",
+          "WRON pulled from Escrow via transferFrom",
+          "WRON unwrapped and native RON sent to user"
+        ],
+        "transformations": [
+          "shares → locked shares per epoch",
+          "locked shares → assets via previewRedeem at finalization time",
+          "locked price per share recorded for later redemption",
+          "individual user shares → proportional assets via _convertToAssets with locked prices"
+        ],
+        "sinks": [
+          "WRON in Escrow (between finalization and user claim)",
+          "Native RON to user on claim"
+        ],
+        "trust_changes": "User trusts operator to finalize epoch. Share-to-asset conversion locked at finalization time - operator controls timing.",
+        "validation_points": [
+          "whenNotPaused",
+          "_checkUserCanReceiveRon",
+          "statusPerEpoch check on redemption",
+          "fulfilled flag prevents double claim"
+        ],
+        "exposure_risks": [
+          "Operator controls finalization timing, can front-run or sandwich to manipulate share price at lock-in",
+          "Owner can change operatorFee before finalization, directly affecting totalAssets() and thus locked price"
+        ],
+        "manipulation_risks": [
+          "Operator can harvest (inflating totalAssets) right before finaliseRonRewardsForEpoch to lock a higher price for requesters",
+          "Owner can setOperatorFee to 0 before finalization then restore it after, inflating totalAssets temporarily",
+          "Multiple users in same epoch share the locked price - early information asymmetry"
+        ]
+      },
+      {
+        "flow_id": "DF-05-delegation-flow",
+        "source": "Operator calls delegateAmount",
+        "path": [
+          "_withdrawRONTo(proxy, total) unwraps WRON from vault, sends native RON to proxy",
+          "Proxy calls IRoninValidator.delegate{value}(consensusAddr) for each",
+          "RON delegated to validators on Ronin staking protocol"
+        ],
+        "transformations": [
+          "WRON in vault → native RON → delegated stake in Ronin staking"
+        ],
+        "sinks": [
+          "Ronin staking contract (delegated to validators)"
+        ],
+        "trust_changes": "Vault-controlled WRON becomes protocol-controlled delegation. Assets now tracked via getTotalStaked() external call.",
+        "validation_points": [
+          "onlyOperator (BROKEN - see business_logic)",
+          "whenNotPaused",
+          "proxy != address(0)",
+          "amounts != 0"
+        ],
+        "exposure_risks": [
+          "Delegated amounts depend on external Ronin staking contract correctness for accounting"
+        ],
+        "manipulation_risks": [
+          "Operator can delegate to malicious validators",
+          "Validator slash could reduce totalAssets unexpectedly"
+        ]
+      },
+      {
+        "flow_id": "DF-06-harvest-flow",
+        "source": "Operator calls harvest(proxyIndex, consensusAddrs)",
+        "path": [
+          "Proxy calls claimRewards (N times in a loop - BUG)",
+          "Native RON received by proxy",
+          "address(this).balance used as claimedAmount",
+          "_depositRONTo(vault, claimedAmount) wraps RON and sends WRON to vault",
+          "operatorFeeAmount += (harvestedAmount * operatorFee) / BIPS in vault"
+        ],
+        "transformations": [
+          "Staking rewards (native RON) → WRON in vault",
+          "Fee calculation applied to gross harvest amount"
+        ],
+        "sinks": [
+          "WRON in vault balance (increases totalAssets)",
+          "operatorFeeAmount updated (tracked but not separated)"
+        ],
+        "trust_changes": "External staking rewards become vault-controlled WRON. operator fee is tracked virtually but remains in vault WRON balance, inflating totalAssets.",
+        "validation_points": [
+          "onlyOperator (BROKEN)",
+          "whenNotPaused"
+        ],
+        "exposure_risks": [
+          "address(this).balance includes any pre-existing native RON in proxy (donation attack on proxy)",
+          "operatorFeeAmount sits in vault WRON balance, inflating totalAssets until fetchOperatorFee is called"
+        ],
+        "manipulation_risks": [
+          "Anyone can send native RON to proxy (open receive()), inflating harvested amount and fee",
+          "Harvest timing affects totalAssets and thus share price - operator can front-run deposits/withdrawals"
+        ]
+      },
+      {
+        "flow_id": "DF-07-harvest-and-delegate-flow",
+        "source": "Operator calls harvestAndDelegateRewards(proxyIndex, consensusAddrs, consensusAddrDst)",
+        "path": [
+          "Proxy calls IRoninValidator.delegateRewards(consensusAddrs, consensusAddrDst)",
+          "Returns claimableAmount (rewards restaked, no RON flows to proxy or vault)",
+          "operatorFeeAmount += (harvestedAmount * operatorFee) / BIPS in vault"
+        ],
+        "transformations": [
+          "Unclaimed rewards → delegated stake (restaked)",
+          "Fee tracked on vault against non-existent WRON"
+        ],
+        "sinks": [
+          "Rewards restaked in Ronin staking",
+          "operatorFeeAmount increased without corresponding WRON"
+        ],
+        "trust_changes": "Rewards move from unclaimed to staked. Fee obligation created without backing.",
+        "validation_points": [
+          "onlyOperator (BROKEN)",
+          "whenNotPaused"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "CRITICAL: operatorFeeAmount increases but no WRON is deposited to vault. fetchOperatorFee will withdraw from vault WRON balance (user deposits), effectively stealing from depositors to pay operator fees",
+          "totalAssets transitions: getTotalRewards decreases (rewards claimed), getTotalStaked increases (restaked). But fee deduction was only in getTotalRewards. Net: totalAssets increases by the fee portion, inflating share price"
+        ]
+      },
+      {
+        "flow_id": "DF-08-operator-fee-withdrawal",
+        "source": "feeRecipient calls fetchOperatorFee()",
+        "path": [
+          "operatorFeeAmount cached and zeroed",
+          "_withdrawRONTo(feeRecipient, amount) unwraps WRON from vault, sends native RON"
+        ],
+        "transformations": [
+          "WRON from vault balance → native RON to feeRecipient"
+        ],
+        "sinks": [
+          "Native RON to feeRecipient"
+        ],
+        "trust_changes": "Vault-controlled WRON becomes feeRecipient-controlled native RON",
+        "validation_points": [
+          "msg.sender == feeRecipient check",
+          "CEI pattern: amount zeroed before transfer"
+        ],
+        "exposure_risks": [
+          "If vault WRON balance < operatorFeeAmount, call reverts"
+        ],
+        "manipulation_risks": [
+          "Fee withdrawal reduces totalAssets(), decreasing share price for all holders",
+          "feeRecipient can time withdrawal to maximize impact on share price"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "1 LRON represents a proportional claim on totalAssets (vault WRON + staked + unclaimed rewards - operator fee on rewards)",
+        "Deposits mint LRON at current exchange rate",
+        "Withdrawals burn LRON at current exchange rate",
+        "Withdrawal requests lock shares at epoch-level, finalized by operator at current price",
+        "Operator manages delegation to validators and harvesting of rewards",
+        "Operator fee is a percentage of harvested rewards"
+      ],
+      "economic_incentives": [
+        "Depositors earn staking yield via LRON appreciation",
+        "Operator earns fee on harvested rewards (up to 9.99%)",
+        "Fee recipient collects accumulated operator fees",
+        "No slashing penalty passthrough mechanism visible"
+      ],
+      "governance_mechanisms": [
+        "Owner can set operator fee (no timelock)",
+        "Owner can add/remove operators",
+        "Owner can deploy staking proxies",
+        "Owner can pause/unpause all operations",
+        "Owner can update fee recipient",
+        "No governance token or DAO mechanism"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "onlyOperator modifier has inverted logic: `if (msg.sender != owner() || operator[msg.sender])` should be `if (msg.sender != owner() && !operator[msg.sender])`",
+          "expected_behavior": "Both owner and designated operators should be able to call operator functions (harvest, delegate, undelegate, redelegate, finalise)",
+          "actual_behavior": "Only the owner can call operator functions, and ONLY if the owner is NOT also marked as an operator. If updateOperator(owner, true) is called, even the owner gets locked out of all operator functions. No designated operator can ever call these functions.",
+          "risk_level": "high",
+          "exploitation_potential": "Protocol is non-functional for operator role delegation. If owner is also added as operator, all staking operations freeze. Funds remain locked in delegation with no way to harvest, undelegate, or finalize withdrawals unless owner removes themselves from operator mapping."
+        },
+        {
+          "scenario": "LiquidProxy.harvest() calls claimRewards with full array in a loop",
+          "expected_behavior": "claimRewards should be called once with the full array",
+          "actual_behavior": "claimRewards(_consensusAddrs) is called N times (once per address) with the ENTIRE array each time. First call claims all rewards; subsequent calls are redundant (claim 0 or may revert depending on staking implementation).",
+          "risk_level": "medium",
+          "exploitation_potential": "Gas waste at minimum. If staking contract reverts on empty claims, harvest becomes impossible for multi-validator arrays."
+        },
+        {
+          "scenario": "harvestAndDelegateRewards creates phantom operator fee obligation",
+          "expected_behavior": "Operator fee should only be tracked when actual WRON/RON is available in vault to pay it",
+          "actual_behavior": "operatorFeeAmount increases but rewards are re-delegated (no WRON enters vault). When fetchOperatorFee is called, it withdraws WRON from vault balance which belongs to depositors.",
+          "risk_level": "high",
+          "exploitation_potential": "Operator fee effectively taxes depositors' principal. Over time, with repeated harvestAndDelegateRewards, operatorFeeAmount could exceed available WRON, causing fetchOperatorFee to revert or drain user deposits."
+        },
+        {
+          "scenario": "operatorFeeAmount inflates totalAssets between harvest and fee withdrawal",
+          "expected_behavior": "totalAssets should reflect assets net of operator fee",
+          "actual_behavior": "After harvest(), full harvested WRON enters vault balance (counted in super.totalAssets()). operatorFeeAmount is tracked but NOT subtracted from totalAssets(). getTotalRewards() deducts fee from UNREALIZED rewards, but once realized via harvest, no deduction occurs.",
+          "risk_level": "high",
+          "exploitation_potential": "Share price is inflated by operatorFeeAmount between harvest and fetchOperatorFee. Depositors during this window get fewer shares. When fetchOperatorFee is called, totalAssets drops, deflating share price. Operator can sandwich harvest→deposit→fetchOperatorFee→withdraw for profit."
+        },
+        {
+          "scenario": "First depositor / inflation attack with _decimalsOffset() = 0",
+          "expected_behavior": "Share price should be resistant to manipulation via small deposits and donations",
+          "actual_behavior": "With _decimalsOffset()=0, virtual shares offset is only 1. Attacker can deposit 1 wei of WRON (getting 1 share), then donate large WRON to vault, inflating share price so next depositor gets 0 shares.",
+          "risk_level": "high",
+          "exploitation_potential": "Classic ERC4626 inflation attack. Attacker can steal significant portion of second depositor's funds. OpenZeppelin v5 mitigates this with virtual offset, but only meaningfully when _decimalsOffset() > 0."
+        },
+        {
+          "scenario": "LiquidProxy.harvest() uses address(this).balance as claimed amount",
+          "expected_behavior": "Only actually claimed staking rewards should be counted",
+          "actual_behavior": "Any native RON pre-existing in the proxy (from open receive() or stuck funds) is counted as harvested rewards",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker can send native RON to proxy before harvest to inflate harvestedAmount, affecting operatorFeeAmount and totalAssets. Could be used to manipulate share price or inflate operator fees."
+        },
+        {
+          "scenario": "requestWithdrawal with 0 shares",
+          "expected_behavior": "Should revert or be no-op",
+          "actual_behavior": "Creates a withdrawal request with 0 shares, wastes gas but no economic impact. _transfer of 0 tokens succeeds.",
+          "risk_level": "low",
+          "exploitation_potential": "Griefing only, no economic exploit"
+        },
+        {
+          "scenario": "redeem(uint256 _epoch) emits wrong epoch in event",
+          "expected_behavior": "WithdrawalClaimed event should emit _epoch (the epoch being redeemed)",
+          "actual_behavior": "Event emits `epoch` (current withdrawalEpoch) instead of `_epoch` (the epoch being claimed). Off-chain indexers would see incorrect epoch data.",
+          "risk_level": "low",
+          "exploitation_potential": "No on-chain exploit, but breaks off-chain tracking and analytics"
+        },
+        {
+          "scenario": "Owner changes operatorFee right before finaliseRonRewardsForEpoch",
+          "expected_behavior": "Fee changes should not affect pending withdrawal requests",
+          "actual_behavior": "operatorFee affects getTotalRewards() which affects totalAssets() which affects previewRedeem() used in finaliseRonRewardsForEpoch to lock share price. Owner can set fee to 0 to inflate totalAssets, finalize at high price, then restore fee.",
+          "risk_level": "medium",
+          "exploitation_potential": "Owner/operator collusion to manipulate locked withdrawal price. No timelock on fee changes."
+        },
+        {
+          "scenario": "undelegateAmount assumes immediate RON return from bulkUndelegate",
+          "expected_behavior": "If Ronin staking has cooldown period, proxy won't have RON to deposit",
+          "actual_behavior": "LiquidProxy.undelegateAmount calls bulkUndelegate then immediately _depositRONTo(vault, totalUndelegated). If staking contract has waiting period, this reverts.",
+          "risk_level": "medium",
+          "exploitation_potential": "Could make undelegation impossible if staking contract behavior changes or has cooldown"
+        },
+        {
+          "scenario": "_checkUserCanReceiveRon sends 0-value call",
+          "expected_behavior": "Should verify user can actually receive RON",
+          "actual_behavior": "0-value call succeeds for most contracts even if they would reject nonzero value transfers. Check provides false sense of security.",
+          "risk_level": "low",
+          "exploitation_potential": "User could pass check but fail to receive RON during actual withdrawal, but withdrawal would revert anyway"
+        },
+        {
+          "scenario": "Multiple epochs finalized while user hasn't claimed",
+          "expected_behavior": "User should be able to claim each epoch independently",
+          "actual_behavior": "Each epoch has independent tracking and the escrow holds cumulative WRON. Works correctly as long as escrow has sufficient balance.",
+          "risk_level": "low",
+          "exploitation_potential": "No exploit, design is correct for multi-epoch claims"
+        }
+      ],
+      "assumption_violations": [
+        "CRITICAL: onlyOperator modifier assumes `||` gives OR-access semantics, but the negated condition creates AND-exclusion - operators are always locked out",
+        "Assumes bulkUndelegate returns RON immediately (Ronin-specific assumption)",
+        "Assumes WRON.transfer reverts on failure (doesn't check return value in RonHelper)",
+        "Assumes Ronin staking contract getRewards/getManyStakingAmounts are always available and not subject to DoS",
+        "Assumes no validator slashing reduces staked amounts (no slashing handler)",
+        "totalAssets() makes external calls to staking contract - could be manipulated if staking contract is upgradeable",
+        "Assumes operatorFeeAmount will always be backed by vault WRON balance (violated by harvestAndDelegateRewards)"
+      ],
+      "game_theory_risks": [
+        "Operator can strategically time harvest and finaliseRonRewardsForEpoch to maximize/minimize locked share price",
+        "Owner can change operatorFee without timelock, directly affecting totalAssets and share price",
+        "Front-running: operator sees requestWithdrawal txs in mempool and harvests before finalizing to lock favorable price",
+        "Fee recipient can time fetchOperatorFee to maximize impact on share price (deposit before, fetch fee, withdraw after)",
+        "Operator and owner roles can collude: change fee → harvest → finalize → restore fee"
+      ],
+      "integration_risks": [
+        "Ronin staking contract interface changes or upgrades could break delegation/undelegation/harvesting",
+        "If Ronin staking contract is paused or deprecated, funds could be locked",
+        "WRON contract behavior assumed to be standard WETH - non-standard behavior would break RonHelper",
+        "claimRewards/delegateRewards return values are trusted without verification",
+        "getManyStakingAmounts/getRewards could return stale or manipulated data if staking contract is compromised"
+      ],
+      "calculation_errors": [
+        "operatorFeeAmount is NOT subtracted from totalAssets() after harvest - totalAssets is inflated by fee amount that belongs to operator",
+        "In harvest(), fee is calculated on gross harvest: (harvestedAmount * operatorFee) / BIPS. If proxy had pre-existing balance, fee is overcalculated",
+        "In harvestAndDelegateRewards(), fee tracks against restaked amount but no WRON is available in vault to back it",
+        "_convertToAssets in redeem(epoch) uses custom formula with +1/+10**_decimalsOffset() which may produce different rounding than standard ERC4626 conversion used during finalization",
+        "getTotalRewards applies fee deduction to ALL unrealized rewards, even those accumulated before current fee was set - retroactive fee application"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "WRON",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Wrapped RON (native token). Used as ERC4626 underlying asset. WETH-like interface assumed. RonHelper uses raw transfer() without return value check - relies on revert-on-failure behavior."
+        },
+        {
+          "address_or_symbol": "LRON",
+          "behaviors": [
+            "rebasing:false",
+            "permit:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Yield-bearing liquid staking token. ERC4626 vault share token. Value accrues via totalAssets() growth from staking rewards. No _decimalsOffset override (defaults to 0) - minimal inflation attack protection."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "totalAssets_composition",
+          "state_vars": [
+            "IERC20(asset()).balanceOf(vault)",
+            "getTotalStaked()",
+            "getTotalRewards()"
+          ],
+          "notes": "totalAssets = vault_wron_balance + staked + (rewards - reward_fees). VIOLATED: vault_wron_balance includes operatorFeeAmount which should be excluded."
+        },
+        {
+          "name": "locked_shares_conservation",
+          "state_vars": [
+            "lockedSharesPerEpoch[e]",
+            "sum(withdrawalRequestsPerEpoch[e][user].shares)"
+          ],
+          "notes": "For each epoch, locked shares should equal sum of all user request shares. Maintained correctly."
+        },
+        {
+          "name": "epoch_monotonicity",
+          "state_vars": [
+            "withdrawalEpoch"
+          ],
+          "notes": "Epoch only increments in finaliseRonRewardsForEpoch. Requests always go to current epoch. Once finalized, epoch is immutable."
+        },
+        {
+          "name": "operator_fee_backing",
+          "state_vars": [
+            "operatorFeeAmount",
+            "IERC20(asset()).balanceOf(vault)"
+          ],
+          "notes": "VIOLATED: operatorFeeAmount should always be <= vault WRON balance, but harvestAndDelegateRewards increases operatorFeeAmount without adding WRON to vault."
+        },
+        {
+          "name": "proxy_fund_conservation",
+          "state_vars": [
+            "vault_wron_balance",
+            "proxy_delegated_amounts",
+            "proxy_native_balance"
+          ],
+          "notes": "All RON should be accounted for across vault, proxies, and staking contract. Open receive() on proxy allows external deposits that break this invariant."
+        }
+      ]
+    }
+  }
+}

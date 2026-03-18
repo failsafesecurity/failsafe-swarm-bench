@@ -1,0 +1,164 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "security_trust_boundaries",
+    "llm_model": null,
+    "methodology_sections": [
+      "1.2 Trust Boundary Analysis - Internal/external/privileged boundaries, validation levels",
+      "2.2 State Transition Mapping - Critical state variables, invariants, conditional paths",
+      "3.1 Vulnerability Pattern Matching - SWC patterns, anti-patterns, missing safeguards"
+    ],
+    "timestamp": "2026-03-09T03:28:18.251Z",
+    "duration_ms": 77936
+  },
+  "analysis": {
+    "trust_boundaries": [
+      {
+        "boundary": "Public User Input",
+        "trust_level": "untrusted",
+        "validation": "basic",
+        "sanitization": "absent",
+        "entry_functions": [
+          "executeFeeSwap",
+          "rebalanceSwap",
+          "mint",
+          "burn"
+        ],
+        "failure_modes": [
+          "Malicious token contracts executing reentrant calls",
+          "Exploitation of state inconsistencies during execution",
+          "Denial of service via reserve manipulation"
+        ],
+        "attack_vectors": [
+          "Reentrancy attacks via ERC777/ERC677 token callbacks",
+          "Inflation attacks on initial liquidity provision",
+          "Accounting desync using fee-on-transfer tokens"
+        ]
+      },
+      {
+        "boundary": "External ERC20 Tokens",
+        "trust_level": "semi-trusted",
+        "validation": "none",
+        "sanitization": "absent",
+        "entry_functions": [
+          "executeFeeSwap",
+          "rebalanceSwap",
+          "mint",
+          "burn"
+        ],
+        "failure_modes": [
+          "Silent transfer failures (returning false instead of reverting)",
+          "Less tokens received than requested (fee-on-transfer)",
+          "Rebasing token balance shifts"
+        ],
+        "attack_vectors": [
+          "Bypassing transfer requirements via non-standard ERC20s",
+          "Draining pool by exploiting unchecked return values",
+          "Creating unbacked pool reserves via fee-on-transfer tokens"
+        ]
+      }
+    ],
+    "state_transitions": [
+      {
+        "from_state": "Uninitialized Pool / Existing Pool",
+        "to_state": "Increased Liquidity & Reserves",
+        "trigger": "mint",
+        "conditions": [
+          "amountValidatorToken > 0",
+          "userToken != validatorToken",
+          "amountValidatorToken / 2 > MIN_LIQUIDITY (if initial)"
+        ],
+        "invariants": [
+          "totalSupply increases proportionally to validatorToken added",
+          "pool.reserveValidatorToken strictly increases by amountValidatorToken"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      },
+      {
+        "from_state": "Existing Pool",
+        "to_state": "Decreased Liquidity & Reserves",
+        "trigger": "burn",
+        "conditions": [
+          "liquidity > 0",
+          "userToken != validatorToken",
+          "liquidityBalances[poolId][msg.sender] >= liquidity"
+        ],
+        "invariants": [
+          "totalSupply decreases by liquidity amount",
+          "user and validator reserves decrease proportionally",
+          "user's liquidity balance decreases by liquidity amount"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "high"
+      },
+      {
+        "from_state": "Pre-Swap Reserves",
+        "to_state": "Post-Swap Reserves",
+        "trigger": "executeFeeSwap / rebalanceSwap",
+        "conditions": [
+          "amountIn/amountOut > 0",
+          "pool has sufficient reserves of the requested output token",
+          "resulting reserves do not exceed type(uint128).max"
+        ],
+        "invariants": [
+          "One reserve increases while the other decreases",
+          "Swap rate strictly follows M/SCALE or N/SCALE constants"
+        ],
+        "atomicity_required": true,
+        "race_condition_risk": "medium"
+      }
+    ],
+    "vulnerability_patterns": [
+      {
+        "swc_id": "SWC-107",
+        "pattern": "Reentrancy",
+        "locations": [
+          "FeeAMM.sol: burn(address,address,uint256,address)"
+        ],
+        "severity": "critical",
+        "evidence": "External calls `IERC20(userToken).transfer(...)` and `IERC20(validatorToken).transfer(...)` are executed before state variables `liquidityBalances`, `totalSupply`, and `pool.reserves` are updated.",
+        "exploitation_method": "An attacker can use a token with a callback hook (e.g., ERC777) as either the userToken or validatorToken. When `burn` calls `transfer`, the token contract calls back into the attacker's contract, allowing them to call `burn` again. Since their `liquidityBalances` hasn't been reduced yet, they can repeatedly burn the same liquidity to drain the pool's entire reserves.",
+        "affected_assets": [
+          "All userTokens and validatorTokens held in the pool"
+        ]
+      },
+      {
+        "swc_id": "SWC-104",
+        "pattern": "Unchecked Call Return Value",
+        "locations": [
+          "FeeAMM.sol: executeFeeSwap",
+          "FeeAMM.sol: rebalanceSwap",
+          "FeeAMM.sol: mint",
+          "FeeAMM.sol: burn"
+        ],
+        "severity": "medium",
+        "evidence": "The contract uses `IERC20(token).transfer(...)` and `transferFrom(...)` without checking the boolean return value or using OpenZeppelin's `SafeERC20` library.",
+        "exploitation_method": "If a pool is created with a token that returns `false` on failure instead of reverting (e.g., ZRX, USDT on some chains), transfers could fail silently. The AMM would update its state reserves as if the transfer succeeded, allowing attackers to steal tokens or permanently desync the pool's accounting.",
+        "affected_assets": [
+          "Pool reserves for non-standard ERC20 tokens"
+        ]
+      },
+      {
+        "swc_id": "SWC-135",
+        "pattern": "Code Logic Error (Fee-on-Transfer Incompatibility)",
+        "locations": [
+          "FeeAMM.sol: executeFeeSwap",
+          "FeeAMM.sol: rebalanceSwap",
+          "FeeAMM.sol: mint"
+        ],
+        "severity": "medium",
+        "evidence": "State reserves are updated using the exact `amountIn` or `amountValidatorToken` parameters (e.g., `pool.reserveUserToken += uint128(amountIn)`), rather than measuring the actual balance change of the contract.",
+        "exploitation_method": "If a fee-on-transfer token is used, the contract will receive fewer tokens than the `amount` specified. The internal `reserve` variables will be larger than the actual token balances. Subsequent users attempting to `burn` or `rebalanceSwap` will experience transaction reverts because the contract will attempt to transfer out more tokens than it actually holds, leading to a Denial of Service.",
+        "affected_assets": [
+          "Liquidity provider funds (locked due to DoS)"
+        ]
+      }
+    ],
+    "inventories": {
+      "privileged_operations": [],
+      "oracle_dependencies": []
+    }
+  }
+}

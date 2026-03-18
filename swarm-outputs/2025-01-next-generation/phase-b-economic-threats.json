@@ -1,0 +1,1031 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "ERC20ControlerMinterUpgradeable.sol",
+      "Token.sol",
+      "Forwarder.sol",
+      "ERC20MetaTxUpgradeable.sol",
+      "ERC20AdminUpgradeable.sol",
+      "FeesHandlerUpgradeable.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T03:27:44.837Z",
+    "duration_ms": 449032
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "transferFrom Fee Deduction Bypasses ERC20 Allowance, Enabling Over-Extraction from Sender",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "When _txfeeRate > 0, calling transferFrom(sender, recipient, amount) deducts fees from the sender's balance via _payTxFee (using _update directly) BEFORE the allowance-checked super.transferFrom. The fee bypasses the allowance mechanism entirely. A spender approved for amount X can force the sender to lose X + calculateTxFee(X) tokens. At 100% fee rate (max allowed), a 100 EURF approval extracts 200 EURF from the sender.",
+      "investigation_rationale": "This is a direct violation of ERC20 allowance invariants. Any spender can extract more tokens than approved, with the excess going to _feesFaucet. The spender doesn't profit directly from the fee, but the sender loses more than they authorized. This enables griefing and unexpected fund loss for any user who grants allowances.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "transferFrom",
+        "transferSanity",
+        "_payTxFee"
+      ],
+      "affected_contracts": [
+        "Token.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Token.sol",
+          "function": "transferFrom"
+        },
+        {
+          "file": "Token.sol",
+          "function": "transferSanity"
+        },
+        {
+          "file": "Token.sol",
+          "function": "_payTxFee"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Token.sol",
+        "lines": "130-140",
+        "pattern": "_payTxFee calls _update(from, _feesFaucet, txFees) before super.transferFrom which only checks allowance against 'amount', not 'amount + fees'"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "_txfeeRate > 0 (set by ADMIN)",
+        "_feesFaucet != address(0)",
+        "Sender has approved spender for amount X",
+        "Sender has balance >= X + calculateTxFee(X)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_payTxFee deducts (amount * _txfeeRate / 10000) from sender via _update; super.transferFrom deducts amount and reduces allowance by amount only",
+        "manipulation_vector": "Spender calls transferFrom for the full approved amount, forcing sender to pay additional fees beyond approval",
+        "profit_hypothesis": "At 1% fee rate, 1000 EURF approval extracts 1010 EURF from sender. At 100% rate, 1000 EURF approval extracts 2000 EURF."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the current _txfeeRate in production?",
+          "How many existing allowances could be exploited by spenders?",
+          "Does the feesFaucet address benefit from this extraction indirectly?"
+        ],
+        "validation_requirements": [
+          "Confirm that super.transferFrom only checks allowance against amount (not amount+fees)",
+          "Test with various fee rates to quantify over-extraction",
+          "Check if any DEX/DeFi integrations grant large allowances that would be affected"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (attacker just needs an existing allowance from a victim)",
+        "estimated_execution_cost": "~0.001 ETH gas on L2",
+        "potential_profit_range": "Up to 100% of approved amount extracted as additional fees (at max fee rate)",
+        "estimated_profit_margin": "Fee extraction is (txfeeRate/10000) * approved_amount extra tokens from sender",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None - pure on-chain accounting exploit",
+        "optimal_timing": "Anytime _txfeeRate > 0 and an allowance exists",
+        "market_impact_assessment": "No market impact - direct balance manipulation"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Any user who has granted ERC20 allowances",
+        "estimated_impact_per_user": "Loss of calculateTxFee(approved_amount) per transferFrom call beyond what they authorized",
+        "total_value_at_risk": "All outstanding allowances multiplied by fee rate"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "_txfeeRate range 0-10000, FEE_RATIO=10000",
+        "calculation_validation": "Verify allowance accounting path in ERC20Upgradeable.transferFrom vs _payTxFee",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "Shared Nonce Space Between permit() and transferWithAuthorization() Causes Cross-Function Invalidation",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "permit() and transferWithAuthorization() share the same _nonces mapping via _useNonce(). Executing one function consumes the nonce and permanently invalidates any pending signed authorization of the other function at the same nonce. A user who signs both a permit and a TWA at the same nonce loses whichever is executed second. Additionally, anyone holding a valid signed message of either type can execute it to consume the nonce, invalidating the other type.",
+      "investigation_rationale": "EIP-2612 (permit) and EIP-3009 (transferWithAuthorization) are designed with separate nonce domains. Merging them creates invalidation vectors that can cause failed transfers, missed payments, and user fund lockups when integrating with DeFi protocols.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "permit",
+        "transferWithAuthorization",
+        "_useNonce"
+      ],
+      "affected_contracts": [
+        "ERC20MetaTxUpgradeable.sol",
+        "Token.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20MetaTxUpgradeable.sol",
+          "function": "permit"
+        },
+        {
+          "file": "ERC20MetaTxUpgradeable.sol",
+          "function": "transferWithAuthorization"
+        },
+        {
+          "file": "ERC20MetaTxUpgradeable.sol",
+          "function": "_useNonce"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20MetaTxUpgradeable.sol",
+        "lines": "57-86",
+        "pattern": "Both permit() and transferWithAuthorization() call _useNonce(owner/holder) on the same _nonces mapping, consuming sequential nonces from a shared pool"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User signs both permit and TWA messages with the same nonce value",
+        "Both messages are distributed to different relayers or dApps"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "_nonces[owner] is incremented by both permit() and transferWithAuthorization()",
+        "manipulation_vector": "Execute a permit to consume nonce N, invalidating a pending TWA at nonce N",
+        "profit_hypothesis": "Griefing attack: prevent user's transfer from executing, potentially causing missed payments or failed DeFi interactions"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Do any DeFi integrations rely on both permit and TWA for EURF?",
+          "Can an attacker profit from preventing specific transfers?",
+          "What is the cost of nonce desync for users?"
+        ],
+        "validation_requirements": [
+          "Confirm shared nonce pool in code",
+          "Test cross-function nonce consumption",
+          "Evaluate EIP-2612 and EIP-3009 compliance requirements"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (only needs a previously obtained valid signed message)",
+        "estimated_execution_cost": "~0.001 ETH gas",
+        "potential_profit_range": "No direct profit; griefing causes failed transfers worth arbitrary amounts",
+        "estimated_profit_margin": "N/A (denial of service / griefing attack)",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When victim has pending signed messages of both types",
+        "market_impact_assessment": "Could disrupt DeFi integrations relying on EURF meta-transactions"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users who sign both permit and TWA messages",
+        "estimated_impact_per_user": "Failed transfers, missed payment deadlines, stuck DeFi positions",
+        "total_value_at_risk": "Depends on value of invalidated authorizations"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Shared _nonces mapping for both functions",
+        "calculation_validation": "Confirm EIP-3009 specifies separate authorization nonces (bytes32, not sequential)",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "Forwarder Accepts Arbitrary Domain Separator Enabling Cross-Contract/Cross-Chain Signature Replay",
+      "risk_level": "CRITICAL",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "The Forwarder's _verifySig() accepts the domainSeparator as a caller-supplied parameter without validating it against the contract's own EIP-712 domain separator. An attacker can replay a user's signed ForwardRequest from another contract or chain by providing the original domain separator, bypassing EIP-712's cross-domain replay protection. If the user signed on chain A and the Forwarder is deployed at a compatible address on chain B with matching EURF address, the signature replays.",
+      "investigation_rationale": "EIP-712 domain separators exist specifically to prevent cross-contract and cross-chain replay. Accepting an arbitrary domainSeparator completely negates this protection. For a stablecoin deployed on multiple chains (documentation mentions Ethereum and Polygon), this creates a concrete replay vector.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "hardhat.config.js shows sepolia and amoy (Polygon) network configs; documentation states target chains are Ethereum and Polygon",
+      "affected_functions": [
+        "execute",
+        "_verifySig"
+      ],
+      "affected_contracts": [
+        "Forwarder.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Forwarder.sol",
+          "function": "execute"
+        },
+        {
+          "file": "Forwarder.sol",
+          "function": "_verifySig"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Forwarder.sol",
+        "lines": "59-75",
+        "pattern": "domainSeparator is passed as calldata parameter to execute() and _verifySig() without any comparison against an internally computed domain separator"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User has signed a ForwardRequest on another chain/contract with a compatible Forwarder",
+        "User's nonce on target Forwarder matches the signed nonce (e.g., both 0 for new users)",
+        "req.to resolves to the same _eurfAddress on the target chain",
+        "EURF token at req.to has the Forwarder set as trustedForwarder"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No domainSeparator validation: keccak256(abi.encodePacked('\\x19\\x01', domainSeparator, ...)) accepts any domainSeparator value",
+        "manipulation_vector": "Replay signed ForwardRequest from chain A on chain B using chain A's domainSeparator",
+        "profit_hypothesis": "Attacker can force unauthorized transfers from users who signed on another chain, stealing their EURF on the target chain"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are Forwarder and EURF deployed at same addresses across chains?",
+          "How many users have low nonce values (matching across chains)?",
+          "What transfer amounts are typical in signed ForwardRequests?"
+        ],
+        "validation_requirements": [
+          "Verify Forwarder has no internal domain separator to compare against",
+          "Test replay with externally-supplied domainSeparator",
+          "Check deployment addresses across target chains"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (replay existing signatures)",
+        "estimated_execution_cost": "~0.001 ETH gas + gasless basefee",
+        "potential_profit_range": "Full value of replayed transfer (minus basefee)",
+        "estimated_profit_margin": "Near 100% on successful replay",
+        "attack_duration": "Single transaction per replay"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When user first uses Forwarder on one chain (nonce=0 matches other chains)",
+        "market_impact_assessment": "Targeted theft from individual users"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users who have signed ForwardRequests on any chain where a compatible Forwarder exists",
+        "estimated_impact_per_user": "Full transfer amount of the replayed transaction",
+        "total_value_at_risk": "Aggregate of all cross-chain replayable signed meta-transactions"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check if Forwarder inherits EIP712 or computes its own domain separator anywhere",
+        "calculation_validation": "Confirm domainSeparator flows unchecked from calldata to signature verification",
+        "execution_complexity": "medium",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "Revoked Controller Retains Ability to Re-Enable Operations via Safety Switch",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "safetySwitch() re-enable path checks `_operatingController == _msgSender()` but does NOT verify the caller still holds the CONTROLLER role. A controller who disabled operations and was subsequently removed from the CONTROLLER role can still call safetySwitch() to re-enable operations, as the _operatingController address persists regardless of role status.",
+      "investigation_rationale": "This is a privilege escalation via stale state reference. In a scenario where a controller is compromised and removed, the compromised address retains a critical capability (re-enabling mint/burn) that should have been revoked with the role.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "safetySwitch",
+        "removeController"
+      ],
+      "affected_contracts": [
+        "ERC20ControlerMinterUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "safetySwitch"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20ControlerMinterUpgradeable.sol",
+        "lines": "64-73",
+        "pattern": "Re-enable branch checks `_operatingController != _msgSender()` but never calls `hasRole(CONTROLLER, _msgSender())` - role membership not verified for re-enabling"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A controller activates safetySwitch (sets _operating=false, _operatingController=controller)",
+        "Owner/admin removes the controller via removeController()",
+        "Removed controller still has access to their private key"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "safetySwitch re-enable: `if (!hasRole(DEFAULT_ADMIN_ROLE, _msgSender()) && _operatingController != _msgSender())` - only checks address match, not role",
+        "manipulation_vector": "Removed controller calls safetySwitch() to re-enable minting/burning despite role revocation",
+        "profit_hypothesis": "Compromised controller re-enables operations allowing unauthorized minting by colluding minters"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the total mintable supply if operations are unexpectedly re-enabled?",
+          "Are there minters with remaining allowances that could be exploited if operations resume?",
+          "Can the re-enabled state be detected and responded to quickly?"
+        ],
+        "validation_requirements": [
+          "Confirm removed controller can call safetySwitch successfully",
+          "Test sequence: activate switch → remove controller → controller re-enables",
+          "Verify _operatingController is not cleared on role revocation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (only needs compromised controller key)",
+        "estimated_execution_cost": "~0.001 ETH gas",
+        "potential_profit_range": "Depends on minter allowances available when operations resume",
+        "estimated_profit_margin": "Could enable unlimited minting if MASTER_MINTER is also compromised",
+        "attack_duration": "Single transaction to re-enable"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "After role revocation, before admin can take additional measures",
+        "market_impact_assessment": "Could destabilize token if minting resumes during emergency"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All token holders if unauthorized minting occurs after re-enable",
+        "estimated_impact_per_user": "Dilution proportional to unauthorized mint amount / total supply",
+        "total_value_at_risk": "Entire token market cap if unlimited minting follows"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check if removeController clears _operatingController",
+        "calculation_validation": "Map all paths that modify _operatingController",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "Mint and Burn Operations Bypass Pause and Blacklist Enforcement",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "mint() and burn() only check the _operating flag and role permissions. They do not call adminSanity() and do not check paused() or isBlacklisted(). Tokens can be minted to blacklisted (sanctioned) addresses and minting/burning continues during contract pause. The burn() NatSpec claims it 'Validates that sender is not blacklisted' but the code does not implement this check.",
+      "investigation_rationale": "For a regulated EUR stablecoin, the ability to mint to sanctioned addresses and mint/burn during emergency pause represents a critical compliance and security gap. The discrepancy between NatSpec documentation and actual code behavior suggests this is a code defect, not an intentional design choice.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "mint",
+        "burn"
+      ],
+      "affected_contracts": [
+        "ERC20ControlerMinterUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "mint"
+        },
+        {
+          "file": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "burn"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20ControlerMinterUpgradeable.sol",
+        "lines": "119-138",
+        "pattern": "mint() checks only MASTER_MINTER/MINTER_ROLE, amount > 0, and _operating; no call to adminSanity(), paused(), or isBlacklisted(). burn() NatSpec says 'Validates that sender is not blacklisted' but code has no blacklist check"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Caller has MINTER_ROLE or MASTER_MINTER",
+        "_operating is true",
+        "Contract may be paused or recipient may be blacklisted"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "mint() contains no reference to paused() or isBlacklisted() in its execution path",
+        "manipulation_vector": "Minter calls mint(blacklistedAddress, amount) or mints during pause state",
+        "profit_hypothesis": "Compliance violation: sanctioned entities receive newly minted tokens, creating regulatory and legal exposure"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is this intentional design (minting should bypass compliance controls)?",
+          "What is the regulatory impact of minting to sanctioned addresses?",
+          "Can a compromised minter exploit this during an emergency pause?"
+        ],
+        "validation_requirements": [
+          "Test minting to blacklisted address succeeds",
+          "Test minting while contract is paused succeeds",
+          "Verify burn() also bypasses blacklist despite NatSpec claim"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (requires minter role)",
+        "estimated_execution_cost": "~0.001 ETH gas",
+        "potential_profit_range": "Full minter allowance can be minted to sanctioned addresses",
+        "estimated_profit_margin": "100% of minted amount reaches blacklisted recipient",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During emergency pause when admin expects all operations halted",
+        "market_impact_assessment": "Regulatory/compliance impact; potential for unauthorized supply changes during emergency"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol reputation and all token holders via regulatory action",
+        "estimated_impact_per_user": "Indirect: potential regulatory shutdown affects all holders",
+        "total_value_at_risk": "Entire protocol if regulatory action is triggered"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Compare adminSanity checks in transfer vs mint/burn code paths",
+        "calculation_validation": "Verify burn() NatSpec vs implementation discrepancy",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "setOwner Can Leave Hidden Extra OWNER Role Holders Due to EnumerableSet Assumptions",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "setOwner() performs grantRole(OWNER, newOwner) then revokeRole(OWNER, getRoleMember(OWNER, 0)). If an OWNER previously called grantRole(OWNER, anotherAddress) directly (which is possible since OWNER is DEFAULT_ADMIN_ROLE's own admin), the EnumerableSet contains multiple members. setOwner only revokes index 0, potentially leaving additional OWNER-role holders hidden from the owner() view function, which only returns getRoleMember(OWNER, 0).",
+      "investigation_rationale": "The single-owner invariant is critical for upgrade security (UUPS) and overall governance. Hidden OWNER addresses could authorize malicious upgrades or role changes invisible to the protocol's nominal owner.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "setOwner",
+        "owner"
+      ],
+      "affected_contracts": [
+        "Token.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Token.sol",
+          "function": "setOwner"
+        },
+        {
+          "file": "Token.sol",
+          "function": "owner"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Token.sol",
+        "lines": "77-82",
+        "pattern": "grantRole(OWNER, newOwner) adds to set, revokeRole(OWNER, getRoleMember(OWNER, 0)) removes index 0 only; no check that getRoleMemberCount(OWNER) == 1 before or after"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "An OWNER has previously called grantRole(DEFAULT_ADMIN_ROLE, anotherAddress) directly",
+        "getRoleMemberCount(OWNER) > 1 at time of setOwner call"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "setOwner adds one member and removes one (index 0), net zero change in count if count > 1",
+        "manipulation_vector": "OWNER grants role to hidden address, setOwner transfers ownership but hidden address retains OWNER role",
+        "profit_hypothesis": "Hidden owner can authorize UUPS upgrade to malicious implementation, draining all token balances"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can getRoleMemberCount(OWNER) ever exceed 1 in normal operations?",
+          "Does the deployment script or initialization create multiple OWNER members?",
+          "What is the impact of a hidden OWNER performing unauthorized upgrades?"
+        ],
+        "validation_requirements": [
+          "Test: grant OWNER to address B, then call setOwner(C), verify B retains OWNER role",
+          "Verify owner() only shows index 0, hiding other OWNER holders",
+          "Confirm hidden OWNER can call _authorizeUpgrade"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (requires current OWNER role)",
+        "estimated_execution_cost": "~0.002 ETH gas for two transactions",
+        "potential_profit_range": "Full protocol TVL via malicious upgrade",
+        "estimated_profit_margin": "Up to total supply value",
+        "attack_duration": "Two transactions: grant hidden owner + wait for setOwner"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Before ownership transfer event",
+        "market_impact_assessment": "Complete protocol compromise if hidden owner performs upgrade"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All token holders",
+        "estimated_impact_per_user": "Potential total loss of holdings via malicious upgrade",
+        "total_value_at_risk": "Total supply value"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check deployment script: deployToken.js calls setOwner(INITIAL_OWNER_ADDRESS) after initialize()",
+        "calculation_validation": "Verify EnumerableSet behavior on add/remove with multiple members",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "MASTER_MINTER Unexpectedly Limited by MINTER_ROLE Allowance When Holding Both Roles",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In mint(), the first check allows both MASTER_MINTER and MINTER_ROLE holders to proceed. However, the allowance enforcement block uses `if (hasRole(MINTER_ROLE, _msgSender()))` independently. A caller with BOTH MASTER_MINTER and MINTER_ROLE hits both checks: passes the role gate as MASTER_MINTER but then gets limited by MINTER_ROLE allowance. This effectively restricts MASTER_MINTER's intended unlimited minting capability.",
+      "investigation_rationale": "MASTER_MINTER is designed to have unlimited minting authority. If MINTER_ROLE is also granted (e.g., by a previous MASTER_MINTER or self-grant via addMinter), the unlimited capability is silently restricted. This could prevent critical minting operations during emergencies.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "mint",
+        "addMinter"
+      ],
+      "affected_contracts": [
+        "ERC20ControlerMinterUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20ControlerMinterUpgradeable.sol",
+          "function": "mint"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20ControlerMinterUpgradeable.sol",
+        "lines": "119-136",
+        "pattern": "First gate: `!hasRole(MASTER_MINTER) && !hasRole(MINTER_ROLE)`, then independent check: `if (hasRole(MINTER_ROLE))` applies allowance - no `else if` or MASTER_MINTER exclusion"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Address holds both MASTER_MINTER and MINTER_ROLE simultaneously",
+        "minterAllowed[address] < desired mint amount"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "if (hasRole(MINTER_ROLE, _msgSender())) block runs regardless of MASTER_MINTER status",
+        "manipulation_vector": "Grant MINTER_ROLE with low allowance to MASTER_MINTER address, effectively capping their unlimited authority",
+        "profit_hypothesis": "Griefing: previous MASTER_MINTER calls addMinter(newMasterMinter, 0) before role transfer, silently crippling the new MASTER_MINTER"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can MASTER_MINTER self-fix by calling removeMinter(self)?",
+          "Is there a scenario where the MASTER_MINTER doesn't realize they have MINTER_ROLE?",
+          "What is the operational impact of a crippled MASTER_MINTER?"
+        ],
+        "validation_requirements": [
+          "Test: grant both roles, verify mint fails when allowance is 0",
+          "Verify removeMinter is callable by MASTER_MINTER to self-fix",
+          "Check if setMasterMinter cleans up MINTER_ROLE for the new address"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (requires MASTER_MINTER role for griefing setup)",
+        "estimated_execution_cost": "~0.001 ETH gas",
+        "potential_profit_range": "No direct profit; operational disruption",
+        "estimated_profit_margin": "N/A (denial of service)",
+        "attack_duration": "Persistent until MASTER_MINTER removes own MINTER_ROLE"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During MASTER_MINTER transition via setMasterMinter",
+        "market_impact_assessment": "Could prevent emergency minting during critical periods"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "MASTER_MINTER operator; indirectly all users if minting is needed",
+        "estimated_impact_per_user": "Operational disruption, delayed minting",
+        "total_value_at_risk": "Value of any pending minting operations"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check if setMasterMinter interacts with MINTER_ROLE membership",
+        "calculation_validation": "Verify role independence of allowance check",
+        "execution_complexity": "low",
+        "detection_difficulty": "high"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "Phantom Fee Requirement Blocks Transfers When feesFaucet Is address(0) Despite No Fee Collection",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "_payTxFee checks `balanceOf(from) < txFees + txAmount` and reverts if insufficient, but only executes `_update(from, _feesFaucet, txFees)` when `_feesFaucet != address(0)`. When _feesFaucet is address(0) and _txfeeRate > 0, the balance check demands fee+amount but the fee is never collected. Users with exact transfer balances are blocked from transferring even though no fee would be taken.",
+      "investigation_rationale": "If admin sets a fee rate but hasn't yet configured the feesFaucet (or clears it), users with exact balances can't transfer. This is a configuration trap that could lock user funds in certain states.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "_txfeeRate > 0 while _feesFaucet == address(0)"
+      ],
+      "config_evidence": "deployToken.js does not call setFeeFaucet or setTxFeeRate - both remain at default 0/address(0). Risk emerges if admin sets feeRate before feesFaucet.",
+      "affected_functions": [
+        "_payTxFee",
+        "setFeeFaucet",
+        "setTxFeeRate"
+      ],
+      "affected_contracts": [
+        "Token.sol",
+        "FeesHandlerUpgradeable.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Token.sol",
+          "function": "_payTxFee"
+        },
+        {
+          "file": "FeesHandlerUpgradeable.sol",
+          "function": "setFeeFaucet"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Token.sol",
+        "lines": "117-121",
+        "pattern": "Balance check `balanceOf(from) < txFees + txAmount` always runs, but `_update(from, _feesFaucet, txFees)` is conditional on `_feesFaucet != address(0)` - asymmetric guard"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "_txfeeRate > 0",
+        "_feesFaucet == address(0)",
+        "User has balance >= amount but < amount + calculateTxFee(amount)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Revert condition: balanceOf(from) < txFees + txAmount; but fee not deducted when feesFaucet is zero",
+        "manipulation_vector": "Admin sets feeRate without feesFaucet, blocking transfers for users with exact balances",
+        "profit_hypothesis": "No direct profit; DoS on user transfers leading to locked funds"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can admin accidentally create this state during normal operations?",
+          "What percentage of users would have exact-balance situations?",
+          "Is there a race between setTxFeeRate and setFeeFaucet?"
+        ],
+        "validation_requirements": [
+          "Test transfer with exact balance when feesFaucet is zero and feeRate > 0",
+          "Verify fee is not deducted but balance check still blocks",
+          "Check if clearing feesFaucet (setFeeFaucet(address(0)) is possible - it reverts with InvalidZeroAddress in Token.sol override... actually checking: Token.sol overrides setFeeFaucet with onlyRole(ADMIN) but calls super.setFeeFaucet which has no zero check"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (configuration issue)",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "No direct profit; user fund lockup",
+        "estimated_profit_margin": "N/A (denial of service)",
+        "attack_duration": "Persistent while misconfiguration exists"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "During fee configuration changes",
+        "market_impact_assessment": "Could block subset of users from transacting"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Users with balance == transfer amount (no excess for phantom fee)",
+        "estimated_impact_per_user": "Unable to transfer until receiving additional tokens or config fix",
+        "total_value_at_risk": "Locked balances of affected users"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Default _feesFaucet is address(0), default _txfeeRate is 0",
+        "calculation_validation": "Verify fee calculation and balance check independence",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Forwarder verify() and execute() Have Inconsistent Validation Leading to Relayer Gas Waste",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "Forwarder.verify() checks nonce, signature, and transfer selector, but does NOT check `req.to == _eurfAddress`. Forwarder.execute() checks all of these plus req.to. A request that passes verify() may fail execute() because req.to != _eurfAddress. Off-chain relayers using verify() for pre-flight checks will waste gas when execute() reverts on the req.to check.",
+      "investigation_rationale": "Inconsistent validation between verify() and execute() creates a griefing vector against relayers. Users can sign requests targeting non-EURF addresses that pass verify() but fail execute(), causing relayers to lose gas without receiving basefee compensation.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "verify",
+        "execute"
+      ],
+      "affected_contracts": [
+        "Forwarder.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Forwarder.sol",
+          "function": "verify"
+        },
+        {
+          "file": "Forwarder.sol",
+          "function": "execute"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Forwarder.sol",
+        "lines": "52-75",
+        "pattern": "verify() has no `require(req.to == _eurfAddress)` but execute() at line 68 has `require(req.to == _eurfAddress)` - asymmetric validation"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-MONO-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "User signs ForwardRequest with req.to != _eurfAddress",
+        "Relayer uses verify() for pre-flight check before calling execute()"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "verify() missing `req.to == _eurfAddress` check present in execute()",
+        "manipulation_vector": "User signs request with wrong 'to' address; verify passes but execute reverts",
+        "profit_hypothesis": "Relayer loses gas cost without receiving basefee compensation (require(success) reverts entire tx)"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How much gas does a failed execute() cost relayers?",
+          "Can this be used to systematically drain relayer ETH?",
+          "Do relayers rely on verify() as authoritative pre-check?"
+        ],
+        "validation_requirements": [
+          "Confirm verify() accepts req.to != _eurfAddress",
+          "Test execute() reverts when req.to != _eurfAddress after verify passes",
+          "Estimate gas waste per failed execution"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (only need to sign invalid requests)",
+        "estimated_execution_cost": "0 for attacker (relayer pays gas)",
+        "potential_profit_range": "No direct profit; relayer griefing causing gas loss",
+        "estimated_profit_margin": "N/A (griefing attack)",
+        "attack_duration": "Per-transaction griefing"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Anytime",
+        "market_impact_assessment": "Could discourage relayers, reducing meta-tx availability"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Relayers/paymasters",
+        "estimated_impact_per_user": "Gas cost per failed transaction (~100k gas)",
+        "total_value_at_risk": "Relayer operational funds"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Compare verify() and execute() validation steps line by line",
+        "calculation_validation": "Gas cost of failed execute()",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "Malicious Trusted Forwarder Can Drain Users via Repeated payGaslessBasefee Bypassing All Controls",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Tampering",
+      "hypothesis_description": "payGaslessBasefee() only checks isTrustedForwarder(msg.sender) and payer balance. It does not enforce pause, blacklist, or any rate limiting. A malicious or compromised trusted forwarder contract could repeatedly call payGaslessBasefee(victim, attacker) to drain any user's balance by _gaslessBasefee per call, completely bypassing adminSanity, pause, and blacklist protections.",
+      "investigation_rationale": "The trusted forwarder is set by ADMIN. If the ADMIN key is compromised or a malicious forwarder is deployed, this becomes an unrestricted drain mechanism with no per-call limit beyond _gaslessBasefee amount.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "payGaslessBasefee",
+        "setTrustedForwarder"
+      ],
+      "affected_contracts": [
+        "Token.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Token.sol",
+          "function": "payGaslessBasefee"
+        },
+        {
+          "file": "Token.sol",
+          "function": "setTrustedForwarder"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Token.sol",
+        "lines": "128-133",
+        "pattern": "payGaslessBasefee uses _update(payer, paymaster, _gaslessBasefee) with only isTrustedForwarder check - no adminSanity, no pause check, no blacklist check"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-004",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "ADMIN compromised or sets malicious trusted forwarder address",
+        "Malicious forwarder contract deployed with function that calls payGaslessBasefee in a loop",
+        "_gaslessBasefee > 0"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "payGaslessBasefee has no rate limiting or context validation beyond isTrustedForwarder",
+        "manipulation_vector": "Malicious forwarder calls payGaslessBasefee(victim, attacker) repeatedly in a single transaction",
+        "profit_hypothesis": "Drain rate: victim_balance / _gaslessBasefee calls to fully drain a user"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can payGaslessBasefee be called in a loop within one tx by a malicious forwarder?",
+          "What is a typical _gaslessBasefee value vs user balances?",
+          "Is there any gas limit constraint preventing full drain?"
+        ],
+        "validation_requirements": [
+          "Deploy malicious forwarder that calls payGaslessBasefee repeatedly",
+          "Test drain speed and gas costs",
+          "Verify no reentrancy guards prevent looped calls"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (requires admin key compromise)",
+        "estimated_execution_cost": "Gas for malicious forwarder deployment + drain transactions",
+        "potential_profit_range": "Total balances of all targeted users",
+        "estimated_profit_margin": "Near 100% of drained funds minus gas",
+        "attack_duration": "Minutes to drain all targeted accounts"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "After compromising ADMIN key",
+        "market_impact_assessment": "Could drain all user balances"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "All EURF holders",
+        "estimated_impact_per_user": "Total balance loss",
+        "total_value_at_risk": "Total supply held by non-blacklisted users"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "_gaslessBasefee value, number of loop iterations per tx",
+        "calculation_validation": "Gas cost per payGaslessBasefee call in loop",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H011",
+      "title": "Blacklisted ADMIN Can Transfer Own Tokens Bypassing Blacklist and Pause Enforcement",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "adminSanity() exempts ADMIN from pause and sender blacklist checks. A compromised ADMIN who gets blacklisted by the OWNER can still call transfer() to move their tokens out, since the blacklist and pause checks are skipped for ADMIN callers. The only way to stop them is to revoke ADMIN role first, creating a race condition between blacklisting and role revocation.",
+      "investigation_rationale": "For a compliance-focused stablecoin, the ability of a blacklisted admin to freely transfer tokens undermines the blacklist mechanism. In the event of admin key compromise, this creates a window where the compromised admin can exfiltrate funds before role revocation.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "adminSanity",
+        "transfer",
+        "transferFrom"
+      ],
+      "affected_contracts": [
+        "ERC20AdminUpgradeable.sol",
+        "Token.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20AdminUpgradeable.sol",
+          "function": "adminSanity"
+        },
+        {
+          "file": "Token.sol",
+          "function": "transfer"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20AdminUpgradeable.sol",
+        "lines": "62-67",
+        "pattern": "`if (!hasRole(ADMIN, _msgSender()))` gates both paused() and isBlacklisted(from) checks - ADMIN skips both completely"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "ADMIN account is compromised",
+        "OWNER blacklists the ADMIN address",
+        "ADMIN role not yet revoked (race condition window)"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "adminSanity: ADMIN check wraps both pause and sender-blacklist, creating blanket exemption",
+        "manipulation_vector": "Blacklisted ADMIN calls transfer() to move tokens despite blacklist",
+        "profit_hypothesis": "Compromised admin exfiltrates their entire EURF balance during the window between blacklist and role revocation"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How much EURF might an ADMIN address hold?",
+          "Can ADMIN also use forceTransfer from other addresses during this window?",
+          "What is the typical response time for revoking ADMIN role?"
+        ],
+        "validation_requirements": [
+          "Test: blacklist ADMIN address, verify they can still call transfer()",
+          "Test: pause contract, verify ADMIN can still transfer",
+          "Verify forceTransfer is also usable by blacklisted ADMIN (it has separate onlyRole check)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (requires compromised ADMIN key)",
+        "estimated_execution_cost": "~0.001 ETH gas",
+        "potential_profit_range": "ADMIN's own balance + any force-transferable amounts",
+        "estimated_profit_margin": "100% of exfiltrated balance",
+        "attack_duration": "Single transaction during response window"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "After blacklisting, before role revocation",
+        "market_impact_assessment": "Limited to ADMIN's own holdings (unless forceTransfer is used)"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol and potentially other users if forceTransfer is used",
+        "estimated_impact_per_user": "ADMIN balance + potential forceTransfer amounts",
+        "total_value_at_risk": "ADMIN holdings + accessible balances via forceTransfer"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "ADMIN role permissions during blacklisted state",
+        "calculation_validation": "Check if forceTransfer also bypasses sender blacklist for ADMIN",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H012",
+      "title": "ETH Permanently Locked in Forwarder Contract Due to Missing Withdrawal Function",
+      "risk_level": "MEDIUM",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The Forwarder contract has `receive() external payable {}` allowing it to receive ETH. However, there is no withdrawal function, and the only ETH outflow path (execute with req.value > 0) requires req.to == _eurfAddress, which likely doesn't have a payable receive/fallback. Any ETH sent to the Forwarder is permanently locked with no recovery mechanism.",
+      "investigation_rationale": "The receive() function signals the contract should handle ETH, but the lack of any withdrawal path means funds are irreversibly trapped. This is a code defect - either receive() should be removed, or a withdrawal function should exist.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "receive",
+        "execute"
+      ],
+      "affected_contracts": [
+        "Forwarder.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Forwarder.sol",
+          "function": "receive"
+        },
+        {
+          "file": "Forwarder.sol",
+          "function": "execute"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Forwarder.sol",
+        "lines": "44-45",
+        "pattern": "receive() external payable {} accepts ETH but no withdraw/rescue function exists; execute() sends ETH only to _eurfAddress which has no payable receive"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "ETH is sent to the Forwarder contract (accidentally or via req.value in a msg.value)",
+        "EURFToken does not have receive() or fallback() function"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "No outflow path: execute requires req.to == _eurfAddress, EURFToken has no payable receive/fallback",
+        "manipulation_vector": "ETH sent to Forwarder via direct transfer or msg.value is permanently trapped",
+        "profit_hypothesis": "No profit extraction - pure fund loss for sender"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any code path that allows ETH extraction from the Forwarder?",
+          "Could the Forwarder be deployed behind a proxy allowing upgrade to add withdrawal?",
+          "What amount of ETH might realistically be sent to the Forwarder?"
+        ],
+        "validation_requirements": [
+          "Verify EURFToken has no receive/fallback function",
+          "Test sending ETH to Forwarder and attempting recovery",
+          "Check if Forwarder is deployed as a proxy (deployment scripts unclear)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A (not an attack - fund loss scenario)",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A (pure loss)",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Permanent lock"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "Isolated to ETH senders"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Anyone who accidentally sends ETH to the Forwarder",
+        "estimated_impact_per_user": "100% of ETH sent is permanently locked",
+        "total_value_at_risk": "Cumulative ETH sent to Forwarder address"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check all ETH outflow paths from Forwarder",
+        "calculation_validation": "Verify EURFToken payability",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

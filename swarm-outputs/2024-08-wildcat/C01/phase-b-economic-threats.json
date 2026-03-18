@@ -1,0 +1,954 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "economic_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "WildcatMarket.sol",
+      "WildcatMarketBase.sol",
+      "WildcatMarketWithdrawals.sol",
+      "WildcatMarketConfig.sol",
+      "WildcatMarketToken.sol",
+      "HooksFactory.sol",
+      "WildcatArchController.sol",
+      "WildcatSanctionsSentinel.sol",
+      "WildcatSanctionsEscrow.sol",
+      "HooksConfig.sol",
+      "MarketState.sol",
+      "ReentrancyGuard.sol",
+      "TransientBytesArray.sol",
+      "LibStoredInitCode.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-09T00:20:33.434Z",
+    "duration_ms": 508278
+  },
+  "threats": [
+    {
+      "hypothesis_id": "ECON-H001",
+      "title": "onSetAnnualInterestAndReserveRatioBips Hook Always Reverts Due to Pre-Call RETURNDATASIZE Check",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In HooksConfig.sol, the assembly for onSetAnnualInterestAndReserveRatioBips evaluates `lt(returndatasize(), 0x40)` BEFORE the `call()` to the hooks contract executes. In Yul, the `or(A, B)` evaluates left argument A first. Since RETURNDATASIZE at that point reflects the prior `balanceOf()` call (32 bytes) from `_getUpdatedState()`, `lt(32, 64)` is always true. The `or(true, ...)` is always true, causing an unconditional revert regardless of whether the hook call succeeds.",
+      "investigation_rationale": "This is a code defect in assembly evaluation ordering. Any market that enables the useOnSetAnnualInterestAndReserveRatioBips hook flag will be permanently unable to change annualInterestBips or reserveRatioBips. The borrower loses the ability to manage market parameters, potentially trapping lenders at unfavorable rates or preventing the borrower from adjusting to market conditions.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onSetAnnualInterestAndReserveRatioBips",
+        "setAnnualInterestAndReserveRatioBips"
+      ],
+      "affected_contracts": [
+        "HooksConfig.sol",
+        "WildcatMarketConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksConfig.sol",
+          "function": "onSetAnnualInterestAndReserveRatioBips"
+        },
+        {
+          "file": "WildcatMarketConfig.sol",
+          "function": "setAnnualInterestAndReserveRatioBips"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksConfig.sol",
+        "lines": "The assembly block containing `if or(lt(returndatasize(), 0x40), iszero(call(gas(), target, ...)))`",
+        "pattern": "Yul evaluates or(A, B) left-to-right: A=lt(returndatasize(),0x40) is evaluated BEFORE B=iszero(call(...)). RETURNDATASIZE reflects the previous balanceOf (32 bytes), making lt(32,64)=true, so or(true,X)=true always."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market deployed with useOnSetAnnualInterestAndReserveRatioBips flag enabled in HooksConfig",
+        "Borrower attempts to call setAnnualInterestAndReserveRatioBips"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "or(lt(returndatasize(), 0x40), iszero(call(...))) where RETURNDATASIZE is from a prior call, not the hook call",
+        "manipulation_vector": "No manipulation needed; the bug triggers on every call to setAnnualInterestAndReserveRatioBips when the hook flag is enabled",
+        "profit_hypothesis": "No direct profit extraction, but permanent DoS on market parameter changes creates economic lock-in for lenders and inability for borrower to respond to market conditions"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many markets are expected to enable this hook flag?",
+          "What is the economic impact of being unable to adjust interest rates and reserve ratios?",
+          "Can a borrower work around this by deploying a new market and migrating?"
+        ],
+        "validation_requirements": [
+          "Deploy a market with useOnSetAnnualInterestAndReserveRatioBips enabled",
+          "Confirm setAnnualInterestAndReserveRatioBips always reverts",
+          "Verify Yul evaluation order of or() arguments via bytecode inspection"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "0 (bug triggers naturally)",
+        "estimated_execution_cost": "0",
+        "potential_profit_range": "Indirect: borrower locked into unfavorable parameters, lenders may face suboptimal rates",
+        "estimated_profit_margin": "N/A - DoS, not direct profit",
+        "attack_duration": "Permanent once market deployed with flag"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Always",
+        "market_impact_assessment": "Any market with this hook flag is permanently bricked for parameter updates"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Borrower (unable to adjust parameters) and all lenders (locked into current rates/ratios)",
+        "estimated_impact_per_user": "Cannot quantify without knowing market parameters, but could be 100% of expected parameter flexibility",
+        "total_value_at_risk": "All deposits in affected markets are subject to stale parameters"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Check which hook deployment configurations enable this flag",
+        "calculation_validation": "Trace RETURNDATASIZE through the execution path from _getUpdatedState to the hook call",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H002",
+      "title": "closeMarket Arithmetic Underflow in availableLiquidity When scaleFactor >= 2*RAY",
+      "risk_level": "CRITICAL",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In closeMarket(), `availableLiquidity -= normalizedAmountPaid` uses unchecked subtraction. The `_applyWithdrawalBatchPayment` function computes `normalizedAmountPaid = mulDiv(scaledAmountBurned, scaleFactor, RAY)` which rounds down, but `scaledAmountBurned = scaleAmount(availableLiquidity)` where scaleAmount uses rayDiv (rounds to nearest/up). When scaleFactor >= 2*RAY (100%+ accumulated interest), this round-trip can produce `normalizedAmountPaid > availableLiquidity`, causing arithmetic underflow and reverting the entire closeMarket transaction.",
+      "investigation_rationale": "Concrete numeric example: scaleFactor=2e27, availableLiquidity=1. scaleAmount(1) = rayDiv(1, 2e27) = (1e27 + 1e27)/2e27 = 1. normalizedAmountPaid = mulDiv(1, 2e27, 1e27) = 2. Then `1 - 2` underflows. Unlike repayAndProcessUnpaidWithdrawalBatches which uses satSub, closeMarket uses regular subtraction. This prevents market closure for any market that has accrued 100%+ interest.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "closeMarket",
+        "_applyWithdrawalBatchPayment"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "WildcatMarketBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        },
+        {
+          "file": "WildcatMarketBase.sol",
+          "function": "_applyWithdrawalBatchPayment"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "closeMarket: availableLiquidity -= normalizedAmountPaid (regular subtraction, not satSub)",
+        "pattern": "scaleAmount uses rayDiv (rounds to nearest) then mulDiv rounds down. When scaleFactor >= 2*RAY, the round-trip normalizedAmountPaid > availableLiquidity causing arithmetic underflow."
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market has accumulated 100%+ interest (scaleFactor >= 2*RAY)",
+        "There are pending or unpaid withdrawal batches at close time",
+        "Dust amounts remain after batch processing"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "availableLiquidity -= normalizedAmountPaid where normalizedAmountPaid can exceed availableLiquidity",
+        "manipulation_vector": "Natural occurrence over market lifetime; attacker could create tiny withdrawal batch to ensure the rounding triggers",
+        "profit_hypothesis": "Borrower is permanently unable to close market, forced to pay interest indefinitely. Attacker (any lender) benefits from perpetual interest accrual."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What is the minimum scaleFactor/time required for this to trigger?",
+          "Can the borrower mitigate by pre-processing all batches before calling closeMarket?",
+          "Does the rounding always produce normalizedAmountPaid > availableLiquidity when scaleFactor >= 2*RAY?"
+        ],
+        "validation_requirements": [
+          "Create market with high interest rate, let scaleFactor grow past 2*RAY",
+          "Queue a tiny withdrawal and attempt closeMarket",
+          "Verify arithmetic underflow in the subtraction"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal - just enough for a 1 wei withdrawal queue",
+        "estimated_execution_cost": "~0.01 ETH in gas",
+        "potential_profit_range": "Perpetual interest income from borrower who can't close market",
+        "estimated_profit_margin": "Depends on market APR and outstanding supply",
+        "attack_duration": "Permanent DoS on market closure"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None for attack; just need to be a lender in the market",
+        "optimal_timing": "After scaleFactor crosses 2*RAY threshold",
+        "market_impact_assessment": "Market becomes uncloseable; borrower stuck paying interest"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Borrower (unable to close market, perpetual interest obligation)",
+        "estimated_impact_per_user": "Borrower pays interest indefinitely on remaining supply",
+        "total_value_at_risk": "Outstanding market supply * annual interest rate * time"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "scaleFactor=2e27, availableLiquidity=1, scaledAmountOwed=1",
+        "calculation_validation": "Exact round-trip: scaleAmount(1) at SF=2e27 → mulDiv result vs input",
+        "execution_complexity": "low",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H003",
+      "title": "closeMarket Reverts Due to Rounding Dust in scaledPendingWithdrawals",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In closeMarket(), the final check `if (state.scaledPendingWithdrawals != 0) revert_CloseMarketWithUnpaidWithdrawals()` can fail due to rounding dust. When _applyWithdrawalBatchPayment computes `scaledAvailableLiquidity = scaleAmount(availableLiquidity)`, the round-trip scaleAmount(normalizeAmount(x)) can be strictly less than x. This means the batch cannot burn all scaled tokens even when sufficient normalized liquidity exists, leaving 1-2 wei of scaledPendingWithdrawals as irrecoverable dust.",
+      "investigation_rationale": "This is distinct from ECON-H002 (which is an underflow). Even when scaleFactor < 2*RAY (no underflow), the lossy integer arithmetic of scaleAmount(normalizeAmount(x)) < x can leave dust that prevents market closure. The code comment acknowledges rounding dust in withdrawals but doesn't account for it in the closeMarket check.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "closeMarket",
+        "_applyWithdrawalBatchPayment"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "WildcatMarketBase.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        },
+        {
+          "file": "WildcatMarketBase.sol",
+          "function": "_applyWithdrawalBatchPayment"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "closeMarket: `if (state.scaledPendingWithdrawals != 0) revert_CloseMarketWithUnpaidWithdrawals()`",
+        "pattern": "scaleAmount(normalizeAmount(x)) can be < x due to integer division rounding, leaving non-zero scaledPendingWithdrawals even when all normalized liquidity has been allocated"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market has any pending withdrawal batch at close time",
+        "scaleFactor * scaledTotalSupply is not a perfect multiple of RAY (true for most markets)",
+        "Borrower has deposited sufficient funds to cover all debts"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "scaleAmount(normalizeAmount(scaledPendingWithdrawals)) can be < scaledPendingWithdrawals due to integer rounding",
+        "manipulation_vector": "Occurs naturally; attacker can ensure it triggers by queuing a small withdrawal before closeMarket is called",
+        "profit_hypothesis": "Market cannot close, borrower forced to continue paying interest. Lenders extract value from perpetual interest accrual."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "For what proportion of scaleFactor values does this dust issue occur?",
+          "Can the borrower work around this by first processing all batches via repayAndProcessUnpaidWithdrawalBatches?",
+          "What is the minimum dust amount that blocks closure?"
+        ],
+        "validation_requirements": [
+          "Test closeMarket with various scaleFactor values and pending batches",
+          "Calculate exact conditions under which scaleAmount(normalizeAmount(x)) < x",
+          "Verify that 1 wei of scaledPendingWithdrawals blocks closure"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal - just enough for a dust-sized withdrawal",
+        "estimated_execution_cost": "~0.01 ETH gas",
+        "potential_profit_range": "Perpetual interest from uncloseable market",
+        "estimated_profit_margin": "Depends on market parameters",
+        "attack_duration": "Permanent DoS"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Any time before borrower attempts closeMarket",
+        "market_impact_assessment": "Market permanently uncloseable in most cases"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Borrower (forced perpetual interest payment)",
+        "estimated_impact_per_user": "Ongoing interest obligation on remaining market supply",
+        "total_value_at_risk": "All outstanding market supply subject to continued interest"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Test with scaleFactor = 1.5e27, scaledTotalSupply = 1e18",
+        "calculation_validation": "Verify scaleAmount(normalizeAmount(x)) < x for typical parameters",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H004",
+      "title": "closeMarket Loop Repeatedly Processes Same Unpaid Batch Without Progress",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In closeMarket(), the loop `for (uint256 i; i < numBatches; i++)` calls `_processUnpaidWithdrawalBatch(state, availableLiquidity)`, which always reads `_withdrawalData.unpaidBatches.first()`. If the first batch cannot be fully paid, it remains at the front of the queue. The loop iterates `numBatches` times, processing the same batch each iteration with diminishing availableLiquidity, wasting gas without meaningful progress toward paying later batches.",
+      "investigation_rationale": "Unlike repayAndProcessUnpaidWithdrawalBatches which has an `availableLiquidity > 0` condition in its while loop, closeMarket iterates a fixed `numBatches` times. Combined with the rounding issues (ECON-H002/H003), this creates a scenario where the loop consumes gas processing the same underpayable batch, and closureMarket ultimately reverts because scaledPendingWithdrawals != 0.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "closeMarket",
+        "_processUnpaidWithdrawalBatch"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "WildcatMarketWithdrawals.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        },
+        {
+          "file": "WildcatMarketWithdrawals.sol",
+          "function": "_processUnpaidWithdrawalBatch"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "closeMarket loop: for (uint256 i; i < numBatches; i++) { uint256 normalizedAmountPaid = _processUnpaidWithdrawalBatch(state, availableLiquidity); availableLiquidity -= normalizedAmountPaid; }",
+        "pattern": "_processUnpaidWithdrawalBatch always reads first() from unpaidBatches; if batch not fully paid, it stays at front; loop wastes gas on same batch"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-008",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Multiple unpaid withdrawal batches exist",
+        "First batch cannot be fully paid with available liquidity",
+        "Borrower calls closeMarket"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Loop iterates numBatches times but only processes the same first batch each time",
+        "manipulation_vector": "Occurs naturally when multiple underfunded batches exist",
+        "profit_hypothesis": "Gas waste makes closeMarket increasingly expensive; combined with rounding issues, market becomes uncloseable"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How much gas is wasted per redundant iteration?",
+          "Can this cause closeMarket to run out of gas?",
+          "Does the second _processUnpaidWithdrawalBatch call actually pay anything after the first?"
+        ],
+        "validation_requirements": [
+          "Create market with multiple unpaid batches, attempt closeMarket",
+          "Measure gas consumption of redundant loop iterations",
+          "Verify that after first iteration with availableLiquidity > 0, subsequent iterations do nothing"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - natural occurrence",
+        "estimated_execution_cost": "Wasted gas from redundant iterations",
+        "potential_profit_range": "Indirect - contributes to closeMarket DoS",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Per closeMarket attempt"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "When multiple unpaid batches exist",
+        "market_impact_assessment": "Increased gas cost for closeMarket, potential block gas limit DoS"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Borrower attempting to close market",
+        "estimated_impact_per_user": "Wasted gas + potential inability to close",
+        "total_value_at_risk": "Gas costs + perpetual interest if market can't close"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "numBatches=100, available liquidity covering only first batch partially",
+        "calculation_validation": "Trace loop execution with concrete values",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H005",
+      "title": "onBorrow Hook Uses RepayHook_Base_Size Instead of BorrowHook_Base_Size for Calldata Sizing",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In HooksConfig.sol, the onBorrow function's assembly block uses `RepayHook_Base_Size` to compute the calldata size for the hook call: `let size := add(RepayHook_Base_Size, extraCalldataBytes)`. The correct constant should be `BorrowHook_Base_Size`. Currently both constants equal 0x0224, so this is a latent bug. If the borrow or repay hook structures ever diverge (e.g., adding parameters to one), incorrect calldata would be sent to the hooks contract.",
+      "investigation_rationale": "This is a code defect where the wrong named constant is used. Both BorrowHook_Base_Size and RepayHook_Base_Size are 0x0224 because borrow and repay hooks have identical parameter layouts. However, this creates a maintenance hazard - any future change to either hook's parameter layout would silently break the other.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "onBorrow"
+      ],
+      "affected_contracts": [
+        "HooksConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksConfig.sol",
+          "function": "onBorrow"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksConfig.sol",
+        "lines": "onBorrow assembly: let size := add(RepayHook_Base_Size, extraCalldataBytes)",
+        "pattern": "Wrong constant name used (RepayHook_Base_Size instead of BorrowHook_Base_Size); both happen to be 0x0224"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "Market has useOnBorrow hook flag enabled",
+        "Borrower calls borrow()"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "size := add(RepayHook_Base_Size, extraCalldataBytes) should be BorrowHook_Base_Size",
+        "manipulation_vector": "Currently both constants are 0x0224, so no immediate exploitation. Latent bug if constants diverge.",
+        "profit_hypothesis": "No immediate profit vector; risk materializes if code is updated without fixing the constant reference"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Are there any circumstances where these constants could differ in the current codebase?",
+          "Could compiler optimizations cause different behavior even with identical values?"
+        ],
+        "validation_requirements": [
+          "Verify both constants are identical (0x0224)",
+          "Confirm the hook parameters for borrow and repay are structurally identical",
+          "Test that onBorrow hook call delivers correct calldata"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A - latent bug",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "N/A currently",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "N/A"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "N/A",
+        "market_impact_assessment": "No current impact; future maintenance risk"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "None currently",
+        "estimated_impact_per_user": "None currently",
+        "total_value_at_risk": "None currently"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "BorrowHook_Base_Size=0x0224, RepayHook_Base_Size=0x0224",
+        "calculation_validation": "Confirm values are identical",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H006",
+      "title": "Unpaid Withdrawal Batch Array Growth Enables Gas-Limit DoS on closeMarket",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "closeMarket() contains an unbounded loop processing all unpaid batches: `for (uint256 i; i < numBatches; i++)`. A malicious lender can create many unpaid withdrawal batches by repeatedly queuing tiny withdrawals that become new batches (each requiring the pending batch to expire first). If withdrawalBatchDuration is short (or 0), a lender can create hundreds or thousands of distinct expired unpaid batches, causing closeMarket to exceed the block gas limit.",
+      "investigation_rationale": "Each unpaid batch requires an SLOAD to read from the queue, an SLOAD for batch data, multiple arithmetic operations, and an SSTORE to update. With withdrawalBatchDuration = 0, a lender could create a new batch per block. Over weeks/months, this accumulates enough batches to make the closeMarket loop exceed 30M gas.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "withdrawalBatchDuration is set to a very small value (0 or a few seconds)",
+        "Attacker is an authorized lender in the market"
+      ],
+      "config_evidence": "withdrawalBatchDuration is set at market deployment via DeployMarketInputs.withdrawalBatchDuration",
+      "affected_functions": [
+        "closeMarket",
+        "_processUnpaidWithdrawalBatch"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "WildcatMarketWithdrawals.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "closeMarket"
+        },
+        {
+          "file": "WildcatMarketWithdrawals.sol",
+          "function": "_processUnpaidWithdrawalBatch"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "closeMarket: for (uint256 i; i < numBatches; i++) { uint256 normalizedAmountPaid = _processUnpaidWithdrawalBatch(state, availableLiquidity); availableLiquidity -= normalizedAmountPaid; }",
+        "pattern": "Unbounded loop over _withdrawalData.unpaidBatches with no gas-limit protection; array can grow unboundedly"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-010",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "withdrawalBatchDuration is short (ideally 0)",
+        "Attacker is an authorized lender",
+        "Attacker has sufficient time to create many small withdrawal batches",
+        "Market becomes delinquent at some point so batches go unpaid"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "numBatches = _withdrawalData.unpaidBatches.length() which has no upper bound",
+        "manipulation_vector": "Queue 1 wei withdrawals across many distinct batch periods to bloat the unpaidBatches array",
+        "profit_hypothesis": "Borrower cannot close market, forced to pay interest indefinitely. Attacker earns from perpetual delinquency fees."
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many batches can be created before closeMarket exceeds block gas limit?",
+          "What is the gas cost per batch iteration in _processUnpaidWithdrawalBatch?",
+          "Can the borrower use repayAndProcessUnpaidWithdrawalBatches to clear the queue first?"
+        ],
+        "validation_requirements": [
+          "Estimate gas per _processUnpaidWithdrawalBatch iteration (~50k-100k gas)",
+          "Calculate: 30M gas / cost_per_iteration = max processable batches",
+          "Test with withdrawalBatchDuration=0 and rapid batch creation"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Minimal per batch (1 wei withdrawal amounts)",
+        "estimated_execution_cost": "Gas for hundreds of queueWithdrawal transactions over time",
+        "potential_profit_range": "Perpetual interest from uncloseable market",
+        "estimated_profit_margin": "Depends on market APR and attacker's share",
+        "attack_duration": "Weeks to months of batch creation, then permanent DoS"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None significant",
+        "optimal_timing": "During periods of market delinquency (batches go unpaid)",
+        "market_impact_assessment": "Market becomes permanently uncloseable"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Borrower (perpetual interest obligation)",
+        "estimated_impact_per_user": "All remaining supply subject to continued interest",
+        "total_value_at_risk": "Market supply * APR * time"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Estimate ~300-600 batches to exceed 30M gas",
+        "calculation_validation": "Gas benchmark for _processUnpaidWithdrawalBatch",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H007",
+      "title": "withdrawableProtocolFees Underflows When Market Is Severely Underfunded",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In MarketState.sol, `withdrawableProtocolFees()` computes `totalAvailableAssets = totalAssets - state.normalizedUnclaimedWithdrawals`. If `totalAssets < normalizedUnclaimedWithdrawals` (severe delinquency where even unclaimed withdrawals aren't fully backed), this underflows with a Solidity panic. This can block the `collectFees()` function and any view function paths that call `withdrawableProtocolFees()`.",
+      "investigation_rationale": "While normal operation should prevent totalAssets from falling below normalizedUnclaimedWithdrawals (since batch payments are bounded by available liquidity), edge cases with fee-on-transfer tokens, rebasing tokens, or rounding accumulation could cause this. The lack of satSub creates an unhandled revert path.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "Market uses a token with non-standard transfer behavior (fee-on-transfer, rebasing), OR severe delinquency with rounding errors accumulating over many state transitions"
+      ],
+      "config_evidence": "Project docs state no fee-on-transfer or rebasing tokens, but code has no validation. Standard ERC20 may still cause this via accumulated rounding.",
+      "affected_functions": [
+        "withdrawableProtocolFees",
+        "collectFees"
+      ],
+      "affected_contracts": [
+        "MarketState.sol",
+        "WildcatMarket.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "MarketState.sol",
+          "function": "withdrawableProtocolFees"
+        },
+        {
+          "file": "WildcatMarket.sol",
+          "function": "collectFees"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "MarketState.sol",
+        "lines": "withdrawableProtocolFees: uint256 totalAvailableAssets = totalAssets - state.normalizedUnclaimedWithdrawals",
+        "pattern": "Unchecked subtraction without satSub; will panic if totalAssets < normalizedUnclaimedWithdrawals"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "totalAssets < normalizedUnclaimedWithdrawals due to edge case or non-standard token",
+        "collectFees or withdrawableProtocolFees view function is called"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "totalAssets - normalizedUnclaimedWithdrawals with no underflow protection",
+        "manipulation_vector": "Possible via accumulated rounding errors or non-standard token behavior",
+        "profit_hypothesis": "No direct profit; DoS on fee collection and view functions"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can accumulated rounding errors over many state transitions cause totalAssets < normalizedUnclaimedWithdrawals?",
+          "What is the maximum rounding error per state transition?",
+          "How many transitions would be needed to create a significant gap?"
+        ],
+        "validation_requirements": [
+          "Analyze rounding error bounds in _applyWithdrawalBatchPayment",
+          "Test with extreme scenarios (many small batches, high scaleFactor)",
+          "Verify whether standard ERC20 tokens can trigger this"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "N/A",
+        "estimated_execution_cost": "N/A",
+        "potential_profit_range": "None direct; DoS on fee collection",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "As long as the condition persists"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "After severe delinquency or many rounding-inducing operations",
+        "market_impact_assessment": "Protocol fee collection blocked"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Fee recipient (unable to collect accrued fees)",
+        "estimated_impact_per_user": "All accrued protocol fees locked",
+        "total_value_at_risk": "accruedProtocolFees amount"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Analyze cumulative rounding error bounds",
+        "calculation_validation": "Test with standard ERC20 and extreme market conditions",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H008",
+      "title": "pushProtocolFeeBipsUpdates Reverts Entire Batch if Any Market is Closed",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "HooksFactory.pushProtocolFeeBipsUpdates iterates over markets and calls `market.setProtocolFeeBips(protocolFeeBips)` for each. If ANY market in the range is closed, `setProtocolFeeBips` reverts with `ProtocolFeeChangeOnClosedMarket()`, and since the factory uses a raw `call()` that reverts on failure, the entire batch update transaction fails. A borrower who closes their market inadvertently (or intentionally) blocks protocol fee updates for all other markets using the same template.",
+      "investigation_rationale": "The `if iszero(call(gas(), market, 0, setProtocolFeeBipsCalldataPointer, 0x24, 0, 0)) { revert }` pattern means any single failed call aborts the entire operation. The admin must manually paginate around closed markets, which requires identifying them and splitting the range.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "pushProtocolFeeBipsUpdates",
+        "setProtocolFeeBips"
+      ],
+      "affected_contracts": [
+        "HooksFactory.sol",
+        "WildcatMarketConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "HooksFactory.sol",
+          "function": "pushProtocolFeeBipsUpdates"
+        },
+        {
+          "file": "WildcatMarketConfig.sol",
+          "function": "setProtocolFeeBips"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "HooksFactory.sol",
+        "lines": "pushProtocolFeeBipsUpdates assembly: if iszero(call(gas(), market, 0, setProtocolFeeBipsCalldataPointer, 0x24, 0, 0)) { mstore(0, 0x4484a4a9) revert(0x1c, 0x04) }",
+        "pattern": "Any single market revert (e.g., closed market, or same protocolFeeBips) causes entire batch to fail"
+      },
+      "invariant_citation": {
+        "invariant_id": null,
+        "relationship": "NONE"
+      },
+      "preconditions": [
+        "At least one market in the template's market array is closed or already has the same protocolFeeBips",
+        "Admin calls pushProtocolFeeBipsUpdates for that template"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Raw call revert propagation blocks all subsequent markets in batch",
+        "manipulation_vector": "Borrower closes their market (legitimate action), blocking fee updates for other markets",
+        "profit_hypothesis": "Other markets avoid protocol fee increases; protocol loses fee revenue"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "How many markets share a typical template?",
+          "Can the admin work around this by specifying index ranges that skip closed markets?",
+          "What is the economic impact of delayed fee updates?"
+        ],
+        "validation_requirements": [
+          "Deploy multiple markets with same template, close one, attempt batch fee update",
+          "Verify the entire call reverts",
+          "Test workaround with specific index ranges"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Cost to deploy and close a market",
+        "estimated_execution_cost": "Gas for market deployment and closure",
+        "potential_profit_range": "Avoided protocol fee increases across all markets using template",
+        "estimated_profit_margin": "Depends on fee delta and market volumes",
+        "attack_duration": "Until admin manually works around the closed market"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Enough to deploy a market with the target template",
+        "optimal_timing": "Before admin pushes fee updates",
+        "market_impact_assessment": "Temporary DoS on protocol fee propagation"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Protocol fee recipient (delayed/blocked fee collection on other markets)",
+        "estimated_impact_per_user": "Depends on protocolFeeBips change magnitude",
+        "total_value_at_risk": "Lost protocol fees across affected markets until workaround applied"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Number of markets per template, frequency of fee updates",
+        "calculation_validation": "Confirm setProtocolFeeBips reverts on closed markets and same-value updates",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H009",
+      "title": "Fee-on-Transfer Token Inflates Internal Accounting Leading to Market Insolvency",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "In _depositUpTo(), the market credits `scaledAmount = scaleAmount(amount)` based on the user-supplied `amount`, then calls `asset.safeTransferFrom(msg.sender, address(this), amount)`. If the underlying asset is a fee-on-transfer token, the actual received amount is `amount - fee`, but the internal accounting credits `amount`. Over time, total scaled claims exceed actual assets, creating insolvency where the last withdrawers cannot fully redeem.",
+      "investigation_rationale": "The code never checks the actual received amount via pre/post balance comparison. The project documentation states fee-on-transfer tokens are not supported, but there is no on-chain validation preventing deployment with such tokens. Any market deployed with a fee-on-transfer token would become progressively insolvent.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "The underlying asset configured at market deployment has fee-on-transfer behavior"
+      ],
+      "config_evidence": "Project docs state 'No fee-on-transfer tokens as underlying' but no code enforcement. Asset is set via DeployMarketInputs.asset in HooksFactory._deployMarket.",
+      "affected_functions": [
+        "_depositUpTo",
+        "repay",
+        "_repay",
+        "repayAndProcessUnpaidWithdrawalBatches"
+      ],
+      "affected_contracts": [
+        "WildcatMarket.sol",
+        "WildcatMarketWithdrawals.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarket.sol",
+          "function": "_depositUpTo"
+        },
+        {
+          "file": "WildcatMarket.sol",
+          "function": "repay"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarket.sol",
+        "lines": "_depositUpTo: asset.safeTransferFrom(msg.sender, address(this), amount) followed by account.scaledBalance += scaledAmount (based on amount, not actual received)",
+        "pattern": "No balance delta check after safeTransferFrom; amount parameter used directly for accounting"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market deployed with a fee-on-transfer token as the underlying asset",
+        "Multiple deposits and withdrawals occur"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "scaledAmount computed from amount (not actual received amount)",
+        "manipulation_vector": "First depositors receive full credit; last withdrawers bear the accumulated deficit",
+        "profit_hypothesis": "Attacker deposits with fee-on-transfer token, gets credited full amount, withdraws more than fair share"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Is there any on-chain check preventing fee-on-transfer tokens?",
+          "How quickly does the accounting gap grow?",
+          "Can the asset blacklist be used to prevent this?"
+        ],
+        "validation_requirements": [
+          "Deploy market with mock fee-on-transfer token",
+          "Perform multiple deposits and withdrawals",
+          "Verify last withdrawer receives less than expected"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Must have fee-on-transfer token to deposit",
+        "estimated_execution_cost": "Standard deposit gas costs",
+        "potential_profit_range": "Proportional to transfer fee rate * total market volume",
+        "estimated_profit_margin": "Depends on fee rate (typical 1-5%)",
+        "attack_duration": "Accumulates over market lifetime"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "Capital to deposit in the market",
+        "optimal_timing": "Early deposits get full credit; withdraw before market depletes",
+        "market_impact_assessment": "Progressive insolvency, last-out loses"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Last lenders to withdraw from the market",
+        "estimated_impact_per_user": "Up to 100% of remaining balance if market fully depleted",
+        "total_value_at_risk": "Accumulated fee deficit across all transfers"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Test with 2% fee-on-transfer, 10 deposits of 1000 tokens each",
+        "calculation_validation": "Track totalAssets vs totalDebts over multiple operations",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H010",
+      "title": "setAnnualInterestAndReserveRatioBips Reserve Ratio Check Uses Stale State for annualInterestBips During Decrease Validation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In setAnnualInterestAndReserveRatioBips, when reserveRatioBips is decreased, the code checks `state.liquidityRequired() > totalAssets()` using the OLD reserveRatioBips and OLD annualInterestBips. Both `_annualInterestBips` and `_reserveRatioBips` are set simultaneously after this check. The hooks contract can return arbitrary values (within uint16 range), potentially setting annualInterestBips much higher than requested. Since `liquidityRequired()` does not depend on annualInterestBips, this specific check is sound. However, the hook could return a very different reserveRatioBips than the borrower intended.",
+      "investigation_rationale": "The hooks' `onSetAnnualInterestAndReserveRatioBips` returns `(newAnnualInterestBips, newReserveRatioBips)` which completely override the borrower's requested values. A malicious hook could return any uint16 values, limited only by the `> BIP` checks. If the hook is compromised or buggy, it could set parameters that trap the borrower or lenders in unfavorable conditions.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "The hooks contract for onSetAnnualInterestAndReserveRatioBips is malicious or buggy and returns unexpected values"
+      ],
+      "config_evidence": "Hook return values used directly at WildcatMarketConfig.sol setAnnualInterestAndReserveRatioBips after the hooks call",
+      "affected_functions": [
+        "setAnnualInterestAndReserveRatioBips",
+        "onSetAnnualInterestAndReserveRatioBips"
+      ],
+      "affected_contracts": [
+        "WildcatMarketConfig.sol",
+        "HooksConfig.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatMarketConfig.sol",
+          "function": "setAnnualInterestAndReserveRatioBips"
+        },
+        {
+          "file": "HooksConfig.sol",
+          "function": "onSetAnnualInterestAndReserveRatioBips"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatMarketConfig.sol",
+        "lines": "(_annualInterestBips, _reserveRatioBips) = hooks.onSetAnnualInterestAndReserveRatioBips(_annualInterestBips, _reserveRatioBips, state);",
+        "pattern": "Hook return values override borrower's requested parameters; only bounded by > BIP check (10000)"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Market has useOnSetAnnualInterestAndReserveRatioBips hook enabled (note: currently blocked by ECON-H001)",
+        "Hook contract returns unexpected values",
+        "Borrower calls setAnnualInterestAndReserveRatioBips"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "Hook return values used without comparison to borrower's original request",
+        "manipulation_vector": "Hook sets reserveRatioBips to 0 (reserve ratio decrease passes old check since market was healthy under old ratio)",
+        "profit_hypothesis": "Borrower could borrow more than intended if reserve ratio dropped by hook; lenders face increased default risk"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "What values can the hook realistically return?",
+          "Does the reserve ratio decrease check protect against hook manipulation?",
+          "Is this a design choice (hooks are trusted) or a vulnerability?"
+        ],
+        "validation_requirements": [
+          "Deploy market with hook that returns different values than requested",
+          "Verify whether the reserve ratio checks catch malicious hook values",
+          "Test boundary conditions (hook returns 0 for reserveRatioBips)"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Must control the hooks contract",
+        "estimated_execution_cost": "Standard transaction gas",
+        "potential_profit_range": "Borrower could extract additional funds if reserve ratio lowered unexpectedly",
+        "estimated_profit_margin": "Up to reserveRatio * totalSupply",
+        "attack_duration": "Single transaction"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "N/A",
+        "optimal_timing": "When borrower calls parameter update",
+        "market_impact_assessment": "Depends on hook behavior"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Lenders if reserve ratio lowered unexpectedly",
+        "estimated_impact_per_user": "Increased default risk proportional to reserve ratio change",
+        "total_value_at_risk": "Freed reserves that borrower could extract"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Test with hook returning reserveRatioBips=0",
+        "calculation_validation": "Verify checks catch malicious hook values",
+        "execution_complexity": "medium",
+        "detection_difficulty": "medium"
+      }
+    },
+    {
+      "hypothesis_id": "ECON-H011",
+      "title": "createEscrow Publicly Callable - Anyone Can Deploy Escrows and Set Sanction Overrides",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Spoofing",
+      "hypothesis_description": "WildcatSanctionsSentinel.createEscrow() is publicly callable with arbitrary (borrower, account, asset) parameters. It deploys an escrow and sets `sanctionOverrides[borrower][escrowContract] = true`. While the escrow address is deterministic and won't hold funds unless directed by a market, calling createEscrow with crafted parameters creates sanction overrides that the specified borrower didn't authorize. These overrides persist and could interfere with the borrower's sanction management.",
+      "investigation_rationale": "The escrow creation sets `sanctionOverrides[borrower][escrowContract] = true` using the caller-supplied `borrower` parameter, not `msg.sender`. An attacker can create overrides in any borrower's sanction override mapping. While the override is for the escrow address (not the attacker), this pollutes the borrower's sanction state. The escrow itself is safe (funds only go there through executeWithdrawal), but the override side-effect may be undesirable.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "createEscrow"
+      ],
+      "affected_contracts": [
+        "WildcatSanctionsSentinel.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "WildcatSanctionsSentinel.sol",
+          "function": "createEscrow"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "WildcatSanctionsSentinel.sol",
+        "lines": "createEscrow: sanctionOverrides[borrower][escrowContract] = true; // borrower is caller-supplied, not msg.sender",
+        "pattern": "Public function sets sanction overrides for arbitrary borrower addresses without their consent"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-016",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker knows the borrower address",
+        "Attacker calls createEscrow with the borrower's address"
+      ],
+      "initial_economic_evidence": {
+        "suspicious_calculation": "sanctionOverrides[borrower][escrowContract] = true where borrower is attacker-supplied",
+        "manipulation_vector": "Attacker pre-creates escrow contracts for any borrower/account/asset combination, polluting sanction override state",
+        "profit_hypothesis": "Limited direct profit; mainly state pollution and potential interference with borrower's sanction management"
+      },
+      "investigation_scope": {
+        "economic_questions": [
+          "Can these spurious overrides be used to bypass sanctions in any meaningful way?",
+          "Does the override for escrow addresses have any impact on isSanctioned checks for non-escrow addresses?",
+          "Can the borrower remove these overrides?"
+        ],
+        "validation_requirements": [
+          "Call createEscrow with arbitrary borrower address",
+          "Verify sanctionOverrides is set for the supplied borrower",
+          "Check if the override has any downstream effects"
+        ]
+      },
+      "preliminary_attack_economics": {
+        "estimated_capital_needed": "Gas costs only",
+        "estimated_execution_cost": "~0.01 ETH per escrow creation",
+        "potential_profit_range": "No direct profit; state pollution",
+        "estimated_profit_margin": "N/A",
+        "attack_duration": "Single transaction per escrow"
+      },
+      "market_conditions_analysis": {
+        "liquidity_requirements": "None",
+        "optimal_timing": "Any time",
+        "market_impact_assessment": "Low direct impact; creates unauthorized sanction overrides for escrow addresses"
+      },
+      "potential_victim_impact": {
+        "direct_victims": "Borrowers whose sanction override mapping is polluted",
+        "estimated_impact_per_user": "Minimal direct impact; override is for an escrow address",
+        "total_value_at_risk": "Minimal; escrow addresses are only relevant for sanctioned account fund routing"
+      },
+      "investigation_priorities": {
+        "parameter_analysis": "Test with arbitrary borrower/account/asset combinations",
+        "calculation_validation": "Verify downstream impact of spurious overrides",
+        "execution_complexity": "low",
+        "detection_difficulty": "low"
+      }
+    }
+  ]
+}

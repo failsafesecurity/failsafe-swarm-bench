@@ -1,0 +1,916 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "B",
+    "specialist_role": "technical_threat_generator",
+    "llm_model": null,
+    "llm_provider": "claude",
+    "phase_a_inputs": [
+      "phase-a-architecture-analysis.json",
+      "phase-a-security-analysis.json",
+      "phase-a-logic-analysis.json",
+      "phase-a-invariant-state-analysis.json",
+      "phase-a-invariant-economic-analysis.json"
+    ],
+    "source_code_files": [
+      "Bridge.sol",
+      "IBridge.sol",
+      "SignalService.sol",
+      "ISignalService.sol",
+      "LibSignals.sol",
+      "ERC20Vault.sol",
+      "ERC1155Vault.sol",
+      "ERC721Vault.sol",
+      "BaseNFTVault.sol",
+      "BaseVault.sol",
+      "BridgedERC20.sol",
+      "BridgedERC721.sol",
+      "BridgedERC1155.sol",
+      "BridgedERC20Base.sol",
+      "LibBridgedToken.sol",
+      "IBridgedERC20.sol",
+      "USDCAdapter.sol",
+      "EssentialContract.sol",
+      "IAddressManager.sol",
+      "LibAddress.sol",
+      "LibTrieProof.sol",
+      "RLPReader.sol",
+      "RLPWriter.sol",
+      "MerkleTrie.sol",
+      "SecureMerkleTrie.sol",
+      "Bytes.sol",
+      "ExcessivelySafeCall.sol"
+    ],
+    "include_source_code": true,
+    "timestamp": "2026-03-05T05:35:14.292Z",
+    "duration_ms": 532455
+  },
+  "threats": [
+    {
+      "hypothesis_id": "TECH-H001",
+      "title": "Relayer Gas Griefing in processMessage Steals Fees While Causing Message Failure",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In processMessage, when msg.sender is not the destOwner, gasLimit is set to _message.gasLimit and passed to _invokeMessageCall. However, there is no check that gasleft() is sufficient to actually forward _message.gasLimit to the subcall. Due to the EVM 63/64 rule, if the relayer provides a transaction with total gas slightly above processMessage overhead but below _message.gasLimit, the excessivelySafeCall will receive less gas than specified. The subcall fails (OOG), message status becomes RETRIABLE, but the relayer still receives _message.fee.",
+      "investigation_rationale": "The fee payment occurs unconditionally after the invocation attempt regardless of success. A malicious relayer can systematically grief messages by providing insufficient gas, collecting fees while forcing users to pay additional gas for retries.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "processMessage",
+        "_invokeMessageCall"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "_invokeMessageCall"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "250-260,290-295",
+        "pattern": "gasLimit = _message.gasLimit used in _invokeMessageCall without checking gasleft() >= gasLimit; fee paid to msg.sender unconditionally after status update"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Message has non-zero fee (incentive for relayer)",
+        "msg.sender != _message.destOwner (uses _message.gasLimit instead of gasleft())",
+        "Message target requires significant gas for execution"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 250-260",
+        "vulnerable_pattern": "gasLimit = msg.sender == _message.destOwner ? gasleft() : _message.gasLimit; then _invokeMessageCall(_message, msgHash, gasLimit)",
+        "specific_concern": "No verification that gasleft() >= _message.gasLimit + overhead before the external call; EVM 63/64 rule silently reduces forwarded gas",
+        "missing_safeguards": "No gasleft() check before invocation; no minimum gas requirement enforced"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the exact gas overhead between processMessage entry and excessivelySafeCall?",
+          "Can the relayer precisely control the gas to cause OOG in the subcall while succeeding in the outer call?",
+          "How much fee can be profitably extracted per griefed message?"
+        ],
+        "validation_requirements": [
+          "Calculate exact gas needed for processMessage overhead",
+          "Demonstrate fee extraction with insufficient gas transaction",
+          "Verify message transitions to RETRIABLE after gas griefing"
+        ]
+      },
+      "preliminary_attack_scenario": "Relayer monitors for high-fee messages, submits processMessage with gas = overhead + small_buffer. Subcall fails due to insufficient forwarded gas. Message becomes RETRIABLE. Relayer collects full _message.fee.",
+      "prerequisites": [
+        "Message with non-zero fee exists",
+        "Relayer can submit transactions"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Systematic theft of all relayer fees for targeted messages",
+        "affected_users": "All bridge users who set non-zero fees",
+        "recovery_possibility": "Users must retry messages at their own gas cost; original fee is lost"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for insufficient-gas relayer scenario",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Calculate processMessage overhead vs. _message.gasLimit forwarding",
+        "capital_requirements": "Only gas costs for the griefing transaction",
+        "execution_timing": "Single transaction per griefed message",
+        "detection_analysis": "Observable on-chain: RETRIABLE status with fee paid to non-preferred relayer"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H002",
+      "title": "Permanent Message DoS via Reverting refundTo Address Locks ETH in Bridge",
+      "risk_level": "HIGH",
+      "attack_realism": "HIGH",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "In processMessage, after the message status is updated, ETH is pushed to refundTo via LibAddress.sendEther. If refundTo is a contract that reverts on ETH receipt (no receive/fallback or explicit revert), the entire processMessage transaction reverts, including the status update. The message remains permanently in NEW status. Since it never transitions to FAILED, it cannot be recalled on the source chain. Both the message value and fee are locked in the bridge indefinitely.",
+      "investigation_rationale": "The push-over-pull pattern for ETH refunds creates an unrecoverable state where a reverting refundTo address prevents any status transition. Even with refundAmount=0, sendEther(refundTo, 0) still makes a call that can revert.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "processMessage"
+      ],
+      "affected_contracts": [
+        "Bridge.sol",
+        "LibAddress.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "LibAddress.sol",
+          "function": "sendEther(address,uint256)"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "271-282",
+        "pattern": "refundTo.sendEther(refundAmount) after status update; entire tx reverts if sendEther fails, undoing status change"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "refundTo is a contract that cannot receive ETH (no receive/fallback)",
+        "msg.sender != refundTo (triggers separate refund path)",
+        "Message is in NEW status and proven"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 271-282",
+        "vulnerable_pattern": "Status update and ETH transfer in same transaction; revert in transfer undoes status",
+        "specific_concern": "refundTo.sendEther(refundAmount) can revert even with refundAmount=0 since ExcessivelySafeCall still makes a call to the target",
+        "missing_safeguards": "No pull-based refund mechanism; no try/catch around refund"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can ExcessivelySafeCall with 0 value to a reverting contract still revert?",
+          "Is there any recovery path for the message if refundTo always reverts?",
+          "Can the destOwner calling processMessage bypass the issue?"
+        ],
+        "validation_requirements": [
+          "Deploy reverting contract as refundTo, attempt processMessage",
+          "Verify message remains in NEW status after failed processMessage",
+          "Confirm recall is impossible since message never reaches FAILED on dest"
+        ]
+      },
+      "preliminary_attack_scenario": "User (or vault integration) sets refundTo to a contract address lacking receive(). Any relayer calling processMessage triggers revert at refund step. Message permanently stuck in NEW, ETH locked in bridge.",
+      "prerequisites": [
+        "Message sent with refundTo pointing to non-ETH-receiving contract"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent loss of message value + fee locked in bridge",
+        "affected_users": "Any user setting refundTo to a non-ETH-receiving contract",
+        "recovery_possibility": "None without contract upgrade; message can never transition"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for reverting refundTo scenario",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Minimal - just confirming revert behavior",
+        "capital_requirements": "None beyond the stuck message value",
+        "execution_timing": "Permanent DoS - single bad message",
+        "detection_analysis": "Observable: message stuck in NEW status with valid proof receipt"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H003",
+      "title": "changeBridgedToken Deletes Wrong Mapping Key Leaving Stale Canonical Reference",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In ERC20Vault.changeBridgedToken, the code executes `delete bridgedToCanonical[_btokenNew]` which is a no-op since _btokenNew was verified to have no existing mapping (bridgedToCanonical[_btokenNew].addr == address(0)). The intended deletion should be `delete bridgedToCanonical[btokenOld_]` to clean up the old bridged token's canonical mapping. After migration, btokenOld_ retains its bridgedToCanonical mapping despite being blacklisted.",
+      "investigation_rationale": "This is a demonstrable code defect. The stale mapping means bridgedToCanonical[btokenOld_] still maps to the canonical token, breaking the bijection invariant between bridgedToCanonical and canonicalToBridged. While the blacklist prevents sendToken usage, the stale data persists in storage and could cause issues in future upgrades or off-chain systems.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "changeBridgedToken"
+      ],
+      "affected_contracts": [
+        "ERC20Vault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Vault.sol",
+          "function": "changeBridgedToken"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Vault.sol",
+        "lines": "188-189",
+        "pattern": "delete bridgedToCanonical[_btokenNew] is no-op; should be delete bridgedToCanonical[btokenOld_]"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Owner calls changeBridgedToken with existing old bridged token",
+        "btokenOld_ != address(0)"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ERC20Vault.sol line 188",
+        "vulnerable_pattern": "delete bridgedToCanonical[_btokenNew] instead of bridgedToCanonical[btokenOld_]",
+        "specific_concern": "bridgedToCanonical[btokenOld_] persists with stale canonical token data after migration",
+        "missing_safeguards": "No post-condition check that old mapping was cleared"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can the stale mapping be exploited to bypass blacklist in any code path?",
+          "Does _handleMessage check blacklist before or after checking bridgedToCanonical?",
+          "Could a future upgrade reference stale bridgedToCanonical data?"
+        ],
+        "validation_requirements": [
+          "Verify bridgedToCanonical[btokenOld_] persists after changeBridgedToken",
+          "Check all code paths that read bridgedToCanonical for blacklist bypass potential",
+          "Confirm storage inconsistency between bridgedToCanonical and canonicalToBridged"
+        ]
+      },
+      "preliminary_attack_scenario": "Owner migrates token. Old token retains canonical mapping. If blacklist check is ever bypassed or removed in upgrade, old token could be used to burn and trigger transfers based on stale mapping.",
+      "prerequisites": [
+        "changeBridgedToken called with existing btokenOld_"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Storage inconsistency; potential double-accounting if blacklist is bypassed",
+        "affected_users": "All users of the migrated token",
+        "recovery_possibility": "Requires contract upgrade to clean stale mapping"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test verifying bridgedToCanonical[btokenOld_] cleanup after migration",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Bug triggered on every changeBridgedToken call",
+        "detection_analysis": "Verifiable via storage read after changeBridgedToken"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H004",
+      "title": "Bridge Message with Short Data Bypasses Selector Check Allowing Arbitrary Fallback Invocation",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In _invokeMessageCall, the selector restriction only applies when _message.data.length >= 4 AND _message.to.isContract(). If data.length is 1-3 bytes and the target is a contract, the call proceeds to excessivelySafeCall with the short data. This triggers the target contract's fallback function with arbitrary short payloads while carrying _message.value in ETH and having bridge context active.",
+      "investigation_rationale": "The selector check exists to restrict contract calls to only onMessageInvocation. The bypass via short data (<4 bytes) allows invoking fallback functions on arbitrary contract targets through the bridge, potentially confusing contracts that check bridge context.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_invokeMessageCall"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "_invokeMessageCall"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "331-344",
+        "pattern": "_message.data.length >= 4 check means <4 bytes bypass selector restriction entirely"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Attacker sends bridge message with data.length between 1 and 3",
+        "Target is a contract with a fallback or receive function",
+        "Target is not bridge, signal_service, address(0), or banned"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 331-340",
+        "vulnerable_pattern": "if (_message.data.length >= 4 && ...) { success_ = false; } else { excessivelySafeCall(...) }",
+        "specific_concern": "Short data (<4 bytes) passes through the else branch to excessivelySafeCall without selector validation",
+        "missing_safeguards": "No check for data.length > 0 && data.length < 4 case with contract targets"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Are there any deployed contracts that use Bridge.context() in their fallback?",
+          "Can the bridge context during fallback invocation be exploited by any known contract?",
+          "What is the practical impact of invoking fallback with short data + ETH?"
+        ],
+        "validation_requirements": [
+          "Send bridge message with 1-3 byte data to a contract target",
+          "Verify fallback is invoked with bridge context active",
+          "Check if any protocol contracts have exploitable fallback functions"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker crafts message with 1-3 byte data targeting a contract. The selector check is bypassed, and the contract's fallback executes within the bridge context. If the target reads bridge context, it may process the call as a legitimate cross-chain message.",
+      "prerequisites": [
+        "Ability to send bridge messages",
+        "Target contract with exploitable fallback"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Depends on target contract's fallback behavior",
+        "affected_users": "Users of contracts with fallback functions reading bridge context",
+        "recovery_possibility": "Message-specific; no protocol-wide impact expected"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for short-data message to contract targets",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Minimal gas for fallback invocation",
+        "capital_requirements": "Only the message value + fee",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Detectable by monitoring messages with short data targeting contracts"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H005",
+      "title": "Fee-on-Transfer Token Causes Systematic Vault Underfunding on Destination Chain",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "ERC20Vault._handleMessage correctly measures balanceChange via before/after balanceOf for fee-on-transfer tokens on the source chain. However, on the destination chain, _transferTokens calls IERC20(token_).safeTransfer(_to, _amount) with the full recorded amount. For fee-on-transfer canonical tokens on the destination chain, the actual amount received by _to is less than _amount, but the vault's internal accounting considers _amount fully transferred. Over multiple bridge cycles, the vault's canonical token balance depletes faster than bridged token supply decreases.",
+      "investigation_rationale": "The asymmetric handling of fee-on-transfer tokens between source (measured) and destination (assumed) creates a systematic drain of canonical token reserves. An attacker can repeatedly bridge tokens back and forth, extracting the fee differential each time.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "A fee-on-transfer ERC20 token is used as a canonical token with the vault"
+      ],
+      "config_evidence": "ERC20Vault._handleMessage (lines measuring balanceChange) vs _transferTokens (line using safeTransfer with full amount)",
+      "affected_functions": [
+        "_handleMessage",
+        "_transferTokens",
+        "onMessageInvocation"
+      ],
+      "affected_contracts": [
+        "ERC20Vault.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "ERC20Vault.sol",
+          "function": "_handleMessage"
+        },
+        {
+          "file": "ERC20Vault.sol",
+          "function": "_transferTokens"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "ERC20Vault.sol",
+        "lines": "326-332,297-302",
+        "pattern": "Source: balanceChange_ = t.balanceOf(after) - t.balanceOf(before); Dest: IERC20(token_).safeTransfer(_to, _amount) without re-measuring"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ECON-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Canonical token on destination chain charges transfer fees",
+        "Vault holds the canonical token on the destination chain",
+        "Multiple bridge cycles amplify the discrepancy"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "ERC20Vault.sol lines 297-302",
+        "vulnerable_pattern": "IERC20(token_).safeTransfer(_to, _amount) without balance delta measurement on destination",
+        "specific_concern": "Vault considers _amount fully disbursed but recipient receives less; vault reserves shrink faster than bridged supply",
+        "missing_safeguards": "No balance delta measurement on destination-side canonical token transfer"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What fee-on-transfer tokens could realistically be bridged?",
+          "How many cycles needed to create material underfunding?",
+          "Does the vault become insolvent for last redeemers?"
+        ],
+        "validation_requirements": [
+          "Test with fee-on-transfer token mock on both chains",
+          "Calculate vault balance deficit after N bridge cycles",
+          "Verify last redeemer cannot withdraw"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker bridges fee-on-transfer token from source (vault correctly accounts for fee) to destination (bridged token minted for full amount). Attacker bridges back: vault burns bridged tokens for full amount, transfers canonical tokens minus fee. After many cycles, vault runs out of canonical tokens while bridged tokens still exist.",
+      "prerequisites": [
+        "Fee-on-transfer canonical token on destination chain",
+        "Multiple bridge operations"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Vault insolvency for the specific token; last redeemers lose funds",
+        "affected_users": "All holders of the corresponding bridged token",
+        "recovery_possibility": "Requires manual token injection into vault"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test with fee-on-transfer token on destination chain",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard bridge transaction gas",
+        "capital_requirements": "Initial token deposit for cycling",
+        "execution_timing": "Multiple transactions across both chains",
+        "detection_analysis": "Observable via vault balance vs. bridged token supply comparison"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H006",
+      "title": "SignalService Cannot Be Paused Leaving No Emergency Stop During Active Exploit",
+      "risk_level": "HIGH",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "SignalService._authorizePause always reverts with SS_UNSUPPORTED, making the pause() and unpause() functions permanently inoperative. If a vulnerability is discovered in Merkle proof verification (LibTrieProof, MerkleTrie) or in the signal storage mechanism, there is no way to halt SignalService operations. Since Bridge._proveSignalReceived depends on SignalService for proof verification, all bridge operations continue even during an active exploit of the proof system.",
+      "investigation_rationale": "While the bridge itself can be paused via bridge_pauser, the SignalService cannot. An attacker exploiting a proof verification bug could continue proving signals even if the bridge is paused, potentially pre-positioning proofs for immediate execution when the bridge is unpaused.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "_authorizePause"
+      ],
+      "affected_contracts": [
+        "SignalService.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SignalService.sol",
+          "function": "_authorizePause"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SignalService.sol",
+        "lines": "202-204",
+        "pattern": "function _authorizePause(address) internal pure override { revert SS_UNSUPPORTED(); }"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-006",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "A vulnerability exists in proof verification logic",
+        "Emergency response requires halting proof operations"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "SignalService.sol lines 202-204",
+        "vulnerable_pattern": "_authorizePause always reverts, making pause permanently unavailable",
+        "specific_concern": "No emergency stop mechanism for signal/proof operations",
+        "missing_safeguards": "No alternative halt mechanism for SignalService"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can pausing the bridge alone provide sufficient protection?",
+          "Can proveSignalReceived with caching continue to write state when bridge is paused?",
+          "Is there an alternative way to disable SignalService (e.g., deauthorize all addresses)?"
+        ],
+        "validation_requirements": [
+          "Confirm pause() on SignalService always reverts",
+          "Verify proveSignalReceived can still cache chain data when bridge is paused",
+          "Assess residual risk if only bridge is paused"
+        ]
+      },
+      "preliminary_attack_scenario": "Proof verification bug discovered. Bridge is paused, but SignalService continues accepting proof operations. Attacker caches malicious chain data via proveSignalReceived. When bridge is unpaused, cached data enables immediate exploitation.",
+      "prerequisites": [
+        "Vulnerability in proof verification",
+        "Need for emergency halt"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Inability to halt proof operations during exploit window",
+        "affected_users": "All bridge users",
+        "recovery_possibility": "Requires contract upgrade of SignalService"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test verifying SignalService emergency pause behavior",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "During emergency response window",
+        "detection_analysis": "N/A - design concern"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H007",
+      "title": "Unchecked Invocation Delay Addition Can Overflow to Bypass Security Delay",
+      "risk_level": "MEDIUM",
+      "attack_realism": "MEDIUM",
+      "stride_category": "Tampering",
+      "hypothesis_description": "In processMessage, when msg.sender is not the preferredExecutor, the invocationDelay is increased by invocationExtraDelay inside an unchecked block: `unchecked { invocationDelay += invocationExtraDelay; }`. While current hardcoded values (3600 + 384) are safe, getInvocationDelays() is a virtual function that can be overridden in derived contracts. If a derived Bridge contract returns large delay values, the unchecked addition wraps around to a small value, effectively eliminating the security delay.",
+      "investigation_rationale": "The unchecked addition of two uint256 values in a security-critical path creates a potential overflow if delay values are ever increased significantly in a derived contract or future upgrade.",
+      "config_dependent": true,
+      "deployment_assumptions": [
+        "getInvocationDelays is overridden in a derived contract with large values"
+      ],
+      "config_evidence": "Bridge.sol getInvocationDelays is virtual; current values are safe but future overrides may not be",
+      "affected_functions": [
+        "processMessage",
+        "getInvocationDelays"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "231-234",
+        "pattern": "unchecked { invocationDelay += invocationExtraDelay; } - uint256 addition in unchecked block"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-001",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "getInvocationDelays returns large values that cause overflow when summed",
+        "Derived contract or upgrade changes delay values"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 231-234",
+        "vulnerable_pattern": "unchecked { invocationDelay += invocationExtraDelay; }",
+        "specific_concern": "If invocationDelay + invocationExtraDelay > type(uint256).max, result wraps to small value, reducing security delay",
+        "missing_safeguards": "No overflow check on the addition; no upper bound validation on delay values"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Are there any deployed derived Bridge contracts with overridden getInvocationDelays?",
+          "Could a future upgrade introduce delay values large enough to overflow?",
+          "What is the minimum pair of values that would cause an exploitable overflow?"
+        ],
+        "validation_requirements": [
+          "Test with maxed delay values to demonstrate overflow",
+          "Verify overflow results in bypassed delay check"
+        ]
+      },
+      "preliminary_attack_scenario": "Derived Bridge contract or future upgrade sets getInvocationDelays to return values where sum overflows. Non-preferred executor calls processMessage; the overflow results in near-zero effective delay, bypassing the security window.",
+      "prerequisites": [
+        "Derived contract with overridden getInvocationDelays returning large values"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Complete bypass of invocation delay security window",
+        "affected_users": "All bridge users on the affected chain",
+        "recovery_possibility": "Fix delay values via contract upgrade"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No overflow test for invocation delay addition",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "N/A",
+        "capital_requirements": "N/A",
+        "execution_timing": "Immediate bypass of delay",
+        "detection_analysis": "Detectable via delay value inspection"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H008",
+      "title": "Suspend+Unsuspend Creates Proof Receipt for Arbitrary Message Hashes Bypassing Merkle Verification",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "suspendMessages sets proofReceipt[msgHash].receivedAt to type(uint64).max (suspend) or block.timestamp (unsuspend). In processMessage, the check `bool isMessageProven = receivedAt != 0` skips _proveSignalReceived entirely if a proof receipt exists. A compromised bridge_watchdog can: (1) call suspendMessages([crafted_hash], true), (2) call suspendMessages([crafted_hash], false) which sets receivedAt=block.timestamp, (3) wait for invocation delay, (4) process a fabricated message matching the hash without any Merkle proof verification. Unlike recallMessage which checks isSignalSent, processMessage has no such additional check.",
+      "investigation_rationale": "This is a critical design flaw in the suspend/unsuspend mechanism. The unsuspend action creates a proof receipt without proof verification. Combined with the default NEW(0) message status for all hashes, any crafted message matching an unsuspended hash can be processed.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "suspendMessages",
+        "processMessage"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "suspendMessages"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "92-100,213-226",
+        "pattern": "suspendMessages sets receivedAt=block.timestamp on unsuspend; processMessage skips proof if receivedAt != 0"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "bridge_watchdog key is compromised or colluding",
+        "Attacker can compute message hash for desired fabricated message",
+        "Invocation delay period passes after unsuspend"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 92-100 (suspendMessages) and 213-226 (processMessage proof bypass)",
+        "vulnerable_pattern": "Unsuspend sets receivedAt=block.timestamp for any msgHash; processMessage checks only receivedAt != 0 to skip proof",
+        "specific_concern": "processMessage lacks isSignalSent check (unlike recallMessage), so completely fabricated messages can be processed",
+        "missing_safeguards": "No proof validation after unsuspend; no isSignalSent check in processMessage"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can the attack drain the bridge's entire ETH balance?",
+          "Can the attack trigger arbitrary vault operations (mint bridged tokens)?",
+          "Does the invocation delay provide sufficient response time?"
+        ],
+        "validation_requirements": [
+          "Demonstrate end-to-end: suspend+unsuspend+process fabricated message",
+          "Calculate maximum extractable value per attack",
+          "Verify recallMessage is NOT vulnerable (has isSignalSent check)"
+        ]
+      },
+      "preliminary_attack_scenario": "Compromised watchdog: (1) Compute hash of fabricated message targeting vault with arbitrary token mint data. (2) Suspend+unsuspend the hash. (3) After invocation delay, call processMessage with fabricated message. Bridge executes message without proof, triggering vault to mint bridged tokens or release canonical tokens.",
+      "prerequisites": [
+        "Compromised bridge_watchdog key",
+        "Knowledge of message encoding format"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Total drain of bridge ETH and vault token holdings",
+        "affected_users": "All bridge users; entire protocol",
+        "recovery_possibility": "Requires pausing bridge and contract upgrade"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "critical",
+      "test_coverage_gap": "No test for suspend+unsuspend followed by fabricated message processing",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard processMessage gas cost",
+        "capital_requirements": "Zero for the attack itself (uses bridge's own funds)",
+        "execution_timing": "Two transactions (suspend+unsuspend) + invocation delay + process",
+        "detection_analysis": "Detectable: suspend+unsuspend events for non-existent messages"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H009",
+      "title": "Banning Vault Address Causes Permanent Loss of In-Flight Bridged Tokens",
+      "risk_level": "CRITICAL",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "When a vault address is added to addressBanned, processMessage handles messages targeting the vault by setting refundAmount=_message.value, marking status as DONE, and refunding ETH. However, the token transfer data encoded in _message.data is never executed (no onMessageInvocation call). On the source chain, the tokens were already locked/burned. Since the message status is DONE (not FAILED), recallMessage cannot be invoked. The tokens are permanently lost.",
+      "investigation_rationale": "The banned address handling in processMessage marks messages as DONE without executing the payload. For vault-targeted messages carrying token operations, this creates an irrecoverable token loss since the recall path requires FAILED status.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "processMessage",
+        "banAddress"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "banAddress"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "243-250",
+        "pattern": "addressBanned[_message.to] → refundAmount = _message.value, status = DONE; token data in _message.data never processed"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-STATE-005",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "bridge_watchdog bans a vault address (maliciously or accidentally)",
+        "Messages are in-flight targeting the banned vault",
+        "Messages contain token transfer operations in their data"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 243-250",
+        "vulnerable_pattern": "Banned target → mark DONE with ETH refund; token data ignored; recall impossible since status is DONE not FAILED",
+        "specific_concern": "DONE status prevents recall on source chain; tokens locked/burned on source with no recovery",
+        "missing_safeguards": "No mechanism to mark banned messages as FAILED instead of DONE"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "How many in-flight messages could be affected by a vault ban?",
+          "Could the ban be reversed and messages re-processed?",
+          "Is there any upgrade path to recover the lost tokens?"
+        ],
+        "validation_requirements": [
+          "Ban vault address, process in-flight message, verify DONE status",
+          "Attempt recall on source chain, confirm failure",
+          "Verify tokens remain locked in source vault"
+        ]
+      },
+      "preliminary_attack_scenario": "Watchdog accidentally or maliciously bans vault address. All pending messages to that vault are processed as DONE with only ETH refunded. Token operations in message data are skipped. Source chain tokens are permanently locked since recall requires FAILED status.",
+      "prerequisites": [
+        "bridge_watchdog bans a vault address",
+        "In-flight messages exist targeting the vault"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Permanent loss of all in-flight token transfers to the banned vault",
+        "affected_users": "All users with pending bridge transfers to the affected vault",
+        "recovery_possibility": "None through normal protocol operation; requires upgrade"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "high",
+      "test_coverage_gap": "No test for banning vault address with in-flight token messages",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard processMessage gas",
+        "capital_requirements": "N/A",
+        "execution_timing": "Immediate upon processing banned-target messages",
+        "detection_analysis": "Observable: DONE messages with token data that were never executed"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H010",
+      "title": "Unauthorized Chain Data Caching via Direct proveSignalReceived Calls Bypasses syncChainData Authorization",
+      "risk_level": "MEDIUM",
+      "attack_realism": "HIGH",
+      "stride_category": "Elevation of Privilege",
+      "hypothesis_description": "SignalService.syncChainData requires isAuthorized[msg.sender]==true. However, proveSignalReceived is public and calls _cacheChainData internally, which calls _syncChainData. This bypasses the authorization check, allowing any caller to write chain data (state roots, signal roots) and advance topBlockId for any chain. While the data must be validated by Merkle proofs, the authorization restriction on syncChainData is rendered meaningless for data that can be proven via multi-hop proofs.",
+      "investigation_rationale": "The authorization gate on syncChainData suggests the protocol wants to control who can write chain data. The caching path through proveSignalReceived circumvents this control. An attacker could advance topBlockId to recent non-finalized blocks, potentially affecting getSyncedChainData results used by other protocol components.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "proveSignalReceived",
+        "_cacheChainData",
+        "_syncChainData",
+        "syncChainData"
+      ],
+      "affected_contracts": [
+        "SignalService.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "SignalService.sol",
+          "function": "proveSignalReceived"
+        },
+        {
+          "file": "SignalService.sol",
+          "function": "_cacheChainData"
+        },
+        {
+          "file": "SignalService.sol",
+          "function": "syncChainData"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "SignalService.sol",
+        "lines": "120-130,227-248",
+        "pattern": "proveSignalReceived calls _cacheChainData → _syncChainData without isAuthorized check; syncChainData requires isAuthorized"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-ACCESS-003",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "Caller provides valid multi-hop Merkle proof with non-zero CacheOption",
+        "proveSignalReceived is called directly (not via Bridge's staticcall)",
+        "Valid chain data exists to prove against"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "SignalService.sol lines 120-130 (_cacheChainData call) and 227-248 (_cacheChainData writes via _syncChainData)",
+        "vulnerable_pattern": "proveSignalReceived → _cacheChainData → _syncChainData bypasses isAuthorized check",
+        "specific_concern": "Any address can write chain data and advance topBlockId by providing valid proofs with cache options",
+        "missing_safeguards": "No authorization check in the caching path; no restriction on CacheOption values"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "Can advancing topBlockId to non-finalized blocks cause issues?",
+          "Do any protocol components rely on topBlockId for security decisions?",
+          "Can this be used for storage griefing (filling slots)?",
+          "Note: Bridge uses staticcall to proveSignalReceived preventing caching through bridge path"
+        ],
+        "validation_requirements": [
+          "Call proveSignalReceived directly with CACHE_BOTH option",
+          "Verify chain data is written and topBlockId is advanced",
+          "Confirm syncChainData authorization is bypassed"
+        ]
+      },
+      "preliminary_attack_scenario": "Attacker calls SignalService.proveSignalReceived directly with valid multi-hop proof and CacheOption.CACHE_BOTH. Chain data is cached and topBlockId is advanced without going through the authorized syncChainData path.",
+      "prerequisites": [
+        "Valid Merkle proof available for the target chain data",
+        "Direct call to SignalService (not through bridge)"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Limited direct impact; topBlockId advancement could affect downstream consumers",
+        "affected_users": "Protocol components relying on topBlockId or cached chain data",
+        "recovery_possibility": "topBlockId cannot be rolled back (monotonic)"
+      },
+      "investigation_complexity": "medium",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for unauthorized caching via proveSignalReceived",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Standard proof verification gas + caching writes",
+        "capital_requirements": "None",
+        "execution_timing": "Single transaction",
+        "detection_analysis": "Observable: ChainDataSynced events from non-authorized addresses"
+      }
+    },
+    {
+      "hypothesis_id": "TECH-H011",
+      "title": "Bridge Watchdog Can Indefinitely Freeze User Funds via Message Suspension Without Escape Mechanism",
+      "risk_level": "HIGH",
+      "attack_realism": "LOW",
+      "stride_category": "Denial of Service",
+      "hypothesis_description": "The bridge_watchdog can suspend any message by setting proofReceipt[msgHash].receivedAt = type(uint64).max via suspendMessages. Suspended messages cannot be processed because block.timestamp will never reach invocationDelay + type(uint64).max. There is no timeout mechanism, no user-initiated escape, and no governance override for suspended messages. A malicious or compromised watchdog can freeze all in-flight bridge messages and their associated funds indefinitely.",
+      "investigation_rationale": "The suspension mechanism lacks a time-bounded recovery path. While the owner can unsuspend messages, if the watchdog key is compromised and the owner is a timelock, the delay in governance response could result in extended fund freezing.",
+      "config_dependent": false,
+      "deployment_assumptions": [],
+      "config_evidence": "",
+      "affected_functions": [
+        "suspendMessages",
+        "processMessage",
+        "recallMessage"
+      ],
+      "affected_contracts": [
+        "Bridge.sol"
+      ],
+      "inventory_refs": [
+        {
+          "file": "Bridge.sol",
+          "function": "suspendMessages"
+        },
+        {
+          "file": "Bridge.sol",
+          "function": "processMessage"
+        }
+      ],
+      "proof_of_signal": {
+        "file": "Bridge.sol",
+        "lines": "92-100,255-257",
+        "pattern": "receivedAt = type(uint64).max blocks processing; no timeout or user escape mechanism"
+      },
+      "invariant_citation": {
+        "invariant_id": "INV-TIME-002",
+        "relationship": "DIRECT_VIOLATION"
+      },
+      "preconditions": [
+        "bridge_watchdog key is compromised or malicious",
+        "Messages exist in processable state"
+      ],
+      "initial_code_evidence": {
+        "suspicious_location": "Bridge.sol lines 92-100 and 255-257",
+        "vulnerable_pattern": "suspendMessages sets receivedAt=type(uint64).max; invocationDelay + type(uint64).max is unreachable; no escape mechanism",
+        "specific_concern": "No time-bounded release for suspended messages; no user-initiated override",
+        "missing_safeguards": "No suspension timeout; no governance override path; no user escape"
+      },
+      "investigation_scope": {
+        "analysis_questions": [
+          "What is the governance response time to unsuspend messages?",
+          "Can the bridge owner directly unsuspend without the watchdog?",
+          "How many messages could be affected by a mass suspension?"
+        ],
+        "validation_requirements": [
+          "Verify suspended messages cannot be processed or recalled",
+          "Confirm only watchdog/owner can unsuspend",
+          "Assess total value at risk from mass suspension"
+        ]
+      },
+      "preliminary_attack_scenario": "Compromised watchdog suspends all pending message hashes. Users cannot process or recall their messages. Funds locked in bridge and vaults until owner (likely timelock) can unsuspend, which may take days.",
+      "prerequisites": [
+        "Compromised bridge_watchdog",
+        "In-flight messages with locked funds"
+      ],
+      "potential_impact_if_confirmed": {
+        "financial_impact": "Temporary freeze of all in-flight bridge funds; potentially millions in TVL",
+        "affected_users": "All users with pending bridge messages",
+        "recovery_possibility": "Possible via owner unsuspend, but delayed by governance timelock"
+      },
+      "investigation_complexity": "low",
+      "validation_priority": "medium",
+      "test_coverage_gap": "No test for mass suspension impact and recovery path",
+      "technical_investigation_focus": {
+        "gas_analysis_needed": "Batch suspension gas costs",
+        "capital_requirements": "None for the attacker",
+        "execution_timing": "Instant suspension; recovery depends on governance speed",
+        "detection_analysis": "Immediately visible via MessageSuspended events"
+      }
+    }
+  ]
+}

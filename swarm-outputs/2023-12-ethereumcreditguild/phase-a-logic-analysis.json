@@ -1,0 +1,521 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T17:09:53.501Z",
+    "duration_ms": 542350
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-01-BORROW",
+        "source": "Borrower (msg.sender)",
+        "path": [
+          "LendingTerm.borrow()",
+          "LendingTerm._borrow()",
+          "ProfitManager.creditMultiplier() [SLOAD]",
+          "ProfitManager.minBorrow() [SLOAD]",
+          "ProfitManager.totalBorrowedCredit() [external call]",
+          "GuildToken.calculateGaugeAllocation() [external call]",
+          "RateLimitedMinter.mint() -> CreditToken.mint()",
+          "IERC20(collateralToken).safeTransferFrom(borrower, this)"
+        ],
+        "transformations": [
+          "loanId = keccak256(borrower, address(this), block.timestamp)",
+          "maxBorrow = collateralAmount * maxDebtPerCollateralToken / creditMultiplier",
+          "debtCeiling = calculateGaugeAllocation(...) * gaugeWeightTolerance / 1e18"
+        ],
+        "sinks": [
+          "loans[loanId] storage",
+          "issuance storage",
+          "RateLimitedMinter buffer"
+        ],
+        "trust_changes": "Borrower input becomes protocol-managed loan state; collateral custody transfers to LendingTerm",
+        "validation_points": [
+          "borrowAmount != 0 && collateralAmount != 0",
+          "borrowAmount <= maxBorrow (collateral sufficiency)",
+          "borrowAmount >= minBorrow",
+          "_postBorrowIssuance <= hardCap",
+          "_postBorrowIssuance <= debtCeiling",
+          "loans[loanId].borrowTime == 0 (no collision)"
+        ],
+        "exposure_risks": [
+          "Predictable loanId via keccak256(borrower, term, timestamp) allows front-running"
+        ],
+        "manipulation_risks": [
+          "Loan ID collision prevents same borrower from borrowing twice in same second on same term",
+          "Gauge weight flash manipulation could inflate debt ceiling before borrow"
+        ]
+      },
+      {
+        "flow_id": "DF-02-REPAY",
+        "source": "Repayer (msg.sender or any address)",
+        "path": [
+          "LendingTerm.repay() or _partialRepay()",
+          "getLoanDebt() -> ProfitManager.creditMultiplier()",
+          "CreditToken.transferFrom(repayer, this, debt)",
+          "CreditToken.transfer(profitManager, interest)",
+          "ProfitManager.notifyPnL(this, interest)",
+          "CreditToken.burn(principal)",
+          "RateLimitedMinter.replenishBuffer(principal)"
+        ],
+        "transformations": [
+          "interest = loanDebt - principal",
+          "principal = borrowAmount * borrowCreditMultiplier / currentCreditMultiplier",
+          "For partial: percentRepaid = debtToRepay * 1e18 / loanDebt, issuanceDecrease = borrowAmount * percentRepaid / 1e18"
+        ],
+        "sinks": [
+          "ProfitManager (interest)",
+          "Burned (principal)",
+          "RateLimitedMinter buffer",
+          "Borrower (collateral return)"
+        ],
+        "trust_changes": "External CREDIT from repayer flows into protocol; principal burned reduces supply",
+        "validation_points": [
+          "Loan open checks (borrowTime, closeTime, callTime)",
+          "borrowTime < block.timestamp (not same block)",
+          "Partial: debtToRepay < loanDebt, principalRepaid != 0 && interestRepaid != 0",
+          "Partial: remaining borrowAmount > minBorrow (strict >)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Rounding in partial repay: principalRepaid rounds down, so interestRepaid rounds up slightly, favoring protocol",
+          "Strict > in minBorrow check prevents reducing to exactly minBorrow"
+        ]
+      },
+      {
+        "flow_id": "DF-03-AUCTION",
+        "source": "Caller (call) and Bidder (bid)",
+        "path": [
+          "LendingTerm._call() -> AuctionHouse.startAuction()",
+          "AuctionHouse.bid() -> getBidDetail() -> LendingTerm.onBid()",
+          "onBid: CreditToken.transferFrom(bidder) -> burn(principal) -> notifyPnL(pnl)",
+          "onBid: collateralToken.safeTransfer(borrower/bidder)"
+        ],
+        "transformations": [
+          "Phase 1: collateralReceived = collateralAmount * elapsed / midPoint; creditAsked = callDebt",
+          "Phase 2: collateralReceived = collateralAmount; creditAsked = callDebt - callDebt * elapsed / PHASE_2_DURATION",
+          "pnl = creditFromBidder >= principal ? int(interest) : int(creditFromBidder) - int(principal)"
+        ],
+        "sinks": [
+          "Bidder (collateral)",
+          "Borrower (remaining collateral)",
+          "ProfitManager (pnl)",
+          "Burned (principal)"
+        ],
+        "trust_changes": "AuctionHouse is trusted caller for LendingTerm.onBid; bidder must approve CREDIT on LendingTerm",
+        "validation_points": [
+          "startAuction: msg.sender has GAUGE_PNL_NOTIFIER role, loan.callTime == block.timestamp",
+          "bid: creditAsked != 0",
+          "onBid: msg.sender == auctionHouse, loan called but not closed",
+          "collateralOut == collateralAmount or 0"
+        ],
+        "exposure_risks": [
+          "MEV extraction: bidder can time bid for maximum collateral / minimum credit"
+        ],
+        "manipulation_risks": [
+          "At auction end (creditAsked=0), bid() reverts requiring forgive() instead, marking total loss"
+        ]
+      },
+      {
+        "flow_id": "DF-04-PROFIT-DISTRIBUTION",
+        "source": "LendingTerm (interest from repay/onBid)",
+        "path": [
+          "ProfitManager.notifyPnL(gauge, amount>0)",
+          "Split: surplusBufferSplit -> surplusBuffer state",
+          "Split: otherSplit -> CreditToken.transfer(otherRecipient)",
+          "Split: creditSplit -> CreditToken.distribute(amount) -> ERC20RebaseDistributor",
+          "Split: guildSplit -> gaugeProfitIndex[gauge] update"
+        ],
+        "transformations": [
+          "amountForSurplusBuffer = amount * surplusBufferSplit / 1e9",
+          "amountForGuild = amount * guildSplit / 1e9",
+          "amountForOther = amount * otherSplit / 1e9",
+          "amountForCredit = amount - buffer - guild - other (residual)",
+          "gaugeProfitIndex += amountForGuild * 1e18 / gaugeWeight"
+        ],
+        "sinks": [
+          "surplusBuffer",
+          "otherRecipient",
+          "Rebasing CREDIT holders",
+          "GUILD gauge voters (via profitIndex)"
+        ],
+        "trust_changes": "Only GAUGE_PNL_NOTIFIER role can call; CREDIT must be pre-transferred",
+        "validation_points": [
+          "Role check: GAUGE_PNL_NOTIFIER"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If gaugeWeight is 0 when profit is notified, amountForGuild stays on ProfitManager unclaimed",
+          "Profit index precision: amountForGuild * 1e18 / gaugeWeight truncates, dust accumulates"
+        ]
+      },
+      {
+        "flow_id": "DF-05-REBASE-DISTRIBUTION",
+        "source": "CreditToken.distribute() caller (ProfitManager)",
+        "path": [
+          "ERC20RebaseDistributor.distribute(amount)",
+          "ERC20._burn(msg.sender, amount)",
+          "Compute new __rebasingSharePrice interpolation target",
+          "Compute new __unmintedRebaseRewards interpolation target",
+          "Over DISTRIBUTION_PERIOD: share price interpolates upward",
+          "On user interaction: _shares2balance computes higher balance, _mint delta to user"
+        ],
+        "transformations": [
+          "newTargetSharePrice = (amount * 1e30 + targetValue * totalShares) / totalShares",
+          "Unminted rewards target += amount",
+          "Share price interpolates linearly over 30 days"
+        ],
+        "sinks": [
+          "__rebasingSharePrice storage",
+          "__unmintedRebaseRewards storage",
+          "Rebasing users' virtual balances"
+        ],
+        "trust_changes": "Burned tokens become unminted rebase rewards",
+        "validation_points": [
+          "amount != 0",
+          "rebasingSupply != 0 (else tokens burnt with no benefit)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Multiple distributions restart the 30-day interpolation, delaying ALL pending rewards",
+          "Low rebasing supply enables share price manipulation (similar to vault inflation attack)",
+          "First rebaser with small balance can have share truncation issues"
+        ]
+      },
+      {
+        "flow_id": "DF-06-SGM-STAKE-REWARDS",
+        "source": "SurplusGuildMinter staker",
+        "path": [
+          "SurplusGuildMinter.stake() -> getRewards()",
+          "CreditToken.transferFrom(user, this) -> donateToTermSurplusBuffer(term, amount)",
+          "RateLimitedMinter.mint(this, guildAmount) -> GuildToken.incrementGauge(term, guildAmount)",
+          "getRewards: ProfitManager.claimRewards(this) -> compute deltaIndex -> transfer creditReward -> mint guildReward"
+        ],
+        "transformations": [
+          "guildAmount = mintRatio * amount / 1e18",
+          "creditReward = userStake.guild * deltaIndex / 1e18",
+          "guildReward = creditReward * rewardRatio / 1e18"
+        ],
+        "sinks": [
+          "termSurplusBuffer (CREDIT)",
+          "GuildToken gauge weight",
+          "User (credit/guild rewards)"
+        ],
+        "trust_changes": "User's CREDIT becomes first-loss capital; GUILD minted for voting power",
+        "validation_points": [
+          "lastGaugeLoss != block.timestamp",
+          "amount >= MIN_STAKE",
+          "Slashed check (BUGGY - see business logic)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "CRITICAL: slashed flag checked against uninitialized userStake memory, always true when lastGaugeLoss > 0",
+          "rewardRatio changes retroactively affect all pending unclaimed rewards"
+        ]
+      },
+      {
+        "flow_id": "DF-07-LOSS-HANDLING",
+        "source": "LendingTerm (bad debt from auction or forgive)",
+        "path": [
+          "ProfitManager.notifyPnL(gauge, amount<0)",
+          "GuildToken.notifyGaugeLoss(gauge) -> lastGaugeLoss[gauge] = block.timestamp",
+          "termSurplusBuffer[gauge] donated to surplusBuffer",
+          "If loss < surplusBuffer: deplete buffer, burn CREDIT",
+          "Else: empty buffer, burn buffer, update creditMultiplier down"
+        ],
+        "transformations": [
+          "newCreditMultiplier = creditMultiplier * (creditTotalSupply - remainingLoss) / creditTotalSupply"
+        ],
+        "sinks": [
+          "surplusBuffer",
+          "creditMultiplier",
+          "Burned CREDIT"
+        ],
+        "trust_changes": "Loss socializes to all CREDIT holders via creditMultiplier reduction",
+        "validation_points": [
+          "Role check: GAUGE_PNL_NOTIFIER"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "If loss >= creditTotalSupply, subtraction underflows and reverts - loss cannot be processed",
+          "creditMultiplier can reach 0 if loss equals totalSupply, bricking all division-by-multiplier calculations"
+        ]
+      },
+      {
+        "flow_id": "DF-08-PSM-MINT-REDEEM",
+        "source": "PSM user",
+        "path": [
+          "SimplePSM.mint(): pegToken.transferFrom(user) -> CreditToken.mint(to, amountOut)",
+          "SimplePSM.redeem(): CreditToken.burnFrom(user) -> pegToken.transfer(to, amountOut)"
+        ],
+        "transformations": [
+          "mintAmountOut = amountIn * decimalCorrection * 1e18 / creditMultiplier",
+          "redeemAmountOut = amountIn * creditMultiplier / 1e18 / decimalCorrection"
+        ],
+        "sinks": [
+          "pegTokenBalance tracking",
+          "CreditToken supply",
+          "User balances"
+        ],
+        "trust_changes": "1:1 peg conversion adjusted by creditMultiplier",
+        "validation_points": [
+          "mint: whenNotPaused",
+          "redeem: !redemptionsPaused (separate from global pause)"
+        ],
+        "exposure_risks": [],
+        "manipulation_risks": [
+          "Very small redeemAmountOut can round to 0, user burns CREDIT for nothing",
+          "creditMultiplier approaching 0 inflates CREDIT minting from PSM"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Loans must be sufficiently collateralized: borrowAmount <= collateralAmount * maxDebtPerCollateralToken / creditMultiplier",
+        "Issuance per term bounded by hardCap, debt ceiling (gauge allocation * tolerance), and rate limiter",
+        "Interest is non-compounding, linear over time, expressed as APR",
+        "Losses are absorbed by: 1) term surplus buffer, 2) global surplus buffer, 3) creditMultiplier markdown",
+        "GUILD voters for loss-generating terms are slashed (burned)",
+        "Rebasing CREDIT holders receive share of interest via ERC20RebaseDistributor",
+        "PSM maintains CREDIT peg at creditMultiplier * pegToken value"
+      ],
+      "economic_incentives": [
+        "Borrowers pay interest split between surplus buffer, GUILD voters, other recipient, and rebasing CREDIT holders",
+        "GUILD voters stake tokens to increase debt ceilings and earn proportional interest share",
+        "GUILD voters risk slashing if their voted term generates bad debt",
+        "SurplusGuildMinter allows CREDIT staking as first-loss capital to earn GUILD voting power at reduced cost",
+        "Surplus buffer acts as first-loss capital protecting CREDIT holders from bad debt"
+      ],
+      "governance_mechanisms": [
+        "Term onboarding via GuildGovernor proposal + timelock with veto capability",
+        "Term offboarding via GUILD holder polling (LendingTermOffboarding) with quorum",
+        "GuildVetoGovernor allows token holders to cancel queued timelock actions",
+        "Governor role controls critical parameters (hardCap, auctionHouse, mintRatio, etc.)",
+        "Guardian can pause contracts in emergency"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "SurplusGuildMinter.getRewards checks slashed flag against uninitialized userStake memory",
+          "expected_behavior": "slashed should be true only if user staked before the last gauge loss and hasn't applied it",
+          "actual_behavior": "slashed is always true when lastGaugeLoss > 0 because userStake.lastGaugeLoss is 0 (default) when checked, before storage is loaded",
+          "risk_level": "high",
+          "exploitation_potential": "Any term with a historical gauge loss causes ALL SurplusGuildMinter stakers on that term to be incorrectly flagged as slashed. In getRewards, their stake is zeroed. In unstake, the function returns early without withdrawing from surplus buffer. User CREDIT in surplus buffer is permanently locked. Anyone can call getRewards(user, term) to trigger this for any user."
+        },
+        {
+          "scenario": "ERC20Gauges._decrementWeightUntilFree has infinite loop when gauge has zero weight",
+          "expected_behavior": "Loop should always terminate, incrementing i for each gauge",
+          "actual_behavior": "The unchecked { ++i; } is inside if(userGaugeWeight != 0) block. If a gauge has 0 weight, i never increments, causing infinite loop (gas exhaustion)",
+          "risk_level": "medium",
+          "exploitation_potential": "A user calling incrementGauge(gauge, 0) adds a 0-weight gauge to their set. When _decrementWeightUntilFree is triggered (on transfer/burn when weight needs freeing) and the 0-weight gauge is iterated before enough weight is freed, transaction reverts with out of gas. Self-inflicted DoS but could affect SurplusGuildMinter if mintRatio=0."
+        },
+        {
+          "scenario": "LendingTerm.forgive() called on a loan in active auction",
+          "expected_behavior": "Either forgive or auction should cleanly close the loan, not both",
+          "actual_behavior": "forgive sets loan.closeTime and decrements issuance. Later, AuctionHouse.bid()/forgive() calls onBid which reverts because closeTime != 0. Auction stuck permanently; nAuctionsInProgress never decremented, blocking setAuctionHouse.",
+          "risk_level": "medium",
+          "exploitation_potential": "Governor-only action, but incorrect usage permanently blocks auction house migration. Requires emergencyAction on AuctionHouse to fix nAuctionsInProgress counter."
+        },
+        {
+          "scenario": "creditMultiplier reaches zero or near-zero from catastrophic bad debt",
+          "expected_behavior": "System should gracefully handle extreme losses",
+          "actual_behavior": "If loss >= creditTotalSupply after buffer depletion, the subtraction (creditTotalSupply - loss) underflows and reverts. If loss equals totalSupply exactly, creditMultiplier becomes 0, causing division by zero in getLoanDebt, getMintAmountOut, etc.",
+          "risk_level": "medium",
+          "exploitation_potential": "Cannot be directly triggered by an attacker but extreme market conditions or cascading liquidations could push toward this state. System becomes permanently bricked if creditMultiplier = 0."
+        },
+        {
+          "scenario": "LendingTerm._partialRepay uses strict > for minBorrow check",
+          "expected_behavior": "Borrower should be able to partially repay down to exactly minBorrow",
+          "actual_behavior": "require(borrowAmount - issuanceDecrease > minBorrow()) uses strict greater-than, preventing reduction to exactly minBorrow",
+          "risk_level": "low",
+          "exploitation_potential": "Not exploitable, but creates a small unusable range near minBorrow boundary. Borrower might need to fully repay instead of partially repaying."
+        },
+        {
+          "scenario": "Loan ID is deterministic and non-reusable after loan closure",
+          "expected_behavior": "Borrowers should be able to take new loans after repayment",
+          "actual_behavior": "loanId = keccak256(borrower, term, timestamp). After loan closure, borrowTime remains non-zero, so same loanId can never be used again. Same borrower cannot borrow in the same second on the same term, even after closing the previous loan.",
+          "risk_level": "low",
+          "exploitation_potential": "Limits borrower to one loan per second per term. Minor UX issue but could affect automated strategies."
+        },
+        {
+          "scenario": "Profit distribution to gauge with 0 weight",
+          "expected_behavior": "Guild's share of profit should be distributed or handled gracefully",
+          "actual_behavior": "If gaugeWeight is 0 when notifyPnL is called with profit, amountForGuild CREDIT tokens remain stuck on ProfitManager with no mechanism to claim them",
+          "risk_level": "low",
+          "exploitation_potential": "Tokens become permanently stuck. Could happen during offboarding if the gauge is deprecated before auction resolution."
+        },
+        {
+          "scenario": "GuildVetoGovernor veto can only be attempted once per timelockId",
+          "expected_behavior": "If a veto fails to reach quorum, another attempt should be possible",
+          "actual_behavior": "createVeto generates a deterministic proposalId from timelockId. After a failed veto, the proposal state is Defeated and cannot be recreated with the same parameters.",
+          "risk_level": "medium",
+          "exploitation_potential": "A malicious actor could create a veto proposal early (when few votes are available) knowing it will fail, preventing future legitimate veto attempts on the same timelock action."
+        },
+        {
+          "scenario": "ERC20RebaseDistributor distribute() resets interpolation period for all pending rewards",
+          "expected_behavior": "Previously distributed rewards should continue interpolating on their original schedule",
+          "actual_behavior": "Each new distribute() call resets both __rebasingSharePrice and __unmintedRebaseRewards interpolation to new 30-day period from current timestamp, delaying ALL pending unminted rewards",
+          "risk_level": "low",
+          "exploitation_potential": "Frequent small distributions can perpetually delay reward materialization. An attacker could call distribute(1) repeatedly to delay other users' rewards."
+        },
+        {
+          "scenario": "AuctionHouse.bid requires creditAsked != 0 but at auction end creditAsked becomes 0 discontinuously",
+          "expected_behavior": "Smooth transition at auction end",
+          "actual_behavior": "At exactly startTime + auctionDuration, creditAsked jumps to 0 from a small positive value. bid() reverts; only forgive() works, marking total loss even though the collateral has full value",
+          "risk_level": "low",
+          "exploitation_potential": "If all bidders are blocked (e.g., MEV censorship) until the exact second auctionDuration elapses, the loan becomes a total loss unnecessarily."
+        },
+        {
+          "scenario": "LendingTermOffboarding pauses PSM redemptions during offboarding",
+          "expected_behavior": "PSM redemptions should remain available for credit holders",
+          "actual_behavior": "First offboarding pauses redemptions. If multiple terms are offboarded, redemptions stay paused until ALL are cleaned up. Long-duration offboardings lock PSM redemptions for extended periods.",
+          "risk_level": "medium",
+          "exploitation_potential": "An attacker with enough GUILD to reach offboarding quorum can force PSM redemptions to pause by continuously proposing offboardings. Combined with existing loans that can't be quickly called, this could lock redemptions for months."
+        }
+      ],
+      "assumption_violations": [
+        "SurplusGuildMinter assumes userStake is loaded before slashed check - VIOLATED",
+        "ERC20Gauges assumes all gauges in user set have non-zero weight - VIOLATED when incrementGauge called with weight=0",
+        "LendingTerm.forgive assumes loan is not in active auction or handles it - NOT HANDLED for auction state cleanup",
+        "ProfitManager assumes creditTotalSupply > loss when calculating new creditMultiplier - can be VIOLATED in extreme scenarios",
+        "System assumes creditMultiplier > 0 for all arithmetic - can be VIOLATED if loss equals totalSupply exactly",
+        "GuildVetoGovernor assumes veto proposals can be retried - VIOLATED by deterministic proposalId"
+      ],
+      "game_theory_risks": [
+        "Gauge weight manipulation: user can flash-loan GUILD, vote for their term to inflate debt ceiling, borrow max, then unvote. Mitigated by _incrementGaugeWeight requiring no pending loss and claiming rewards.",
+        "SurplusGuildMinter slashing bug creates risk-free griefing: anyone can call getRewards on any user's position on a term with historical loss to zero their stake",
+        "Offboarding polling: GUILD holder can snapshot their votes, create poll, vote, then transfer tokens. Snapshot-based so this is by design.",
+        "Auction MEV: bidders can time bids to extract maximum value; first phase offers increasing collateral for full debt, second phase decreases debt for all collateral",
+        "Borrower can front-run a call by repaying in the same block to avoid auction (prevented by borrowTime < block.timestamp check)"
+      ],
+      "integration_risks": [
+        "Fee-on-transfer collateral tokens would cause LendingTerm to receive less than collateralAmount, breaking collateral accounting",
+        "Rebasing collateral tokens would silently change collateral balances, making collateralAmount in loan struct inaccurate",
+        "Non-standard ERC20 tokens (no return value) handled by SafeERC20 but could still have unexpected behavior",
+        "External oracle dependency: none (Dutch auction for price discovery), but creditMultiplier acts as internal oracle",
+        "CreditToken combines ERC20MultiVotes + ERC20RebaseDistributor creating complex interaction surface for share/vote/balance tracking"
+      ],
+      "calculation_errors": [
+        "SurplusGuildMinter.getRewards: slashed = (lastGaugeLoss > uint256(userStake.lastGaugeLoss)) checked before userStake is loaded from storage; userStake.lastGaugeLoss is always 0",
+        "LendingTerm.getLoanDebt interest calculation order: (borrowAmount * interestRate * time) / YEAR / 1e18 - potential intermediate overflow for very large values though unlikely with uint256",
+        "ProfitManager.setProfitSharingConfig truncation: uint32(split / 1e9) loses precision for values not divisible by 1e9; creditSplit absorbs rounding remainder",
+        "ProfitManager.claimGaugeRewards: creditEarned = (userGaugeWeight * deltaIndex) / 1e18 truncates; accumulated dust across all users can exceed available balance"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "CREDIT (CreditToken)",
+          "behaviors": [
+            "rebasing:true",
+            "permit:true",
+            "mint_burn_restricted",
+            "rebase_positive_only",
+            "snapshot:false"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "hooks",
+          "accounting_model": "shares_indexed",
+          "notes": "Combines ERC20RebaseDistributor (share-based rebasing with 30-day interpolated distribution) and ERC20MultiVotes. balanceOf is virtual for rebasing users. totalSupply includes unminted rebase rewards. Use SafeERC20 when interacting externally. Internal mint/burn/transfer override chain: CreditToken -> ERC20RebaseDistributor -> ERC20MultiVotes (_decrementVotesUntilFree)."
+        },
+        {
+          "address_or_symbol": "GUILD (GuildToken)",
+          "behaviors": [
+            "rebasing:false",
+            "permit:true",
+            "pausable",
+            "mint_burn_restricted",
+            "snapshot:false"
+          ],
+          "decimals": 18,
+          "approval_model": "infinite_ok",
+          "transfer_model": "hooks",
+          "accounting_model": "balanceOf",
+          "notes": "Non-transferable by default until governance calls enableTransfer(). ERC20Gauges + ERC20MultiVotes combined. _decrementGaugeWeight checks for pending gauge losses and debt ceiling usage. _incrementGaugeWeight checks for pending losses and claims rewards. _burn calls both _decrementWeightUntilFree and _decrementVotesUntilFree."
+        },
+        {
+          "address_or_symbol": "collateralToken (configurable per LendingTerm)",
+          "behaviors": [],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Arbitrary ERC20 set per LendingTerm. SafeERC20 used for all transfers. Fee-on-transfer or rebasing tokens would break collateral accounting. Decimals vary; maxDebtPerCollateralToken must account for decimal differences."
+        },
+        {
+          "address_or_symbol": "pegToken (SimplePSM)",
+          "behaviors": [],
+          "decimals": -1,
+          "approval_model": "unknown",
+          "transfer_model": "standard",
+          "accounting_model": "balanceOf",
+          "notes": "Stable coin used for PSM. decimalCorrection = 10^(18 - pegToken.decimals). pegTokenBalance tracked separately to exclude donations. SafeERC20 used."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "supply_conservation_credit",
+          "state_vars": [
+            "CreditToken.totalSupply()",
+            "ERC20.totalSupply() + unmintedRebaseRewards()"
+          ],
+          "notes": "CreditToken.totalSupply() = ERC20.totalSupply() + unmintedRebaseRewards(). The sum of all balanceOf should equal totalSupply (with per-account 1 wei rounding)."
+        },
+        {
+          "name": "rebasing_supply_conservation",
+          "state_vars": [
+            "totalSupply()",
+            "nonRebasingSupply() + rebasingSupply()"
+          ],
+          "notes": "totalSupply == nonRebasingSupply + rebasingSupply. nonRebasingSupply uses max(0, totalSupply - rebasingSupply) to handle rounding."
+        },
+        {
+          "name": "gauge_weight_conservation",
+          "state_vars": [
+            "totalWeight",
+            "sum(getGaugeWeight[liveGauge])"
+          ],
+          "notes": "totalWeight equals sum of weights of all live (non-deprecated) gauges. Deprecated gauges retain weight in storage but excluded from totalWeight."
+        },
+        {
+          "name": "issuance_tracking",
+          "state_vars": [
+            "LendingTerm.issuance",
+            "sum(loan.borrowAmount for open loans)"
+          ],
+          "notes": "issuance tracks total borrowAmount of open loans. Partial repays reduce both issuance and loan.borrowAmount. Full repay/onBid/forgive decrements by full remaining borrowAmount."
+        },
+        {
+          "name": "credit_multiplier_monotonic_decrease",
+          "state_vars": [
+            "ProfitManager.creditMultiplier"
+          ],
+          "notes": "creditMultiplier can only decrease (through bad debt) or stay constant. Never increases. Starts at 1e18."
+        },
+        {
+          "name": "surplus_buffer_solvency",
+          "state_vars": [
+            "ProfitManager.surplusBuffer",
+            "CreditToken.balanceOf(profitManager)"
+          ],
+          "notes": "CreditToken balance of ProfitManager should be >= surplusBuffer + sum(termSurplusBuffer) + unclaimed guild rewards"
+        },
+        {
+          "name": "sgm_stake_surplus_buffer_parity",
+          "state_vars": [
+            "SurplusGuildMinter._stakes[user][term].credit",
+            "ProfitManager.termSurplusBuffer[term]"
+          ],
+          "notes": "Sum of all users' credit stakes for a term should equal the termSurplusBuffer for that term (minus any losses). BROKEN by slashing bug."
+        }
+      ]
+    }
+  }
+}

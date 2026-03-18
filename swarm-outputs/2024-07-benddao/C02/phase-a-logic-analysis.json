@@ -1,0 +1,428 @@
+{
+  "metadata": {
+    "threat_model_id": null,
+    "phase": "A",
+    "specialist_role": "data_flow_logic",
+    "llm_model": null,
+    "methodology_sections": [
+      "2.3 Data Flow Tracing - Input flow, external data, asset movement, permission escalation",
+      "3.2 Business Logic Analysis - Economic incentives, edge cases, assumption violations, race conditions"
+    ],
+    "timestamp": "2026-03-08T03:05:42.967Z",
+    "duration_ms": 501018
+  },
+  "analysis": {
+    "data_flows": [
+      {
+        "flow_id": "DF-001",
+        "source": "User via Proxy",
+        "path": [
+          "Proxy.fallback",
+          "PoolManager.dispatch (implied)",
+          "BaseModule.unpackTrailingParamMsgSender",
+          "Module function execution"
+        ],
+        "transformations": [
+          "Proxy appends caller address to calldata",
+          "Module extracts trailing 20-byte address as msgSender"
+        ],
+        "sinks": [
+          "StorageSlot PoolStorage via delegatecall context"
+        ],
+        "trust_changes": "Trust transitions from EOA through Proxy to module; caller identity encoded in calldata trailing params",
+        "validation_points": [
+          "trustedSenders mapping check in dispatch (implied)",
+          "Module-level whenNotPaused and nonReentrant modifiers"
+        ],
+        "exposure_risks": [
+          "If dispatch function does not validate trustedSenders, any contract could spoof msgSender by crafting trailing calldata"
+        ],
+        "manipulation_risks": [
+          "Direct calls to dispatch bypassing Proxy could inject arbitrary msgSender addresses"
+        ]
+      },
+      {
+        "flow_id": "DF-002",
+        "source": "ERC20 deposit (user wallet)",
+        "path": [
+          "BVault.depositERC20",
+          "SupplyLogic.executeDepositERC20",
+          "InterestLogic.updateInterestIndexs",
+          "VaultLogic.erc20IncreaseCrossSupply",
+          "VaultLogic.erc20TransferInLiquidity"
+        ],
+        "transformations": [
+          "Amount divided by supplyIndex to get scaledAmount",
+          "availableLiquidity increased",
+          "Supply cap validation against totalScaledCrossSupply + accruedFee"
+        ],
+        "sinks": [
+          "assetData.userScaledCrossSupply[account]",
+          "assetData.totalScaledCrossSupply",
+          "assetData.availableLiquidity"
+        ],
+        "trust_changes": "User-supplied amount validated against supply cap; actual transfer verified by pre/post balance check",
+        "validation_points": [
+          "validateDepositERC20 checks caps",
+          "erc20TransferInLiquidity verifies balance delta"
+        ],
+        "exposure_risks": [
+          "Fee-on-transfer tokens would cause balance mismatch but this is caught by the balance check"
+        ],
+        "manipulation_risks": [
+          "Direct ETH/token transfer to pool can inflate actual balance without updating availableLiquidity"
+        ]
+      },
+      {
+        "flow_id": "DF-003",
+        "source": "Flash loan initiation",
+        "path": [
+          "FlashLoan.flashLoanERC20",
+          "FlashLoanLogic.executeFlashLoanERC20",
+          "VaultLogic.erc20TransferOutOnFlashLoan",
+          "IFlashLoanReceiver.executeOperationERC20 (callback)",
+          "VaultLogic.erc20TransferInOnFlashLoan"
+        ],
+        "transformations": [
+          "No availableLiquidity modification during flash loan",
+          "Tokens sent out and expected to return"
+        ],
+        "sinks": [
+          "External receiver contract via callback"
+        ],
+        "trust_changes": "Trust fully delegated to receiver during callback; no reentrancy lock prevents callback from invoking other pool functions",
+        "validation_points": [
+          "Only checks receiver returns true",
+          "Flash loan return verified by safeTransferFrom"
+        ],
+        "exposure_risks": [
+          "availableLiquidity inflated during callback as flash-loaned tokens not tracked"
+        ],
+        "manipulation_risks": [
+          "Callback can re-enter pool functions (no nonReentrant on flashLoanERC20), seeing stale availableLiquidity that includes flash-loaned amounts"
+        ]
+      },
+      {
+        "flow_id": "DF-004",
+        "source": "Oracle price feed",
+        "path": [
+          "IPriceOracleGetter.getAssetPrice",
+          "GenericLogic.calculateUserAccountData",
+          "Health factor calculation",
+          "Liquidation threshold validation"
+        ],
+        "transformations": [
+          "Price * balance / decimals for base currency conversion",
+          "Weighted average LTV and liquidation threshold",
+          "Health factor = collateral * LT / debt"
+        ],
+        "sinks": [
+          "ResultTypes.UserAccountResult",
+          "Liquidation decisions"
+        ],
+        "trust_changes": "Oracle is fully trusted; no staleness checks visible in provided code",
+        "validation_points": [
+          "No explicit oracle price validation (zero price, stale price)"
+        ],
+        "exposure_risks": [
+          "Oracle manipulation directly affects liquidation eligibility and borrow capacity"
+        ],
+        "manipulation_risks": [
+          "Flash loan callback + oracle manipulation could create artificial undercollateralization or prevent legitimate liquidations"
+        ]
+      },
+      {
+        "flow_id": "DF-005",
+        "source": "Isolate auction bid",
+        "path": [
+          "IsolateLiquidation.isolateAuction",
+          "IsolateLogic.executeIsolateAuction",
+          "VaultLogic.erc20TransferOutBidAmount (refund previous)",
+          "VaultLogic.erc20TransferInBidAmount (new bid)"
+        ],
+        "transformations": [
+          "Bid stored in loanData.bidAmount",
+          "Previous bid refunded from totalBidAmout escrow",
+          "New bid added to totalBidAmout escrow"
+        ],
+        "sinks": [
+          "loanData.bidAmount",
+          "loanData.lastBidder",
+          "assetData.totalBidAmout"
+        ],
+        "trust_changes": "Bid amount held in escrow tracked by totalBidAmout; separated from availableLiquidity",
+        "validation_points": [
+          "Bid >= borrowAmount",
+          "Bid >= previous bid + 1% delta",
+          "Auction duration check"
+        ],
+        "exposure_risks": [
+          "Interest accrual between bid and liquidation can cause bid < final borrow amount"
+        ],
+        "manipulation_risks": [
+          "Bidder can bid minimum amount knowing interest will push borrow above bid, requiring liquidator to pay extra"
+        ]
+      },
+      {
+        "flow_id": "DF-006",
+        "source": "Isolate redeem (borrower reclaiming NFT from auction)",
+        "path": [
+          "IsolateLiquidation.isolateRedeem",
+          "IsolateLogic.executeIsolateRedeem",
+          "VaultLogic.erc20DecreaseIsolateScaledBorrow(debtGroupData, params.msgSender, ...)",
+          "loanData.scaledAmount -= amountScaled"
+        ],
+        "transformations": [
+          "Redeem amount = borrowAmount * redeemThreshold",
+          "Scaled borrow decreased for params.msgSender NOT token owner"
+        ],
+        "sinks": [
+          "groupData.userScaledIsolateBorrow[params.msgSender]",
+          "loanData.scaledAmount"
+        ],
+        "trust_changes": "No validation that msgSender is the actual borrower/token owner",
+        "validation_points": [
+          "validateIsolateRedeemBasic does not check caller == borrower",
+          "validateIsolateRedeemLoan checks loan status only"
+        ],
+        "exposure_risks": [
+          "Wrong account's borrow is decreased - accounting inconsistency between loan data and user aggregate borrow"
+        ],
+        "manipulation_risks": [
+          "Third party with own isolate borrows can call redeem for someone else's loan, getting their own debt decreased while paying the redeem amount"
+        ]
+      },
+      {
+        "flow_id": "DF-007",
+        "source": "Native token withdrawal",
+        "path": [
+          "BVault.withdrawERC20 (isNative=true)",
+          "SupplyLogic.executeWithdrawERC20 (caps amount to userBalance)",
+          "VaultLogic.unwrapNativeTokenInWallet(asset, msgSender, amount)"
+        ],
+        "transformations": [
+          "executeWithdrawERC20 may cap params.amount to userBalance",
+          "Original uncapped amount used for unwrapNativeTokenInWallet"
+        ],
+        "sinks": [
+          "ETH transferred to msgSender"
+        ],
+        "trust_changes": "Amount parameter not propagated back from struct modification",
+        "validation_points": [
+          "executeWithdrawERC20 adjusts internally but BVault uses original amount"
+        ],
+        "exposure_risks": [
+          "If requested amount > userBalance, unwrap attempts wrong amount"
+        ],
+        "manipulation_risks": [
+          "Users using type(uint256).max for 'withdraw all' will have unwrap fail or unwrap wrong amount"
+        ]
+      }
+    ],
+    "business_logic": {
+      "core_rules": [
+        "Cross-margin: users deposit ERC20/ERC721 as collateral, borrow ERC20 against weighted collateral value per group",
+        "Isolate-margin: users deposit ERC721 in isolate mode, borrow against individual NFT floor price",
+        "Health factor >= 1.0 prevents liquidation; HF < 1.0 triggers liquidation eligibility",
+        "Interest accrued via supply index (linear) and borrow index (compound) per asset/group",
+        "Scaled amounts (amount / index) stored for gas-efficient interest tracking",
+        "Auction-based liquidation for isolate loans with bid fine mechanism"
+      ],
+      "economic_incentives": [
+        "Liquidation bonus incentivizes liquidators to cover bad debt",
+        "Bid fine discourages frivolous first bids and compensates first bidder on redeem",
+        "Interest spread (feeFactor) accrued to treasury",
+        "Close factor (50% or 100% depending on HF severity) limits single liquidation impact"
+      ],
+      "governance_mechanisms": [
+        "Pool admin configures assets, groups, interest rate models, caps via ACLManager",
+        "Emergency admin can pause pools/assets",
+        "Treasury address set via AddressProvider"
+      ],
+      "edge_cases": [
+        {
+          "scenario": "executeIsolateRedeem called by non-borrower who has isolate borrows in the same group",
+          "expected_behavior": "Only the actual borrower (NFT owner) should be able to redeem, and their borrow balance should decrease",
+          "actual_behavior": "Any caller's isolate borrow is decreased via erc20DecreaseIsolateScaledBorrow(debtGroupData, params.msgSender, amountScaled) instead of the token owner. Loan's scaledAmount is reduced but original borrower's userScaledIsolateBorrow is unchanged.",
+          "risk_level": "high",
+          "exploitation_potential": "Attacker with isolate borrows calls redeem for another user's auctioned NFT. Attacker pays redeem amount but gets their OWN debt reduced. Original borrower's aggregate tracked debt becomes inconsistent with their loan amounts, potentially preventing full repayment and bricking their position."
+        },
+        {
+          "scenario": "BVault.withdrawERC20 with native token when user balance < requested amount",
+          "expected_behavior": "Withdraw actual user balance, unwrap that exact amount to ETH",
+          "actual_behavior": "executeWithdrawERC20 internally caps to userBalance, but BVault passes original uncapped amount to unwrapNativeTokenInWallet. The unwrap tries to transferFrom(msgSender, pool, originalAmount) which exceeds what was received.",
+          "risk_level": "medium",
+          "exploitation_potential": "Users calling withdrawERC20 with type(uint256).max for native tokens will have the transaction revert. If user has pre-existing WETH balance, excess WETH could be erroneously taken."
+        },
+        {
+          "scenario": "Full debt repayment in cross-margin liquidation via _repayUserERC20Debt with rounding",
+          "expected_behavior": "Full group debt repaid, scaled borrow reduced to zero",
+          "actual_behavior": "scaledBorrow.rayMul(index).rayDiv(index) may exceed scaledBorrow by 1 in rare cases (when rayMul rounds up AND rayDiv rounds up), causing arithmetic underflow revert in erc20DecreaseCrossBorrow",
+          "risk_level": "medium",
+          "exploitation_potential": "Certain positions become temporarily unliquidatable when the rounding hits the edge case. Attacker could deliberately create positions with scaled amounts that trigger this, making their position immune to liquidation during critical price drops."
+        },
+        {
+          "scenario": "Flash loan ERC20 without reentrancy guard during callback",
+          "expected_behavior": "Flash loan is atomic; pool state consistent during callback",
+          "actual_behavior": "flashLoanERC20 has no nonReentrant modifier. During callback, availableLiquidity is inflated (flash-loaned tokens not subtracted). Callback can invoke deposit/borrow/withdraw operations that see incorrect availableLiquidity.",
+          "risk_level": "medium",
+          "exploitation_potential": "During callback, borrow validation checks against inflated availableLiquidity. While actual token transfers may fail if insufficient balance, complex multi-step attacks involving oracle manipulation + flash loan could exploit the inflated liquidity view."
+        },
+        {
+          "scenario": "Interest index overflow due to uint128 casting",
+          "expected_behavior": "Index grows indefinitely as interest accrues",
+          "actual_behavior": "borrowIndex and supplyIndex stored as uint128 (max ~3.4e38). Starting from RAY (1e27), can grow ~3.4e11x before overflow. toUint128() in SafeCast reverts on overflow, bricking the entire asset.",
+          "risk_level": "medium",
+          "exploitation_potential": "For assets with very high interest rates or very long periods without index updates, the pool could become permanently bricked. Admin inaction or extreme market conditions could trigger this."
+        },
+        {
+          "scenario": "executeCollectFeeToTreasury order of operations",
+          "expected_behavior": "All accrued fees collected to treasury",
+          "actual_behavior": "accruedFee is read and zeroed BEFORE updateInterestIndexs is called. The update accrues new fees since last update. Those new fees are NOT included in the collection, only collected in next call.",
+          "risk_level": "low",
+          "exploitation_potential": "Minor loss of fee timing accuracy. Not directly exploitable but results in slightly delayed fee collection."
+        },
+        {
+          "scenario": "Isolate liquidation with supplyAsCollateral=true missing account flag updates",
+          "expected_behavior": "Liquidator's supplied assets set updated, borrower's set updated",
+          "actual_behavior": "After erc721TransferIsolateSupplyOnLiquidate, no call to accountCheckAndSetSuppliedAsset for either party. However, isolate supply is not tracked in suppliedAssets for ERC721 (accountCheckAndSetSuppliedAsset only checks cross supply), so this is by design.",
+          "risk_level": "low",
+          "exploitation_potential": "Not directly exploitable since isolate ERC721 supply doesn't affect cross-margin health factor calculations."
+        },
+        {
+          "scenario": "Cross liquidation ERC721 - remainDebtToLiquidate surplus handling",
+          "expected_behavior": "If NFT collateral value exceeds total debt, excess handled cleanly",
+          "actual_behavior": "When remainDebtToLiquidate > 0 after repaying all groups, surplus is added as cross supply to borrower via erc20IncreaseCrossSupply. This credits borrower with debt-asset supply, which is correct behavior.",
+          "risk_level": "low",
+          "exploitation_potential": "Not exploitable - proper handling of surplus."
+        },
+        {
+          "scenario": "Zero price from oracle for collateral asset",
+          "expected_behavior": "Borrow/withdraw blocked if collateral has no value",
+          "actual_behavior": "If oracle returns 0 for an asset price, userBalanceInBaseCurrency=0, health factor calculation may return max uint256 (no debt case) or 0 (with debt). No explicit zero-price guard in GenericLogic.",
+          "risk_level": "medium",
+          "exploitation_potential": "A compromised oracle returning 0 for a collateral asset would make all positions using it immediately liquidatable, enabling mass liquidation."
+        },
+        {
+          "scenario": "Isolate auction bid timing - debt accrues between bid and liquidation",
+          "expected_behavior": "Bid amount sufficient to cover final borrow amount at liquidation time",
+          "actual_behavior": "Interest accrues between bidding and liquidation execution. If bidAmount < borrowAmount at liquidation time, the liquidator (last bidder) must pay the extra via extraBorrowAmounts. First bidder who triggered the auction has no such obligation.",
+          "risk_level": "low",
+          "exploitation_potential": "Known design; liquidator bears interest risk between auction end and liquidation execution."
+        },
+        {
+          "scenario": "Multiple tokens in flash loan ERC20 array with same asset",
+          "expected_behavior": "Each entry processed independently",
+          "actual_behavior": "No deduplication check for flash loan ERC20 assets array. Same asset could appear multiple times, causing double-transfer of the same amount without proper liquidity checks.",
+          "risk_level": "medium",
+          "exploitation_potential": "Attacker could request flash loan of [USDC, USDC] with [1000, 1000] to effectively borrow 2000 while only returning 1000 if the transfer-back doesn't properly validate. However, erc20TransferInOnFlashLoan does transferFrom for each entry, so 2000 would need to be returned."
+        }
+      ],
+      "assumption_violations": [
+        "Assumption: msgSender in isolate redeem is the borrower - VIOLATED: no check enforced, any address can call",
+        "Assumption: rayMul then rayDiv is identity operation on scaled amounts - VIOLATED in rare rounding edge cases",
+        "Assumption: amount parameter unchanged after executeWithdrawERC20 - VIOLATED: struct copy means modifications don't propagate",
+        "Assumption: WETH.transferFrom works when msg.sender == from without approval - depends on WETH implementation",
+        "Assumption: Oracle always returns valid non-zero prices - no explicit staleness or zero checks in core logic"
+      ],
+      "game_theory_risks": [
+        "Isolate redeem bug: rational attacker with isolate borrows can reduce own debt by redeeming others' auctioned NFTs",
+        "Flash loan + oracle manipulation: attacker can manipulate collateral values within a single transaction",
+        "Auction sniping: bidder can bid at last moment before auction end, leaving no time for counter-bids",
+        "Liquidation MEV: liquidators can sandwich oracle updates to capture maximum liquidation bonus",
+        "First bidder incentive misalignment: first bidder receives bid fine on redeem but bears no cost if outbid"
+      ],
+      "integration_risks": [
+        "Yield protocol integrations (Lido, EtherFi, MakerDAO) through YieldManager - not fully visible in provided code but locker mechanism exists",
+        "Oracle dependency: single oracle failure or manipulation impacts entire protocol",
+        "WETH integration: assumes specific WETH behavior for wrap/unwrap operations",
+        "Delegate registry V2 integration: delegateERC721 trusts external registry contract"
+      ],
+      "calculation_errors": [
+        "IsolateLogic.executeIsolateRedeem: erc20DecreaseIsolateScaledBorrow uses params.msgSender instead of tokenData.owner (the actual borrower)",
+        "BVault.withdrawERC20: unwrapNativeTokenInWallet uses original amount instead of potentially-capped amount from executeWithdrawERC20",
+        "InterestLogic.updateInterestRates: liquidityAdded/liquidityTaken must be called BEFORE the actual transfer to avoid double-counting; ordering is correct in current code but fragile to refactoring",
+        "GenericLogic._getUserERC20DebtInBaseCurrency: multiplication order (assetPrice * userTotalDebt) could overflow for very high prices and large debts before division by decimals"
+      ]
+    },
+    "inventories": {
+      "token_semantics": [
+        {
+          "address_or_symbol": "WETH",
+          "behaviors": [
+            "permit:false",
+            "rebasing:false",
+            "fee_on_transfer:false"
+          ],
+          "decimals": 18,
+          "notes": "Used as wrappedNativeToken. wrapNativeTokenInWallet uses transferFrom(address(this), user) after deposit. unwrapNativeTokenInWallet uses transferFrom(user, address(this)) requiring user approval."
+        },
+        {
+          "address_or_symbol": "ERC20_GENERAL",
+          "behaviors": [
+            "fee_on_transfer:guarded",
+            "rebasing:false"
+          ],
+          "decimals": -1,
+          "notes": "Fee-on-transfer tokens handled by pre/post balance checks in erc20TransferInLiquidity/erc20TransferOutLiquidity. Rebasing tokens would break scaled amount accounting."
+        },
+        {
+          "address_or_symbol": "ERC721_COLLATERAL",
+          "behaviors": [
+            "callback_onTransfer:true"
+          ],
+          "decimals": 0,
+          "notes": "safeTransferFrom used throughout, triggering onERC721Received callbacks. Base contract inherits ERC721Holder."
+        }
+      ],
+      "invariants": [
+        {
+          "name": "scaled_supply_conservation",
+          "state_vars": [
+            "assetData.totalScaledCrossSupply",
+            "sum(assetData.userScaledCrossSupply[all_users])",
+            "assetData.accruedFee"
+          ]
+        },
+        {
+          "name": "scaled_borrow_conservation",
+          "state_vars": [
+            "groupData.totalScaledCrossBorrow",
+            "sum(groupData.userScaledCrossBorrow[all_users])"
+          ]
+        },
+        {
+          "name": "isolate_borrow_consistency",
+          "state_vars": [
+            "groupData.totalScaledIsolateBorrow",
+            "sum(groupData.userScaledIsolateBorrow[all_users])",
+            "sum(loanData.scaledAmount for all active loans in group)"
+          ],
+          "notes": "BROKEN by executeIsolateRedeem bug: userScaledIsolateBorrow decreased for wrong user while loanData.scaledAmount decreased for correct loan"
+        },
+        {
+          "name": "liquidity_accounting",
+          "state_vars": [
+            "assetData.availableLiquidity",
+            "IERC20(asset).balanceOf(pool)",
+            "assetData.totalBidAmout"
+          ],
+          "notes": "balanceOf(pool) should equal availableLiquidity + totalBidAmout at rest; violated during flash loans"
+        },
+        {
+          "name": "erc721_supply_count",
+          "state_vars": [
+            "assetData.totalScaledCrossSupply + assetData.totalScaledIsolateSupply",
+            "count of tokenData where owner != address(0)"
+          ]
+        },
+        {
+          "name": "health_factor_threshold",
+          "state_vars": [
+            "healthFactor >= 1e18 for non-liquidatable positions"
+          ]
+        }
+      ]
+    }
+  }
+}
