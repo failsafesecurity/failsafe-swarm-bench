@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="FailSafe Swarm on EVMBench — 83/120 (69.2%)" width="100%">
+  <img src="assets/swarm-bench.jpg" alt="FailSafe SWARM on EVMBench — 83/120 (69.2%)" width="100%">
 </p>
 
 ---
 
-FailSafe Swarm is a multi-agent pipeline that builds structured threat models before performing targeted agentic exploration. The pipeline maps architecture, invariants, and trust boundaries through multiple specialist LLMs, then uses those artifacts to guide autonomous agents toward gaps in coverage.
+SWARM: Short for Systemic Weakness Analysis and Remediation Model, FailSafe SWARM is a multi-agent pipeline that builds structured threat models before performing targeted agentic exploration. The pipeline maps architecture, invariants, and trust boundaries through multiple specialist LLMs, then uses those artifacts to guide autonomous agents toward gaps in coverage. Rather than relying on a single pass, SWARM uses these deep, structured threat models to guide autonomous agents in executing targeted attacks, ensuring no gap in coverage is missed.
 
 ## Results
 
@@ -12,7 +12,7 @@ FailSafe Swarm is a multi-agent pipeline that builds structured threat models be
 
 | Approach | Detected | Recall |
 |----------|----------|--------|
-| **FailSafe Swarm** | **83 / 120** | **69.2%** |
+| **FailSafe SWARM** | **83 / 120** | **69.2%** |
 | Claude Opus 4.6 (single agent) | ~55 / 120 | 45.6% |
 | GPT-5.2 (single agent) | ~26 / 120 | ~22% |
 
@@ -78,15 +78,15 @@ FailSafe Swarm is a multi-agent pipeline that builds structured threat models be
 
 ## Coverage Beyond EVMBench: Threat Model Depth
 
-EVMBench tests detection of 120 curated HIGH-severity vulnerabilities. However, the original audit contests that sourced these codebases also produced MEDIUM-severity findings — typically 10–26 per contest — that fall outside EVMBench's scope. Because Swarm produces full threat models rather than isolated bug reports, its confirmed findings naturally extend into this territory.
+EVMBench tests detection of 120 curated HIGH-severity vulnerabilities. However, the original audit contests that sourced these codebases also produced MEDIUM-severity findings — typically 10–26 per contest — that fall outside EVMBench's scope. Because SWARM produces full threat models rather than isolated bug reports, its confirmed findings naturally extend into this territory.
 
-To illustrate, we cross-referenced Swarm's output against the complete set of confirmed findings from the original Curves Code4rena contest.
+To illustrate, we cross-referenced SWARM's output against the complete set of confirmed findings from the original Curves Code4rena contest.
 
 ### Curves: 9 of 14 Confirmed Contest Vulnerabilities Detected
 
-The Curves contest produced 4 HIGHs and 10 MEDIUMs. EVMBench tests only the 4 HIGHs. Swarm detected 3 of 4 HIGHs and independently identified 6 of 10 MEDIUMs — a total of **9 out of 14 confirmed contest vulnerabilities (64%)**.
+The Curves contest produced 4 HIGHs and 10 MEDIUMs. EVMBench tests only the 4 HIGHs. SWARM detected 3 of 4 HIGHs and independently identified 6 of 10 MEDIUMs — a total of **9 out of 14 confirmed contest vulnerabilities (64%)**.
 
-| ID | Contest Finding | Swarm Finding |
+| ID | Contest Finding | SWARM Finding |
 |----|----------------|---------------|
 | H | *(3 of 4 HIGHs detected — graded by EVMBench)* | |
 | M-01 | Protocol fee permanently locked on sells | Protocol Fee Permanently Locked on Sells |
@@ -110,7 +110,7 @@ EVMBench evaluates three capabilities: **Detect** (find vulnerabilities), **Patc
 
 ## Methodology
 
-Swarm's approach is that structured threat modeling provides better coverage than free-form code review. The pipeline builds a layered threat model through four phases, then uses those artifacts to guide autonomous deep-dive agents.
+SWARM's approach is that structured threat modeling provides better coverage than free-form code review. The pipeline builds a layered threat model through four phases, then uses those artifacts to guide autonomous deep-dive agents.
 
 ```mermaid
 flowchart TD
@@ -174,13 +174,13 @@ Each hypothesis receives a verdict: **CONFIRMED**, **REFUTED**, or **CONTESTED**
 
 ### Phase E — Guided Agentic Deep Dive
 
-Phases A–D produce the majority of detections. Phase E supplements them with autonomous agents (Claude Opus 4.6 and Codex 5.3) that perform independent deep dives into the codebase. These agents receive Swarm's full threat model as context — the architecture, invariants, trust boundaries, confirmed findings, and refuted hypotheses from Phases A–D. This allows them to build on what the pipeline has already established and focus on areas where it has known gaps: integration boundaries, mathematical edge cases, and multi-step attack chains.
+Phases A–D produce the majority of detections. Phase E supplements them with autonomous agents (Claude Opus 4.6 and Codex 5.3) that perform independent deep dives into the codebase. These agents receive SWARM's full threat model as context — the architecture, invariants, trust boundaries, confirmed findings, and refuted hypotheses from Phases A–D. This allows them to build on what the pipeline has already established and focus on areas where it has known gaps: integration boundaries, mathematical edge cases, and multi-step attack chains.
 
 Phase E contributed 8 additional detections across the 40 contests.
 
 ### Multi-Model Diversity
 
-Swarm uses multiple LLM providers (Claude, GPT, Gemini) across all phases. Different models surface different classes of vulnerabilities; the heterogeneous ensemble provides broader coverage than any single model.
+SWARM uses multiple LLM providers (Claude, GPT, Gemini) across all phases. Different models surface different classes of vulnerabilities; the heterogeneous ensemble provides broader coverage than any single model.
 
 ## Known Limitations
 
@@ -201,13 +201,13 @@ This repository includes full artifacts for all 40 contests. Each directory has 
 | Directory | Contents | Start Here |
 |-----------|----------|------------|
 | [`results/`](results/) | Judge inputs and outputs (40 contests) | `audit-graded-all-combined.json` — the grading verdict for each contest |
-| [`swarm-outputs/`](swarm-outputs/) | Full Swarm threat models (Phases A–D, ~4,750 files) | `phase-d/confirmed/` — validated findings with root cause and code paths |
+| [`swarm-outputs/`](swarm-outputs/) | Full SWARM threat models (Phases A–D, ~4,750 files) | `phase-d/confirmed/` — validated findings with root cause and code paths |
 | [`scripts/`](scripts/) | Phase E runners, grading, and aggregation scripts | `phase-e-agent.js` — the Claude Phase E autonomous agent |
 | [`prompts/`](prompts/) | Phase E prompt template | `phase-e-prompt.txt` |
 
 ### Quick Start: Exploring a Contest
 
-To examine Swarm's full analysis of a specific contest (e.g., Curves):
+To examine SWARM's full analysis of a specific contest (e.g., Curves):
 
 1. **Grading results** — `results/per-contest/2024-01-curves/audit-graded-all-combined.json`
 2. **Confirmed findings** — `swarm-outputs/2024-01-curves/phase-d/confirmed/*.json`
@@ -216,13 +216,13 @@ To examine Swarm's full analysis of a specific contest (e.g., Curves):
 
 ### Reproducibility
 
-- **Phase E**: Requires a Claude API key (`phase-e-agent.js`) and/or an OpenAI API key (`phase-e-codex.mjs`). Run against any EVMBench contest codebase with Swarm artifacts as input.
+- **Phase E**: Requires a Claude API key (`phase-e-agent.js`) and/or an OpenAI API key (`phase-e-codex.mjs`). Run against any EVMBench contest codebase with SWARM artifacts as input.
 - **Grading**: Requires an OpenAI API key (GPT-5 judge). Run `grade-detect.js` against EVMBench ground truth.
-- **Swarm pipeline** (Phases A–D): The pipeline scripts and prompts are not included. Swarm outputs for all 40 contests are provided in `swarm-outputs/`.
+- **SWARM pipeline** (Phases A–D): The pipeline scripts and prompts are not included. SWARM outputs for all 40 contests are provided in `swarm-outputs/`.
 
 ## Scope
 
-EVMBench evaluates Detect, Patch, and Exploit capabilities. This submission addresses **Detect only**. Swarm's threat models include attack scenarios, affected code paths, and remediation guidance that could inform Patch and Exploit evaluation, but we have not optimized for those modes.
+EVMBench evaluates Detect, Patch, and Exploit capabilities. This submission addresses **Detect only**. SWARM's threat models include attack scenarios, affected code paths, and remediation guidance that could inform Patch and Exploit evaluation, but we have not optimized for those modes.
 
 ---
 
