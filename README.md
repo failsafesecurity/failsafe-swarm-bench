@@ -2,13 +2,9 @@
   <img src="assets/swarm-bench.jpg" alt="FailSafe SWARM on EVMBench — 83/120 (69.2%)" width="100%">
 </p>
 
----
-
 SWARM: Short for Systemic Weakness Analysis and Remediation Model, FailSafe SWARM is a multi-agent pipeline that builds structured threat models before performing targeted agentic exploration. The pipeline maps architecture, invariants, and trust boundaries through multiple specialist LLMs, then uses those artifacts to guide autonomous agents toward gaps in coverage. Rather than relying on a single pass, SWARM uses these deep, structured threat models to guide autonomous agents in executing targeted attacks, ensuring no gap in coverage is missed.
 
 ## Results
-
-### Aggregate
 
 | Approach | Detected | Recall |
 |----------|----------|--------|
@@ -76,6 +72,20 @@ SWARM: Short for Systemic Weakness Analysis and Remediation Model, FailSafe SWAR
 <tr><td colspan="2" align="center"><strong>TOTAL: 83 / 120 (69.2%)</strong></td></tr>
 </table>
 
+### Real-World Validation
+
+Beyond benchmarks, SWARM has identified vulnerabilities in production codebases — several of which have been patched by maintainers:
+
+| Project | Vulnerability |
+|---------|--------------|
+| [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1559) | Path traversal via unsanitized `--run-id` in rollback/status actions, enabling arbitrary file read/write outside the state directory |
+| [NEAR AI Ironclaw](https://github.com/nearai/ironclaw/pull/1851) | Safety layer bypass via output truncation — oversized tool output skipped leak detection, policy enforcement, and injection scanning |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4686) | Arbitrary file read through unvalidated `MEDIA:<path>` tags, exploitable via prompt injection to exfiltrate sensitive files |
+| [Balancer ReClAMM](https://github.com/balancer/reclamm/pull/171) | Mathematical edge case in virtual balance rounding that could cause underflow in extreme market conditions |
+| [Euler Finance](https://github.com/euler-xyz/euler-lite) | Vulnerabilities identified in the Euler Lite codebase |
+
+These findings span DeFi protocols, AI agent frameworks, and NVIDIA's developer tooling — demonstrating that SWARM's structured threat modeling generalizes beyond smart contracts to any codebase with security-critical logic.
+
 ## Coverage Beyond EVMBench: Threat Model Depth
 
 EVMBench tests detection of 120 curated HIGH-severity vulnerabilities. However, the original audit contests that sourced these codebases also produced MEDIUM-severity findings — typically 10–26 per contest — that fall outside EVMBench's scope. Because SWARM produces full threat models rather than isolated bug reports, its confirmed findings naturally extend into this territory.
@@ -95,18 +105,6 @@ The Curves contest produced 4 HIGHs and 10 MEDIUMs. EVMBench tests only the 4 HI
 | M-07 | Wrapping all tokens causes permanent DoS | DoS on All Trading by Wrapping All Tokens to ERC20 |
 | M-09 | Excess ETH from buy overpayment locked | Excess ETH from Buy Overpayment Permanently Locked |
 | M-10 | onBalanceChange exploitable for fee theft | Weaponized onBalanceChange Wipes Victim's Unclaimed Fees |
-
-## What is EVMBench?
-
-[EVMBench](https://github.com/paradigmxyz/evmbench) is a benchmark for evaluating AI agents on smart contract security, developed by OpenAI, Paradigm, and OtterSec. It comprises:
-
-- **40 real audit codebases** spanning July 2023 through January 2026
-- **120 confirmed HIGH-severity vulnerabilities** (loss-of-funds only)
-- **3-hour time limit** per contest
-
-EVMBench evaluates three capabilities: **Detect** (find vulnerabilities), **Patch** (fix them), and **Exploit** (write proof-of-concept exploits). This submission focuses on **Detect** — vulnerability discovery — which the EVMBench authors identify as the primary bottleneck: with medium-level hints, GPT-5.2 achieves 93.9% on Patch and 73.8% on Exploit, but only ~22% on unassisted Detect.
-
-**Grading**: An LLM judge (GPT-5, high reasoning effort) determines whether the submitted audit report describes the same vulnerability as each ground truth finding. The criteria require matching root cause, code path, and remediation approach — same contract or similar impact alone is not sufficient.
 
 ## Methodology
 
