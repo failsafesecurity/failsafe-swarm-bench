@@ -79,8 +79,10 @@ Beyond benchmarks, SWARM has identified vulnerabilities in production codebases 
 | Project | Vulnerability |
 |---------|--------------|
 | [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1559) | Path traversal via unsanitized `--run-id` in rollback/status actions, enabling arbitrary file read/write outside the state directory |
+| [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1557) | Incomplete SSRF blocklist missing IANA-reserved IP ranges (`0.0.0.0/8`, `198.18.0.0/15`), allowing bypass to reach internal infrastructure |
 | [NEAR AI Ironclaw](https://github.com/nearai/ironclaw/pull/1851) | Safety layer bypass via output truncation — oversized tool output skipped leak detection, policy enforcement, and injection scanning |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4686) | Arbitrary file read through unvalidated `MEDIA:<path>` tags, exploitable via prompt injection to exfiltrate sensitive files |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4688) | Missing Twilio webhook signature validation, allowing forged requests to bypass SMS allowlist and impersonate authorized users |
 | [Balancer ReClAMM](https://github.com/balancer/reclamm/pull/171) | Mathematical edge case in virtual balance rounding that could cause underflow in extreme market conditions |
 | [Euler Finance](https://github.com/euler-xyz/euler-lite) | Vulnerabilities identified in the Euler Lite codebase |
 
