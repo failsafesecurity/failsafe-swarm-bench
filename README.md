@@ -24,18 +24,90 @@ We're publishing everything: the methodology, the full pipeline artifacts, the r
 
 SWARM has found and disclosed vulnerabilities in production codebases.
 
-| Project | Vulnerability |
-|---------|--------------|
-| [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1559) | Path traversal via unsanitized `--run-id` in rollback/status actions, enabling arbitrary file read/write outside the state directory |
-| [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1558) | Prototype pollution via unsanitized config path in snapshot migration, allowing arbitrary property injection into `Object.prototype` |
-| [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1557) | Incomplete SSRF blocklist missing IANA-reserved IP ranges (`0.0.0.0/8`, `198.18.0.0/15`), allowing bypass to reach internal infrastructure |
-| [NEAR AI Ironclaw](https://github.com/nearai/ironclaw/pull/1851) | Safety layer bypass via output truncation: oversized tool output skipped leak detection, policy enforcement, and injection scanning |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4686) | Arbitrary file read through unvalidated `MEDIA:<path>` tags, exploitable via prompt injection to exfiltrate sensitive files |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4688) | Missing Twilio webhook signature validation, allowing forged requests to bypass SMS allowlist and impersonate authorized users |
-| [Balancer ReClAMM](https://github.com/balancer/reclamm/pull/171) | Mathematical edge case in virtual balance rounding that could cause underflow in extreme market conditions |
-| [Euler Finance](https://github.com/euler-xyz/euler-lite) | Vulnerabilities identified in the Euler Lite codebase |
-| [FFmpeg](reports/ffmpegcve%20Agentic%20Penetration%20Testing%20Report%20Report.pdf) | CVE-level vulnerabilities identified via agentic penetration testing ([full report](reports/ffmpegcve%20Agentic%20Penetration%20Testing%20Report%20Report.pdf)) |
-| [OpenBSD](reports/openbsdslaacd%20Agentic%20Penetration%20Testing%20Report%20Report.pdf) | Vulnerabilities identified in OpenBSD's slaacd daemon via agentic penetration testing ([full report](reports/openbsdslaacd%20Agentic%20Penetration%20Testing%20Report%20Report.pdf)) |
+<table>
+<tr><th>Project</th><th>Vulnerability</th></tr>
+<tr>
+  <td rowspan="3"><a href="https://github.com/NVIDIA/NemoClaw">NVIDIA NemoClaw</a></td>
+  <td>Path traversal via unsanitized <code>--run-id</code> in rollback/status actions, enabling arbitrary file read/write outside the state directory (<a href="https://github.com/NVIDIA/NemoClaw/pull/1559">PR</a>)</td>
+</tr>
+<tr>
+  <td>Prototype pollution via unsanitized config path in snapshot migration, allowing arbitrary property injection into <code>Object.prototype</code> (<a href="https://github.com/NVIDIA/NemoClaw/pull/1558">PR</a>)</td>
+</tr>
+<tr>
+  <td>Incomplete SSRF blocklist missing IANA-reserved IP ranges (<code>0.0.0.0/8</code>, <code>198.18.0.0/15</code>), allowing bypass to reach internal infrastructure (<a href="https://github.com/NVIDIA/NemoClaw/pull/1557">PR</a>)</td>
+</tr>
+<tr>
+  <td rowspan="4"><a href="https://github.com/nearai/ironclaw">NEAR AI Ironclaw</a></td>
+  <td>Safety layer bypass via output truncation: oversized tool output skipped leak detection, policy enforcement, and injection scanning (<a href="https://github.com/nearai/ironclaw/pull/1851">PR</a>)</td>
+</tr>
+<tr>
+  <td>Indirect prompt injection via memory poisoning (<a href="https://github.com/nearai/ironclaw/pull/2092">PR</a>)</td>
+</tr>
+<tr>
+  <td>Zip bomb denial of service in document extraction (<a href="https://github.com/nearai/ironclaw/pull/2093">PR</a>)</td>
+</tr>
+<tr>
+  <td>SSRF via extension download and MCP transport redirects (<a href="https://github.com/nearai/ironclaw/pull/2094">PR</a>)</td>
+</tr>
+<tr>
+  <td rowspan="2"><a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a></td>
+  <td>Arbitrary file read through unvalidated <code>MEDIA:&lt;path&gt;</code> tags, exploitable via prompt injection to exfiltrate sensitive files (<a href="https://github.com/NousResearch/hermes-agent/pull/4686">PR</a>)</td>
+</tr>
+<tr>
+  <td>Missing Twilio webhook signature validation, allowing forged requests to bypass SMS allowlist and impersonate authorized users (<a href="https://github.com/NousResearch/hermes-agent/pull/4688">PR</a>)</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/balancer/reclamm/pull/171">Balancer ReClAMM</a></td>
+  <td>Mathematical edge case in virtual balance rounding that could cause underflow in extreme market conditions</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/euler-xyz/euler-lite">Euler Finance</a></td>
+  <td>Vulnerabilities identified in the Euler Lite codebase</td>
+</tr>
+<tr>
+  <td rowspan="2"><a href="https://github.com/Web3Auth/web3auth-web">Consensys Web3Auth</a></td>
+  <td>Insecure PRNG used for authentication nonce in WalletConnectV2Connector (<a href="https://github.com/Web3Auth/web3auth-web/pull/2461">PR</a>)</td>
+</tr>
+<tr>
+  <td>Open redirect via WalletConnect peer metadata (<a href="https://github.com/Web3Auth/web3auth-web/pull/2460">PR</a>)</td>
+</tr>
+<tr>
+  <td rowspan="3"><a href="https://github.com/jitsi/jitsi">Jitsi</a></td>
+  <td>Cryptographic weakness: hardcoded salt and low iteration count in AESCrypto.java (<a href="https://github.com/jitsi/jitsi/pull/840">PR</a>)</td>
+</tr>
+<tr>
+  <td>Missing braces logic error leading to UI denial of service (<a href="https://github.com/jitsi/jitsi/pull/839">PR</a>)</td>
+</tr>
+<tr>
+  <td>Business logic flaw: TOCTOU bypass in OTR fingerprint verification (<a href="https://github.com/jitsi/jitsi/pull/838">PR</a>)</td>
+</tr>
+<tr>
+  <td rowspan="3"><a href="https://github.com/okx/wallet-core">OKX Wallet Core</a></td>
+  <td>Use <code>abi.encodePacked</code> for EIP-712 array hashing (<a href="https://github.com/okx/wallet-core/pull/20">PR</a>)</td>
+</tr>
+<tr>
+  <td>Missing deadline field in <code>CALLS_TYPEHASH</code> for validator execution path (<a href="https://github.com/okx/wallet-core/pull/19">PR</a>)</td>
+</tr>
+<tr>
+  <td>Non-standard EIP-712 two-part digest in EIP-1271 validator path (<a href="https://github.com/okx/wallet-core/pull/18">PR</a>)</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/vercel/vercel/pull/15995">Vercel</a></td>
+  <td>Arbitrary code execution via path traversal in x-matched-path header</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/supabase-community/supabase-mcp/pull/254">Supabase MCP</a></td>
+  <td>Missing maximum operation limits: unbounded file array and content size in deployEdgeFunction</td>
+</tr>
+<tr>
+  <td><a href="reports/ffmpegcve%20Agentic%20Penetration%20Testing%20Report%20Report.pdf">FFmpeg</a></td>
+  <td>CVE-level vulnerabilities identified via agentic penetration testing (<a href="reports/ffmpegcve%20Agentic%20Penetration%20Testing%20Report%20Report.pdf">full report</a>)</td>
+</tr>
+<tr>
+  <td><a href="reports/openbsdslaacd%20Agentic%20Penetration%20Testing%20Report%20Report.pdf">OpenBSD</a></td>
+  <td>Vulnerabilities identified in OpenBSD's slaacd daemon via agentic penetration testing (<a href="reports/openbsdslaacd%20Agentic%20Penetration%20Testing%20Report%20Report.pdf">full report</a>)</td>
+</tr>
+</table>
 
 Also see how we compare against Claude Mythos [here](https://getfailsafe.com/swarm-finds-mythos-zero-days) using Gemini 3 Flash.
 
