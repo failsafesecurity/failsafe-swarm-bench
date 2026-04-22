@@ -14,10 +14,6 @@ We're publishing everything: the methodology, the full pipeline artifacts, the r
 
 ## Introducing SWARM
 
-<p align="center">
-  <img src="assets/swarm-bench.jpg" alt="FailSafe SWARM - 83/120 (69.2%)" width="100%">
-</p>
-
 ***SWARM*** (Systemic Weakness Analysis and Remediation Model) maps out threat models, system architectures, invariants, and trust boundaries through multiple specialised frontier models, and using harnessed toolings & artifacts to guide autonomous red-team agents towards exploit validation in an isolated environment. The same methodology applies to any codebase with security-critical logic: smart contracts, AI agent frameworks, web and mobile applications.
 
 ## Vulnerability Disclosures
