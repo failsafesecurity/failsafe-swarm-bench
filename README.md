@@ -1,19 +1,35 @@
+## Why This Exists
+
 <p align="center">
-  <img src="assets/swarm-bench.jpg" alt="FailSafe SWARM — 83/120 (69.2%)" width="100%">
+  <img src="assets/meme.png" alt="The current state of AI security benchmarks" width="500">
 </p>
 
-***SWARM*** (Systemic Weakness Analysis and Remediation Model) maps out threat models, system architectures, invariants, and trust boundaries through multiple specialised frontier models, and using harnessed toolings & artifacts to guide autonomous red-team agents towards exploit validation in an isolated environment. The same methodology applies to any codebase with security-critical logic — smart contracts, AI agent frameworks to web and mobile applications.
+The AI boom has turned "AI-powered code security" into one of the noisiest categories in software. Every week brings another tool claiming superhuman vulnerability detection, backed by self-reported benchmarks on private datasets.
+
+We're publishing everything: the methodology, the full pipeline artifacts, the raw results, and [real vulnerability disclosures](#vulnerability-disclosures) accepted into production codebases like NVIDIA, NEAR, FFmpeg, and OpenBSD. These aren't benchmark scores on synthetic bugs. They're confirmed security findings that required coordinated disclosure.
+
+**Don't trust our words. Trust the outcome.**
+
+---
+
+## Introducing SWARM
+
+<p align="center">
+  <img src="assets/swarm-bench.jpg" alt="FailSafe SWARM - 83/120 (69.2%)" width="100%">
+</p>
+
+***SWARM*** (Systemic Weakness Analysis and Remediation Model) maps out threat models, system architectures, invariants, and trust boundaries through multiple specialised frontier models, and using harnessed toolings & artifacts to guide autonomous red-team agents towards exploit validation in an isolated environment. The same methodology applies to any codebase with security-critical logic: smart contracts, AI agent frameworks, web and mobile applications.
 
 ## Vulnerability Disclosures
 
-SWARM has identified vulnerabilities in production codebases, showcasing the performance of our methological approach.
+SWARM has found and disclosed vulnerabilities in production codebases.
 
 | Project | Vulnerability |
 |---------|--------------|
 | [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1559) | Path traversal via unsanitized `--run-id` in rollback/status actions, enabling arbitrary file read/write outside the state directory |
 | [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1558) | Prototype pollution via unsanitized config path in snapshot migration, allowing arbitrary property injection into `Object.prototype` |
 | [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw/pull/1557) | Incomplete SSRF blocklist missing IANA-reserved IP ranges (`0.0.0.0/8`, `198.18.0.0/15`), allowing bypass to reach internal infrastructure |
-| [NEAR AI Ironclaw](https://github.com/nearai/ironclaw/pull/1851) | Safety layer bypass via output truncation — oversized tool output skipped leak detection, policy enforcement, and injection scanning |
+| [NEAR AI Ironclaw](https://github.com/nearai/ironclaw/pull/1851) | Safety layer bypass via output truncation: oversized tool output skipped leak detection, policy enforcement, and injection scanning |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4686) | Arbitrary file read through unvalidated `MEDIA:<path>` tags, exploitable via prompt injection to exfiltrate sensitive files |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/4688) | Missing Twilio webhook signature validation, allowing forged requests to bypass SMS allowlist and impersonate authorized users |
 | [Balancer ReClAMM](https://github.com/balancer/reclamm/pull/171) | Mathematical edge case in virtual balance rounding that could cause underflow in extreme market conditions |
@@ -23,9 +39,9 @@ SWARM has identified vulnerabilities in production codebases, showcasing the per
 
 Also see how we compare against Claude Mythos [here](https://getfailsafe.com/swarm-finds-mythos-zero-days) using Gemini 3 Flash.
 
-## Benchmark Results
+## Benchmark
 
-To make our results reproducible, we evaluated SWARM against [EVMBench](https://github.com/ethanbabel/EVMBench) — an open-source benchmark of 120 confirmed HIGH-severity vulnerabilities across 40 audit contests. Anyone can run the same evaluation against the same codebases.
+To make our results reproducible, we evaluated SWARM against [EVMBench](https://github.com/ethanbabel/EVMBench), an open-source benchmark of 120 confirmed HIGH-severity vulnerabilities across 40 audit contests. Anyone can run the same evaluation against the same codebases.
 
 | Approach | Detected | Recall |
 |----------|----------|--------|
@@ -38,11 +54,11 @@ To make our results reproducible, we evaluated SWARM against [EVMBench](https://
 
 ### Beyond HIGH Severity
 
-The benchmark tests only HIGH-severity findings, but the original audit contests also produced MEDIUM-severity findings (typically 10–26 per contest). Because SWARM produces full threat models rather than isolated bug reports, its confirmed findings naturally extend into this territory.
+The benchmark tests only HIGH-severity findings, but the original audit contests also produced MEDIUM-severity findings (typically 10-26 per contest). Because SWARM produces full threat models rather than isolated bug reports, its confirmed findings cover this territory too.
 
 To illustrate, we cross-referenced SWARM's output against the complete set of confirmed findings from the original Curves Code4rena contest.
 
-**Curves: 9 of 14 confirmed contest vulnerabilities detected.** The contest produced 4 HIGHs and 10 MEDIUMs. SWARM detected 3 of 4 HIGHs and independently identified 6 of 10 MEDIUMs — **64% total recall** across all severities.
+**Curves: 9 of 14 confirmed contest vulnerabilities detected.** The contest produced 4 HIGHs and 10 MEDIUMs. SWARM detected 3 of 4 HIGHs and independently identified 6 of 10 MEDIUMs, hitting **64% total recall** across all severities.
 
 | ID | Contest Finding | SWARM Finding |
 |----|----------------|---------------|
@@ -60,11 +76,11 @@ SWARM's core insight is that structured threat modeling provides better coverage
 
 ```mermaid
 flowchart TD
-    A["Phase A — Foundation<br/>5 specialist analyses"]
-    B["Phase B — Threat Generation<br/>6 specialists × 2 LLM passes"]
-    C["Phase C — Deduplication<br/>Semantic consolidation"]
-    D["Phase D — Validation<br/>CONFIRMED / REFUTED"]
-    E["Phase E — Agentic Deep Dive<br/>Claude Opus + Codex 5.3"]
+    A["Phase A - Foundation<br/>5 specialist analyses"]
+    B["Phase B - Threat Generation<br/>6 specialists × 2 LLM passes"]
+    C["Phase C - Deduplication<br/>Semantic consolidation"]
+    D["Phase D - Validation<br/>CONFIRMED / REFUTED"]
+    E["Phase E - Agentic Deep Dive<br/>Claude Opus + Codex 5.3"]
 
     A -->|"invariants &<br/>architecture"| B
     B -->|"50-80<br/>hypotheses"| C
@@ -78,7 +94,7 @@ flowchart TD
     style E fill:#dc2626,color:#fff,stroke:#b91c1c
 ```
 
-### Phase A — Foundation Analysis
+### Phase A - Foundation Analysis
 
 Five specialist LLMs analyze the codebase in parallel, each from a different perspective:
 
@@ -90,9 +106,9 @@ Five specialist LLMs analyze the codebase in parallel, each from a different per
 | State Machine Invariants | Lifecycle rules, monotonicity, access control invariants |
 | Economic Invariants | Conservation laws, solvency rules, yield consistency |
 
-Phase A establishes structural understanding — invariants, trust boundaries, and entry points. No attack hypotheses are generated; this phase produces the foundational context that downstream phases build on.
+Phase A establishes structural understanding: invariants, trust boundaries, and entry points. No attack hypotheses are generated here. This phase produces the context that downstream phases build on.
 
-### Phase B — Threat Hypothesis Generation
+### Phase B - Threat Hypothesis Generation
 
 Six specialists generate concrete attack hypotheses informed by Phase A's analysis. Each specialist runs two passes with different LLMs to maximize coverage through model diversity:
 
@@ -102,13 +118,13 @@ Six specialists generate concrete attack hypotheses informed by Phase A's analys
 | Economic Threats | LLM-A | LLM-C |
 | Operational Threats | LLM-A | LLM-B |
 
-Every hypothesis must be code-anchored: exact file, line numbers, and the specific pattern that triggered it. Typical output: 50–80 hypotheses per codebase.
+Every hypothesis must be code-anchored: exact file, line numbers, and the specific pattern that triggered it. Typical output: 50-80 hypotheses per codebase.
 
-### Phase C — Semantic Deduplication
+### Phase C - Semantic Deduplication
 
-Multiple specialists often identify the same vulnerability from different angles — a "reentrancy" finding from the technical specialist and a "flash loan manipulation" finding from the economic specialist may target the same state change. Phase C consolidates semantic duplicates while preserving distinct findings. Typical reduction: ~45%.
+Multiple specialists often flag the same vulnerability from different angles. A "reentrancy" finding from the technical specialist and a "flash loan manipulation" finding from the economic specialist may target the same state change. Phase C consolidates semantic duplicates while preserving distinct findings. Typical reduction: ~45%.
 
-### Phase D — Validation
+### Phase D - Validation
 
 Each deduplicated hypothesis is validated independently through deep code analysis:
 1. Verify the proof-of-signal exists in the actual code
@@ -118,9 +134,9 @@ Each deduplicated hypothesis is validated independently through deep code analys
 
 Each hypothesis receives a verdict: **CONFIRMED**, **REFUTED**, or **CONTESTED** (when validators disagree). No hypothesis is confirmed without citing the specific code that proves the defect.
 
-### Phase E — Guided Agentic Deep Dive
+### Phase E - Guided Agentic Deep Dive
 
-Phases A–D produce the majority of detections. Phase E supplements them with autonomous agents (Claude Opus 4.6 and Codex 5.3) that perform independent deep dives into the codebase. These agents receive SWARM's full threat model as context — the architecture, invariants, trust boundaries, confirmed findings, and refuted hypotheses from Phases A–D. This allows them to build on what the pipeline has already established and focus on areas where it has known gaps: integration boundaries, mathematical edge cases, and multi-step attack chains.
+Phases A-D produce the majority of detections. Phase E supplements them with autonomous agents (Claude Opus 4.6 and Codex 5.3) that run independent deep dives into the codebase. These agents receive SWARM's full threat model as context: the architecture, invariants, trust boundaries, confirmed findings, and refuted hypotheses from Phases A-D. This lets them build on what the pipeline has already established and focus on areas with known gaps: integration boundaries, mathematical edge cases, and multi-step attack chains.
 
 Phase E contributed 8 additional detections across the 40 benchmark contests.
 
@@ -132,13 +148,13 @@ SWARM uses multiple LLM providers (Claude, GPT, Gemini) across all phases. Diffe
 
 ### Integration Boundary Bugs
 
-The primary miss pattern involves vulnerabilities at the boundary between audited code and external protocols — for example, Pendle's `skim()` behavior, Balancer's `getActualSupply` vs `totalSupply`, or Morpho Blue decimal normalization. These require knowledge of external protocol interfaces that is not present in the audited codebase.
+The primary miss pattern involves vulnerabilities at the boundary between audited code and external protocols, e.g. Pendle's `skim()` behavior, Balancer's `getActualSupply` vs `totalSupply`, or Morpho Blue decimal normalization. These require knowledge of external protocol interfaces that isn't present in the audited codebase.
 
-In controlled experiments, providing integration documentation for external protocols increased detection from 10/20 to 15/20 on the noya contest (+50%). We did not include integration documentation in our benchmark submission to maintain parity with other approaches that operate on code alone. In production deployments, users supply third-party protocol documentation, which measurably improves detection of integration boundary vulnerabilities.
+In controlled experiments, providing integration documentation for external protocols increased detection from 10/20 to 15/20 on the noya contest (+50%). We did not include integration documentation in our benchmark submission to maintain parity with other approaches that operate on code alone. In production deployments, users supply third-party protocol documentation, which improves detection of integration boundary bugs.
 
 ### Judge Variance
 
-The GPT-5 LLM judge exhibits ±2–3% variance across grading runs on borderline cases. All results reported here are from a single consistent grading session.
+The GPT-5 LLM judge exhibits +-2-3% variance across grading runs on borderline cases. All results reported here are from a single consistent grading session.
 
 ## Per-Contest Breakdown
 
@@ -203,25 +219,25 @@ This repository includes full artifacts for all 40 contests. Each directory has 
 
 | Directory | Contents | Start Here |
 |-----------|----------|------------|
-| [`results/`](results/) | Judge inputs and outputs (40 contests) | `audit-graded-all-combined.json` — the grading verdict for each contest |
-| [`swarm-outputs/`](swarm-outputs/) | Full SWARM threat models (Phases A–D, ~4,750 files) | `phase-d/confirmed/` — validated findings with root cause and code paths |
-| [`scripts/`](scripts/) | Phase E runners, grading, and aggregation scripts | `phase-e-agent.js` — the Claude Phase E autonomous agent |
+| [`results/`](results/) | Judge inputs and outputs (40 contests) | `audit-graded-all-combined.json` - the grading verdict for each contest |
+| [`swarm-outputs/`](swarm-outputs/) | Full SWARM threat models (Phases A-D, ~4,750 files) | `phase-d/confirmed/` - validated findings with root cause and code paths |
+| [`scripts/`](scripts/) | Phase E runners, grading, and aggregation scripts | `phase-e-agent.js` - the Claude Phase E autonomous agent |
 | [`prompts/`](prompts/) | Phase E prompt template | `phase-e-prompt.txt` |
 
 ### Quick Start: Exploring a Contest
 
 To examine SWARM's full analysis of a specific contest (e.g., Curves):
 
-1. **Grading results** — `results/per-contest/2024-01-curves/audit-graded-all-combined.json`
-2. **Confirmed findings** — `swarm-outputs/2024-01-curves/phase-d/confirmed/*.json`
-3. **Threat model context** — `swarm-outputs/2024-01-curves/phase-a-*.json`
-4. **Raw submission** — `results/per-contest/2024-01-curves/audit.json`
+1. **Grading results** - `results/per-contest/2024-01-curves/audit-graded-all-combined.json`
+2. **Confirmed findings** - `swarm-outputs/2024-01-curves/phase-d/confirmed/*.json`
+3. **Threat model context** - `swarm-outputs/2024-01-curves/phase-a-*.json`
+4. **Raw submission** - `results/per-contest/2024-01-curves/audit.json`
 
 ### Reproducibility
 
 - **Phase E**: Requires a Claude API key (`phase-e-agent.js`) and/or an OpenAI API key (`phase-e-codex.mjs`). Run against any contest codebase with SWARM artifacts as input.
 - **Grading**: Requires an OpenAI API key (GPT-5 judge). Run `grade-detect.js` against ground truth.
-- **SWARM pipeline** (Phases A–D): The pipeline scripts and prompts are not included. SWARM outputs for all 40 contests are provided in `swarm-outputs/`.
+- **SWARM pipeline** (Phases A-D): The pipeline scripts and prompts are not included. SWARM outputs for all 40 contests are provided in `swarm-outputs/`.
 
 ---
 
