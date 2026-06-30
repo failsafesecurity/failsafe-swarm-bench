@@ -1,22 +1,6 @@
-# FailSafe
+**Project GlassBreak** is FailSafe's public good responsible-disclosure initiative for open-source repositories. We report vulnerabilities we discover to  maintainers and contribute fixes upstream. Our aim is straightforward: make the software everyone builds on safer, and give back to the community.
 
-<p align="center">
-  <img src="assets/meme.png" alt="FailSafe" width="500">
-</p>
-
-This repository is the public record of the vulnerabilities FailSafe has discovered and disclosed in production open-source software — including NVIDIA, NEAR, FFmpeg, and OpenBSD — together with the methodology, pipeline artifacts, and benchmark results behind them.
-
-These aren't benchmark scores on synthetic bugs. They're confirmed findings, responsibly disclosed to maintainers and — in many cases — already merged upstream.
-
-**Don't trust our words. Trust the outcome.**
-
----
-
-## Project GlassBreak
-
-**Project GlassBreak** is FailSafe's responsible-disclosure initiative for open source. We point our platform at the open-source projects the broader ecosystem depends on, privately report the vulnerabilities we find to their maintainers, and contribute fixes back upstream — coordinating disclosure so issues are patched before they are made public. The aim is straightforward: make the software everyone builds on measurably safer, and give back to the security community rather than only benchmarking against it.
-
-Every disclosure below was discovered by FailSafe and reported under this initiative. Status reflects the current state of each upstream report.
+Every disclosure below was discovered by FailSafe and reported under this initiative.
 
 <table>
 <tr><th>Project</th><th>Vulnerability</th><th>Status</th></tr>
@@ -267,7 +251,7 @@ Every disclosure below was discovered by FailSafe and reported under this initia
 
 Also see how we compare against Claude Mythos [here](https://getfailsafe.com/swarm-finds-mythos-zero-days) using Gemini 3 Flash.
 
-## The Engine: FailSafe's Agentic Offensive Security Platform
+## FailSafe's Agentic Offensive Security Platform
 
 Every finding above comes from **FailSafe's Agentic Offensive Security Platform** — an autonomous system that maps out threat models, system architectures, invariants, and trust boundaries through multiple specialised frontier models, then uses harnessed tooling and artifacts to guide autonomous red-team agents toward exploit validation in an isolated environment. The same approach applies to any codebase with security-critical logic: smart contracts, AI agent frameworks, web and mobile applications.
 
