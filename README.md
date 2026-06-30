@@ -1,10 +1,10 @@
-# FailSafe SWARM
+# FailSafe
 
 <p align="center">
-  <img src="assets/meme.png" alt="FailSafe SWARM" width="500">
+  <img src="assets/meme.png" alt="FailSafe" width="500">
 </p>
 
-This repository is the public record of what **SWARM** — FailSafe's autonomous AI penetration-testing system — has found in real-world software. Alongside the full methodology, pipeline artifacts, and benchmark results, it documents the security vulnerabilities SWARM has [discovered and disclosed](#project-glassbreak) in production open-source codebases, including NVIDIA, NEAR, FFmpeg, and OpenBSD.
+This repository is the public record of the vulnerabilities FailSafe has discovered and disclosed in production open-source software — including NVIDIA, NEAR, FFmpeg, and OpenBSD — together with the methodology, pipeline artifacts, and benchmark results behind them.
 
 These aren't benchmark scores on synthetic bugs. They're confirmed findings, responsibly disclosed to maintainers and — in many cases — already merged upstream.
 
@@ -12,15 +12,11 @@ These aren't benchmark scores on synthetic bugs. They're confirmed findings, res
 
 ---
 
-## Introducing SWARM
-
-***SWARM*** (Systemic Weakness Analysis and Remediation Model) maps out threat models, system architectures, invariants, and trust boundaries through multiple specialised frontier models, and using harnessed toolings & artifacts to guide autonomous red-team agents towards exploit validation in an isolated environment. The same methodology applies to any codebase with security-critical logic: smart contracts, AI agent frameworks, web and mobile applications.
-
 ## Project GlassBreak
 
-**Project GlassBreak** is FailSafe's responsible-disclosure initiative for open source. We point SWARM at the projects the broader ecosystem depends on, privately report the vulnerabilities we find to their maintainers, and contribute fixes back upstream — coordinating disclosure so issues are patched before they are made public. The aim is straightforward: make the software everyone builds on measurably safer, and give back to the security community rather than only benchmarking against it.
+**Project GlassBreak** is FailSafe's responsible-disclosure initiative for open source. We point our platform at the open-source projects the broader ecosystem depends on, privately report the vulnerabilities we find to their maintainers, and contribute fixes back upstream — coordinating disclosure so issues are patched before they are made public. The aim is straightforward: make the software everyone builds on measurably safer, and give back to the security community rather than only benchmarking against it.
 
-Every disclosure below was discovered by SWARM and reported under this policy. Status reflects the current state of each upstream report.
+Every disclosure below was discovered by FailSafe and reported under this initiative. Status reflects the current state of each upstream report.
 
 <table>
 <tr><th>Project</th><th>Vulnerability</th><th>Status</th></tr>
@@ -271,13 +267,19 @@ Every disclosure below was discovered by SWARM and reported under this policy. S
 
 Also see how we compare against Claude Mythos [here](https://getfailsafe.com/swarm-finds-mythos-zero-days) using Gemini 3 Flash.
 
+## The Engine: FailSafe's Agentic Offensive Security Platform
+
+Every finding above comes from **FailSafe's Agentic Offensive Security Platform** — an autonomous system that maps out threat models, system architectures, invariants, and trust boundaries through multiple specialised frontier models, then uses harnessed tooling and artifacts to guide autonomous red-team agents toward exploit validation in an isolated environment. The same approach applies to any codebase with security-critical logic: smart contracts, AI agent frameworks, web and mobile applications.
+
+The rest of this README documents how the platform works and how it performs.
+
 ## Benchmark
 
-To make our results reproducible, we evaluated SWARM against [EVMBench](https://github.com/ethanbabel/EVMBench), an open-source benchmark of 120 confirmed HIGH-severity vulnerabilities across 40 audit contests. Anyone can run the same evaluation against the same codebases.
+To make our results reproducible, we evaluated FailSafe against [EVMBench](https://github.com/ethanbabel/EVMBench), an open-source benchmark of 120 confirmed HIGH-severity vulnerabilities across 40 audit contests. Anyone can run the same evaluation against the same codebases.
 
 | Approach | Detected | Recall |
 |----------|----------|--------|
-| **FailSafe SWARM** | **83 / 120** | **69.2%** |
+| **FailSafe** | **83 / 120** | **69.2%** |
 | Claude Opus 4.6 (single agent) | ~55 / 120 | 45.6% |
 | GPT-5.2 (single agent) | ~26 / 120 | ~22% |
 
@@ -286,13 +288,13 @@ To make our results reproducible, we evaluated SWARM against [EVMBench](https://
 
 ### Beyond HIGH Severity
 
-The benchmark tests only HIGH-severity findings, but the original audit contests also produced MEDIUM-severity findings (typically 10-26 per contest). Because SWARM produces full threat models rather than isolated bug reports, its confirmed findings cover this territory too.
+The benchmark tests only HIGH-severity findings, but the original audit contests also produced MEDIUM-severity findings (typically 10-26 per contest). Because the platform produces full threat models rather than isolated bug reports, its confirmed findings cover this territory too.
 
-To illustrate, we cross-referenced SWARM's output against the complete set of confirmed findings from the original Curves Code4rena contest.
+To illustrate, we cross-referenced the platform's output against the complete set of confirmed findings from the original Curves Code4rena contest.
 
-**Curves: 9 of 14 confirmed contest vulnerabilities detected.** The contest produced 4 HIGHs and 10 MEDIUMs. SWARM detected 3 of 4 HIGHs and independently identified 6 of 10 MEDIUMs, hitting **64% total recall** across all severities.
+**Curves: 9 of 14 confirmed contest vulnerabilities detected.** The contest produced 4 HIGHs and 10 MEDIUMs. FailSafe detected 3 of 4 HIGHs and independently identified 6 of 10 MEDIUMs, hitting **64% total recall** across all severities.
 
-| ID | Contest Finding | SWARM Finding |
+| ID | Contest Finding | FailSafe Finding |
 |----|----------------|---------------|
 | H | *(3 of 4 HIGHs detected)* | |
 | M-01 | Protocol fee permanently locked on sells | Protocol Fee Permanently Locked on Sells |
@@ -304,7 +306,7 @@ To illustrate, we cross-referenced SWARM's output against the complete set of co
 
 ## Methodology
 
-SWARM's core insight is that structured threat modeling provides better coverage than free-form code review. The pipeline builds a layered threat model through four phases, then uses those artifacts to guide autonomous deep-dive agents.
+The platform's core insight is that structured threat modeling provides better coverage than free-form code review. The pipeline builds a layered threat model through four phases, then uses those artifacts to guide autonomous deep-dive agents.
 
 ```mermaid
 flowchart TD
@@ -368,13 +370,13 @@ Each hypothesis receives a verdict: **CONFIRMED**, **REFUTED**, or **CONTESTED**
 
 ### Phase E - Guided Agentic Deep Dive
 
-Phases A-D produce the majority of detections. Phase E supplements them with autonomous agents (Claude Opus 4.6 and Codex 5.3) that run independent deep dives into the codebase. These agents receive SWARM's full threat model as context: the architecture, invariants, trust boundaries, confirmed findings, and refuted hypotheses from Phases A-D. This lets them build on what the pipeline has already established and focus on areas with known gaps: integration boundaries, mathematical edge cases, and multi-step attack chains.
+Phases A-D produce the majority of detections. Phase E supplements them with autonomous agents (Claude Opus 4.6 and Codex 5.3) that run independent deep dives into the codebase. These agents receive the platform's full threat model as context: the architecture, invariants, trust boundaries, confirmed findings, and refuted hypotheses from Phases A-D. This lets them build on what the pipeline has already established and focus on areas with known gaps: integration boundaries, mathematical edge cases, and multi-step attack chains.
 
 Phase E contributed 8 additional detections across the 40 benchmark contests.
 
 ### Multi-Model Diversity
 
-SWARM uses multiple LLM providers (Claude, GPT, Gemini) across all phases. Different models surface different classes of vulnerabilities; the heterogeneous ensemble provides broader coverage than any single model.
+The platform uses multiple LLM providers (Claude, GPT, Gemini) across all phases. Different models surface different classes of vulnerabilities; the heterogeneous ensemble provides broader coverage than any single model.
 
 ## Known Limitations
 
@@ -452,13 +454,13 @@ This repository includes full artifacts for all 40 contests. Each directory has 
 | Directory | Contents | Start Here |
 |-----------|----------|------------|
 | [`results/`](results/) | Judge inputs and outputs (40 contests) | `audit-graded-all-combined.json` - the grading verdict for each contest |
-| [`swarm-outputs/`](swarm-outputs/) | Full SWARM threat models (Phases A-D, ~4,750 files) | `phase-d/confirmed/` - validated findings with root cause and code paths |
+| [`swarm-outputs/`](swarm-outputs/) | Full threat models (Phases A-D, ~4,750 files) | `phase-d/confirmed/` - validated findings with root cause and code paths |
 | [`scripts/`](scripts/) | Phase E runners, grading, and aggregation scripts | `phase-e-agent.js` - the Claude Phase E autonomous agent |
 | [`prompts/`](prompts/) | Phase E prompt template | `phase-e-prompt.txt` |
 
 ### Quick Start: Exploring a Contest
 
-To examine SWARM's full analysis of a specific contest (e.g., Curves):
+To examine the platform's full analysis of a specific contest (e.g., Curves):
 
 1. **Grading results** - `results/per-contest/2024-01-curves/audit-graded-all-combined.json`
 2. **Confirmed findings** - `swarm-outputs/2024-01-curves/phase-d/confirmed/*.json`
@@ -467,9 +469,9 @@ To examine SWARM's full analysis of a specific contest (e.g., Curves):
 
 ### Reproducibility
 
-- **Phase E**: Requires a Claude API key (`phase-e-agent.js`) and/or an OpenAI API key (`phase-e-codex.mjs`). Run against any contest codebase with SWARM artifacts as input.
+- **Phase E**: Requires a Claude API key (`phase-e-agent.js`) and/or an OpenAI API key (`phase-e-codex.mjs`). Run against any contest codebase with the platform's artifacts as input.
 - **Grading**: Requires an OpenAI API key (GPT-5 judge). Run `grade-detect.js` against ground truth.
-- **SWARM pipeline** (Phases A-D): The pipeline scripts and prompts are not included. SWARM outputs for all 40 contests are provided in `swarm-outputs/`.
+- **Pipeline** (Phases A-D): The pipeline scripts and prompts are not included. Outputs for all 40 contests are provided in `swarm-outputs/`.
 
 ---
 
